@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - app-data:/app/data
+    restart: unless-stopped
+#    healthcheck:
+#      # Image has no curl; use the bundled python interpreter instead.
+#      test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://localhost:8000/api/health',timeout=5).status==200 else 1)"]
+#      interval: 30s
+#      timeout: 10s
+#      retries: 3
+
+#  whatsapp-service:
+#    profiles: ["disabled"]
+#    build: ./whatsapp-service
+#    restart: unless-stopped
+#    environment:
+#      - PORT=3000
+#      - BACKEND_URL=http://app:8000
+#    volumes:
+#      - whatsapp-sessions:/app/whatsapp_sessions
+
+volumes:
+  app-data:
+#  whatsapp-sessions:

@@ -1,0 +1,1 @@
+{"nodes": [{"id": "services_portfolio_service_fetch_current_prices", "label": "fetch_current_prices (batch portfolio price fetch)", "file_type": "code", "source_file": "backend/app/services/portfolio_service.py", "source_location": "line 23", "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}

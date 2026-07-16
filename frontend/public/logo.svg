@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1"/>
+      <stop offset="50%" style="stop-color:#7c3aed"/>
+      <stop offset="100%" style="stop-color:#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="pulse" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#e0e7ff"/>
+      <stop offset="100%" style="stop-color:#ffffff"/>
+    </linearGradient>
+    <linearGradient id="arrow" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#34d399"/>
+      <stop offset="100%" style="stop-color:#6ee7b7"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="innerShadow">
+      <feFlood flood-color="#1e1b4b" flood-opacity="0.3"/>
+      <feComposite in2="SourceAlpha" operator="in"/>
+      <feOffset dx="0" dy="4"/>
+      <feGaussianBlur stdDeviation="6"/>
+      <feComposite in2="SourceAlpha" operator="arithmetic" k2="-1" k3="1"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="url(#bg)" filter="url(#innerShadow)"/>
+
+  <!-- Subtle grid lines for depth -->
+  <line x1="80" y1="360" x2="432" y2="360" stroke="#818cf8" stroke-width="1" opacity="0.2"/>
+  <line x1="80" y1="300" x2="432" y2="300" stroke="#818cf8" stroke-width="1" opacity="0.15"/>
+  <line x1="80" y1="240" x2="432" y2="240" stroke="#818cf8" stroke-width="1" opacity="0.1"/>
+
+  <!-- Pulse/heartbeat line that trends upward -->
+  <!-- Path: flat → small beat → big V-beat → upward trend -->
+  <polyline
+    points="60,310 110,310 140,310 160,290 175,340 195,200 215,320 240,280 270,270 310,240 350,210 390,160 420,130"
+    fill="none"
+    stroke="url(#pulse)"
+    stroke-width="20"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    filter="url(#glow)"
+    opacity="0.95"
+  />
+
+  <!-- Upward arrow tip (green) -->
+  <polygon
+    points="420,130 380,155 395,142 385,190 415,190 405,142 420,155"
+    fill="url(#arrow)"
+    opacity="0"
+  />
+
+  <!-- Arrow head at the end of the pulse line -->
+  <polyline
+    points="395,165 420,130 445,155"
+    fill="none"
+    stroke="url(#arrow)"
+    stroke-width="18"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Small dot at pulse start -->
+  <circle cx="60" cy="310" r="8" fill="#c7d2fe" opacity="0.6"/>
+
+  <!-- Glowing dot at arrow tip -->
+  <circle cx="420" cy="130" r="12" fill="#34d399" opacity="0.8"/>
+  <circle cx="420" cy="130" r="6" fill="#ffffff" opacity="0.9"/>
+</svg>

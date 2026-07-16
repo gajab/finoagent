@@ -1,0 +1,21 @@
+User-agent: *
+Allow: /
+Allow: /calculators
+Allow: /financial-calculators
+Allow: /retirement-calculator
+Disallow: /api/
+Disallow: /dashboard
+Disallow: /portfolio
+Disallow: /market
+Disallow: /agents
+Disallow: /strategies
+Disallow: /debt
+Disallow: /settings
+Disallow: /ai-research
+Disallow: /impact
+Disallow: /channels
+Disallow: /metrics
+Disallow: /tracking
+Disallow: /my-trades
+
+Sitemap: https://finoagent.ai/sitemap.xml

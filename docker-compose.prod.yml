@@ -1,0 +1,46 @@
+# Production docker-compose for Google Cloud (e.g. a VM with Docker).
+#
+# Secrets can come from GCP Secret Manager OR direct env vars on the host.
+# Direct env vars take priority over Secret Manager.
+#
+# Minimal setup (Secret Manager):
+#   export GCP_PROJECT_ID=your-gcp-project-id
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Or pass SMTP directly (bypasses Secret Manager for email):
+#   export GCP_PROJECT_ID=your-gcp-project-id
+#   export SMTP_PASS=your-smtp-password
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# The container's service account must have (for Secret Manager):
+#   roles/secretmanager.secretAccessor
+
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # GCP project — enables Secret Manager loading for all other secrets
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      # Direct env-var overrides — these take priority over Secret Manager.
+      # Leave unset (or empty) to fall back to Secret Manager.
+      SMTP_PASS: "${SMTP_PASS:-}"
+      # Override DATABASE_URL here if using Cloud SQL Auth Proxy socket
+      # DATABASE_URL: "postgresql+asyncpg://user:pass@/dbname?host=/cloudsql/PROJECT:REGION:INSTANCE"
+    volumes:
+      - app-data:/app/data
+      # Mount Cloud SQL Auth Proxy socket if using Cloud SQL
+      # - /cloudsql:/cloudsql
+    restart: unless-stopped
+#    healthcheck:
+#      # Image has no curl; use the bundled python interpreter instead.
+#      test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://localhost:8000/api/health',timeout=5).status==200 else 1)"]
+#      interval: 30s
+#      timeout: 10s
+#      retries: 3
+
+volumes:
+  app-data:

@@ -1,0 +1,364 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ================================================================
+   BASE LAYER — Global resets & foundation
+   ================================================================ */
+@layer base {
+  body {
+    @apply bg-base-200 text-base-content min-h-screen font-sans antialiased;
+  }
+
+  /* Smoother font rendering */
+  * {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Focus ring for accessibility */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-primary;
+  }
+
+  /* Selection color */
+  ::selection {
+    @apply bg-primary/30 text-primary-content;
+  }
+}
+
+/* ================================================================
+   COMPONENT LAYER — Reusable styled components
+   ================================================================ */
+@layer components {
+  /* --- Glass morphism card --- */
+  .glass-card {
+    @apply bg-base-100/80 backdrop-blur-md border border-white/[0.06] rounded-2xl shadow-lg shadow-black/10;
+  }
+
+  .glass-card-elevated {
+    @apply bg-base-100/90 backdrop-blur-lg border border-white/[0.08] rounded-2xl shadow-xl shadow-black/20;
+  }
+
+  /* --- Card variants --- */
+  .card-section {
+    @apply bg-base-100 rounded-2xl shadow-lg shadow-black/10 border border-white/[0.04] p-6
+           transition-all duration-300 hover:shadow-xl hover:shadow-black/15 hover:border-white/[0.08];
+  }
+
+  .card-section-flat {
+    @apply bg-base-100 rounded-xl border border-white/[0.04] p-5;
+  }
+
+  .card-interactive {
+    @apply card-section cursor-pointer hover:scale-[1.01] active:scale-[0.99] transition-all duration-200;
+  }
+
+  /* --- Section title --- */
+  .section-title {
+    @apply text-lg font-bold mb-4 flex items-center gap-2.5;
+  }
+
+  /* --- Stat cards --- */
+  .stat-card {
+    @apply bg-base-200/60 rounded-xl p-4 text-center border border-white/[0.03]
+           transition-all duration-300 hover:bg-base-200/80 hover:border-white/[0.06];
+  }
+
+  .stat-card-glow {
+    @apply stat-card relative overflow-hidden;
+  }
+
+  .stat-card-glow::before {
+    content: '';
+    @apply absolute inset-0 opacity-0 transition-opacity duration-500;
+    background: radial-gradient(circle at 50% 50%, oklch(var(--p) / 0.08), transparent 70%);
+  }
+
+  .stat-card-glow:hover::before {
+    @apply opacity-100;
+  }
+
+  /* --- Badge variants --- */
+  .badge-positive {
+    @apply badge bg-success/15 text-success border-success/20 font-semibold;
+  }
+
+  .badge-negative {
+    @apply badge bg-error/15 text-error border-error/20 font-semibold;
+  }
+
+  .badge-neutral {
+    @apply badge bg-warning/15 text-warning border-warning/20 font-semibold;
+  }
+
+  .badge-glow {
+    @apply badge font-semibold shadow-sm;
+    text-shadow: 0 0 8px currentColor;
+  }
+
+  /* --- Gradient text --- */
+  .text-gradient-primary {
+    @apply bg-gradient-to-r from-primary via-secondary to-accent bg-clip-text text-transparent;
+  }
+
+  .text-gradient-warm {
+    @apply bg-gradient-to-r from-warning via-error to-secondary bg-clip-text text-transparent;
+  }
+
+  /* --- Button enhancements --- */
+  .btn-glow {
+    @apply relative overflow-hidden;
+    box-shadow: 0 0 20px -5px oklch(var(--p) / 0.5);
+  }
+
+  .btn-glow:hover {
+    box-shadow: 0 0 30px -5px oklch(var(--p) / 0.7);
+  }
+
+  /* --- Input enhancements --- */
+  .input-glass {
+    @apply input bg-base-200/50 border-white/[0.06] focus:border-primary/50 focus:bg-base-200/80
+           transition-all duration-200 placeholder:text-base-content/30;
+  }
+
+  /* --- Metric card for numbers --- */
+  .metric-card {
+    @apply bg-base-200/40 rounded-xl p-3.5 text-center border border-white/[0.03]
+           transition-all duration-300 hover:bg-base-200/60;
+  }
+
+  .metric-value {
+    @apply text-2xl font-black tracking-tight;
+  }
+
+  .metric-label {
+    @apply text-[10px] font-medium uppercase tracking-wider text-base-content/50 mt-1;
+  }
+
+  /* --- Divider --- */
+  .divider-subtle {
+    @apply border-t border-white/[0.04] my-4;
+  }
+
+  /* --- Tab styling --- */
+  .tab-pill {
+    @apply px-4 py-2 rounded-xl text-sm font-semibold transition-all duration-200
+           text-base-content/60 hover:text-base-content hover:bg-base-200/60;
+  }
+
+  .tab-pill-active {
+    @apply tab-pill bg-primary/15 text-primary border border-primary/20 shadow-sm shadow-primary/10;
+  }
+
+  /* --- Skeleton loading --- */
+  .skeleton-wave {
+    @apply bg-gradient-to-r from-base-200 via-base-300 to-base-200 bg-[length:200%_100%] animate-shimmer rounded-lg;
+  }
+
+  /* --- Tooltip enhancement --- */
+  .tooltip-glass {
+    @apply bg-neutral/95 backdrop-blur-sm text-neutral-content text-xs rounded-lg
+           px-3 py-1.5 shadow-xl shadow-black/30 border border-white/[0.08];
+  }
+
+  /* --- Score bar --- */
+  .score-bar {
+    @apply h-2 rounded-full overflow-hidden bg-base-300;
+  }
+
+  .score-bar-fill {
+    @apply h-full rounded-full transition-all duration-700 ease-out;
+  }
+
+  /* --- Navbar link --- */
+  .nav-link {
+    @apply flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium
+           text-base-content/60 hover:text-base-content hover:bg-base-200/50
+           transition-all duration-200;
+  }
+
+  .nav-link-active {
+    @apply nav-link text-primary bg-primary/10 border border-primary/15;
+  }
+
+  /* --- Responsive container --- */
+  .container-app {
+    @apply max-w-7xl mx-auto px-4 sm:px-6 lg:px-8;
+  }
+
+  /* --- Page header --- */
+  .page-header {
+    @apply flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6;
+  }
+
+  .page-title {
+    @apply text-2xl sm:text-3xl font-bold flex items-center gap-3 tracking-tight;
+  }
+
+  .page-subtitle {
+    @apply text-sm text-base-content/50 mt-1;
+  }
+
+  /* --- Table enhancements --- */
+  .table-pro {
+    @apply w-full text-sm;
+  }
+
+  .table-pro thead tr {
+    @apply border-b border-white/[0.06];
+  }
+
+  .table-pro thead th {
+    @apply text-xs font-semibold uppercase tracking-wider text-base-content/40 py-3 px-4;
+  }
+
+  .table-pro tbody tr {
+    @apply border-b border-white/[0.03] transition-colors duration-150
+           hover:bg-base-200/30;
+  }
+
+  .table-pro tbody td {
+    @apply py-3.5 px-4;
+  }
+
+  /* --- Empty state --- */
+  .empty-state {
+    @apply flex flex-col items-center justify-center py-20 text-center animate-fade-in;
+  }
+
+  .empty-state-icon {
+    @apply w-20 h-20 rounded-3xl bg-gradient-to-br from-primary/20 to-secondary/10
+           flex items-center justify-center mb-6 border border-primary/10;
+  }
+}
+
+/* ================================================================
+   UTILITY LAYER — Custom utilities
+   ================================================================ */
+@layer utilities {
+  /* Stagger animations for lists */
+  .stagger-1 { animation-delay: 0.05s; }
+  .stagger-2 { animation-delay: 0.1s; }
+  .stagger-3 { animation-delay: 0.15s; }
+  .stagger-4 { animation-delay: 0.2s; }
+  .stagger-5 { animation-delay: 0.25s; }
+  .stagger-6 { animation-delay: 0.3s; }
+  .stagger-7 { animation-delay: 0.35s; }
+
+  /* Text shadow utilities */
+  .text-glow {
+    text-shadow: 0 0 12px currentColor;
+  }
+
+  .text-glow-sm {
+    text-shadow: 0 0 6px currentColor;
+  }
+
+  /* Hide scrollbar but keep functionality */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Gradient border trick */
+  .gradient-border {
+    border: 1px solid transparent;
+    background-clip: padding-box;
+    position: relative;
+  }
+
+  .gradient-border::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    background: linear-gradient(135deg, oklch(var(--p) / 0.3), oklch(var(--s) / 0.1));
+    z-index: -1;
+  }
+}
+
+/* ================================================================
+   SCROLLBAR — Dark themed scrollbar
+   ================================================================ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: oklch(var(--bc) / 0.15);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(var(--bc) / 0.25);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: oklch(var(--bc) / 0.15) transparent;
+}
+
+/* ================================================================
+   CHART.JS — Dark mode canvas
+   ================================================================ */
+canvas {
+  max-width: 100%;
+}
+
+/* ================================================================
+   RESPONSIVE OVERRIDES
+   ================================================================ */
+@media (max-width: 640px) {
+  .tabs {
+    @apply flex-wrap gap-1;
+  }
+
+  .tab {
+    @apply text-xs px-2.5 py-1.5;
+  }
+
+  .card-body {
+    @apply p-4;
+  }
+
+  .stats {
+    @apply grid grid-cols-1 gap-0;
+  }
+}
+
+/* ================================================================
+   DAISYUI TAB OVERRIDES — Better tab appearance
+   ================================================================ */
+.tabs-boxed {
+  @apply bg-base-300/50 backdrop-blur-sm p-1.5 rounded-2xl border border-white/[0.04];
+}
+
+.tabs-boxed .tab-active {
+  @apply bg-primary/15 text-primary font-semibold rounded-xl shadow-sm;
+}
+
+/* ================================================================
+   SMOOTH PAGE TRANSITIONS
+   ================================================================ */
+.page-transition-enter {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.page-transition-enter-active {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 300ms ease-out, transform 300ms ease-out;
+}
