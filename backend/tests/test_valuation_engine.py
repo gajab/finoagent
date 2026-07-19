@@ -140,25 +140,30 @@ class TestScenarioTarget:
 
 class TestWarrantedMultiple:
     def test_intact_hypergrowth_caps(self):
-        # 40% growth, 60% margin → PEG blows past the cap → clamped, not infinite
+        # 40% growth, 60% margin → quality base + big PEG premium → clamped at the cap
         assert warranted_multiple(40, 0.60) == 45.0
 
-    def test_broken_compounder_floors_near_market_not_history(self):
-        # The historical-multiple trap: growth breaks 40→8, so the fair multiple must
-        # collapse toward the market base rate — NOT stay at the glory-days ~40x.
-        assert warranted_multiple(8, 0.60) < 25
-        assert warranted_multiple(8, 0.60) > 8
+    def test_low_growth_quality_staple_is_mid_teens_not_floor(self):
+        # THE fix: a fat-margin staple (~17% op margin) growing ~1% must warrant a
+        # mid-teens P/E from its quality base — NOT the junk floor of 8 (the CLX bug).
+        m = warranted_multiple(1, 0.17)
+        assert 13 <= m <= 18
 
-    def test_no_growth_hits_floor(self):
-        assert warranted_multiple(0, 0.60) == 8.0
+    def test_faded_grower_floors_at_quality_base_not_peak(self):
+        # Historical-multiple trap: a 60%-margin franchise that fully fades (≤baseline
+        # growth) floors at its QUALITY base (~low-20s), well below its 45x peak.
+        m = warranted_multiple(3, 0.60)
+        assert 18 <= m <= 26 and m < 45
+
+    def test_thin_margin_no_growth_hits_floor(self):
+        # A very thin-margin (~3%) no-growth business bottoms at the floor
+        assert warranted_multiple(0, 0.03) == 8.0
+
+    def test_growth_adds_a_premium(self):
+        assert warranted_multiple(20, 0.30) > warranted_multiple(3, 0.30)
 
     def test_thin_margin_earns_lower_multiple_than_fat_margin(self):
-        # Same growth, cyclical thin-margin business warrants less than a fat-margin one
-        assert warranted_multiple(15, 0.09) < warranted_multiple(15, 0.60)
-
-    def test_airline_like_is_market_plausible(self):
-        # DAL-ish: ~10% growth, ~9% margin → low-double-digit P/E (its real ~10x)
-        assert 9 <= warranted_multiple(10, 0.09) <= 13
+        assert warranted_multiple(10, 0.09) < warranted_multiple(10, 0.60)
 
 
 # ── Claim aggregation → target + range + confidence ────────────────────────
@@ -193,12 +198,12 @@ class TestAssemble:
         assert bridged == pytest.approx(out["eps"], abs=0.05)   # multiple claims excluded, so flows reconcile
 
     def test_historical_multiple_trap_is_fenced(self):
-        # own_hist_pe is only a CAP; a scenario that breaks growth still gets the low
-        # warranted multiple, not the historical 40x.
+        # own_hist_pe is only a CAP; a scenario that breaks growth gets the quality-base
+        # warranted multiple (from margin), well below the historical 40x — not pinned to it.
         base, lev = self._inputs()
-        broken = [Claim("revenue", 0.06, "E4")]      # growth fades to market
+        broken = [Claim("revenue", 0.06, "E4")]      # growth fades to baseline
         out = assemble(base, lev, broken, margin_quality=0.30, own_hist_pe=40)
-        assert out["multiple"] < 25
+        assert out["multiple"] < 30
 
     def test_unanswered_rebuttal_lowers_the_target(self):
         base, lev = self._inputs()

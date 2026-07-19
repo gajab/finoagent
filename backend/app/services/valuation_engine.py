@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .valuation_priors import (
-    PE_CAP, PE_FLOOR, PEG_TARGET,
+    PE_CAP, PE_FLOOR, PEG_TARGET, GROWTH_BASELINE_PCT,
+    QUALITY_BASE_INTERCEPT, QUALITY_BASE_SLOPE, QUALITY_BASE_MIN, QUALITY_BASE_MAX,
     combine_persistence, persistence_prior, survival_from_tier,
 )
 
@@ -136,23 +137,30 @@ def scenario_target(base: PnL, lev: OperatingLeverage, d: Drivers, multiple: flo
 
 # ── Cross-sectional warranted multiple (Fix 3) ─────────────────────────────
 
+def quality_base_multiple(margin_quality: float | None) -> float:
+    """P/E a NO-GROWTH version of the business warrants, from its operating margin — the
+    durability/quality anchor. A fat-margin franchise holds a mid-teens P/E at zero growth;
+    a thin cyclical does not. Clamped to a market-plausible band."""
+    m = margin_quality if margin_quality is not None else 0.12
+    return min(QUALITY_BASE_MAX, max(QUALITY_BASE_MIN, QUALITY_BASE_INTERCEPT + QUALITY_BASE_SLOPE * m))
+
+
 def warranted_multiple(growth_pct: float, margin_quality: float | None = None,
                        *, peg: float = PEG_TARGET, floor: float = PE_FLOOR,
                        cap: float = PE_CAP) -> float:
     """Fair forward P/E conditioned on the SCENARIO's fundamentals, not the stock's own
-    history — so a broken compounder floors at the market base rate instead of its
-    glory-days multiple (the "historical multiple trap").
+    history — so a broken compounder floors at its QUALITY base (from margin), not its
+    glory-days multiple (the "historical multiple trap"), and a low-growth quality staple
+    is NOT mispriced down to the junk floor.
 
-    PEG discipline: fair fwd P/E ≈ PEG × growth% (whole percent), with a quality tilt —
-    fatter, more durable operating/FCF margins warrant a higher PEG. Clamped to a
-    market-plausible band; low/no growth collapses toward the floor regardless of what
-    the name used to trade at.
+        fair P/E = quality_base(margin) + PEG × max(0, growth% − baseline)
+
+    The margin-driven base fixes what a flat floor got wrong; the PEG term rewards only
+    growth above a nominal baseline. Clamped to a market-plausible band.
     """
-    g = max(0.0, growth_pct)
-    tilt = 1.0
-    if margin_quality is not None:
-        tilt = min(1.5, max(0.5, 0.5 + 2.0 * margin_quality))
-    return round(min(cap, max(floor, peg * tilt * g)), 1)
+    base = quality_base_multiple(margin_quality)
+    premium = peg * max(0.0, growth_pct - GROWTH_BASELINE_PCT)
+    return round(min(cap, max(floor, base + premium)), 1)
 
 
 # ── Claim aggregation — driver-claims → target + range + confidence ────────

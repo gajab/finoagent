@@ -12,7 +12,7 @@ import {
   type DcfScenarioParams, type DebateHistoryItem,
 } from '../api';
 import type {
-  AgentDebateResult, DebateRound, BullValuation, DebateAnchors,
+  AgentDebateResult, DebateRound, DebateAnchors,
   StructuralValuation, StructuralClaim,
 } from '../types';
 
@@ -48,45 +48,16 @@ function NewTag({ isNew }: { isNew: boolean }) {
 const money0 = (x?: number | null) => (x == null ? '—' : `$${x.toLocaleString(undefined, { maximumFractionDigits: 0 })}`);
 const signPct = (x?: number | null) => (x == null ? '—' : `${x > 0 ? '+' : ''}${x}%`);
 
-/** The Bull's price target as a recomputed EPS × multiple bridge, with guardrail flags. */
-function ValuationBridge({ v }: { v: BullValuation }) {
-  return (
-    <div className="mt-2 rounded-lg bg-base-200/40 p-2.5 text-xs">
-      <div className="flex items-center gap-1.5 font-mono flex-wrap">
-        <span className="text-base-content/50">EPS beat</span>
-        <span className="font-semibold">{signPct(v.eps_beat_pct)}</span>
-        <span className="text-base-content/30">×</span>
-        <span className="text-base-content/50">multiple</span>
-        <span className="font-semibold">{v.target_multiple ?? '—'}×</span>
-        <span className="text-base-content/30">→</span>
-        <span className="text-base-content/50">target</span>
-        <span className="font-semibold">{money0(v.computed_target_price)}</span>
-        <span className="text-base-content/30">=</span>
-        <span className={`font-bold ${(v.computed_upside_pct ?? 0) >= 0 ? 'text-success' : 'text-error'}`}>{signPct(v.computed_upside_pct)}</span>
-        <span className="badge badge-xs badge-ghost ml-1">recomputed in code</span>
-      </div>
-      {v.multiple_anchor && <div className="text-base-content/50 mt-1">Multiple: {v.multiple_anchor}</div>}
-      {v.reconciliation && <div className="text-base-content/50">Reconciliation: {v.reconciliation}</div>}
-      {v.flags && v.flags.length > 0 && (
-        <div className="mt-1.5 space-y-0.5">
-          {v.flags.map((f, i) => (
-            <div key={i} className="flex items-start gap-1 text-warning">
-              <AlertTriangle className="w-3 h-3 flex-shrink-0 mt-0.5" /><span>{f}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // Evidence tier → colour (E1 disclosed → strong, E5 narrative → faint).
 const TIER_CLASS: Record<string, string> = {
   E1: 'badge-success', E2: 'badge-info', E3: 'badge-primary',
   E4: 'badge-warning', E5: 'badge-ghost',
 };
 const TIER_LABEL: Record<string, string> = {
-  E1: 'disclosed', E2: 'guidance', E3: 'consensus', E4: 'trend', E5: 'narrative',
+  E1: 'disclosed figure', E2: 'guidance', E3: 'analyst consensus', E4: 'trend/segment', E5: 'narrative',
+};
+const VERDICT_CLASS: Record<string, string> = {
+  keep: 'badge-success', haircut: 'badge-warning', reject: 'badge-error', unreviewed: 'badge-ghost',
 };
 
 /** Format a claim magnitude in its native unit for display. */
@@ -100,15 +71,65 @@ function claimMag(c: StructuralClaim): string {
   }
 }
 
+/** Full "show your work" ledger: each driver-claim with its cited figure (linked to the
+    EDGAR filing), the Judge's verdict, and the one-line reason. */
+function ClaimsLedger({ claims }: { claims: StructuralClaim[] }) {
+  if (!claims?.length) return null;
+  return (
+    <div className="space-y-1.5">
+      {claims.map((c) => {
+        const v = c.verdict || 'unreviewed';
+        return (
+          <div key={c.id} className={`rounded-lg border p-2 text-xs ${c.rejected ? 'border-error/30 bg-error/5 opacity-70' : 'border-base-300/40 bg-base-100/40'}`}>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className={`badge badge-xs ${TIER_CLASS[c.tier] || 'badge-ghost'}`} title={TIER_LABEL[c.tier]}>{c.tier}</span>
+              <span className={`font-mono font-semibold ${c.rejected ? 'line-through text-base-content/40' : ''}`}>{claimMag(c)}</span>
+              <span className="text-base-content/60 truncate">{c.label}</span>
+              {c.source === 'bear' && <span className="badge badge-xs badge-ghost">bear</span>}
+              {c.unanswered && <span className="badge badge-xs badge-outline badge-error gap-0.5" title="Bear rebuttal landed, unrefuted → haircut"><AlertTriangle className="w-2.5 h-2.5" />unrebutted</span>}
+              <span className={`badge badge-xs ${VERDICT_CLASS[v]} ml-auto capitalize`}>{v}</span>
+            </div>
+            {c.cite && (
+              <div className="mt-1 text-[11px] text-base-content/50 flex items-start gap-1">
+                <FileText className="w-3 h-3 mt-0.5 shrink-0" />
+                {c.source_url
+                  ? <a href={c.source_url} target="_blank" rel="noopener noreferrer" className="link link-hover text-primary/80">{c.cite}</a>
+                  : <span>{c.cite}</span>}
+              </div>
+            )}
+            {c.judge_reason && (
+              <div className="mt-1 text-[11px] text-base-content/60 flex items-start gap-1">
+                <Gavel className="w-3 h-3 mt-0.5 shrink-0 text-primary/70" /><span className="italic">{c.judge_reason}</span>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Factor({ label, val, sub }: { label: string; val?: number; sub?: string }) {
+  return (
+    <div>
+      <div className="text-[10px] text-base-content/40 uppercase tracking-wider">{label}</div>
+      <div className="text-sm font-bold font-mono">{val == null ? '—' : val.toFixed(2)}</div>
+      {sub && <div className="text-[10px] text-base-content/50">{sub}</div>}
+    </div>
+  );
+}
+
 /** Driver-claims priced through a real P&L — the authoritative, arithmetic-owned target.
-    The LLM only extracted + tiered the claims; every number below is computed in code. */
+    The LLM only extracted, cited & adjudicated the claims; every number below is code. */
 function StructuralValuationPanel({ v }: { v: StructuralValuation }) {
   const up = v.upside_pct ?? null;
+  const mb = v.multiple_breakdown;
+  const cf = v.confidence_factors;
   return (
-    <div className="rounded-xl bg-primary/5 border border-primary/20 p-3">
-      <div className="text-xs font-semibold text-base-content/60 mb-2 flex items-center gap-1">
+    <div className="rounded-xl bg-primary/5 border border-primary/20 p-3 space-y-3">
+      <div className="text-xs font-semibold text-base-content/60 flex items-center gap-1">
         <Target className="w-3.5 h-3.5 text-primary" /> Structural valuation — driver-claims priced through the P&L
-        <span className="badge badge-xs badge-primary ml-1">computed in code</span>
+        <span className="badge badge-xs badge-primary ml-1">every number computed in code</span>
       </div>
 
       {/* headline */}
@@ -131,13 +152,30 @@ function StructuralValuationPanel({ v }: { v: StructuralValuation }) {
         <div>
           <div className="text-[10px] text-base-content/40 uppercase tracking-wider">Confidence</div>
           <div className="text-lg font-black">{fmtConf(v.confidence)}</div>
-          <div className="text-[11px] text-base-content/50">from range width</div>
+          <div className="text-[11px] text-base-content/50">code-derived</div>
         </div>
       </div>
 
+      {/* multiple derivation */}
+      {mb && (
+        <div className="rounded-lg bg-base-100/40 p-2.5 text-xs">
+          <div className="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">How the {mb.warranted}× multiple is built</div>
+          <div className="font-mono flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span>quality base <b>{mb.quality_base.toFixed(1)}×</b></span>
+            <span className="text-base-content/40">(op margin {(mb.op_margin * 100).toFixed(1)}%)</span>
+            <span className="text-base-content/30">+</span>
+            <span>growth premium on <b>{mb.sustainable_growth_pct ?? 0}%</b> sustainable</span>
+            <span className="text-base-content/30">=</span>
+            <span className="font-bold text-primary">{mb.warranted}×</span>
+            {mb.own_hist_pe != null && <span className="text-base-content/40">· vs its own trailing {mb.own_hist_pe}×</span>}
+          </div>
+          <div className="text-[10px] text-base-content/40 mt-1">{mb.formula}</div>
+        </div>
+      )}
+
       {/* EPS waterfall */}
       {v.waterfall.length > 0 && (
-        <div className="mt-3 rounded-lg bg-base-100/40 p-2.5">
+        <div className="rounded-lg bg-base-100/40 p-2.5">
           <div className="text-[10px] uppercase tracking-wider text-base-content/40 mb-1.5">Base EPS → forward EPS (survival-weighted)</div>
           <div className="space-y-1 font-mono text-xs">
             <div className="flex items-center justify-between text-base-content/50">
@@ -159,23 +197,31 @@ function StructuralValuationPanel({ v }: { v: StructuralValuation }) {
         </div>
       )}
 
-      {/* claims ledger */}
-      {v.claims.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {v.claims.map((c, i) => (
-            <span key={i} className={`badge badge-sm gap-1 ${c.unanswered ? 'badge-outline badge-error' : 'badge-ghost'}`}
-                  title={`${c.tier} · ${TIER_LABEL[c.tier] || ''}${c.unanswered ? ' · unanswered Bear rebuttal → haircut' : ''}${c.persistence_nudge ? ` · persistence ${c.persistence_nudge > 0 ? '+' : ''}${c.persistence_nudge}` : ''}`}>
-              <span className={`badge badge-xs ${TIER_CLASS[c.tier] || 'badge-ghost'}`}>{c.tier}</span>
-              {claimMag(c)}
-              {c.unanswered && <AlertTriangle className="w-3 h-3" />}
-            </span>
-          ))}
+      {/* confidence derivation */}
+      {cf && (
+        <div className="rounded-lg bg-base-100/40 p-2.5 text-xs">
+          <div className="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">How the {fmtConf(v.confidence)} confidence is built</div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <Factor label="band tightness" val={cf.dispersion} />
+            <Factor label="coverage" val={cf.coverage} sub={`${cf.n_surviving} surviving`} />
+            <Factor label="evidence tier" val={cf.evidence_quality} sub="E1/E2 share" />
+            <Factor label="analyst/DCF band" val={cf.band_agreement} />
+          </div>
+          <div className="text-[10px] text-base-content/40 mt-1">{cf.formula}</div>
         </div>
       )}
-      <div className="mt-2 text-[11px] text-base-content/45 leading-tight">
-        Each surviving argument is a tiered driver-claim; code composes them through a real income statement
-        (operating leverage + price↔margin covariance), prices EPS on a warranted multiple that fades with
-        growth, and haircuts unanswered rebuttals. The LLM never multiplies — it only extracts &amp; classifies.
+
+      {/* claims ledger — cited, adjudicated, linked */}
+      <div>
+        <div className="text-[10px] uppercase tracking-wider text-base-content/40 mb-1.5">Priced claims — cited, adjudicated, linked to filings</div>
+        <ClaimsLedger claims={v.claims} />
+      </div>
+
+      <div className="text-[11px] text-base-content/45 leading-tight">
+        The Bull extracts cited driver-claims; the Bear rebuts them by id; the Judge rules keep / haircut /
+        reject on each (with a reason). Code then composes the survivors through a real income statement
+        (operating leverage + price↔margin covariance), prices EPS on a quality-based multiple, and derives
+        confidence from the named factors above. The LLM never multiplies — it only extracts &amp; adjudicates.
       </div>
     </div>
   );
@@ -216,8 +262,16 @@ function RoundBlock({ r, isLast }: { r: DebateRound; isLast: boolean }) {
   return (
     <div className="relative pl-4 border-l-2 border-base-300/40">
       <div className="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-secondary" />
-      <div className="text-xs font-bold text-base-content/50 uppercase tracking-wider mb-2">
-        Round {r.round}{r.user_input ? ' · your input' : ''}
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-xs font-bold text-base-content/50 uppercase tracking-wider">
+          Round {r.round}{r.user_input ? ' · your input' : ''}
+        </span>
+        {r.upside_pct != null && (
+          <span className={`badge badge-xs ${r.upside_pct >= 0 ? 'badge-success' : 'badge-error'} gap-1`}>
+            <Target className="w-3 h-3" />{signPct(Math.round(r.upside_pct))} · conf {fmtConf(r.confidence)}
+          </span>
+        )}
+        <span className="text-[10px] text-base-content/30">code-priced</span>
       </div>
       {r.user_input && (
         <div className="mb-2 rounded-lg bg-secondary/5 border border-secondary/20 p-2 text-xs">
@@ -226,43 +280,52 @@ function RoundBlock({ r, isLast }: { r: DebateRound; isLast: boolean }) {
         </div>
       )}
 
-      {/* Bull */}
+      {/* Bull — argument + cited claims (with the Judge's verdicts folded in) */}
       <div className="rounded-xl border-l-4 border-success bg-base-100/40 p-3 mb-2">
         <div className="flex items-center gap-2 mb-1">
           <TrendingUp className="w-4 h-4 text-success" />
           <span className="font-semibold text-sm">Bull</span>
-          {r.bull.upside_pct != null && (
-            <span className="badge badge-sm badge-success gap-1"><Target className="w-3 h-3" />+{r.bull.upside_pct}%</span>
-          )}
+          <span className="badge badge-xs badge-ghost">{(r.bull.claims || []).length} claims</span>
           <span className="ml-auto"><NewTag isNew={r.bull.new_argument} /></span>
         </div>
         <div className="prose prose-sm max-w-none prose-p:text-base-content/70 prose-strong:text-base-content prose-li:text-base-content/70">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{r.bull.argument || ''}</ReactMarkdown>
         </div>
-        {r.bull.valuation && <ValuationBridge v={r.bull.valuation} />}
+        {(r.bull.claims || []).length > 0 && (
+          <div className="mt-2"><ClaimsLedger claims={r.bull.claims} /></div>
+        )}
       </div>
 
-      {/* Bear */}
+      {/* Bear — argument + rebuttals targeting claim ids */}
       <div className="rounded-xl border-l-4 border-error bg-base-100/40 p-3 mb-2">
         <div className="flex items-center gap-2 mb-1">
           <TrendingDown className="w-4 h-4 text-error" />
           <span className="font-semibold text-sm">Bear</span>
+          {(r.bear.rebuttals || []).length > 0 && <span className="badge badge-xs badge-ghost">{r.bear.rebuttals.length} rebuttals</span>}
           <span className="ml-auto"><NewTag isNew={r.bear.new_argument} /></span>
         </div>
         <div className="prose prose-sm max-w-none prose-p:text-base-content/70 prose-strong:text-base-content prose-li:text-base-content/70">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{r.bear.argument || ''}</ReactMarkdown>
         </div>
+        {(r.bear.rebuttals || []).length > 0 && (
+          <div className="mt-2 space-y-1">
+            {r.bear.rebuttals.map((rb, i) => (
+              <div key={i} className="text-[11px] flex items-start gap-1.5">
+                <span className="badge badge-xs badge-error shrink-0">→ {rb.target}</span>
+                <span className="text-base-content/60">{rb.counter}</span>
+                {rb.severity && <span className="badge badge-xs badge-ghost shrink-0">{rb.severity}</span>}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Judge ruling for the round */}
+      {/* Judge — adjudicator (no numbers), rationale + open questions */}
       <div className="rounded-xl border-l-4 border-primary bg-primary/5 p-3 mb-4">
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <Gavel className="w-4 h-4 text-primary" />
           <span className="font-semibold">Judge</span>
-          <span className="badge badge-sm badge-ghost">conf {fmtConf(r.judge.confidence)}</span>
-          <span className={`badge badge-sm badge-ghost ${(r.judge.view_return ?? 0) >= 0 ? 'text-success' : 'text-error'}`}>
-            view {fmtRet(r.judge.view_return)}
-          </span>
+          <span className="badge badge-sm badge-ghost">adjudicated {(r.judge.adjudication || []).length}</span>
           <span className="badge badge-sm badge-ghost gap-1">
             {r.judge.new_information ? <CheckCircle2 className="w-3 h-3 text-success" /> : <StopCircle className="w-3 h-3 text-warning" />}
             {r.judge.new_information ? 'new info' : 'stale'}
@@ -274,6 +337,11 @@ function RoundBlock({ r, isLast }: { r: DebateRound; isLast: boolean }) {
           </span>
         </div>
         {r.judge.rationale && <p className="text-xs text-base-content/60 italic mt-1">{r.judge.rationale}</p>}
+        {(r.judge.open_questions || []).length > 0 && (
+          <ul className="mt-1.5 text-[11px] text-base-content/60 list-disc pl-4 space-y-0.5">
+            {r.judge.open_questions!.map((q, i) => <li key={i}>{q}</li>)}
+          </ul>
+        )}
       </div>
     </div>
   );
@@ -451,9 +519,9 @@ export function AgentDebate({ ticker, dcfOverride }: Props) {
               <span className="badge badge-outline badge-sm gap-1"><Gavel className="w-3 h-3" /> Judge referees each round</span>
             </div>
             <p className="text-sm text-base-content/50 mb-4 max-w-md mx-auto">
-              Bull and Bear debate {ticker} over its SEC filings, earnings and the macro backdrop for
-              multiple rounds. The Judge stops the debate once it converges or hits high confidence,
-              then outputs an expected return + confidence — the view a Black-Litterman step would consume.
+              Bull and Bear debate {ticker} over its SEC filings, earnings and the macro backdrop as
+              CITED driver-claims; the Judge adjudicates each (keep / haircut / reject) and code prices the
+              survivors through a real P&L. Every number — target, return, confidence — is computed, not guessed.
             </p>
             <button className="btn btn-secondary btn-sm gap-2" onClick={generate} disabled={generating}>
               {generating
@@ -500,12 +568,15 @@ export function AgentDebate({ ticker, dcfOverride }: Props) {
                       {concl?.view_source === 'structural' && <span className="badge badge-xs badge-primary" title="Headline priced by the structural engine from the debate's driver-claims, not the Judge's gestalt">priced from claims</span>}
                     </div>
                     <div className={`text-2xl font-black ${(concl?.view_return ?? 0) >= 0 ? 'text-success' : 'text-error'}`}>{fmtRet(concl?.view_return)}</div>
-                    {concl?.view_source === 'structural' && concl?.judge_view_return != null && (
-                      <div className="text-[11px] text-base-content/45">Judge's read: {fmtRet(concl.judge_view_return)}</div>
+                    {concl?.target_price != null && (
+                      <div className="text-[11px] text-base-content/45">target {money0(concl.target_price)}</div>
                     )}
                   </div>
                   <div>
-                    <div className="text-xs text-base-content/40 uppercase tracking-wider">Confidence</div>
+                    <div className="text-xs text-base-content/40 uppercase tracking-wider flex items-center gap-1">
+                      Confidence
+                      <span className="badge badge-xs badge-primary" title="Computed from band tightness, evidence tier, and analyst/DCF-band agreement — see the factor breakdown below">computed</span>
+                    </div>
                     <div className="text-2xl font-black">{fmtConf(concl?.base_confidence)}</div>
                     <progress className="progress progress-primary w-full h-1.5 mt-1" value={(concl?.base_confidence ?? 0) * 100} max={100} />
                   </div>

@@ -189,7 +189,7 @@ def _context_sync(ticker: str) -> dict:
     date, from ONE 1-year history pull. Best-effort: returns ``None`` defaults if
     yfinance is unavailable for the name."""
     out: dict = {"hv20": None, "hv30": None, "next_earnings": None,
-                 "week52_high": None, "week52_low": None}
+                 "week52_high": None, "week52_low": None, "hv_series": None}
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
@@ -204,6 +204,10 @@ def _context_sync(ticker: str) -> dict:
                 out["hv20"] = round(float(log_ret.tail(20).std() * math.sqrt(252)), 4)
             if len(log_ret) >= 30:
                 out["hv30"] = round(float(log_ret.tail(30).std() * math.sqrt(252)), 4)
+            # Rolling 30-day annualized realized-vol series → drives vol rank/percentile.
+            roll = (log_ret.rolling(30).std() * math.sqrt(252)).dropna()
+            if len(roll) >= 20:
+                out["hv_series"] = [round(float(x), 4) for x in roll.tolist()]
         # Next earnings — try the modern earnings_dates frame, then the calendar.
         try:
             ed = getattr(stock, "earnings_dates", None)
@@ -367,14 +371,18 @@ def _leg(q: OptionQuote, action: str, exp: str, spot: float, dte: int,
     }
 
 
-def _opp_flags(richness: str) -> list[dict]:
+def _opp_flags(richness: str, atm_iv: Optional[float], iv_hv_ratio: Optional[float]) -> list[dict]:
     """Only *opportunity-specific* flags. Common context (exercise style, earnings,
     macro events) is surfaced once at the top level, not repeated on every row."""
     flags: list[dict] = []
+    iv_pct = round(atm_iv * 100, 1) if atm_iv else None
+    hv_pct = round(iv_pct / iv_hv_ratio, 1) if (iv_pct and iv_hv_ratio) else None
     if richness == "rich":
-        flags.append({"level": "good", "text": "IV rich vs HV — premium well-paid (good time to sell)"})
+        flags.append({"level": "good",
+                      "text": f"IV ({iv_pct}%) rich vs HV ({hv_pct}%) — premium well-paid (good time to sell)"})
     elif richness == "cheap":
-        flags.append({"level": "warn", "text": "IV cheap vs HV — premium light"})
+        flags.append({"level": "warn",
+                      "text": f"IV ({iv_pct}%) cheap vs HV ({hv_pct}%) — premium light"})
     return flags
 
 
@@ -385,7 +393,7 @@ def _quant_block(rnd, calls: dict, puts: dict, strikes_all: list[float],
     and the risk-neutral 1-sigma expected move."""
     q: dict = {"rnd_available": rnd is not None, "svi_rmse_vol_pts": None,
                "arb_free": None, "n_quotes": None, "heston": None,
-               "expected_move_pct": None}
+               "expected_move_pct": None, "skew_pts": _skew_pts(rnd, spot)}
     if rnd is not None and getattr(rnd, "smile", None) is not None:
         sm = rnd.smile
         q["svi_rmse_vol_pts"] = round(sm.rmse * 100, 2)
@@ -451,6 +459,48 @@ def _richness(atm_iv: Optional[float], hv: Optional[float]) -> tuple[Optional[fl
     return ratio, label
 
 
+def _skew_pts(rnd, spot: float) -> Optional[float]:
+    """Put-vs-call vol skew in vol points: IV(90% strike) − IV(110% strike) off the
+    fitted smile. Positive = downside puts richer (normal equity skew)."""
+    if rnd is None or getattr(rnd, "smile", None) is None:
+        return None
+    try:
+        return round((float(rnd.smile.iv(spot * 0.90)) - float(rnd.smile.iv(spot * 1.10))) * 100, 1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _rank_pctile(series: Optional[list], value: Optional[float]) -> tuple[Optional[int], Optional[int]]:
+    """(rank, percentile) of *value* within *series* (both 0–100). Rank is where the
+    value sits in the min→max range; percentile is the fraction of the series below it."""
+    if not series or value is None:
+        return None, None
+    lo, hi = min(series), max(series)
+    rank = max(0, min(100, round((value - lo) / (hi - lo) * 100))) if hi > lo else None
+    pctile = round(sum(1 for x in series if x <= value) / len(series) * 100)
+    return rank, pctile
+
+
+def _vol_stats(ctx: dict, front_summary: dict) -> dict:
+    """Per-ticker volatility read: IV/vol rank & percentile + skew. IV rank/percentile
+    are positioned against the trailing 1-year *realized*-vol range (no free historical
+    IV feed) — i.e. 'how rich is today's implied vol vs how much the stock actually moved'."""
+    hv_series = ctx.get("hv_series") or []
+    hv_cur = ctx.get("hv30")
+    iv_atm = (front_summary.get("atm_iv_pct") / 100.0) if front_summary.get("atm_iv_pct") else None
+    skew = (front_summary.get("quant") or {}).get("skew_pts")
+    vol_rank, vol_pctile = _rank_pctile(hv_series, hv_cur)
+    iv_rank, iv_pctile = _rank_pctile(hv_series, iv_atm)
+    return {
+        "iv_atm_pct": round(iv_atm * 100, 1) if iv_atm else None,
+        "hv_current_pct": round(hv_cur * 100, 1) if hv_cur else None,
+        "iv_rank": iv_rank, "iv_percentile": iv_pctile,
+        "vol_rank": vol_rank, "vol_percentile": vol_pctile,
+        "skew_pts": skew,
+        "basis": "IV rank/percentile vs trailing 1y realized-vol range",
+    }
+
+
 def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
                        dte: int, exp: str, rnd, r: float, sofr_pct: float,
                        atm_iv: Optional[float], iv_hv_ratio: Optional[float],
@@ -492,7 +542,7 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
     exp_intr = _expected_intrinsic(rnd, q.strike, right)
     expected_pnl = round(premium - exp_intr * CONTRACT_MULTIPLIER, 2) if exp_intr is not None else None
 
-    flags = _opp_flags(richness)
+    flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
     return {
         "structure": structure,
         "label": label,
@@ -559,7 +609,7 @@ def _credit_spread(structure: str, label: str, short_q: OptionQuote, long_q: Opt
                    else (spot - short_q.strike) / spot * 100)
     g = _bs_greeks(spot, short_q.strike, dte, iv or 0.0, right)
 
-    flags = _opp_flags(richness)
+    flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
     flags.append({"level": "good", "text": f"Defined risk — max loss capped at ${round(capital, 2)}"})
     return {
         "structure": structure,
@@ -640,7 +690,7 @@ def _collar(short_call: OptionQuote, long_put: OptionQuote, spot: float, dte: in
     max_loss = round((spot - long_put.strike) * CONTRACT_MULTIPLIER - premium, 2)
     g = _bs_greeks(spot, short_call.strike, dte, iv or 0.0, "C")
 
-    flags = _opp_flags(richness)
+    flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
     flags.append({"level": "good",
                   "text": f"Downside floor at ${round(long_put.strike, 2)} ({floor_pct:.1f}%) — gap-down protected"})
     return {
@@ -681,6 +731,156 @@ def _collar(short_call: OptionQuote, long_put: OptionQuote, spot: float, dte: in
         "flags": flags,
         "legs": [_leg(short_call, "SELL", exp, spot, dte, atm_iv, rnd),
                  _leg(long_put, "BUY", exp, spot, dte, atm_iv, rnd)],
+    }
+
+
+def _pick_wing(qmap: dict, short_strike: float, side: str) -> Optional[float]:
+    """Nearest *executable* strike further OTM than the short. side: 'below' | 'above'."""
+    cands = [k for k in qmap if (k < short_strike if side == "below" else k > short_strike)]
+    cands.sort(key=lambda k: abs(k - short_strike))
+    for k in cands[:15]:
+        if _executable(qmap[k])[0]:
+            return k
+    return None
+
+
+def _iron_condor(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
+                 atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
+                 min_prob: float, min_income: float, european: bool, ticker: str) -> Optional[dict]:
+    """Neutral, defined-risk both sides: short put spread + short call spread. Income if
+    the underlying stays between the short strikes. P(keep) = P(in band)."""
+    if rnd is None:
+        return None
+    put_strikes = sorted((k for k in puts if k < spot), reverse=True)
+    call_strikes = sorted(k for k in calls if k > spot)
+    if not put_strikes or not call_strikes:
+        return None
+    tail = (1 - min_prob) / 2.0                       # split the breach budget both sides
+    kp_s = _nearest_strike(put_strikes, rnd.strike_for_prob_below(tail), "below")
+    kc_s = _nearest_strike(call_strikes, rnd.strike_for_prob_below(1 - tail), "above")
+    if not kp_s or not kc_s or kp_s not in puts or kc_s not in calls:
+        return None
+    kp_l = _pick_wing(puts, kp_s, "below")
+    kc_l = _pick_wing(calls, kc_s, "above")
+    if not kp_l or not kc_l:
+        return None
+    if not all(_executable(q)[0] for q in (puts[kp_s], puts[kp_l], calls[kc_s], calls[kc_l])):
+        return None
+    net_credit = (puts[kp_s].mid - puts[kp_l].mid) + (calls[kc_s].mid - calls[kc_l].mid)
+    premium = net_credit * CONTRACT_MULTIPLIER
+    if net_credit <= 0 or premium < min_income:
+        return None
+    p_keep = rnd.prob_below(kc_s) - rnd.prob_below(kp_s)   # both shorts OTM (finish in band)
+    if p_keep < min_prob:
+        return None
+    capital = max(kp_s - kp_l, kc_l - kc_s) * CONTRACT_MULTIPLIER - premium   # only one side breaches
+    if capital <= 0:
+        return None
+    premium_ann = annualized_return_pct(premium, capital, dte)
+    g = _bs_greeks(spot, kc_s, dte, (calls[kc_s].iv or atm_iv or 0.0), "C")
+    flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
+    flags.append({"level": "good", "text": f"Defined risk both sides — max loss capped at ${round(capital, 2)}"})
+    flags.append({"level": "info", "text": f"Profit if it stays in ${round(kp_s, 2)}–${round(kc_s, 2)}"})
+    return {
+        "structure": "iron_condor", "label": "Iron Condor",
+        "expiration": exp, "dte": dte,
+        "short_strike": round(kp_s, 2),
+        "short_strike_pct": round((kp_s - spot) / spot * 100, 1),
+        "put_short": round(kp_s, 2), "put_long": round(kp_l, 2),
+        "call_short": round(kc_s, 2), "call_long": round(kc_l, 2),
+        "band_low": round(kp_s, 2), "band_high": round(kc_s, 2),
+        "short_delta": g["delta"],
+        "prob_keep_pct": round(p_keep * 100, 1), "prob_assign_pct": round((1 - p_keep) * 100, 1),
+        "prob_in_band_pct": round(p_keep * 100, 1), "prob_method": "RND",
+        "premium": round(premium, 2), "premium_per_share": round(net_credit, 2),
+        "collateral": round(capital, 2),
+        "premium_annualized_pct": round(premium_ann, 2), "total_annualized_pct": round(premium_ann, 2),
+        "sofr_excess_pct": round(premium_ann, 2), "beats_sofr": True,
+        "static_return_pct": round(premium / capital * 100, 2),
+        "breakeven": round(kp_s - net_credit, 2),
+        "cushion_pct": round((spot - kp_s) / spot * 100, 2),
+        "max_profit": round(premium, 2), "max_loss": round(capital, 2),
+        "expected_pnl": None,
+        "greeks": {"delta": g["delta"], "gamma": g["gamma"], "theta": g["theta"], "vega": g["vega"]},
+        "theta_per_day": round(-g["theta"] * CONTRACT_MULTIPLIER, 2),
+        "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
+        "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
+        "liquidity": {"oi": calls[kc_s].oi, "volume": calls[kc_s].volume, "spread_pct": _spread_pct(calls[kc_s])},
+        "exercise_style": "European (cash-settled)" if european else "American",
+        "flags": flags,
+        "legs": [_leg(puts[kp_s], "SELL", exp, spot, dte, atm_iv, rnd), _leg(puts[kp_l], "BUY", exp, spot, dte, atm_iv, rnd),
+                 _leg(calls[kc_s], "SELL", exp, spot, dte, atm_iv, rnd), _leg(calls[kc_l], "BUY", exp, spot, dte, atm_iv, rnd)],
+    }
+
+
+def _jade_lizard(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
+                 atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
+                 min_prob: float, min_income: float, european: bool, ticker: str) -> Optional[dict]:
+    """Short put + short call spread, sized so net credit ≥ call-spread width ⇒ NO upside
+    risk. Downside is CSP-style (the short put). P(keep) = P(put not assigned)."""
+    if rnd is None:
+        return None
+    put_strikes = sorted((k for k in puts if k < spot), reverse=True)
+    call_strikes = sorted(k for k in calls if k > spot)
+    if not put_strikes or not call_strikes:
+        return None
+    kp = _headline_put(rnd, put_strikes, spot, min_prob)      # CSP-style short put
+    if not kp or kp not in puts or not _executable(puts[kp])[0]:
+        return None
+    p_keep, method = _prob_keep(rnd, kp, "P", spot, dte, r, puts[kp].iv or atm_iv)
+    if p_keep is None or p_keep < min_prob:
+        return None
+    # Find the call spread that MAXIMIZES credit while keeping net credit ≥ call width.
+    best = None
+    for kc_s in call_strikes:
+        if not _executable(calls[kc_s])[0]:
+            continue
+        kc_l = _pick_wing(calls, kc_s, "above")
+        if not kc_l:
+            continue
+        net_credit = puts[kp].mid + calls[kc_s].mid - calls[kc_l].mid
+        premium = net_credit * CONTRACT_MULTIPLIER
+        if net_credit < (kc_l - kc_s) or premium < min_income:   # the no-upside-risk condition
+            continue
+        if best is None or premium > best[0]:
+            best = (premium, kc_s, kc_l, net_credit)
+    if best is None:
+        return None
+    premium, kc_s, kc_l, net_credit = best
+    collateral = kp * CONTRACT_MULTIPLIER
+    premium_ann = annualized_return_pct(premium, collateral, dte)
+    g = _bs_greeks(spot, kp, dte, (puts[kp].iv or atm_iv or 0.0), "P")
+    flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
+    flags.append({"level": "good", "text": f"No upside risk — credit ${round(net_credit, 2)} ≥ call-spread width ${round(kc_l - kc_s, 2)}"})
+    flags.append({"level": "info", "text": f"Downside like a CSP: assigned below ${round(kp, 2)}"})
+    return {
+        "structure": "jade_lizard", "label": "Jade Lizard",
+        "expiration": exp, "dte": dte,
+        "short_strike": round(kp, 2),
+        "short_strike_pct": round((kp - spot) / spot * 100, 1),
+        "put_short": round(kp, 2), "call_short": round(kc_s, 2), "call_long": round(kc_l, 2),
+        "short_delta": g["delta"],
+        "prob_keep_pct": round(p_keep * 100, 1), "prob_assign_pct": round((1 - p_keep) * 100, 1),
+        "prob_method": method,
+        "premium": round(premium, 2), "premium_per_share": round(net_credit, 2),
+        "collateral": round(collateral, 2),
+        "premium_annualized_pct": round(premium_ann, 2), "total_annualized_pct": round(premium_ann, 2),
+        "sofr_excess_pct": round(premium_ann, 2), "beats_sofr": premium_ann > 0,
+        "static_return_pct": round(premium / collateral * 100, 2),
+        "breakeven": round(kp - net_credit, 2),
+        "cushion_pct": round((spot - kp) / spot * 100, 2),
+        "max_profit": round(premium, 2), "max_loss": None,       # CSP-style open downside
+        "expected_pnl": None,
+        "greeks": {"delta": g["delta"], "gamma": g["gamma"], "theta": g["theta"], "vega": g["vega"]},
+        "theta_per_day": round(-g["theta"] * CONTRACT_MULTIPLIER, 2),
+        "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
+        "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
+        "liquidity": {"oi": puts[kp].oi, "volume": puts[kp].volume, "spread_pct": _spread_pct(puts[kp])},
+        "exercise_style": "European (cash-settled)" if european else "American",
+        "flags": flags,
+        "legs": [_leg(puts[kp], "SELL", exp, spot, dte, atm_iv, rnd),
+                 _leg(calls[kc_s], "SELL", exp, spot, dte, atm_iv, rnd),
+                 _leg(calls[kc_l], "BUY", exp, spot, dte, atm_iv, rnd)],
     }
 
 
@@ -782,6 +982,20 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
             if o:
                 opps.append(o)
 
+    # ---- Iron Condor (neutral, defined risk both sides) ----
+    if "iron_condor" in structures:
+        o = _iron_condor(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
+                         richness, min_prob, min_income, european, ticker)
+        if o:
+            opps.append(o)
+
+    # ---- Jade Lizard (short put + call spread, no upside risk) ----
+    if "jade_lizard" in structures:
+        o = _jade_lizard(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
+                         richness, min_prob, min_income, european, ticker)
+        if o:
+            opps.append(o)
+
     # Per-opportunity confidence (fill + trust), from the expiry's quant diagnostics.
     for o in opps:
         o["confidence"] = _confidence(o, quant)
@@ -840,7 +1054,8 @@ async def run_derivative_income(
     """Deep-scan one underlying for income opportunities (≥``min_prob`` no-assignment,
     ≥``min_income`` premium), ranked by annualized yield vs SOFR."""
     ticker = _norm_ticker(ticker)
-    structures = structures or ["covered_call", "cash_secured_put", "collar", "credit_spread"]
+    structures = structures or ["covered_call", "cash_secured_put", "collar",
+                                "credit_spread", "iron_condor", "jade_lizard"]
     min_prob = min(max(min_prob, 0.5), 0.99)
     today = date.today()
 
@@ -931,6 +1146,7 @@ async def run_derivative_income(
         "hv30_pct": round(ctx["hv30"] * 100, 1) if ctx.get("hv30") else None,
         "hv20_pct": round(ctx["hv20"] * 100, 1) if ctx.get("hv20") else None,
         "next_earnings": ctx.get("next_earnings"),
+        "vol_stats": _vol_stats(ctx, expiry_summaries[0] if expiry_summaries else {}),
     }
 
     result = {

@@ -3257,7 +3257,7 @@ export interface DerivativeIncomeGreeks {
 }
 
 export interface DerivativeIncomeOpportunity {
-  structure: 'covered_call' | 'cash_secured_put' | 'collar' | 'put_credit_spread' | 'call_credit_spread' | string;
+  structure: 'covered_call' | 'cash_secured_put' | 'collar' | 'put_credit_spread' | 'call_credit_spread' | 'iron_condor' | 'jade_lizard' | string;
   label: string;
   expiration: string;
   dte: number;
@@ -3266,6 +3266,13 @@ export interface DerivativeIncomeOpportunity {
   long_strike?: number;
   floor_strike?: number;
   width?: number;
+  // multi-leg extras (iron condor / jade lizard)
+  put_short?: number;
+  put_long?: number;
+  call_short?: number;
+  call_long?: number;
+  band_low?: number;
+  band_high?: number;
   short_delta: number | null;
   prob_keep_pct: number;
   prob_assign_pct: number;
@@ -3321,6 +3328,17 @@ export interface DerivativeIncomeQuant {
   expected_move_pct: number | null;
 }
 
+export interface DerivativeIncomeVolStats {
+  iv_atm_pct: number | null;
+  hv_current_pct: number | null;
+  iv_rank: number | null;
+  iv_percentile: number | null;
+  vol_rank: number | null;
+  vol_percentile: number | null;
+  skew_pts: number | null;
+  basis: string;
+}
+
 export interface DerivativeIncomeContext {
   spot: number;
   shares_per_contract: number;
@@ -3333,6 +3351,7 @@ export interface DerivativeIncomeContext {
   hv30_pct: number | null;
   hv20_pct: number | null;
   next_earnings: string | null;
+  vol_stats?: DerivativeIncomeVolStats;
 }
 
 export interface DerivativeIncomeExpirySummary {
@@ -3475,30 +3494,6 @@ export interface DebateFiling {
   url: string | null;
 }
 
-export interface RoundJudge {
-  view_return: number | null;      // decimal, e.g. 0.12
-  confidence: number | null;       // 0..1
-  new_information: boolean;
-  should_continue: boolean;
-  open_questions?: string[];
-  rationale: string;
-  raw?: string;
-  parse_error?: boolean;
-}
-
-export interface BullValuation {
-  eps_beat_pct: number | null;
-  target_multiple: number | null;
-  drivers: { revenue_growth_pct?: number; margin_delta_bps?: number; buyback_reduction_pct?: number } | null;
-  multiple_anchor: string | null;
-  catalyst: string | null;
-  reconciliation: string | null;
-  computed_target_price: number | null;
-  computed_upside_pct: number | null;
-  stated_upside_pct: number | null;
-  flags: string[];
-}
-
 export interface DebateAnchors {
   price: number | null;
   forward_pe: number | null; trailing_pe: number | null; peg: number | null;
@@ -3511,26 +3506,45 @@ export interface DebateAnchors {
   analyst_count: number | null; market_cap: number | null;
 }
 
-export interface DebateRound {
-  round: number;
-  user_input?: string;   // present on rounds the user triggered by answering open questions
-  bull: { argument: string; upside_pct: number | null; new_argument: boolean; valuation?: BullValuation | null };
-  bear: { argument: string; new_argument: boolean };
-  judge: RoundJudge;
+// --- Structural valuation: driver-claims priced through a P&L (valuation_engine) ---
+export type ClaimDriver = 'revenue' | 'margin' | 'buyback' | 'other' | 'multiple';
+export type EvidenceTier = 'E1' | 'E2' | 'E3' | 'E4' | 'E5';
+export type ClaimVerdict = 'keep' | 'haircut' | 'reject' | 'unreviewed';
+
+export interface StructuralClaim {
+  id: string;
+  driver: ClaimDriver;
+  magnitude: number;             // native unit: rev frac; margin bps; share frac; $; P/E pts
+  tier: EvidenceTier;            // final tier (after Judge adjudication)
+  cite?: string;                 // the specific figure + form the claim rests on
+  source_url?: string | null;    // EDGAR link inferred from the cited form
+  label: string;
+  source?: 'bull' | 'bear';
+  unanswered?: boolean;
+  persistence_nudge?: number;
+  verdict?: ClaimVerdict;        // Judge's ruling
+  rejected?: boolean;
+  judge_reason?: string;         // why the Judge kept/haircut/rejected it
 }
 
-// --- Structural valuation: driver-claims priced through a P&L (valuation_engine) ---
-export interface StructuralClaim {
-  driver: 'revenue' | 'margin' | 'buyback' | 'other' | 'multiple';
-  magnitude: number;             // native unit: rev frac; margin bps; share frac; $; P/E pts
-  tier: 'E1' | 'E2' | 'E3' | 'E4' | 'E5';
-  unanswered: boolean;
-  persistence_nudge: number;
-  label: string;
+export interface BearRebuttal { target: string; counter: string; severity?: string; }
+
+export interface ClaimAdjudication {
+  id: string; verdict: ClaimVerdict; tier_final?: string; unanswered?: boolean; reason?: string;
 }
 
 export interface StructuralWaterfallStep {
   label: string; driver: string; tier: string; survival: number; eps_delta: number;
+}
+
+export interface MultipleBreakdown {
+  quality_base: number; op_margin: number; sustainable_growth_pct: number | null;
+  own_hist_pe: number | null; warranted: number; formula: string;
+}
+
+export interface ConfidenceFactors {
+  dispersion: number; coverage?: number; evidence_quality: number;
+  band_agreement: number; n_surviving: number; formula: string;
 }
 
 export interface StructuralValuation {
@@ -3542,11 +3556,32 @@ export interface StructuralValuation {
   target: number;
   range: [number, number];       // [bear, bull]
   scenarios: { bear: number; base: number; bull: number };
-  confidence: number;            // 0..1, from range width
+  confidence: number;            // 0..1, code-derived
+  confidence_factors?: ConfidenceFactors;
+  multiple_breakdown?: MultipleBreakdown;
   price?: number;
   upside_pct?: number;
   waterfall: StructuralWaterfallStep[];
   claims: StructuralClaim[];
+}
+
+export interface DebateRound {
+  round: number;
+  user_input?: string;   // present on rounds the user triggered by answering open questions
+  bull: { argument: string; new_argument: boolean; claims: StructuralClaim[] };
+  bear: { argument: string; new_argument: boolean; rebuttals: BearRebuttal[] };
+  judge: {
+    adjudication: ClaimAdjudication[];
+    rationale: string;
+    open_questions?: string[];
+    new_information?: boolean;
+    should_continue?: boolean;
+    parse_error?: boolean;
+    raw?: string;
+  };
+  valuation?: StructuralValuation | null;   // code-priced result for this round
+  upside_pct?: number | null;
+  confidence?: number | null;
 }
 
 export interface StructuralBase {
@@ -3575,9 +3610,8 @@ export interface AgentDebateResult {
   conclusion?: {
     view_return: number | null;
     base_confidence: number | null;
-    view_source?: 'structural' | 'judge';
-    judge_view_return?: number | null;
-    judge_confidence?: number | null;
+    view_source?: 'structural' | 'none';
+    target_price?: number | null;
     rationale: string;
     open_questions?: string[];
     rounds: number;

@@ -3,6 +3,7 @@ Allow: /
 Allow: /calculators
 Allow: /financial-calculators
 Allow: /retirement-calculator
+Allow: /blog
 Disallow: /api/
 Disallow: /dashboard
 Disallow: /portfolio

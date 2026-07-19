@@ -171,3 +171,276 @@ li { margin-bottom: 8px; }
   h1 { font-size: 1.8rem; }
   main { padding-top: 36px; }
 }
+
+/* ==========================================================================
+   Blog — index listing + long-form article styles
+   Layered on top of the shared SEO page styles above.
+   ========================================================================== */
+
+/* Wider container for the blog index card grid (articles keep the 760px
+   reading measure via the default `main`). */
+main.wide { max-width: 1040px; }
+
+/* --- Article meta row (category · date · reading time) --- */
+.article-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: 0 0 20px;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+}
+
+.article-meta .sep { color: var(--border); }
+
+.tag {
+  display: inline-block;
+  background: rgba(99, 102, 241, 0.14);
+  color: var(--primary-light);
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+
+a.tag:hover { background: rgba(99, 102, 241, 0.24); }
+
+/* --- Blog index: post card grid --- */
+.post-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 22px;
+  margin: 40px 0 0;
+}
+
+.post-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px 24px 22px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.post-card:hover {
+  border-color: rgba(99, 102, 241, 0.5);
+  transform: translateY(-2px);
+}
+
+.post-card h2 {
+  color: var(--heading);
+  font-size: 1.2rem;
+  line-height: 1.3;
+  margin: 14px 0 10px;
+}
+
+.post-card p {
+  margin: 0 0 18px;
+  font-size: 0.92rem;
+  color: var(--text-dim);
+}
+
+.post-card .read-more {
+  margin-top: auto;
+  color: var(--primary-light);
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.post-card .card-meta {
+  font-size: 0.76rem;
+  color: var(--text-dim);
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* --- Long-form article building blocks --- */
+
+/* Data / metrics panel styled like a trading terminal read-out. */
+.data-panel {
+  background: #0a0e14;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px 22px;
+  margin: 28px 0;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.9rem;
+}
+
+.data-panel .panel-title {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin: 0 0 12px;
+}
+
+.data-panel .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.data-panel .row:last-child { border-bottom: none; }
+.data-panel .row .k { color: var(--text-dim); }
+.data-panel .row .v { color: var(--heading); font-weight: 600; }
+.data-panel .row .v.hot { color: #f87171; }
+.data-panel .row .v.warm { color: #fbbf24; }
+
+/* Definition tables for metric breakdowns. */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 24px 0;
+  font-size: 0.92rem;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.data-table thead th {
+  color: var(--heading);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.4);
+}
+
+.data-table td:first-child {
+  color: var(--primary-light);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* Takeaway / callout box. */
+.takeaway {
+  background: var(--bg-card);
+  border-left: 3px solid var(--primary);
+  border-radius: 0 12px 12px 0;
+  padding: 16px 20px;
+  margin: 24px 0;
+}
+
+.takeaway .label {
+  display: block;
+  color: var(--primary-light);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.takeaway p { margin: 0; }
+
+.takeaway.warn { border-left-color: #fbbf24; }
+.takeaway.warn .label { color: #fbbf24; }
+
+/* Highlighted formula / equation. */
+.formula {
+  background: #0a0e14;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 22px;
+  margin: 24px 0;
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 1.05rem;
+  color: var(--heading);
+}
+
+.formula .result { color: var(--primary-light); font-weight: 700; }
+
+/* Greek definition cards. */
+.greek {
+  display: flex;
+  gap: 18px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px 22px;
+  margin: 20px 0;
+}
+
+.greek .glyph {
+  flex: none;
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--primary-light);
+  font-size: 1.6rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.greek .greek-body { min-width: 0; }
+.greek .greek-body h3 { margin: 0 0 6px; }
+.greek .greek-body p:last-child { margin-bottom: 0; }
+
+/* Inline metric chip, e.g. IV Rank 79. */
+.metric {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 0.86em;
+  color: var(--heading);
+  white-space: nowrap;
+}
+
+/* "Next in this series" teaser. */
+.next-post {
+  display: block;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px 24px;
+  margin: 40px 0 0;
+  text-decoration: none;
+}
+
+.next-post:hover { border-color: rgba(99, 102, 241, 0.5); }
+.next-post .up-next {
+  color: var(--primary-light);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.next-post strong { display: block; color: var(--heading); margin-top: 4px; font-size: 1.05rem; }
+
+/* Back-to-blog link above the article title. */
+.back-link {
+  display: inline-block;
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 0.82rem;
+  margin-bottom: 18px;
+}
+.back-link:hover { color: var(--primary-light); }
+
+@media (max-width: 640px) {
+  .greek { flex-direction: column; gap: 12px; }
+  .data-panel .row { flex-direction: column; gap: 0; }
+  .data-panel .row .v { align-self: flex-start; }
+}

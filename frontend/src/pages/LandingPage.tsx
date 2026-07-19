@@ -265,6 +265,7 @@ export default function LandingPage() {
           {/* Plain anchors: these are prerendered static pages served outside
               the SPA router (see frontend/public/*.html) */}
           <nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-xs text-base-content/40 mb-4">
+            <a href="/blog" className="hover:text-primary transition-colors">Blog</a>
             <a href="/agentic-finance" className="hover:text-primary transition-colors">Agentic Finance</a>
             <a href="/agentic-stock-research" className="hover:text-primary transition-colors">Agentic Stock Research</a>
             <a href="/agentic-trading" className="hover:text-primary transition-colors">Agentic Trading</a>

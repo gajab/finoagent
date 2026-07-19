@@ -68,7 +68,17 @@ def combine_persistence(prior: float, llm_nudge: float = 0.0, evidence_tier: str
 
 
 # ── Market anchors for the warranted multiple ──────────────────────────────
+# Fair fwd P/E = QUALITY BASE (what a no-growth version of the business is worth, from
+# its margin/durability) + a PEG growth premium for growth above a nominal baseline.
+# A flat floor mispriced quality staples (a fat-margin, low-growth name like a household
+# staple is worth a mid-teens P/E at zero growth, NOT the junk floor). PEG alone only
+# works for real growers, so it can't set the base — margin quality does.
 MARKET_FWD_PE = 18.0
-PEG_TARGET = 1.6         # market-normal PEG: fair fwd P/E ≈ PEG × growth%
+PEG_TARGET = 1.6              # PEG premium: +PEG × (growth% − baseline) above the base
+GROWTH_BASELINE_PCT = 3.0    # growth at/below this earns no premium (~nominal GDP)
+QUALITY_BASE_INTERCEPT = 6.0 # base P/E = INTERCEPT + SLOPE × operating margin …
+QUALITY_BASE_SLOPE = 55.0
+QUALITY_BASE_MIN = 8.0       # … clamped to this band (thin cyclical → low-teens/single)
+QUALITY_BASE_MAX = 22.0      # … (durable franchise → low-20s even with no growth)
 PE_FLOOR = 8.0
 PE_CAP = 45.0

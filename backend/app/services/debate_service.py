@@ -30,7 +30,7 @@ from .stock_service import fetch_stock_data
 from .edgar_service import gather_company_filings
 from .dcf_service import run_dcf_analysis, dcf_from_override
 from .valuation_data import fetch_valuation_inputs
-from .valuation_engine import Claim, assemble
+from .valuation_engine import Claim, assemble, quality_base_multiple
 from . import rates_service
 
 logger = logging.getLogger(__name__)
@@ -60,18 +60,10 @@ _MAX_ROUNDS = 4
 _ROUNDS_CEILING = 6
 _CONFIDENCE_TARGET = 0.80
 
-# Valuation-bridge guardrails — the price target is EPS×multiple, recomputed in
-# Python, then sanity-checked so the LLM can't dump a number.
-_MULT_BAND = 0.30          # target multiple must sit within ±30% of forward P/E …
-_LARGE_BEAT_PCT = 15.0     # … and an EPS beat over consensus above this is "large"
-_MEGACAP_USD = 500e9       # above this market cap …
-_MEGACAP_UPSIDE = 60.0     # … an upside beyond this is flagged as aggressive
-_STATED_VS_COMPUTED_TOL = 5.0   # pp gap between LLM-stated & recomputed upside
-
-# Structural valuation — after the debate concludes, an extractor turns the surviving
-# arguments into tiered DRIVER-CLAIMS, and valuation_engine.assemble() prices them through
-# a real P&L (covariance-aware) with warranted multiples + fade priors. The LLM only
-# extracts+classifies; the engine owns every number. This is the authoritative headline.
+# Structural valuation — the Bull emits tiered DRIVER-CLAIMS, the Bear rebuts them, the
+# Judge ADJUDICATES each (keep/haircut/reject + reason), and valuation_engine.assemble()
+# prices the survivors through a real P&L (covariance-aware) with warranted multiples +
+# fade priors. No agent emits a target/return/confidence — code owns every number.
 _CLAIM_DRIVERS = {"revenue", "margin", "buyback", "other", "multiple"}
 _MAX_CLAIMS = 6
 
@@ -390,33 +382,29 @@ _EVIDENCE_RULES = (
 
 def _bull_prompt(ticker: str, dossier: str) -> str:
     return (
-        f"You are a long-biased equity analyst in a MULTI-ROUND debate about {ticker}. Build a "
-        f"SOPHISTICATED bull case. Hunt the dossier specifically for: hidden/under-covered segment "
-        f"strength, margin or mix inflections, operating leverage, capital-return capacity (buybacks/"
-        f"dividends), and guidance vs. buy-side expectations.\n\n"
+        f"You are a long-biased equity analyst in a MULTI-ROUND debate about {ticker}. Build the bull "
+        f"case as a set of CITED, FORWARD-LOOKING DRIVER-CLAIMS. You do NOT set a price target, an EPS "
+        f"beat, or a multiple — code computes ALL of those from your claims. Your only job is to surface "
+        f"the real, quantified, cited drivers and defend them.\n\n"
         f"{_EVIDENCE_RULES}\n"
-        f"FORMAT: at most 5 one-line, number-first bullets — no intro or summary paragraph.\n\n"
-        f"Iterative debate — you see the full transcript.\n"
-        f"- Round 1: open with your thesis and a valuation bridge.\n"
-        f"- Later rounds: rebut the Bear's newest points, CONCEDE what's valid, and adjust the SPECIFIC "
-        f"driver the Bear undercut (e.g. lower margin_delta_bps → lower EPS → lower target). Add ONLY "
-        f"new, evidence-backed reasoning — never repeat.\n\n"
-        f"PRICE TARGET — build it, don't guess it. Your target is derived, not stated:\n"
-        f"  target_price = consensus_fwd_EPS × (1 + eps_beat_pct/100) × target_multiple\n"
-        f"We recompute this in code from your two inputs, so make BOTH defensible against the "
-        f"VALUATION ANCHORS section:\n"
-        f"  • eps_beat_pct — how much your NTM EPS beats consensus; it MUST follow from your drivers "
-        f"(revenue growth, margin delta, buyback share reduction) and be consistent with the computed "
-        f"trends, or explicitly justify the divergence.\n"
-        f"  • target_multiple — vs the CURRENT forward P/E; a re-rating >±30% needs a named catalyst.\n"
-        f"Your implied target should land within the band set by the DCF fair value and the analyst "
-        f"high/low unless you name a specific catalyst to exceed it. Reconcile explicitly.\n\n"
-        f"End EVERY response with a one-line JSON VALUATION block, then the two lines, and nothing after:\n"
-        f'VALUATION: {{"eps_beat_pct": <num>, "drivers": {{"revenue_growth_pct": <num>, '
-        f'"margin_delta_bps": <num>, "buyback_reduction_pct": <num>}}, "target_multiple": <num>, '
-        f'"multiple_anchor": "<why vs current fwd P/E + peers>", "catalyst": "<needed if multiple '
-        f'>±30% from fwd P/E, else empty>", "reconciliation": "<how your target sits vs DCF + analyst mean/high/low>"}}\n'
-        f"TARGET_UPSIDE: <number>%\n"
+        f"FORMAT: at most 5 one-line, number-first prose bullets (the narrative), THEN a CLAIMS JSON block.\n\n"
+        f"Each claim is a forward driver off the STRUCTURAL BASE in the dossier:\n"
+        f"  driver ∈ revenue | margin | buyback | other | multiple. UNITS (strict):\n"
+        f"   • revenue: fractional NEXT-YEAR COMPANY-WIDE growth (0.03 = +3%). A single-segment or "
+        f"PAST-quarter number is NOT company-wide forward growth — scale it to the whole company and tier it E4.\n"
+        f"   • margin: forward operating-margin change in BPS (+150, -120)\n"
+        f"   • buyback: fractional share change, NEGATIVE for a repurchase (-0.02 = 2% fewer shares)\n"
+        f"   • other: one-off pretax dollars, absolute (-3.0e8 = $300M charge)\n"
+        f"   • multiple: re-rating in P/E POINTS — ONLY with a named, dated catalyst; otherwise omit it.\n"
+        f"  tier — classify HONESTLY (the Judge re-tiers and can REJECT): E1 disclosed figure in a filing/"
+        f"release · E2 management guidance · E3 analyst consensus · E4 historical/segment extrapolation · "
+        f"E5 narrative. A narrative with no magnitude ('strong brand') is NOT a claim — leave it in prose.\n"
+        f"  cite — the SPECIFIC figure + form, e.g. '10-Q: op margin 15.1% vs 14.0% PY'. No figure → no claim.\n\n"
+        f"Iterative debate: Round 1 opens your claim set. Later rounds — DROP or DOWNGRADE any claim the "
+        f"Bear rebutted with evidence, ADD new cited claims, and RE-EMIT your FULL current set (the latest "
+        f"CLAIMS block is the only one that counts, so a claim you don't repeat is dropped).\n\n"
+        f"End EVERY response with the CLAIMS block then the signal line, nothing after:\n"
+        f'CLAIMS: [{{"id":"c1","driver":"revenue","magnitude":0.03,"tier":"E2","cite":"<form: figure>","label":"<=8 words>"}}, ...]\n'
         f"NEW_ARGUMENT: <yes|no>\n\n"
         f"=== EVIDENCE DOSSIER ===\n{dossier}"
     )
@@ -424,21 +412,20 @@ def _bull_prompt(ticker: str, dossier: str) -> str:
 
 def _bear_prompt(ticker: str, dossier: str) -> str:
     return (
-        f"You are a forensic short-seller in a MULTI-ROUND debate about {ticker}. Invalidate the Bull "
-        f"using the SAME dossier, and find what a retail investor would NEVER check. Hunt specifically "
-        f"for:\n"
-        f"- Quality-of-earnings red flags: net-income vs. free-cash-flow divergence, rising receivables/"
-        f"inventory vs. sales, one-off or 'other income' boosts, stock-based comp & share-count "
-        f"dilution, tax-rate or margin flattery.\n"
-        f"- Decelerating segments, adverse mix shifts, weak guidance, and valuation vs. the ACTUAL "
-        f"growth in the numbers.\n"
-        f"- Secular/competitive threats and macro sensitivity (rates, FX, demand) from the snapshot.\n"
-        f"Do NOT publish your own price target.\n\n"
+        f"You are a forensic short-seller in a MULTI-ROUND debate about {ticker}. Your job is to REBUT the "
+        f"Bull's specific CLAIMS with cited counter-evidence, and to surface your own cited negative "
+        f"drivers. You do NOT publish a price target — code prices the surviving claims.\n\n"
+        f"Hunt for: net-income vs. FCF divergence, receivables/inventory build, one-off / 'other income' "
+        f"boosts, stock-based comp & dilution, tax-rate or margin flattery, a single-segment or past-quarter "
+        f"number dressed up as company-wide forward growth, weak guidance, and secular/competitive/macro threats.\n\n"
         f"{_EVIDENCE_RULES}\n"
-        f"FORMAT: at most 5 one-line, number-first bullets — no intro or summary paragraph.\n\n"
-        f"Iterative debate — attack the Bull's weakest NEW points and add fresh, non-obvious red flags "
-        f"each round; CONCEDE genuinely sound points; never repeat.\n\n"
-        f"End EVERY response with exactly this line and nothing after it:\n"
+        f"FORMAT: at most 5 one-line, number-first prose bullets, THEN a REBUTTALS JSON block. Attack each "
+        f"Bull claim BY its id with a cited counter and a severity. You MAY add your own negative CLAIMS "
+        f"(same schema as the Bull, negative magnitudes) for risks the code should price in.\n\n"
+        f"Iterative debate — attack the weakest NEW claims, concede genuinely sound ones, never repeat.\n\n"
+        f"End EVERY response with the blocks then the signal, nothing after:\n"
+        f'REBUTTALS: [{{"target":"c1","counter":"<form: counter-figure>","severity":"high|med|low"}}, ...]\n'
+        f'CLAIMS: []   (optional negative drivers; [] if none)\n'
         f"NEW_ARGUMENT: <yes|no>\n\n"
         f"=== EVIDENCE DOSSIER ===\n{dossier}"
     )
@@ -446,29 +433,28 @@ def _bear_prompt(ticker: str, dossier: str) -> str:
 
 def _judge_prompt(ticker: str, confidence_target: float) -> str:
     return (
-        f"You are a skeptical quantitative PM MODERATING a multi-round Bull vs. Bear debate on {ticker}. "
-        f"Judge on EVIDENCE, not eloquence: reward claims cited to the dossier's real figures and "
-        f"HEAVILY discount uncited or generic assertions from either side. Apply base rates — most "
-        f"12-month single-stock views should be modest.\n\n"
-        f"Output ONLY a JSON object, no prose, no markdown fences:\n"
-        f'{{"view_return": <float>, "confidence": <float>, "new_information": <bool>, '
-        f'"should_continue": <bool>, "open_questions": ["<...>"], "rationale": "<2-3 sentences>"}}\n\n'
-        f"- view_return: expected 12-month TOTAL return as a decimal (0.12 = +12%, -0.05 = -5%). "
-        f"ANCHOR it to the code-recomputed target upside in the COMPUTED VALUATION note (NOT the Bull's "
-        f"stated number), then adjust DOWN for every well-evidenced Bear risk and every valuation flag.\n"
-        f"- confidence: 0.0 (thesis destroyed / coin-flip) to 1.0 (robust, verdict settled); lower it "
-        f"for uncited claims, thin/contradictory evidence, AND for each valuation flag.\n"
-        f"- UNCERTAINTY PENALTY: for every 'NOT IN FILINGS' item or claim the documents can't verify, "
-        f"pull view_return toward the LOW end of the DCF/analyst range and lower confidence — do not give "
-        f"credit for facts that aren't in the filings.\n"
-        f"- open_questions: a short list (may be empty) of what the FILINGS don't answer but would change "
-        f"the view — written for the user as concrete research to-dos / data to provide "
-        f"(e.g. 'What share of Delta's $4.6B FCF is recurring vs. working-capital timing?'). "
-        f"Roll up the debate's 'NOT IN FILINGS' items here.\n"
-        f"- new_information: true only if THIS round surfaced a substantively new, evidence-backed point.\n"
-        f"- should_continue: true if another round would sharpen the verdict; false if the debate has "
-        f"CONVERGED, is repeating, or confidence is already at/above {confidence_target:.2f}.\n"
-        f"- rationale: 2-3 sentences, number-first, citing the pivotal evidence. No filler."
+        f"You are a skeptical PM ADJUDICATING a Bull vs. Bear debate on {ticker}. You emit NO price target, "
+        f"NO return, NO confidence — code computes every number from the claims you rule on. Your job is to "
+        f"decide, for EACH Bull claim (and any Bear negative claim), whether it survives, and WHY.\n\n"
+        f"For every claim id, rule:\n"
+        f"  • verdict: keep | haircut | reject\n"
+        f"     keep    — cited to a real figure, forward-looking, unrebutted.\n"
+        f"     haircut — partly valid but weaker than stated: set a LOWER tier_final and/or unanswered=true.\n"
+        f"     reject  — narrative/uncited, backward-looking or single-segment sold as company-wide, or a "
+        f"Bear rebuttal fully invalidated it.\n"
+        f"  • tier_final: the corrected E1..E5 tier (downgrade backward-looking / single-segment / thin claims).\n"
+        f"  • unanswered: true if a Bear rebuttal landed on this claim and the Bull did not refute it.\n"
+        f"  • reason: ONE line, number-first, citing the pivotal figure or the exact defect.\n\n"
+        f"Judge on EVIDENCE, not eloquence. Output ONLY this JSON (no prose, no fences):\n"
+        f'{{"adjudication":[{{"id":"c1","verdict":"haircut","tier_final":"E4","unanswered":true,'
+        f'"reason":"<one line, number-first>"}}, ...], "new_information":<bool>, "should_continue":<bool>, '
+        f'"open_questions":["<what the filings do NOT answer but would move the view>"], '
+        f'"rationale":"<2-3 sentences, number-first>"}}\n\n'
+        f"- Every claim id in the Bull/Bear CLAIMS must appear exactly once in adjudication.\n"
+        f"- Roll every 'NOT IN FILINGS' item into open_questions as a concrete research to-do for the user.\n"
+        f"- new_information: true only if THIS round added a substantively new, evidence-backed claim/rebuttal.\n"
+        f"- should_continue: false once the claim set has stabilized, is repeating, or is fully adjudicated "
+        f"(you decide whether another round would change the CLAIMS; the code decides the confidence)."
     )
 
 
@@ -476,109 +462,73 @@ def _judge_prompt(ticker: str, confidence_target: float) -> str:
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def _extract_upside(text: str) -> float | None:
-    """Pull the Bull's `TARGET_UPSIDE: X%` line (fallback: last %). Returns %."""
-    m = re.search(r"TARGET[_\s]?UPSIDE\s*[:=]\s*([+-]?\d+(?:\.\d+)?)\s*%", text, re.IGNORECASE)
-    if m:
-        try:
-            return round(float(m.group(1)), 2)
-        except ValueError:
-            return None
-    return None
-
-
-def _parse_valuation(text: str) -> Optional[dict]:
-    """Extract the Bull's ``VALUATION: {json}`` block (balanced-brace, nested-safe)."""
-    m = re.search(r"VALUATION\s*:\s*", text or "", re.IGNORECASE)
+def _json_after_key(text: str, key: str):
+    """Balanced-bracket JSON ([...] or {...}) after ``KEY:`` — robust to surrounding prose."""
+    m = re.search(rf"{key}\s*:\s*", text or "", re.IGNORECASE)
     if not m:
         return None
-    i = text.find("{", m.end())
-    if i < 0:
+    start = None
+    for ch in ("[", "{"):
+        j = text.find(ch, m.end())
+        if j >= 0 and (start is None or j < start):
+            start = j
+    if start is None:
         return None
+    open_ch, close_ch = text[start], ("]" if text[start] == "[" else "}")
     depth = 0
-    for j in range(i, len(text)):
-        if text[j] == "{":
+    for k in range(start, len(text)):
+        if text[k] == open_ch:
             depth += 1
-        elif text[j] == "}":
+        elif text[k] == close_ch:
             depth -= 1
             if depth == 0:
                 try:
-                    return json.loads(text[i:j + 1])
+                    return json.loads(text[start:k + 1])
                 except Exception:
                     return None
     return None
 
 
-def _recompute_bridge(val: dict, anchors: dict, stated_upside: Optional[float]) -> dict:
-    """Recompute the price target from the Bull's inputs (we own the arithmetic) and
-    run the guardrails. target = consensus_fwd_EPS × (1 + eps_beat) × target_multiple."""
-    price = anchors.get("price")
-    cons_eps = anchors.get("forward_eps")
-    fwd_pe = anchors.get("forward_pe")
-    beat = _numf(val.get("eps_beat_pct")) or 0.0
-    mult = _numf(val.get("target_multiple"))
-    catalyst = str(val.get("catalyst") or "").strip()
-    flags: list[str] = []
-
-    target = upside = None
-    if cons_eps and mult:
-        target = round(cons_eps * (1 + beat / 100) * mult, 2)
-        upside = _upside(target, price)
-
-    # 1) Multiple must sit within ±band of the current forward P/E unless a catalyst is named.
-    if mult and fwd_pe:
-        lo, hi = fwd_pe * (1 - _MULT_BAND), fwd_pe * (1 + _MULT_BAND)
-        if (mult > hi or mult < lo) and not catalyst:
-            flags.append(f"target multiple {mult:.1f}x is outside ±{int(_MULT_BAND*100)}% of forward P/E {fwd_pe:.1f}x with no catalyst named")
-    # 2) A large EPS beat must be backed by the drivers.
-    if abs(beat) >= _LARGE_BEAT_PCT:
-        flags.append(f"large EPS beat vs consensus ({beat:+.0f}%) — must be justified by the drivers")
-    # 3) Triangulation: target should land within the DCF + analyst band.
-    refs = [x for x in (anchors.get("dcf_fair_value"), anchors.get("analyst_high"),
-                        anchors.get("analyst_low"), anchors.get("analyst_mean")) if x]
-    if target and refs:
-        hi_ref, lo_ref = max(refs), min(refs)
-        if target > hi_ref * 1.10:
-            flags.append(f"implied target ${target:,.0f} exceeds the DCF/analyst band (max ${hi_ref:,.0f}) by >10%")
-        elif target < lo_ref * 0.90:
-            flags.append(f"implied target ${target:,.0f} is below the DCF/analyst band (min ${lo_ref:,.0f}) by >10%")
-    # 4) Absurd move for a mega-cap.
-    mc = anchors.get("market_cap")
-    if mc and mc > _MEGACAP_USD and upside is not None and abs(upside) > _MEGACAP_UPSIDE:
-        flags.append(f"{abs(upside):.0f}% move is aggressive for a ${mc/1e9:.0f}B mega-cap")
-    # 5) The LLM's own stated number must match our recomputation.
-    if stated_upside is not None and upside is not None and abs(stated_upside - upside) > _STATED_VS_COMPUTED_TOL:
-        flags.append(f"Bull's stated target ({stated_upside:+.0f}%) diverges from the recomputed bridge ({upside:+.0f}%)")
-
-    return {
-        "eps_beat_pct": beat,
-        "target_multiple": mult,
-        "drivers": val.get("drivers") if isinstance(val.get("drivers"), dict) else None,
-        "multiple_anchor": str(val.get("multiple_anchor") or "") or None,
-        "catalyst": catalyst or None,
-        "reconciliation": str(val.get("reconciliation") or "") or None,
-        "computed_target_price": target,
-        "computed_upside_pct": upside,
-        "stated_upside_pct": stated_upside,
-        "flags": flags,
-    }
+def _parse_bull_claims(text: str) -> list:
+    """The Bull's ``CLAIMS: [...]`` block (its full current claim set)."""
+    v = _json_after_key(text, "CLAIMS")
+    return v if isinstance(v, list) else []
 
 
-def _bridge_note(bridge: dict) -> str:
-    """A compact, authoritative recomputation the Judge must anchor to."""
-    if not bridge:
-        return ""
-    tgt = bridge.get("computed_target_price")
-    up = bridge.get("computed_upside_pct")
-    flags = bridge.get("flags") or []
-    return (
-        "\n=== COMPUTED VALUATION (recomputed in code — authoritative) ===\n"
-        f"target ${tgt:,.2f} → {up:+.1f}% upside "
-        f"(EPS beat {bridge.get('eps_beat_pct'):+.0f}% × multiple {bridge.get('target_multiple')}x)\n"
-        f"Valuation flags ({len(flags)}): " + ("; ".join(flags) if flags else "none") + "\n\n"
-    ) if tgt is not None and up is not None else (
-        "\n=== COMPUTED VALUATION ===\nBull did not supply a parseable valuation bridge this round.\n\n"
-    )
+def _parse_bear_rebuttals(text: str) -> tuple[list, list]:
+    """The Bear's ``REBUTTALS: [...]`` (targeting claim ids) and optional negative ``CLAIMS: [...]``."""
+    reb = _json_after_key(text, "REBUTTALS")
+    neg = _json_after_key(text, "CLAIMS")
+    return (reb if isinstance(reb, list) else [], neg if isinstance(neg, list) else [])
+
+
+def _parse_adjudication(text: str) -> dict:
+    """Parse the Judge's per-claim adjudication JSON. On failure the continue/new-info
+    gates default False so the loop halts rather than spinning on an unreadable verdict."""
+    raw = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
+    candidate = fence.group(1) if fence else None
+    if candidate is None:
+        brace = re.search(r"\{.*\}", raw, re.DOTALL)
+        candidate = brace.group(0) if brace else raw
+    try:
+        obj = json.loads(candidate)
+        adj = obj.get("adjudication")
+        oq = obj.get("open_questions") or []
+        if isinstance(oq, str):
+            oq = [oq]
+        return {
+            "adjudication": adj if isinstance(adj, list) else [],
+            "new_information": _as_bool(obj.get("new_information"), True),
+            "should_continue": _as_bool(obj.get("should_continue"), True),
+            "open_questions": [str(q).strip() for q in oq if str(q).strip()][:8],
+            "rationale": str(obj.get("rationale", "")).strip(),
+            "parse_error": False,
+        }
+    except Exception as exc:
+        logger.info("Judge adjudication parse failed: %s", exc)
+        return {"adjudication": [], "new_information": False, "should_continue": False,
+                "open_questions": [], "rationale": raw, "parse_error": True}
 
 
 # ---------------------------------------------------------------------------
@@ -614,125 +564,175 @@ def _structural_base_dict(vi) -> Optional[dict]:
     }
 
 
-def _extract_claims_prompt(ticker: str, structural_text: str) -> str:
-    return (
-        f"You are a valuation analyst. From the CONCLUDED {ticker} debate, extract the price-relevant "
-        "DRIVER-CLAIMS that SURVIVED, so a deterministic engine can price them. You do NOT compute a "
-        "target — you only extract and CLASSIFY. Output STRICT JSON only, no prose:\n"
-        '{"claims": [{"driver": "...", "magnitude": <number>, "tier": "E1|E2|E3|E4|E5", '
-        '"unanswered": <bool>, "persistence_nudge": <number>, "label": "..."}]}\n\n'
-        "driver ∈ revenue | margin | buyback | other | multiple. UNITS (strict):\n"
-        "- revenue: fractional 1-yr growth (0.08 = +8%)\n"
-        "- margin: operating-margin change in BPS (+150, -120)\n"
-        "- buyback: fractional share change, NEGATIVE for a repurchase (-0.02 = 2% fewer shares)\n"
-        "- other: one-off pretax dollars, absolute (e.g. -3.0e8 for a $300M charge)\n"
-        "- multiple: re-rating in P/E POINTS (+2, -3) — use SPARINGLY, only for a named re-rating catalyst\n"
-        "Evidence tier — classify HONESTLY (most 'story' claims are E4/E5):\n"
-        "  E1 disclosed figure in a filing/release · E2 management guidance · E3 analyst consensus · "
-        "E4 historical-trend extrapolation · E5 pure narrative.\n"
-        "unanswered=true ONLY when the Bear landed a specific rebuttal to THIS driver that the Bull "
-        "never refuted. persistence_nudge (−0.2..0.2, default 0): >0 ONLY with E1/E2 mechanism evidence "
-        "(a disclosed backlog / contract / capacity) that the driver DURABLY persists; <0 if clearly "
-        "one-off. label ≤8 words incl. the source tag.\n"
-        f"Anchor magnitudes to the base:\n{structural_text}\n"
-        f"At most {_MAX_CLAIMS} claims — only material, price-moving ones. If the debate supports no "
-        'quantifiable driver, return {"claims": []}.'
-    )
+# --- claim sanitization / citation linking / engine mapping ---
+_TIERS = {"E1", "E2", "E3", "E4", "E5"}
+_CLAMP = {"revenue": (-0.9, 3.0), "margin": (-2000.0, 2000.0),
+          "buyback": (-0.5, 0.5), "multiple": (-20.0, 20.0)}
 
 
-def _parse_claims_json(text: str) -> list:
-    """Defensive JSON extraction (mirrors ``_parse_judge``), returns the raw claims list."""
-    raw = (text or "").strip()
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
-    candidate = fence.group(1) if fence else None
-    if candidate is None:
-        brace = re.search(r"\{.*\}", raw, re.DOTALL)
-        candidate = brace.group(0) if brace else raw
-    try:
-        obj = json.loads(candidate)
-    except Exception as exc:
-        logger.info("claim extraction JSON parse failed: %s", exc)
-        return []
-    items = obj.get("claims") if isinstance(obj, dict) else obj
-    return items if isinstance(items, list) else []
+def _sanitize_claim(raw, idx: int) -> Optional[dict]:
+    """Validate + clamp one raw agent claim into the canonical dict. Per-driver clamps
+    stop a hallucinated magnitude from running away before it reaches the engine."""
+    if not isinstance(raw, dict):
+        return None
+    driver = str(raw.get("driver", "")).strip().lower()
+    mag = _numf(raw.get("magnitude"))
+    if driver not in _CLAIM_DRIVERS or mag is None:
+        return None
+    if driver in _CLAMP:
+        lo, hi = _CLAMP[driver]
+        mag = max(lo, min(hi, mag))
+    tier = str(raw.get("tier", "E5")).strip().upper()
+    if tier not in _TIERS:
+        tier = "E5"
+    return {
+        "id": str(raw.get("id") or f"c{idx}").strip()[:12],
+        "driver": driver, "magnitude": mag, "tier": tier,
+        "cite": str(raw.get("cite", "") or "")[:200],
+        "label": str(raw.get("label", "") or "")[:80] or driver,
+        "unanswered": _as_bool(raw.get("unanswered"), False),
+        "persistence_nudge": max(-0.2, min(0.2, _numf(raw.get("persistence_nudge")) or 0.0)),
+    }
 
 
-def _claims_from_json(items: list) -> list:
-    """Validate + clamp extracted claims into ``Claim`` objects. Per-driver clamps stop a
-    hallucinated magnitude from running away before it reaches the engine."""
-    _CLAMP = {"revenue": (-0.9, 3.0), "margin": (-2000.0, 2000.0),
-              "buyback": (-0.5, 0.5), "multiple": (-20.0, 20.0)}
-    claims: list = []
-    for it in (items or [])[:_MAX_CLAIMS]:
-        if not isinstance(it, dict):
-            continue
-        driver = str(it.get("driver", "")).strip().lower()
-        mag = _numf(it.get("magnitude"))
-        if driver not in _CLAIM_DRIVERS or mag is None:
-            continue
-        if driver in _CLAMP:
-            lo, hi = _CLAMP[driver]
-            mag = max(lo, min(hi, mag))
-        tier = str(it.get("tier", "E5")).strip().upper()
-        if tier not in {"E1", "E2", "E3", "E4", "E5"}:
-            tier = "E5"
-        nudge = max(-0.2, min(0.2, _numf(it.get("persistence_nudge")) or 0.0))
-        claims.append(Claim(
-            driver=driver, magnitude=mag, tier=tier, persistence_nudge=nudge,
-            unanswered=_as_bool(it.get("unanswered"), False),
-            label=str(it.get("label", "") or "")[:80],
-        ))
+def _sanitize_claims(raw_list, source: str) -> list:
+    """Sanitize an agent's claim list, de-dup by id, cap the count, tag the source side."""
+    out, seen = [], set()
+    for i, raw in enumerate(raw_list or [], 1):
+        c = _sanitize_claim(raw, i)
+        if c and c["id"] not in seen:
+            c["source"] = source
+            seen.add(c["id"])
+            out.append(c)
+        if len(out) >= _MAX_CLAIMS:
+            break
+    return out
+
+
+def _link_citations(claims: list, filings_meta: list) -> list:
+    """Attach the EDGAR source URL to each claim by matching the form named in its cite."""
+    form_urls: dict = {}
+    for f in filings_meta or []:
+        form = (f.get("form") or "").upper()
+        if form and f.get("url") and form not in form_urls:
+            form_urls[form] = f["url"]
+    for c in claims:
+        cu = (c.get("cite") or "").upper()
+        c["source_url"] = next((url for form, url in form_urls.items() if form in cu), None)
     return claims
 
 
-async def _structural_valuation(vi, transcript: list, structural_text: str, ticker: str,
-                                api_key: str, model: str, call_llm) -> Optional[dict]:
-    """Extract driver-claims from the concluded debate and price them with the engine.
-    Returns assemble()'s dict (target/range/confidence/waterfall) + the parsed claims,
-    or None if inputs are missing or nothing quantifiable survived."""
-    if vi is None:
-        return None
-    sys_prompt = _extract_claims_prompt(ticker, structural_text)
-    user = (f"Concluded debate transcript:\n\n{_join_transcript(transcript)}\n\n"
-            "Extract the surviving driver-claims as JSON.")
-    try:
-        text = await call_llm(
-            api_key=api_key, model=model, max_tokens=700, temperature=0.1,
-            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
-        )
-    except Exception as exc:
-        logger.info("claim extraction call failed: %s", exc)
-        return None
-    claims = _claims_from_json(_parse_claims_json(text))
-    if not claims:
-        return None
-    result = assemble(vi.base, vi.leverage, claims, price=vi.price,
-                      margin_quality=vi.margin_quality, own_hist_pe=vi.own_hist_pe)
-    result["claims"] = [
-        {"driver": c.driver, "magnitude": c.magnitude, "tier": c.tier,
-         "unanswered": c.unanswered, "persistence_nudge": c.persistence_nudge, "label": c.label}
-        for c in claims
+def _claims_to_engine(claim_dicts: list) -> list:
+    """Build engine ``Claim`` objects from the surviving (non-rejected) claim dicts."""
+    return [
+        Claim(driver=c["driver"], magnitude=c["magnitude"], tier=c["tier"],
+              persistence_nudge=c.get("persistence_nudge", 0.0),
+              unanswered=bool(c.get("unanswered")), label=c.get("label", ""))
+        for c in claim_dicts if not c.get("rejected")
     ]
+
+
+def _apply_adjudication(claims: list, adjudication: list) -> list:
+    """Fold the Judge's per-claim verdicts back onto the claim dicts (final tier, unanswered,
+    rejected, reason). Claims the Judge didn't rule on are flagged 'unreviewed' and kept."""
+    by_id = {str(a.get("id")): a for a in (adjudication or []) if isinstance(a, dict)}
+    out = []
+    for c in claims:
+        c = dict(c)
+        a = by_id.get(c["id"])
+        if a:
+            verdict = str(a.get("verdict", "keep")).strip().lower()
+            if verdict not in {"keep", "haircut", "reject"}:
+                verdict = "keep"
+            tf = str(a.get("tier_final", "") or "").strip().upper()
+            if tf in _TIERS:
+                c["tier"] = tf
+            c["unanswered"] = _as_bool(a.get("unanswered"), c.get("unanswered", False))
+            c["verdict"] = verdict
+            c["rejected"] = verdict == "reject"
+            c["judge_reason"] = str(a.get("reason", "") or "")[:240]
+        else:
+            c["verdict"] = "unreviewed"
+            c["judge_reason"] = ""
+        out.append(c)
+    return out
+
+
+def _band_agreement(target: Optional[float], anchors: dict) -> float:
+    """1.0 if the target sits inside the analyst/DCF band, decaying with distance outside it."""
+    lo = anchors.get("analyst_low") or anchors.get("dcf_low")
+    hi = anchors.get("analyst_high") or anchors.get("dcf_high")
+    if not target or not lo or not hi or hi <= lo:
+        return 0.6
+    if lo <= target <= hi:
+        return 1.0
+    d = (lo - target) / (hi - lo) if target < lo else (target - hi) / (hi - lo)
+    return round(max(0.15, 1.0 - d), 3)
+
+
+def _derive_confidence(structural: dict, anchors: dict) -> dict:
+    """Confidence COMPUTED (not an LLM number) from three named, auditable factors:
+    band tightness, surviving-evidence quality, and analyst/DCF-band agreement."""
+    target = structural.get("target") or 0.0
+    lo, hi = structural.get("range", [0.0, 0.0]) or [0.0, 0.0]
+    dispersion = round(1 - min(1.0, (hi - lo) / target), 3) if target else 0.0
+    surviving = [c for c in structural.get("claims", []) if not c.get("rejected")]
+    tiers = [c.get("tier", "E5") for c in surviving]
+    evidence_quality = round(sum(t in ("E1", "E2") for t in tiers) / len(tiers), 3) if tiers else 0.0
+    band = _band_agreement(target, anchors)
+    # A tight range earns credit only if enough claims actually survived — otherwise a lone
+    # weak claim (tiny range) would masquerade as high conviction.
+    coverage = round(min(1.0, len(surviving) / 3.0), 3)
+    conf = round(min(0.9, max(0.15, 0.20 + 0.30 * dispersion * coverage
+                                    + 0.25 * evidence_quality + 0.25 * band)), 2)
+    return {"confidence": conf, "factors": {
+        "dispersion": dispersion, "coverage": coverage, "evidence_quality": evidence_quality,
+        "band_agreement": band, "n_surviving": len(surviving),
+        "formula": "0.20 + 0.30·tightness·coverage + 0.25·(E1/E2 share) + 0.25·(analyst/DCF-band agreement)",
+    }}
+
+
+def _price_claims(vi, claim_dicts: list, anchors: dict) -> Optional[dict]:
+    """Price the adjudicated claims through the engine and attach the full verification
+    detail: per-claim verdicts/cites/links, the multiple breakdown, and confidence factors."""
+    if vi is None or not claim_dicts:
+        return None
+    engine_claims = _claims_to_engine(claim_dicts)
+    if not engine_claims:
+        return None
+    result = assemble(vi.base, vi.leverage, engine_claims, price=vi.price,
+                      margin_quality=vi.margin_quality, own_hist_pe=vi.own_hist_pe)
+    result["claims"] = claim_dicts                 # full set (incl. rejected/flagged) with reasons
+    result["multiple_breakdown"] = {
+        "quality_base": quality_base_multiple(vi.margin_quality),
+        "op_margin": round(vi.margin_quality, 4),
+        "sustainable_growth_pct": result.get("sustainable_growth_pct"),
+        "own_hist_pe": round(vi.own_hist_pe, 1) if vi.own_hist_pe else None,
+        "warranted": result.get("multiple"),
+        "formula": "warranted P/E = quality_base(margin) + 1.6 × max(0, sustainable_growth% − 3), capped [8, 45]",
+    }
+    conf = _derive_confidence(result, anchors)
+    result["confidence"] = conf["confidence"]
+    result["confidence_factors"] = conf["factors"]
     return result
 
 
-def _reconcile_conclusion(judge_verdict: dict, structural: Optional[dict]) -> dict:
-    """Headline view_return comes from the STRUCTURAL engine when available (that's the
-    whole point — the number is tied to priced claims, not the Judge's gestalt); the
-    Judge's number/confidence are retained for provenance. Confidence = the more
-    conservative of the two, so both the debate AND the arithmetic must be tight."""
-    vr = judge_verdict.get("view_return")
-    conf = judge_verdict.get("confidence")
-    source = "judge"
-    if structural and structural.get("upside_pct") is not None:
-        vr = round(structural["upside_pct"] / 100, 4)
-        source = "structural"
-        s_conf = structural.get("confidence")
-        if s_conf is not None:
-            conf = round(min(conf, s_conf), 2) if conf is not None else s_conf
-    return {"view_return": vr, "base_confidence": conf, "view_source": source,
-            "judge_view_return": judge_verdict.get("view_return"),
-            "judge_confidence": judge_verdict.get("confidence")}
+def _final_conclusion(structural: Optional[dict], judge: dict, stop_reason: str, rounds_len: int) -> dict:
+    """The headline: view_return AND confidence are both CODE-derived from the structural
+    valuation. The Judge supplies only the narrative rationale + open questions."""
+    vr = (round(structural["upside_pct"] / 100, 4)
+          if (structural and structural.get("upside_pct") is not None) else None)
+    return {
+        "view_return": vr,
+        "base_confidence": structural.get("confidence") if structural else None,
+        "view_source": "structural" if structural else "none",
+        "target_price": structural.get("target") if structural else None,
+        "rationale": (judge or {}).get("rationale", ""),
+        "open_questions": (judge or {}).get("open_questions", []),
+        "rounds": rounds_len,
+        "stop_reason": stop_reason,
+        "parse_error": (judge or {}).get("parse_error", False),
+    }
 
 
 def _parse_new_argument(text: str) -> bool:
@@ -754,45 +754,6 @@ def _as_bool(v, default: bool) -> bool:
     return bool(v)
 
 
-def _parse_judge(text: str) -> dict:
-    """Strict-ish JSON parse of the per-round Judge verdict; defensive to fences/prose.
-
-    On failure, ``should_continue``/``new_information`` default to False so the
-    loop halts rather than spinning on an unreadable verdict.
-    """
-    raw = (text or "").strip()
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
-    candidate = fence.group(1) if fence else None
-    if candidate is None:
-        brace = re.search(r"\{.*\}", raw, re.DOTALL)  # first {...} block
-        candidate = brace.group(0) if brace else raw
-    try:
-        obj = json.loads(candidate)
-        vr = obj.get("view_return")
-        conf = obj.get("confidence", obj.get("base_confidence"))
-        oq = obj.get("open_questions") or []
-        if isinstance(oq, str):
-            oq = [oq]
-        oq = [str(q).strip() for q in oq if str(q).strip()][:8]
-        return {
-            "view_return": float(vr) if vr is not None else None,
-            "confidence": float(conf) if conf is not None else None,
-            "new_information": _as_bool(obj.get("new_information"), True),
-            "should_continue": _as_bool(obj.get("should_continue"), True),
-            "open_questions": oq,
-            "rationale": str(obj.get("rationale", "")).strip(),
-            "parse_error": False,
-        }
-    except Exception as exc:
-        logger.info("Judge JSON parse failed: %s", exc)
-        return {
-            "view_return": None, "confidence": None,
-            "new_information": False, "should_continue": False,
-            "open_questions": [],
-            "rationale": raw, "parse_error": True,
-        }
-
-
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -803,66 +764,83 @@ def _join_transcript(lines: list[str]) -> str:
 
 async def _one_round(
     *, r: int, total_rounds: int, transcript: list[str], bull_sys: str, bear_sys: str,
-    judge_sys: str, anchors: dict, api_key: str, model: str, call_llm, user_note: str = "",
-) -> tuple[dict, bool, bool, dict]:
-    """Run one Bull→Bear→Judge round. Appends the BULL/BEAR turns to ``transcript``
-    (mutated) and returns (round_dict, bull_new, bear_new, verdict). ``user_note``
-    injects verified analyst input (answers to prior open questions) into every turn."""
+    judge_sys: str, vi, anchors: dict, filings_meta: list, prior_claims: list,
+    api_key: str, model: str, call_llm, user_note: str = "",
+) -> tuple[dict, bool, bool, dict, dict]:
+    """One round: Bull emits CITED CLAIMS → Bear REBUTS them → Judge ADJUDICATES each →
+    code PRICES the survivors. No agent emits a target/return/confidence. Mutates
+    ``transcript`` and returns (round_dict, bull_new, bear_new, verdict, structural)."""
     ctx = f"\n\n{user_note}\n" if user_note else ""
 
-    # --- Bull ---
+    # --- Bull → cited driver-claims ---
     if r == 1 and not transcript:
-        bull_user = f"Round 1. Open the debate: make the definitive bull case.{ctx}"
+        bull_user = f"Round 1. Open: build the bull case and your CLAIMS set.{ctx}"
     else:
         bull_user = (
             f"Debate so far:\n\n{_join_transcript(transcript)}{ctx}\n\n"
-            f"Round {r}. As the BULL, rebut the Bear's latest points, concede what's valid, and "
-            f"refine your target. Add ONLY new reasoning not already above."
+            f"Round {r}. As the BULL: drop/downgrade any claim the Bear rebutted, add new cited claims, "
+            f"and RE-EMIT your FULL current CLAIMS set."
         )
     bull_text = await call_llm(
-        api_key=api_key, model=model, max_tokens=450, temperature=0.7,
+        api_key=api_key, model=model, max_tokens=600, temperature=0.6,
         messages=[{"role": "system", "content": bull_sys}, {"role": "user", "content": bull_user}],
     )
     bull_new = _parse_new_argument(bull_text)
-    stated = _extract_upside(bull_text)
-    bull_val = _parse_valuation(bull_text)
-    bridge = _recompute_bridge(bull_val, anchors, stated) if bull_val else None
-    up = bridge["computed_upside_pct"] if (bridge and bridge["computed_upside_pct"] is not None) else stated
+    claims = _link_citations(_sanitize_claims(_parse_bull_claims(bull_text), "bull"), filings_meta)
+    if not claims:
+        claims = prior_claims or []           # fall back to the last good set if this round didn't re-emit
     transcript.append(f"[Round {r} · BULL]\n{bull_text}")
 
-    # --- Bear ---
+    # --- Bear → rebuttals (+ optional negative claims) ---
     bear_user = (
         f"Debate so far:\n\n{_join_transcript(transcript)}{ctx}\n\n"
-        f"Round {r}. As the BEAR, dismantle the Bull's latest argument — attack its weakest new "
-        f"points and add fresh red flags. Add ONLY new reasoning not already above."
+        f"Round {r}. As the BEAR: rebut the Bull's CLAIMS by id with cited counters; add red flags "
+        f"and any negative claims of your own."
     )
     bear_text = await call_llm(
-        api_key=api_key, model=model, max_tokens=450, temperature=0.7,
+        api_key=api_key, model=model, max_tokens=600, temperature=0.6,
         messages=[{"role": "system", "content": bear_sys}, {"role": "user", "content": bear_user}],
     )
     bear_new = _parse_new_argument(bear_text)
+    rebuttals, bear_raw_claims = _parse_bear_rebuttals(bear_text)
+    bear_claims = _link_citations(_sanitize_claims(bear_raw_claims, "bear"), filings_meta)
+    all_claims = claims + [c for c in bear_claims if c["id"] not in {x["id"] for x in claims}]
     transcript.append(f"[Round {r} · BEAR]\n{bear_text}")
 
-    # --- Judge ---
+    # --- Judge → per-claim adjudication (no numbers) ---
+    claims_view = json.dumps([{k: c[k] for k in ("id", "driver", "magnitude", "tier", "cite", "label")}
+                              for c in all_claims])
     judge_user = (
-        f"Full debate transcript through round {r} (of up to {total_rounds}):\n\n"
-        f"{_join_transcript(transcript)}{ctx}\n"
-        f"{_bridge_note(bridge)}"
-        f"Output your JSON verdict for round {r}."
+        f"Bull+Bear CLAIMS to adjudicate:\n{claims_view}\n\n"
+        f"Bear REBUTTALS (target = claim id):\n{json.dumps(rebuttals)}\n\n"
+        f"Full transcript through round {r} of {total_rounds}:\n\n{_join_transcript(transcript)}{ctx}\n\n"
+        f"Adjudicate EVERY claim id. JSON only."
     )
     judge_text = await call_llm(
-        api_key=api_key, model=model, max_tokens=600, temperature=0.2,
+        api_key=api_key, model=model, max_tokens=800, temperature=0.15,
         messages=[{"role": "system", "content": judge_sys}, {"role": "user", "content": judge_user}],
     )
-    verdict = _parse_judge(judge_text)
+    verdict = _parse_adjudication(judge_text)
+
+    # --- Code prices the survivors — the ONLY place a number is produced ---
+    adjudicated = _apply_adjudication(all_claims, verdict["adjudication"])
+    structural = _price_claims(vi, adjudicated, anchors)
 
     round_dict = {
         "round": r,
-        "bull": {"argument": bull_text, "upside_pct": up, "new_argument": bull_new, "valuation": bridge},
-        "bear": {"argument": bear_text, "new_argument": bear_new},
-        "judge": {**verdict, "raw": judge_text},
+        "bull": {"argument": bull_text, "new_argument": bull_new, "claims": adjudicated},
+        "bear": {"argument": bear_text, "new_argument": bear_new, "rebuttals": rebuttals},
+        "judge": {
+            "adjudication": verdict["adjudication"], "rationale": verdict["rationale"],
+            "open_questions": verdict["open_questions"], "new_information": verdict["new_information"],
+            "should_continue": verdict["should_continue"], "parse_error": verdict["parse_error"],
+            "raw": judge_text,
+        },
+        "valuation": structural,
+        "upside_pct": structural.get("upside_pct") if structural else None,
+        "confidence": structural.get("confidence") if structural else None,
     }
-    return round_dict, bull_new, bear_new, verdict
+    return round_dict, bull_new, bear_new, verdict, structural
 
 
 async def run_debate(
@@ -890,29 +868,35 @@ async def run_debate(
     bear_sys = _bear_prompt(ticker, dossier)
     judge_sys = _judge_prompt(ticker, confidence_target)
 
+    vi = evidence.get("valuation_inputs")
+    filings_meta = evidence["filings_meta"]
     transcript: list[str] = []   # running, labelled debate log shown to every agent
     rounds: list[dict] = []
-    last_upside: float | None = None
+    prior_claims: list = []      # last good claim set, so a non-re-emitting round doesn't lose it
+    structural: Optional[dict] = None
     stop_reason = "reached the round cap without converging"
 
     for r in range(1, max_rounds + 1):
-        round_dict, bull_new, bear_new, verdict = await _one_round(
+        round_dict, bull_new, bear_new, verdict, structural = await _one_round(
             r=r, total_rounds=max_rounds, transcript=transcript,
-            bull_sys=bull_sys, bear_sys=bear_sys, judge_sys=judge_sys, anchors=anchors,
+            bull_sys=bull_sys, bear_sys=bear_sys, judge_sys=judge_sys,
+            vi=vi, anchors=anchors, filings_meta=filings_meta, prior_claims=prior_claims,
             api_key=api_key, model=model, call_llm=call_llm,
         )
         rounds.append(round_dict)
+        if structural and structural.get("claims"):
+            prior_claims = [dict(c) for c in structural["claims"] if not c.get("rejected")]
 
-        # --- Termination gates (individual agents + judge) ---
-        conf = verdict["confidence"]
+        # --- Termination gates: CODE confidence (not an LLM number) + Judge's convergence calls ---
+        conf = structural.get("confidence") if structural else None
         if verdict["parse_error"]:
-            stop_reason = "Judge verdict was unreadable — halting"
+            stop_reason = "Judge adjudication was unreadable — halting"
             break
         if conf is not None and conf >= confidence_target:
-            stop_reason = f"Judge reached the confidence target ({conf:.0%} ≥ {confidence_target:.0%})"
+            stop_reason = f"computed confidence hit the target ({conf:.0%} ≥ {confidence_target:.0%})"
             break
         if not verdict["should_continue"]:
-            stop_reason = "Judge ruled the debate had converged"
+            stop_reason = "Judge ruled the claim set had stabilized"
             break
         if not verdict["new_information"]:
             stop_reason = "the round added no new information"
@@ -921,12 +905,7 @@ async def run_debate(
             stop_reason = "both sides had nothing new to add"
             break
 
-    final = rounds[-1]["judge"] if rounds else {}
-    # Price the surviving arguments through the structural engine — the authoritative view.
-    structural = await _structural_valuation(
-        evidence.get("valuation_inputs"), transcript, evidence.get("structural_text", ""),
-        ticker, api_key, model, call_llm)
-    reconciled = _reconcile_conclusion(final, structural)
+    final_judge = rounds[-1]["judge"] if rounds else {}
     return {
         "ticker": ticker,
         "company_name": evidence["company_name"],
@@ -939,18 +918,11 @@ async def run_debate(
         },
         "anchors": anchors,
         "structural_base": evidence.get("structural_base"),
-        "structural_valuation": structural,
+        "structural_valuation": structural,   # the last round's priced result (authoritative)
         "dcf_source": "user" if dcf_override else "auto",
         "prompts": {"bull": bull_sys, "bear": bear_sys, "judge": judge_sys},
         "rounds": rounds,
-        "conclusion": {
-            **reconciled,
-            "rationale": final.get("rationale", ""),
-            "open_questions": final.get("open_questions", []),
-            "rounds": len(rounds),
-            "stop_reason": stop_reason,
-            "parse_error": final.get("parse_error", False),
-        },
+        "conclusion": _final_conclusion(structural, final_judge, stop_reason, len(rounds)),
         "settings": {"max_rounds": max_rounds, "confidence_target": confidence_target},
     }
 
@@ -971,36 +943,34 @@ async def continue_debate(db, ticker: str, api_key: str, model: str,
     if not (bull_sys and bear_sys and judge_sys and prior_rounds):
         raise ValueError("Cannot continue — the stored debate is missing prompts or rounds.")
 
-    # Rebuild the running transcript from the prior rounds.
+    # Rebuild the running transcript + carry the prior surviving claim set forward.
     transcript: list[str] = []
     for rd in prior_rounds:
         n = rd.get("round")
         transcript.append(f"[Round {n} · BULL]\n{(rd.get('bull') or {}).get('argument', '')}")
         transcript.append(f"[Round {n} · BEAR]\n{(rd.get('bear') or {}).get('argument', '')}")
+    prior_sv = prior.get("structural_valuation") or {}
+    prior_claims = [dict(c) for c in (prior_sv.get("claims") or []) if not c.get("rejected")]
 
-    user_note = (
-        "=== USER-PROVIDED ANSWERS (verified analyst input — treat as FACT; it resolves prior open "
-        f"questions where applicable, so update your view and confidence accordingly) ===\n{user_input.strip()}"
-    )
-    r = len(prior_rounds) + 1
-    round_dict, _bn, _rn, verdict = await _one_round(
-        r=r, total_rounds=r, transcript=transcript,
-        bull_sys=bull_sys, bear_sys=bear_sys, judge_sys=judge_sys, anchors=anchors,
-        api_key=api_key, model=model, call_llm=call_llm, user_note=user_note,
-    )
-    round_dict["user_input"] = user_input.strip()   # shown above this round in the UI
-
-    # Re-price through the structural engine with the extra round (+ the user's answers)
-    # folded in. Re-fetch the base (prompts are stored, but the ValuationInputs are not).
+    # Re-fetch the base (prompts are stored, but the ValuationInputs are not).
     try:
         vi = await fetch_valuation_inputs(ticker)
     except Exception as exc:
         logger.info("valuation inputs failed on continue for %s: %s", ticker, exc)
         vi = None
-    structural_text = _structural_base_text(vi) if vi else ""
-    structural = await _structural_valuation(
-        vi, transcript, structural_text, ticker, api_key, model, call_llm)
-    reconciled = _reconcile_conclusion(verdict, structural)
+
+    user_note = (
+        "=== USER-PROVIDED ANSWERS (verified analyst input — treat as FACT; it resolves prior open "
+        f"questions where applicable, so update your claims accordingly) ===\n{user_input.strip()}"
+    )
+    r = len(prior_rounds) + 1
+    round_dict, _bn, _rn, verdict, structural = await _one_round(
+        r=r, total_rounds=r, transcript=transcript,
+        bull_sys=bull_sys, bear_sys=bear_sys, judge_sys=judge_sys,
+        vi=vi, anchors=anchors, filings_meta=(prior.get("evidence") or {}).get("filings", []),
+        prior_claims=prior_claims, api_key=api_key, model=model, call_llm=call_llm, user_note=user_note,
+    )
+    round_dict["user_input"] = user_input.strip()   # shown above this round in the UI
 
     updated = dict(prior)
     updated["rounds"] = prior_rounds + [round_dict]
@@ -1008,13 +978,7 @@ async def continue_debate(db, ticker: str, api_key: str, model: str,
     if structural is not None:
         updated["structural_valuation"] = structural
         updated["structural_base"] = _structural_base_dict(vi)
-    updated["conclusion"] = {
-        **reconciled,
-        "rationale": verdict.get("rationale", ""),
-        "open_questions": verdict.get("open_questions", []),
-        "rounds": len(updated["rounds"]),
-        "stop_reason": "continued with your input",
-        "parse_error": verdict.get("parse_error", False),
-    }
+    updated["conclusion"] = _final_conclusion(structural, round_dict["judge"],
+                                              "continued with your input", len(updated["rounds"]))
     updated["available"] = True
     return updated

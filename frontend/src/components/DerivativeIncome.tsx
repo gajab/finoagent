@@ -3,13 +3,14 @@ import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
   AlertCircle, ChevronDown, ChevronUp, Database, Zap, Activity, Landmark,
-  BarChart3, Target,
+  BarChart3, Target, Layers, Feather,
 } from 'lucide-react';
 import { runDerivativeIncome, runDerivativeIncomePortfolio, fetchTechnicalForTimeframe } from '../api';
 import type {
   DerivativeIncomeResult, DerivativeIncomeOpportunity, DerivativeIncomePortfolioResult,
   DerivativeIncomePortfolioRow, DerivativeIncomeFlag, DerivativeIncomeExpirySummary,
-  DerivativeIncomeContext, DerivativeIncomeQuant, DerivativeIncomeLeg, TechnicalData,
+  DerivativeIncomeContext, DerivativeIncomeQuant, DerivativeIncomeLeg, DerivativeIncomeVolStats,
+  TechnicalData,
 } from '../types';
 import { TechnicalAnalysis } from './TechnicalAnalysis';
 import PreTradeAdvisor, { type AdvisorMetric, type QuantSignal } from './PreTradeAdvisor';
@@ -36,6 +37,8 @@ const STRUCTURE_OPTIONS = [
   { id: 'cash_secured_put', label: 'Cash-Secured Put', icon: <DollarSign className="w-3.5 h-3.5" /> },
   { id: 'collar', label: 'Collar', icon: <Shield className="w-3.5 h-3.5" /> },
   { id: 'credit_spread', label: 'Credit Spreads', icon: <ShieldCheck className="w-3.5 h-3.5" /> },
+  { id: 'iron_condor', label: 'Iron Condor', icon: <Layers className="w-3.5 h-3.5" /> },
+  { id: 'jade_lizard', label: 'Jade Lizard', icon: <Feather className="w-3.5 h-3.5" /> },
 ];
 
 const money = (n: number | null | undefined, d = 0) =>
@@ -273,9 +276,13 @@ function OpportunityCard({ opp, compact, ticker, spot, quant }: {
   const [showLegs, setShowLegs] = useState(false);
   const isSpread = opp.structure.includes('spread');
   const isCollar = opp.structure === 'collar';
-  const strikeStr = isSpread ? `${opp.short_strike} / ${opp.long_strike}`
-    : isCollar ? `cap ${opp.short_strike} · floor ${opp.floor_strike}`
-      : `${opp.short_strike}`;
+  const isCondor = opp.structure === 'iron_condor';
+  const isJade = opp.structure === 'jade_lizard';
+  const strikeStr = isCondor ? `${opp.put_long}/${opp.put_short} – ${opp.call_short}/${opp.call_long}`
+    : isJade ? `put ${opp.put_short} · call ${opp.call_short}/${opp.call_long}`
+      : isSpread ? `${opp.short_strike} / ${opp.long_strike}`
+        : isCollar ? `cap ${opp.short_strike} · floor ${opp.floor_strike}`
+          : `${opp.short_strike}`;
 
   return (
     <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4 space-y-3 hover:border-secondary/30 transition-colors">
@@ -320,10 +327,11 @@ function OpportunityCard({ opp, compact, ticker, spot, quant }: {
           sub={<span className={`badge badge-xs ${richnessBadge(opp.premium_richness)}`}>{opp.premium_richness}</span>} />
       </div>
 
-      {/* collar / spread extras */}
-      {(isCollar || isSpread) && (
+      {/* multi-leg extras (collar / spread / condor / jade lizard) */}
+      {(isCollar || isSpread || isCondor || isJade) && (
         <div className="flex flex-wrap gap-3 text-[11px] text-base-content/60">
-          {isCollar && opp.prob_in_band_pct != null && <span>P(in band): <b>{pct(opp.prob_in_band_pct)}</b></span>}
+          {opp.prob_in_band_pct != null && <span>P(in band): <b>{pct(opp.prob_in_band_pct)}</b></span>}
+          {isCondor && opp.band_low != null && <span>Profit band: <b>${opp.band_low}–${opp.band_high}</b></span>}
           {isCollar && opp.floor_pct != null && <span>Floor: <b>{pct(opp.floor_pct)}</b></span>}
           {opp.max_profit != null && <span>Max profit: <b>{money(opp.max_profit, 0)}</b></span>}
           {opp.width != null && <span>Width: <b>${opp.width}</b></span>}
@@ -414,6 +422,32 @@ function ExpiryChips({ summaries }: { summaries: DerivativeIncomeExpirySummary[]
 
 // Full single-ticker detail — reused for the Single-Ticker tab AND for each
 // expanded holding in Portfolio mode, so every ticker gets identical treatment.
+const rankTone = (v: number | null | undefined) =>
+  v == null ? '' : v >= 70 ? 'text-success' : v >= 40 ? 'text-warning' : 'text-base-content/70';
+
+// Per-ticker volatility read: IV/vol rank & percentile + skew.
+function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
+  const skewSub = vs.skew_pts == null ? '—' : vs.skew_pts > 1 ? 'puts richer' : vs.skew_pts < -1 ? 'calls richer' : 'flat';
+  return (
+    <div className="rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
+      <p className="text-xs font-bold flex items-center gap-1.5 mb-2">
+        <Activity className="w-4 h-4 text-secondary" /> Volatility
+        <span className="text-[10px] font-normal text-base-content/40" title={vs.basis}>
+          — IV/vol rank vs trailing 1y realized vol · higher = premium richer
+        </span>
+      </p>
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+        <MetricTile label="ATM IV" value={pct(vs.iv_atm_pct)} sub={`HV ${pct(vs.hv_current_pct)}`} />
+        <MetricTile label="IV Rank" tone={rankTone(vs.iv_rank)} value={vs.iv_rank ?? '—'} sub="0–100" />
+        <MetricTile label="IV Percentile" tone={rankTone(vs.iv_percentile)} value={vs.iv_percentile != null ? `${vs.iv_percentile}%` : '—'} sub="of 1y" />
+        <MetricTile label="Vol Rank" tone={rankTone(vs.vol_rank)} value={vs.vol_rank ?? '—'} sub="realized" />
+        <MetricTile label="Vol Percentile" tone={rankTone(vs.vol_percentile)} value={vs.vol_percentile != null ? `${vs.vol_percentile}%` : '—'} sub="realized" />
+        <MetricTile label="Skew" value={vs.skew_pts != null ? `${vs.skew_pts}vp` : '—'} sub={skewSub} />
+      </div>
+    </div>
+  );
+}
+
 function SingleTickerResult({ result, shares, costBasis, hideCommonEvents }: {
   result: DerivativeIncomeResult; shares?: number; costBasis?: number | null; hideCommonEvents?: boolean;
 }) {
@@ -427,6 +461,7 @@ function SingleTickerResult({ result, shares, costBasis, hideCommonEvents }: {
   return (
     <div className="space-y-4">
       {result.context && <TickerHeader result={result} ctx={result.context} shares={shares} costBasis={costBasis} />}
+      {result.context?.vol_stats && <VolatilityPanel vs={result.context.vol_stats} />}
       {shownEvents && shownEvents.length > 0 && (
         <EventsBanner events={shownEvents} title={hideCommonEvents ? `${result.ticker} events` : undefined} />
       )}
