@@ -124,6 +124,50 @@ export interface TechnicalData {
   bollingerBands?: BollingerBandsData;
   movingAverages?: MovingAveragesData;
   emaCrossover?: EMACrossoverData;
+  // Institutional market-structure / order-flow read
+  institutional?: InstitutionalTA | null;
+}
+
+export interface VolumeProfileBin { price: number; volume: number; pct: number }
+export interface VolumeProfile { poc: number; vah: number; val: number; value_area_pct: number; bins: VolumeProfileBin[] }
+export interface OrderBlock { type: 'bullish' | 'bearish'; top: number; bottom: number; price: number; strength: number; mitigated: boolean; index: number }
+export interface FairValueGap { type: 'bullish' | 'bearish'; bottom: number; top: number; mid: number; filled: boolean; index: number }
+export interface LiquiditySweep { type: 'buyside' | 'sellside'; level: number; swept_to: number; reversed: boolean; index: number }
+export interface Displacement { index: number; direction: 'up' | 'down'; magnitude: number }
+export interface MarketStructure {
+  trend: 'up' | 'down' | 'range' | string;
+  bos: { type: 'bullish' | 'bearish'; level: number } | null;
+  change_of_character: boolean;
+  recent_swing_high: number | null;
+  recent_swing_low: number | null;
+}
+export interface TARegime {
+  state: string;
+  mode: 'mean_reversion' | 'trend' | 'range' | string;
+  bias: 'bullish' | 'bearish' | 'neutral' | string;
+  rationale: string;
+  favored_income: string[];
+  favored_income_labels: string[];
+  signals: {
+    rsi: number | null;
+    vs_value_area: 'above' | 'below' | 'inside' | null;
+    at_demand: boolean;
+    at_supply: boolean;
+    trend: string | null;
+    bos: string | null;
+    recent_sweep: string | null;
+  };
+}
+export interface InstitutionalTA {
+  price: number;
+  atr: number;
+  volume_profile: VolumeProfile | null;
+  order_blocks: OrderBlock[];
+  fair_value_gaps: FairValueGap[];
+  liquidity_sweeps: LiquiditySweep[];
+  displacement: Displacement[];
+  market_structure: MarketStructure;
+  regime: TARegime;
 }
 
 export interface QuarterlyEarningsHistory {
@@ -3420,6 +3464,81 @@ export interface DerivativeIncomePortfolioResult {
   expiry_mode: string;
   common_events?: DerivativeIncomeFlag[];
   results: DerivativeIncomePortfolioRow[];
+  error?: string;
+}
+
+// ===== Desk Review (ticker-level, ranks all trades + Quant→Risk→PM cascade) =====
+
+export interface DeskMetrics {
+  trader: {
+    net_delta?: number; net_gamma?: number; net_vega?: number; net_theta?: number;
+    net_vanna?: number; net_charm?: number; net_volga?: number; avg_iv_pct?: number | null;
+  };
+  pm: {
+    omega?: number | null; sortino?: number | null; calmar?: number | null; pop?: number | null;
+    expected_value?: number | null; expected_return_pct?: number | null; kelly_fraction?: number | null;
+  };
+  risk: { var_95?: number | null; cvar_95?: number | null; max_loss?: number | null; max_profit?: number | null; capital?: number | null };
+  quant: { score?: number | null; verdict?: string | null; reasons?: string[] };
+}
+
+export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
+  desk_metrics: DeskMetrics;
+  desk_score: number;
+  ta_note?: string;
+}
+
+export interface DeskReviewResult {
+  ticker: string;
+  spot: number;
+  sofr_pct: number;
+  as_of?: string;
+  ta_summary: {
+    state?: string; mode?: string; bias?: string; rsi?: number | null; rsi_signal?: string;
+    support?: number | null; resistance?: number | null; poc?: number | null;
+    value_area?: (number | null)[] | null; trend?: string; bos?: string | null;
+  };
+  events?: DeskReviewEvent[];
+  ranked: DeskRankedTrade[];
+  algo_top_pick: DeskRankedTrade | null;
+  n_trades: number;
+  note?: string;
+  error?: string;
+}
+
+export interface DeskReviewEvent {
+  kind: 'earnings' | 'dividend' | 'macro';
+  level: 'warn' | 'info' | 'good';
+  text: string;
+}
+
+export interface DeskAgent {
+  role: string;
+  title: string;
+  verdict: string;
+  action_needed: boolean;
+  content: string;
+  model: string;
+  input_context: string;
+  system_prompt: string;
+}
+
+export interface DeskAgentsResult {
+  ticker: string;
+  n_trades: number;
+  quant: DeskAgent;
+  risk: DeskAgent;
+  rebuttal: DeskAgent;
+  pm: DeskAgent;
+  final_recommendation: {
+    verdict: string; action_needed: boolean; decision?: string | null;
+    rationale?: string | null; consistency?: string | null;
+    winning_argument?: string | null; sizing?: string | null; desk_mandate?: string | null;
+    quant_choice?: string | null; quant_agrees_with_algo?: string | null;
+    rebuttal_stance?: string | null; final_pick?: string | null;
+    algo_top_pick?: string | null; risk_verdict?: string | null;
+    chosen_index?: number | null;   // index into DeskReviewResult.ranked — the trade to Explore
+  };
   error?: string;
 }
 

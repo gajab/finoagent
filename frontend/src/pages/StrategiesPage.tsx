@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import {
-  Layers, Box, ArrowLeftRight, Building, Shield, Target, ArrowDownRight, Crown, Lock, Briefcase, ClipboardList, ShieldCheck, Coins
+  Layers, Box, ArrowLeftRight, Building, Shield, Target, ArrowDownRight, Crown, Lock, Briefcase, ClipboardList, ShieldCheck, Coins, Sparkles
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
@@ -15,8 +15,9 @@ import { TaxLossHarvesting } from '../components/TaxLossHarvesting';
 import { CppiStrategy } from '../components/CppiStrategy';
 import { HedgingStrategy } from '../components/HedgingStrategy';
 import { DerivativeIncome } from '../components/DerivativeIncome';
+import { DerivativeIncomeV2 } from '../components/DerivativeIncomeV2';
 
-type Strategy = 'box' | 'longshort' | 'structured' | 'dual_direction' | 'concentration' | 'poormans' | 'zebra' | 'tax_loss_harvesting' | 'cppi' | 'hedging' | 'derivative_income';
+type Strategy = 'box' | 'longshort' | 'structured' | 'dual_direction' | 'concentration' | 'poormans' | 'zebra' | 'tax_loss_harvesting' | 'cppi' | 'hedging' | 'derivative_income' | 'derivative_income_v2';
 
 const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; description: string }[] = [
 
@@ -25,6 +26,12 @@ const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; descript
     label: 'Derivative Income',
     icon: <Coins className="w-5 h-5" />,
     description: 'Covered calls, cash-secured puts, collars & credit spreads with ≥85% probability of not being exercised — ranked vs SOFR.',
+  },
+  {
+    id: 'derivative_income_v2',
+    label: 'Derivative Income v2',
+    icon: <Sparkles className="w-5 h-5" />,
+    description: 'New master–detail workspace for the income scanner — same engine, calmer layout.',
   },
   {
     id: 'box',
@@ -170,6 +177,7 @@ export default function StrategiesPage() {
 
               {activeStrategy === 'box' && <BoxStrategy />}
               {activeStrategy === 'derivative_income' && <DerivativeIncome />}
+              {activeStrategy === 'derivative_income_v2' && <DerivativeIncomeV2 />}
               {activeStrategy === 'hedging' && <HedgingStrategy />}
               {activeStrategy === 'longshort' && <LongShortStrategy />}
               {activeStrategy === 'tax_loss_harvesting' && <TaxLossHarvesting />}

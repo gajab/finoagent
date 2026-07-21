@@ -37,6 +37,7 @@ from ..services.concentration_service import run_concentration_management
 from ..services.pmcc_service import run_pmcc_pmcp
 from ..services.zebra_service import run_zebra
 from ..services.derivative_income_service import run_derivative_income, run_portfolio_derivative_income
+from ..services.desk_review_service import rank_desk, run_desk_agents
 from ..services.cppi_service import run_cppi_simulation
 from ..services.tax_loss_harvesting_service import run_portfolio_tax_loss_harvesting
 from ..services.market_impact_service import analyze_market_impact
@@ -1844,6 +1845,87 @@ async def compute_derivative_income(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Derivative income failed: {exc}")
+
+
+# =========================================================================
+# Desk Review — ticker-level, ranks every candidate trade (+ Quant→Risk→PM cascade)
+# =========================================================================
+
+class DeskReviewIn(BaseModel):
+    target_dte: int | None = Field(default=None, ge=1, le=365)
+    min_prob: float = Field(default=0.85, ge=0.5, le=0.99)
+    min_income: float = Field(default=20.0, ge=0)
+    structures: list[str] = Field(default_factory=lambda: list(_DI_DEFAULT_STRUCTURES))
+    quote_source: str = Field(default="yfinance")
+
+
+class FocusTrade(BaseModel):
+    """Desk Review v2 selector — the single trade to review (structure + expiry + primary short strike)."""
+    structure: str
+    expiration: str | None = None
+    short_strike: float | None = None
+
+
+class DeskReviewAgentsIn(DeskReviewIn):
+    model: str = Field(default="gpt-4o", description="LLM for the Quant/Risk/PM cascade")
+    focus: FocusTrade | None = Field(default=None, description="v2: review ONE trade instead of ranking all")
+
+
+@router.post("/{ticker}/desk-review")
+async def compute_desk_review(
+    ticker: str,
+    body: DeskReviewIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deterministic ticker-level desk review: rank ALL candidate income trades by a
+    blended desk score (algorithmic quant + technical alignment) with full desk metrics.
+    No LLM — instant."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    try:
+        result = await rank_desk(
+            ticker, target_dte=body.target_dte, min_prob=body.min_prob,
+            min_income=body.min_income, structures=body.structures,
+            quote_source=body.quote_source, user=user, db=db,
+        )
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Desk review failed: {exc}")
+
+
+@router.post("/{ticker}/desk-review/agents")
+async def compute_desk_review_agents(
+    ticker: str,
+    body: DeskReviewAgentsIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """On-demand Quant → Risk → PM LLM cascade over ALL ranked trades — recommends the
+    single best trade to enter. Each agent feeds the next; needs the user's OpenAI key."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured. Please add it in Settings.")
+    try:
+        result = await run_desk_agents(
+            ticker, api_key=api_key, target_dte=body.target_dte, min_prob=body.min_prob,
+            min_income=body.min_income, structures=body.structures,
+            quote_source=body.quote_source, model=body.model,
+            focus=body.focus.model_dump() if body.focus else None, user=user, db=db,
+        )
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Desk review agents failed: {exc}")
 
 
 # =========================================================================

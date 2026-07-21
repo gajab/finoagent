@@ -792,6 +792,7 @@ def compute_technical_block(stock, timeframe: str = _DEFAULT_TIMEFRAME) -> dict:
         fmt = "%Y-%m-%d %H:%M" if is_intraday else "%Y-%m-%d"
         timestamps = [t.strftime(fmt) for t in hist.index]
         closes = hist["Close"].values.tolist()
+        opens = hist["Open"].values.tolist()
         highs = hist["High"].values.tolist()
         lows = hist["Low"].values.tolist()
         volumes = hist["Volume"].values.tolist()
@@ -817,6 +818,16 @@ def compute_technical_block(stock, timeframe: str = _DEFAULT_TIMEFRAME) -> dict:
             np.array(highs), np.array(lows), np.array(closes), n=3
         )
         vol_analysis = analyze_volume_price(closes, volumes)
+
+        # Institutional market-structure / order-flow read (Volume Profile, SMC, regime).
+        # Best-effort: returns None on thin data, so the base TA block is unaffected.
+        try:
+            from .institutional_ta_service import compute_institutional_ta
+            institutional = compute_institutional_ta(
+                opens, highs, lows, closes, volumes, current_rsi
+            )
+        except Exception:  # noqa: BLE001
+            institutional = None
 
         analysis_lines = []
         analysis_lines.append(f"RSI ({current_rsi:.1f}): {rsi_signal}" if current_rsi else "RSI: N/A")
@@ -844,6 +855,7 @@ def compute_technical_block(stock, timeframe: str = _DEFAULT_TIMEFRAME) -> dict:
             "supportLevel": support,
             "resistanceLevel": resistance,
             "volumeAnalysis": vol_analysis,
+            "institutional": institutional,
             "analysisSummary": "\n".join(analysis_lines),
         })
         return _san(technical)

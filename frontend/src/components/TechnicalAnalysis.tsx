@@ -17,6 +17,7 @@ import {
 } from 'chart.js';
 import { Line, Bar } from 'react-chartjs-2';
 import { TechnicalData } from '../types';
+import { InstitutionalTA, makeSmartMoneyPlugin, SmartMoneyChartLegend } from './InstitutionalTA';
 
 ChartJS.register(
   CategoryScale,
@@ -254,6 +255,9 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
       },
     },
   };
+
+  // Smart-money zones overlay for the price chart (rebuilt when the read changes).
+  const smartMoneyPlugin = useMemo(() => makeSmartMoneyPlugin(technical.institutional), [technical.institutional]);
 
   // Volume chart data
   const volumeChartData = useMemo(() => {
@@ -500,6 +504,13 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
           </div>
         )}
 
+        {/* Institutional read: market structure, order flow & regime (retail-friendly) */}
+        {technical.institutional && (
+          <div className="mb-4">
+            <InstitutionalTA data={technical.institutional} price={technical.prices?.[technical.prices.length - 1]} />
+          </div>
+        )}
+
         {/* Top indicators row */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
           <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03] text-center">
@@ -642,8 +653,9 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
             Price Action with Support &amp; Resistance
           </h4>
           <div className="h-64">
-            {priceChartData && <Line data={priceChartData} options={priceChartOptions} />}
+            {priceChartData && <Line data={priceChartData} options={priceChartOptions} plugins={[smartMoneyPlugin]} />}
           </div>
+          {technical.institutional && <SmartMoneyChartLegend />}
         </div>
 
         {/* Volume Chart */}

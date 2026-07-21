@@ -133,6 +133,7 @@ class YFinanceProvider(QuoteProvider):
         is_index = _normalize_ticker(symbol).startswith("^")
 
         quotes: list[OptionQuote] = []
+        any_synth = False
         for right_label, df in [("C", chain.calls), ("P", chain.puts)]:
             for _, row in df.iterrows():
                 strike = float(row["strike"])
@@ -141,11 +142,16 @@ class YFinanceProvider(QuoteProvider):
                 last = _safe_float(row.get("lastPrice"))
                 mid = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else last
 
-                # For index options with stale bid/ask, synthesize from lastPrice
-                if is_index and bid == 0 and ask == 0 and last > 0:
-                    bid = round(last * 0.97, 4)
-                    ask = round(last * 1.03, 4)
+                # No live two-sided market (index with stale quotes, or ANY option
+                # after-hours / on a weekend) → synthesize an INDICATIVE bid/ask from
+                # lastPrice so the analysis still runs. Liquidity (OI+vol) and the
+                # executability gates downstream still guard against junk strikes.
+                if bid == 0 and ask == 0 and last > 0:
+                    spread = 0.03 if is_index else 0.05
+                    bid = round(last * (1 - spread), 4)
+                    ask = round(last * (1 + spread), 4)
                     mid = last
+                    any_synth = True
 
                 iv = _safe_float(row.get("impliedVolatility"))
                 oi = int(_safe_float(row.get("openInterest")))
@@ -169,5 +175,5 @@ class YFinanceProvider(QuoteProvider):
             expiration=expiration,
             underlying_price=underlying.price,
             quotes=quotes,
-            source="yfinance",
+            source="yfinance (indicative — market closed)" if any_synth else "yfinance",
         )

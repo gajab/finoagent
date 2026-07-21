@@ -1,4 +1,4 @@
-import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight } from './types';
+import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, DeskReviewResult, DeskAgentsResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight } from './types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -650,6 +650,35 @@ export async function runDerivativeIncomePortfolio(params: {
   quote_source?: string;
 }): Promise<DerivativeIncomePortfolioResult> {
   return apiFetch<DerivativeIncomePortfolioResult>('/api/stock/strategies/derivative-income/portfolio', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+// ===== Desk Review =====
+
+export type DeskReviewParams = {
+  target_dte?: number | null;
+  min_prob?: number;
+  min_income?: number;
+  structures?: string[];
+  quote_source?: string;
+};
+
+export async function runDeskReview(ticker: string, params: DeskReviewParams): Promise<DeskReviewResult> {
+  return apiFetch<DeskReviewResult>(`/api/stock/${encodeURIComponent(ticker)}/desk-review`, {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export type DeskFocusTrade = { structure: string; expiration?: string | null; short_strike?: number | null };
+
+export async function runDeskReviewAgents(
+  ticker: string,
+  params: DeskReviewParams & { model?: string; focus?: DeskFocusTrade },
+): Promise<DeskAgentsResult> {
+  return apiFetch<DeskAgentsResult>(`/api/stock/${encodeURIComponent(ticker)}/desk-review/agents`, {
     method: 'POST',
     body: JSON.stringify(params),
   });

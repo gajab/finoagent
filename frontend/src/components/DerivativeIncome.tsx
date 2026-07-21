@@ -14,6 +14,7 @@ import type {
 } from '../types';
 import { TechnicalAnalysis } from './TechnicalAnalysis';
 import PreTradeAdvisor, { type AdvisorMetric, type QuantSignal } from './PreTradeAdvisor';
+import { DeskReview, SingleTradeDeskReview } from './DeskReview';
 
 type Mode = 'single' | 'portfolio';
 
@@ -169,7 +170,7 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
 
 // Events banner — common (market-wide) events shown once at the top; ticker-specific
 // events (earnings) shown per name.
-function EventsBanner({ events, title }: { events: DerivativeIncomeFlag[]; title?: string }) {
+export function EventsBanner({ events, title }: { events: DerivativeIncomeFlag[]; title?: string }) {
   if (!events?.length) return null;
   return (
     <div className="rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
@@ -226,7 +227,7 @@ function LegsTable({ legs }: { legs: DerivativeIncomeLeg[] }) {
 }
 
 // Lazy technical analysis — reuses the app's TA component; fetched + mounted only on expand (req 5)
-function LazyTechnicals({ ticker }: { ticker: string }) {
+export function LazyTechnicals({ ticker }: { ticker: string }) {
   const [open, setOpen] = useState(false);
   const [data, setData] = useState<TechnicalData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -270,8 +271,9 @@ function LazyTechnicals({ ticker }: { ticker: string }) {
   );
 }
 
-function OpportunityCard({ opp, compact, ticker, spot, quant }: {
+export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams }: {
   opp: DerivativeIncomeOpportunity; compact?: boolean; ticker?: string; spot?: number; quant?: DerivativeIncomeQuant | null;
+  deskParams?: { target_dte: number | null; min_prob: number; min_income: number; structures: string[]; quote_source: string };
 }) {
   const [showLegs, setShowLegs] = useState(false);
   const isSpread = opp.structure.includes('spread');
@@ -394,6 +396,16 @@ function OpportunityCard({ opp, compact, ticker, spot, quant }: {
           {showLegs && <div className="mt-1"><LegsTable legs={opp.legs} /></div>}
         </div>
       )}
+      {ticker && deskParams && !compact && (
+        <SingleTradeDeskReview
+          ticker={ticker}
+          params={deskParams}
+          trade={{
+            structure: opp.structure, expiration: opp.expiration, label: opp.label,
+            short_strike: opp.short_strike ?? opp.put_short ?? opp.call_short ?? null,
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -426,7 +438,7 @@ const rankTone = (v: number | null | undefined) =>
   v == null ? '' : v >= 70 ? 'text-success' : v >= 40 ? 'text-warning' : 'text-base-content/70';
 
 // Per-ticker volatility read: IV/vol rank & percentile + skew.
-function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
+export function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
   const skewSub = vs.skew_pts == null ? '—' : vs.skew_pts > 1 ? 'puts richer' : vs.skew_pts < -1 ? 'calls richer' : 'flat';
   return (
     <div className="rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
@@ -448,8 +460,9 @@ function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
   );
 }
 
-function SingleTickerResult({ result, shares, costBasis, hideCommonEvents }: {
+function SingleTickerResult({ result, shares, costBasis, hideCommonEvents, deskParams }: {
   result: DerivativeIncomeResult; shares?: number; costBasis?: number | null; hideCommonEvents?: boolean;
+  deskParams?: { target_dte: number | null; min_prob: number; min_income: number; structures: string[]; quote_source: string };
 }) {
   const primaryQuant = result.expiry_summaries?.[0]?.quant;
   const spot = result.context?.spot;
@@ -467,6 +480,16 @@ function SingleTickerResult({ result, shares, costBasis, hideCommonEvents }: {
       )}
       <LazyTechnicals ticker={result.ticker} />
 
+      {deskParams && (
+        <DeskReview
+          ticker={result.ticker}
+          params={deskParams}
+          renderTrade={(t) => (
+            <OpportunityCard opp={t} ticker={result.ticker} spot={spot} quant={quantForExp(t.expiration)} />
+          )}
+        />
+      )}
+
       {result.expiry_summaries?.length > 0 && <ExpiryChips summaries={result.expiry_summaries} />}
 
       {result.best_by_structure?.length > 0 ? (
@@ -476,7 +499,7 @@ function SingleTickerResult({ result, shares, costBasis, hideCommonEvents }: {
           </h4>
           <div className="grid grid-cols-1 gap-3">
             {result.best_by_structure.map((o, i) => (
-              <OpportunityCard key={i} opp={o} ticker={result.ticker} spot={spot} quant={quantForExp(o.expiration)} />
+              <OpportunityCard key={i} opp={o} ticker={result.ticker} spot={spot} quant={quantForExp(o.expiration)} deskParams={deskParams} />
             ))}
           </div>
         </>
@@ -750,7 +773,7 @@ export function DerivativeIncome() {
         <div className="alert alert-error text-sm"><AlertTriangle className="w-4 h-4 shrink-0" /><span>{error}</span></div>
       )}
 
-      {mode === 'single' && result && <SingleTickerResult result={result} />}
+      {mode === 'single' && result && <SingleTickerResult result={result} deskParams={commonParams()} />}
 
       {/* ───────── PORTFOLIO RESULTS ───────── */}
       {mode === 'portfolio' && pfError && (

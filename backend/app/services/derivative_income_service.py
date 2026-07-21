@@ -364,6 +364,7 @@ def _leg(q: OptionQuote, action: str, exp: str, spot: float, dte: int,
         "strike": round(q.strike, 2),
         "expiration": exp,
         "bid": round(q.bid, 2), "ask": round(q.ask, 2), "mid": round(q.mid, 2),
+        "bid_ask_spread_pct": _spread_pct(q),      # execution slippage — costly to exit if wide
         "iv": round(iv * 100, 1) if iv else None,
         "oi": q.oi, "vol": q.volume,
         "prob_reach_pct": round(reach * 100, 1) if reach is not None else None,
@@ -491,14 +492,33 @@ def _vol_stats(ctx: dict, front_summary: dict) -> dict:
     skew = (front_summary.get("quant") or {}).get("skew_pts")
     vol_rank, vol_pctile = _rank_pctile(hv_series, hv_cur)
     iv_rank, iv_pctile = _rank_pctile(hv_series, iv_atm)
+    skew_dir = None
+    if skew is not None:
+        skew_dir = "put_skew" if skew > 0.5 else "call_skew" if skew < -0.5 else "flat"
     return {
         "iv_atm_pct": round(iv_atm * 100, 1) if iv_atm else None,
         "hv_current_pct": round(hv_cur * 100, 1) if hv_cur else None,
         "iv_rank": iv_rank, "iv_percentile": iv_pctile,
         "vol_rank": vol_rank, "vol_percentile": vol_pctile,
-        "skew_pts": skew,
+        "skew_pts": skew, "skew_direction": skew_dir,
+        "skew_basis": "IV(90% strike) − IV(110% strike) in vol pts; positive = downside puts richer (sell puts)",
         "basis": "IV rank/percentile vs trailing 1y realized-vol range",
     }
+
+
+def _term_structure(summaries: list[dict]) -> dict:
+    """Contango (normal) vs backwardation (event/earnings panic) from scanned expiries'
+    ATM IV. Backwardation = front IV > back IV → favor SHORTER DTE to harvest fast decay."""
+    pts = sorted((s["dte"], s["atm_iv_pct"]) for s in summaries
+                 if s.get("dte") and s.get("atm_iv_pct"))
+    if len(pts) < 2:
+        return {"state": None, "basis": "needs ≥2 scanned expiries; only one available"}
+    (d0, v0), (d1, v1) = pts[0], pts[-1]
+    diff = round(v1 - v0, 1)                       # back minus front, vol pts
+    state = "backwardation" if diff < -0.5 else "contango" if diff > 0.5 else "flat"
+    return {"state": state, "front_dte": d0, "front_iv_pct": v0, "back_dte": d1, "back_iv_pct": v1,
+            "back_minus_front_pts": diff,
+            "note": "backwardation (front IV > back) signals event/earnings panic → favor shorter DTE"}
 
 
 def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
@@ -1000,12 +1020,19 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     for o in opps:
         o["confidence"] = _confidence(o, quant)
 
+    # Gamma-pin magnet: the strike carrying the most open interest at this expiry.
+    oi_by_strike: dict[float, int] = {}
+    for q in chain.quotes:
+        oi_by_strike[q.strike] = oi_by_strike.get(q.strike, 0) + (q.oi or 0)
+    max_oi_strike = max(oi_by_strike, key=oi_by_strike.get) if any(oi_by_strike.values()) else None
+
     summary = {
         "expiration": exp, "dte": dte, "monthly": _is_monthly_expiry(exp_date),
         "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
         "hv30_pct": round(hv * 100, 1) if hv else None,
         "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
         "rnd_available": rnd is not None,
+        "max_oi_strike": max_oi_strike,
         "earnings_before_expiry": earnings_before,
         "macro_events": macro,
         "quant": quant,
@@ -1146,7 +1173,8 @@ async def run_derivative_income(
         "hv30_pct": round(ctx["hv30"] * 100, 1) if ctx.get("hv30") else None,
         "hv20_pct": round(ctx["hv20"] * 100, 1) if ctx.get("hv20") else None,
         "next_earnings": ctx.get("next_earnings"),
-        "vol_stats": _vol_stats(ctx, expiry_summaries[0] if expiry_summaries else {}),
+        "vol_stats": {**_vol_stats(ctx, expiry_summaries[0] if expiry_summaries else {}),
+                      "term_structure": _term_structure(expiry_summaries)},
     }
 
     result = {
