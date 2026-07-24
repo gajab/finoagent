@@ -389,6 +389,11 @@ a.tag:hover { background: rgba(99, 102, 241, 0.24); }
 .table-scroll { overflow-x: auto; margin: 24px 0; }
 .table-scroll .data-table { margin: 0; min-width: 520px; }
 
+/* Inline directional emphasis, e.g. "buy shares" / "sell shares",
+   "suppressed" / "amplified". Reusable across posts. */
+.pos { color: #34d399; font-weight: 600; }
+.neg { color: #f87171; font-weight: 600; }
+
 /* Greek definition cards. */
 .greek {
   display: flex;

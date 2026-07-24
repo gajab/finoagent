@@ -1,21 +1,23 @@
-import React, { useState } from 'react';
+import React, { useState, lazy, Suspense } from 'react';
 import {
   Layers, Box, ArrowLeftRight, Building, Shield, Target, ArrowDownRight, Crown, Lock, Briefcase, ClipboardList, ShieldCheck, Coins, Sparkles
 } from 'lucide-react';
-import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { BoxStrategy } from '../components/BoxStrategy';
-import { LongShortStrategy } from '../components/LongShortStrategy';
-import { StructuredTrades } from '../components/StructuredTrades';
-import { DualDirectionBuffer } from '../components/DualDirectionBuffer';
-import { ConcentrationManager } from '../components/ConcentrationManager';
-import { PoorMansCovered } from '../components/PoorMansCovered';
-import { ZebraStrategy } from '../components/ZebraStrategy';
-import { TaxLossHarvesting } from '../components/TaxLossHarvesting';
-import { CppiStrategy } from '../components/CppiStrategy';
-import { HedgingStrategy } from '../components/HedgingStrategy';
-import { DerivativeIncome } from '../components/DerivativeIncome';
-import { DerivativeIncomeV2 } from '../components/DerivativeIncomeV2';
+
+// Each strategy is a heavy component (charts, quant panels); load only the selected one so the
+// Strategies chunk isn't one giant bundle. Named exports → unwrap to default for React.lazy.
+const BoxStrategy = lazy(() => import('../components/BoxStrategy').then(m => ({ default: m.BoxStrategy })));
+const LongShortStrategy = lazy(() => import('../components/LongShortStrategy').then(m => ({ default: m.LongShortStrategy })));
+const StructuredTrades = lazy(() => import('../components/StructuredTrades').then(m => ({ default: m.StructuredTrades })));
+const DualDirectionBuffer = lazy(() => import('../components/DualDirectionBuffer').then(m => ({ default: m.DualDirectionBuffer })));
+const ConcentrationManager = lazy(() => import('../components/ConcentrationManager').then(m => ({ default: m.ConcentrationManager })));
+const PoorMansCovered = lazy(() => import('../components/PoorMansCovered').then(m => ({ default: m.PoorMansCovered })));
+const ZebraStrategy = lazy(() => import('../components/ZebraStrategy').then(m => ({ default: m.ZebraStrategy })));
+const TaxLossHarvesting = lazy(() => import('../components/TaxLossHarvesting').then(m => ({ default: m.TaxLossHarvesting })));
+const CppiStrategy = lazy(() => import('../components/CppiStrategy').then(m => ({ default: m.CppiStrategy })));
+const HedgingStrategy = lazy(() => import('../components/HedgingStrategy').then(m => ({ default: m.HedgingStrategy })));
+const DerivativeIncome = lazy(() => import('../components/DerivativeIncome').then(m => ({ default: m.DerivativeIncome })));
+const DerivativeIncomeV2 = lazy(() => import('../components/DerivativeIncomeV2').then(m => ({ default: m.DerivativeIncomeV2 })));
 
 type Strategy = 'box' | 'longshort' | 'structured' | 'dual_direction' | 'concentration' | 'poormans' | 'zebra' | 'tax_loss_harvesting' | 'cppi' | 'hedging' | 'derivative_income' | 'derivative_income_v2';
 
@@ -138,9 +140,6 @@ export default function StrategiesPage() {
           <Layers className="w-7 h-7 text-secondary" />
           Advanced Strategies
         </h1>
-        <p className="page-subtitle">
-          Explore advanced options and equity strategies with real-time market data.
-        </p>
       </div>
 
       <div className="flex flex-col lg:flex-row gap-6">
@@ -174,19 +173,20 @@ export default function StrategiesPage() {
         <div className="w-full lg:w-3/4">
           <div className="glass-card h-full">
             <div className="card-body">
-
-              {activeStrategy === 'box' && <BoxStrategy />}
-              {activeStrategy === 'derivative_income' && <DerivativeIncome />}
-              {activeStrategy === 'derivative_income_v2' && <DerivativeIncomeV2 />}
-              {activeStrategy === 'hedging' && <HedgingStrategy />}
-              {activeStrategy === 'longshort' && <LongShortStrategy />}
-              {activeStrategy === 'tax_loss_harvesting' && <TaxLossHarvesting />}
-              {activeStrategy === 'structured' && <StructuredTrades />}
-              {activeStrategy === 'dual_direction' && <DualDirectionBuffer />}
-              {activeStrategy === 'concentration' && <ConcentrationManager />}
-              {activeStrategy === 'poormans' && <PoorMansCovered />}
-              {activeStrategy === 'zebra' && <ZebraStrategy />}
-              {activeStrategy === 'cppi' && <CppiStrategy />}
+              <Suspense fallback={<div className="flex items-center justify-center py-24 text-base-content/50"><span className="loading loading-spinner loading-md" /></div>}>
+                {activeStrategy === 'box' && <BoxStrategy />}
+                {activeStrategy === 'derivative_income' && <DerivativeIncome />}
+                {activeStrategy === 'derivative_income_v2' && <DerivativeIncomeV2 />}
+                {activeStrategy === 'hedging' && <HedgingStrategy />}
+                {activeStrategy === 'longshort' && <LongShortStrategy />}
+                {activeStrategy === 'tax_loss_harvesting' && <TaxLossHarvesting />}
+                {activeStrategy === 'structured' && <StructuredTrades />}
+                {activeStrategy === 'dual_direction' && <DualDirectionBuffer />}
+                {activeStrategy === 'concentration' && <ConcentrationManager />}
+                {activeStrategy === 'poormans' && <PoorMansCovered />}
+                {activeStrategy === 'zebra' && <ZebraStrategy />}
+                {activeStrategy === 'cppi' && <CppiStrategy />}
+              </Suspense>
             </div>
           </div>
         </div>

@@ -1,15 +1,16 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
   AlertCircle, ChevronDown, ChevronUp, Activity, Landmark,
   BarChart3, Layers, Feather,
 } from 'lucide-react';
-import { runDerivativeIncome, runDerivativeIncomePortfolio, fetchTechnicalForTimeframe } from '../api';
+import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, fetchTechnicalForTimeframe, fetchOptionExpirations } from '../api';
 import type {
   DerivativeIncomeResult, DerivativeIncomeOpportunity, DerivativeIncomePortfolioResult,
   DerivativeIncomePortfolioRow, DerivativeIncomeFlag,
   DerivativeIncomeContext, DerivativeIncomeQuant, DerivativeIncomeLeg, DerivativeIncomeVolStats,
+  DerivativeIncomeExpirySummary, DeskReviewResult,
   TechnicalData,
 } from '../types';
 import { TechnicalAnalysis } from './TechnicalAnalysis';
@@ -45,6 +46,18 @@ const STRUCTURE_OPTIONS = [
 const money = (n: number | null | undefined, d = 0) =>
   n == null ? '—' : `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`;
 const pct = (n: number | null | undefined, d = 1) => (n == null ? '—' : `${n.toFixed(d)}%`);
+// Win / keep probability shown to the seller: asymptotic to — never exactly — 100%, so cap the
+// DISPLAY at 99.9% (100.0% reads as a false guarantee). One decimal, floored at 0.
+const winPct = (n: number | null | undefined) =>
+  n == null ? '—' : `${Math.min(99.9, Math.max(0, n)).toFixed(1)}%`;
+// Calendar-days from today to a YYYY-MM-DD expiry (UTC midnights → no DST drift).
+const dteFromExpiry = (iso: string): number => {
+  const [y, m, d] = iso.split('-').map(Number);
+  const exp = Date.UTC(y, (m || 1) - 1, d || 1);
+  const now = new Date();
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return Math.round((exp - today) / 86400000);
+};
 // Geometric annualization is the repo standard but explodes for short-dated, high-ROC
 // trades — format compactly; the period (static) return is the honest anchor.
 const annPct = (n: number | null | undefined) =>
@@ -131,7 +144,10 @@ function Week52Bar({ ctx }: { ctx: DerivativeIncomeContext }) {
 }
 
 function TickerHeader({ result, ctx, shares, costBasis }: {
-  result: DerivativeIncomeResult; ctx: DerivativeIncomeContext; shares?: number; costBasis?: number | null;
+  // Only ticker + expiry_summaries are read here — narrowed so both the scan result and the
+  // folded desk-review payload satisfy it.
+  result: { ticker: string; expiry_summaries?: DerivativeIncomeExpirySummary[] };
+  ctx: DerivativeIncomeContext; shares?: number; costBasis?: number | null;
 }) {
   const gainPct = (shares != null && costBasis != null && costBasis > 0)
     ? ((ctx.spot - costBasis) / costBasis) * 100 : null;
@@ -197,34 +213,34 @@ export function EventsBanner({ events, title }: { events: DerivativeIncomeFlag[]
 export function LegsTable({ legs }: { legs: DerivativeIncomeLeg[] }) {
   const hasGreeks = legs.some(l => l.delta != null);
   return (
-    <div className="overflow-x-auto">
+    <div className="w-full overflow-x-auto">
       <table className="table table-xs table-pro w-full">
         <thead>
           <tr className="text-base-content/60">
-            <th>Action</th><th>Type</th><th>Strike</th>
+            <th>Leg</th><th>Strike</th>
             <th title="Probability the underlying reaches this strike by expiry">P(reach)</th>
             <th>Exp</th>
-            <th>Bid</th><th>Ask</th><th>Mid</th><th>IV</th><th>OI</th><th>Vol</th>
+            <th>Bid/Ask</th><th>Mid</th><th>IV</th><th>OI/Vol</th>
             {hasGreeks && (<><th>Δ</th><th>Θ</th></>)}
           </tr>
         </thead>
         <tbody>
           {legs.map((l, i) => (
             <tr key={i} className={l.action === 'BUY' ? 'bg-success/5' : 'bg-error/5'}>
-              <td><span className={`badge badge-xs ${l.action === 'BUY' ? 'badge-success' : 'badge-error'}`}>{l.action}</span></td>
-              <td className="font-medium">{l.type}</td>
+              <td className="whitespace-nowrap">
+                <span className={`badge badge-xs mr-1.5 ${l.action === 'BUY' ? 'badge-success' : 'badge-error'}`}>{l.action}</span>
+                <span className="font-medium">{l.type}</span>
+              </td>
               <td className="font-mono">${l.strike}</td>
               <td className="font-mono">{l.prob_reach_pct != null ? `${l.prob_reach_pct}%` : '—'}</td>
-              <td className="text-[10px] text-base-content/50">{l.expiration?.slice(5)}</td>
-              <td className="font-mono">${l.bid.toFixed(2)}</td>
-              <td className="font-mono">${l.ask.toFixed(2)}</td>
+              <td className="text-[10px] text-base-content/50 whitespace-nowrap">{l.expiration?.slice(5)}</td>
+              <td className="font-mono text-[10px] text-base-content/50 whitespace-nowrap">${l.bid.toFixed(2)} / ${l.ask.toFixed(2)}</td>
               <td className="font-mono font-medium">${l.mid.toFixed(2)}</td>
               <td>{l.iv != null ? `${l.iv}%` : '—'}</td>
-              <td>{l.oi.toLocaleString()}</td>
-              <td>{l.vol.toLocaleString()}</td>
+              <td className="text-[10px] text-base-content/60 whitespace-nowrap">{l.oi.toLocaleString()} / {l.vol.toLocaleString()}</td>
               {hasGreeks && (<>
-                <td className="font-mono">{l.delta != null ? l.delta.toFixed(2) : '—'}</td>
-                <td className="font-mono">{l.theta != null ? l.theta.toFixed(2) : '—'}</td>
+                <td className="font-mono text-[11px]">{l.delta != null ? l.delta.toFixed(2) : '—'}</td>
+                <td className="font-mono text-[11px]">{l.theta != null ? l.theta.toFixed(2) : '—'}</td>
               </>)}
             </tr>
           ))}
@@ -308,7 +324,7 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
           </p>
         </div>
         <div className="text-right shrink-0">
-          <p className={`text-2xl font-bold ${probTone(opp.prob_keep_pct)}`}>{pct(opp.prob_keep_pct)}</p>
+          <p className={`text-2xl font-bold ${probTone(opp.prob_keep_pct)}`}>{winPct(opp.prob_keep_pct)}</p>
           <p className="text-[10px] uppercase tracking-wider text-base-content/50">keep · {opp.prob_method}</p>
         </div>
       </div>
@@ -356,7 +372,7 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
 
 export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams }: {
   opp: DerivativeIncomeOpportunity; compact?: boolean; ticker?: string; spot?: number; quant?: DerivativeIncomeQuant | null;
-  deskParams?: { target_dte: number | null; min_prob: number; min_income: number; structures: string[]; quote_source: string };
+  deskParams?: DiParams;
 }) {
   const [showLegs, setShowLegs] = useState(false);
 
@@ -445,8 +461,13 @@ export function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
           — IV/vol rank vs trailing 1y realized vol · higher = premium richer
         </span>
       </p>
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2">
         <MetricTile label="ATM IV" value={pct(vs.iv_atm_pct)} sub={`HV ${pct(vs.hv_current_pct)}`} />
+        {vs.har_rv_pct != null && (
+          <MetricTile label="Fwd RV · HAR" value={pct(vs.har_rv_pct)}
+            tone={vs.iv_vs_har_pts != null ? (vs.iv_vs_har_pts >= 0 ? 'text-success' : 'text-error') : ''}
+            sub={vs.iv_vs_har_pts != null ? `IV ${vs.iv_vs_har_pts >= 0 ? '+' : ''}${vs.iv_vs_har_pts}vp` : '1-mo forecast'} />
+        )}
         <MetricTile label="IV Rank" tone={rankTone(vs.iv_rank)} value={vs.iv_rank ?? '—'} sub="0–100" />
         <MetricTile label="IV Percentile" tone={rankTone(vs.iv_percentile)} value={vs.iv_percentile != null ? `${vs.iv_percentile}%` : '—'} sub="of 1y" />
         <MetricTile label="Vol Rank" tone={rankTone(vs.vol_rank)} value={vs.vol_rank ?? '—'} sub="realized" />
@@ -457,40 +478,55 @@ export function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
   );
 }
 
-function SingleTickerResult({ result, shares, costBasis, hideCommonEvents, deskParams }: {
-  result: DerivativeIncomeResult; shares?: number; costBasis?: number | null; hideCommonEvents?: boolean;
-  deskParams?: { target_dte: number | null; min_prob: number; min_income: number; structures: string[]; quote_source: string };
+// Renders one ticker's full read. Two feeds share the same chrome:
+//   • SINGLE-TICKER: `desk` = the ONE /desk-review payload (chrome folded in + the ranking) — no
+//     second /derivative-income call, and DeskReview renders it presentationally (`data`).
+//   • PORTFOLIO EXPAND: `result` = a /derivative-income scan (no desk ranking); shows chrome + the
+//     empty-state note only.
+function SingleTickerResult({ result, desk, shares, costBasis, hideCommonEvents, deskParams }: {
+  result?: DerivativeIncomeResult; desk?: DeskReviewResult;
+  shares?: number; costBasis?: number | null; hideCommonEvents?: boolean; deskParams?: DiParams;
 }) {
-  const primaryQuant = result.expiry_summaries?.[0]?.quant;
-  const spot = result.context?.spot;
+  const ticker = desk?.ticker ?? result?.ticker ?? '';
+  const context = desk?.context ?? result?.context ?? null;
+  const expirySummaries = desk?.expiry_summaries ?? result?.expiry_summaries ?? [];
+  const events: DerivativeIncomeFlag[] = desk?.flag_events ?? result?.events ?? [];
+  const note = desk?.note ?? result?.note;
+  const oppEmpty = desk ? desk.ranked.length === 0 : (result?.opportunities.length ?? 0) === 0;
+
+  const primaryQuant = expirySummaries[0]?.quant;
+  const spot = context?.spot;
   // Pricing-confidence signals are per-expiration; fall back to the primary one.
-  const quantForExp = (exp: string) => result.expiry_summaries?.find(s => s.expiration === exp)?.quant ?? primaryQuant;
+  const quantForExp = (exp: string) => expirySummaries.find(s => s.expiration === exp)?.quant ?? primaryQuant;
   // In portfolio mode the market-wide (common) events are shown once at the top,
   // so a holding's expanded view only repeats its ticker-specific events.
-  const shownEvents = hideCommonEvents ? (result.events || []).filter(e => e.scope !== 'common') : result.events;
+  const shownEvents = hideCommonEvents ? events.filter(e => e.scope !== 'common') : events;
   return (
     <div className="space-y-4">
-      {result.context && <TickerHeader result={result} ctx={result.context} shares={shares} costBasis={costBasis} />}
-      {result.context?.vol_stats && <VolatilityPanel vs={result.context.vol_stats} />}
-      {shownEvents && shownEvents.length > 0 && (
-        <EventsBanner events={shownEvents} title={hideCommonEvents ? `${result.ticker} events` : undefined} />
+      {context && <TickerHeader result={{ ticker, expiry_summaries: expirySummaries }} ctx={context} shares={shares} costBasis={costBasis} />}
+      {context?.vol_stats && <VolatilityPanel vs={context.vol_stats} />}
+      {shownEvents.length > 0 && (
+        <EventsBanner events={shownEvents} title={hideCommonEvents ? `${ticker} events` : undefined} />
       )}
-      <LazyTechnicals ticker={result.ticker} />
+      <LazyTechnicals ticker={ticker} />
 
-      {deskParams && (
+      {desk && deskParams && (
         <DeskReview
-          ticker={result.ticker}
+          ticker={ticker}
           params={deskParams}
+          data={desk}
           renderTrade={(t) => (
-            <OpportunityCard opp={t} ticker={result.ticker} spot={spot} quant={quantForExp(t.expiration)} />
+            <OpportunityCard opp={t} ticker={ticker} spot={spot} quant={quantForExp(t.expiration)} />
           )}
         />
       )}
 
-      {result.opportunities.length === 0 && (
+      {/* Empty-state note — only the portfolio-expand path (no desk); the single-ticker DeskReview
+          shows its own "no candidate trades" banner. */}
+      {!desk && oppEmpty && (
         <div className="alert alert-warning text-sm">
           <AlertTriangle className="w-4 h-4 shrink-0" />
-          <span>{result.note || 'No executable opportunities cleared your filters. Try a lower probability, a longer target DTE, or a more volatile underlying.'}</span>
+          <span>{note || 'No executable opportunities cleared your filters. Try a lower probability, a longer target DTE, or a more volatile underlying.'}</span>
         </div>
       )}
 
@@ -500,6 +536,7 @@ function SingleTickerResult({ result, shares, costBasis, hideCommonEvents, deskP
 
 interface DiParams {
   target_dte: number | null;
+  target_expiration: string | null;
   min_prob: number;
   min_income: number;
   structures: string[];
@@ -540,7 +577,7 @@ function PortfolioHoldingRow({ row, params }: { row: DerivativeIncomePortfolioRo
         {row.best_opportunity && (
           <div className="flex items-center gap-3 text-xs">
             <ConfidenceBadge conf={row.best_opportunity.confidence} />
-            <span className={`font-bold ${probTone(row.best_opportunity.prob_keep_pct)}`}>{pct(row.best_opportunity.prob_keep_pct)} keep</span>
+            <span className={`font-bold ${probTone(row.best_opportunity.prob_keep_pct)}`}>{winPct(row.best_opportunity.prob_keep_pct)} keep</span>
             <span className="text-success font-semibold">{money(row.best_opportunity.total_premium ?? row.best_opportunity.premium, 0)}</span>
           </div>
         )}
@@ -580,37 +617,80 @@ function PortfolioHoldingRow({ row, params }: { row: DerivativeIncomePortfolioRo
 export function DerivativeIncome() {
   const [mode, setMode] = useState<Mode>('single');
   const [ticker, setTicker] = useState('AAPL');
-  const [targetDte, setTargetDte] = useState('');
-  const [minProb, setMinProb] = useState(85);
+  const [selectedExpiry, setSelectedExpiry] = useState('');   // '' = auto (monthlies ≤45d)
+  const [expiries, setExpiries] = useState<string[]>([]);
+  const [expiryLoading, setExpiryLoading] = useState(false);
+  const [minProb, setMinProb] = useState(90);
   const [minIncome, setMinIncome] = useState(20);
-  const [structures, setStructures] = useState<string[]>(['covered_call', 'cash_secured_put', 'collar', 'credit_spread']);
+  const [structures, setStructures] = useState<string[]>(
+    ['covered_call', 'cash_secured_put', 'collar', 'credit_spread', 'iron_condor', 'jade_lizard']);
   const [quoteSource, setQuoteSource] = useState<'yfinance' | 'ibkr'>('yfinance');
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<DerivativeIncomeResult | null>(null);
+  // Single-ticker uses ONE /desk-review call — its payload carries the chrome (header/volatility/
+  // events) AND the ranking, so there's no separate /derivative-income fetch.
+  const [deskResult, setDeskResult] = useState<DeskReviewResult | null>(null);
+  // Params are FROZEN at scan time — changing the ticker/date/sliders afterwards must NOT
+  // re-run the scan or the desk review; only "Find Income Opportunities" does (#4).
+  const [scanParams, setScanParams] = useState<DiParams | null>(null);
 
   const [pfResult, setPfResult] = useState<DerivativeIncomePortfolioResult | null>(null);
   const [pfLoading, setPfLoading] = useState(false);
   const [pfError, setPfError] = useState<string | null>(null);
 
+  // Load the option-expiry calendar for the current ticker (metadata only — NOT a scan), so the
+  // date dropdown is ready to pick from. Debounced; resets the picked date when the ticker changes.
+  useEffect(() => {
+    if (mode !== 'single') return;
+    const sym = ticker.trim().toUpperCase();
+    if (!sym) { setExpiries([]); return; }
+    let alive = true;
+    setExpiryLoading(true);
+    const id = setTimeout(async () => {
+      try {
+        const r = await fetchOptionExpirations(sym);
+        if (!alive) return;
+        setExpiries(r.expirations || []);
+        setSelectedExpiry(prev => (r.expirations || []).includes(prev) ? prev : '');
+      } catch { if (alive) setExpiries([]); }
+      finally { if (alive) setExpiryLoading(false); }
+    }, 350);
+    return () => { alive = false; clearTimeout(id); };
+  }, [ticker, mode]);
+
   const toggleStructure = (id: string) =>
     setStructures(s => (s.includes(id) ? s.filter(x => x !== id) : [...s, id]));
 
-  const commonParams = () => ({
-    target_dte: targetDte.trim() ? Number(targetDte) : null,
-    min_prob: minProb / 100,
-    min_income: minIncome,
-    structures,
-    quote_source: quoteSource,
-  });
+  const commonParams = (): DiParams => {
+    // The exact expiry only applies to a single ticker; portfolio scans many names (a specific date
+    // won't exist for all), so it falls back to auto monthlies.
+    const useExp = mode === 'single' && !!selectedExpiry;
+    return {
+      target_dte: useExp ? dteFromExpiry(selectedExpiry) : null,
+      target_expiration: useExp ? selectedExpiry : null,
+      min_prob: minProb / 100,
+      min_income: minIncome,
+      structures,
+      quote_source: quoteSource,
+    };
+  };
+
+  // True when the filters differ from the scan that produced the results on screen — so the frozen
+  // results (#4) are never silently stale; the button pulses and a hint appears.
+  const singleStale = !!deskResult && !!scanParams &&
+    (ticker.trim().toUpperCase() !== deskResult.ticker ||
+      JSON.stringify(commonParams()) !== JSON.stringify(scanParams));
 
   const handleSingle = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true); setError(null); setResult(null);
+    const frozen = commonParams();
+    setScanParams(frozen);
+    setLoading(true); setError(null); setDeskResult(null);
     try {
-      const data = await runDerivativeIncome(ticker.trim().toUpperCase(), commonParams());
-      if (data.error) setError(data.error); else setResult(data);
+      // ONE call: /desk-review carries the ticker chrome (header/volatility/events) + the ranking.
+      const data = await runDeskReview(ticker.trim().toUpperCase(), frozen);
+      if (data.error) setError(data.error); else setDeskResult(data);
     } catch (err: any) { setError(err?.message || 'Failed to scan opportunities'); }
     finally { setLoading(false); }
   };
@@ -664,12 +744,23 @@ export function DerivativeIncome() {
           </div>
         )}
         <div className="form-control">
-          <label className="label py-1"><span className="label-text text-xs font-medium">Target days-to-expiry</span></label>
+          <label className="label py-1"><span className="label-text text-xs font-medium">Expiry date</span></label>
           <div className="relative">
-            <Calendar className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40" />
-            <input type="number" className="input input-bordered input-sm w-full pl-7" value={targetDte}
-              onChange={(e) => setTargetDte(e.target.value)} min={1} max={365} placeholder="blank = monthlies ≤45d" />
+            <Calendar className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40 pointer-events-none z-10" />
+            <select className="select select-bordered select-sm w-full pl-7" value={selectedExpiry}
+              onChange={(e) => setSelectedExpiry(e.target.value)} disabled={mode !== 'single'}>
+              <option value="">Auto — monthlies ≤45d</option>
+              {expiries
+                .map(d => [d, dteFromExpiry(d)] as const)
+                .filter(([, dte]) => dte >= 1 && dte <= 366)
+                .map(([d, dte]) => <option key={d} value={d}>{d} · {dte}d</option>)}
+            </select>
           </div>
+          <span className="text-[10px] text-base-content/45 mt-1 h-3">
+            {expiryLoading ? 'Loading expiry dates…'
+              : selectedExpiry ? `${dteFromExpiry(selectedExpiry)} DTE`
+                : 'Nearest monthlies within 45 days'}
+          </span>
         </div>
         <div className="form-control">
           <label className="label py-1">
@@ -704,12 +795,19 @@ export function DerivativeIncome() {
             ))}
           </div>
         </div>
-        <div className="form-control lg:col-span-3">
+        <div className="form-control lg:col-span-3 gap-1">
           {mode === 'single' ? (
-            <button type="submit" className="btn btn-primary btn-sm gap-2 w-fit" disabled={loading || !ticker.trim() || !structures.length}>
-              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Coins className="w-4 h-4" />}
-              {loading ? 'Scanning options…' : 'Find Income Opportunities'}
-            </button>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button type="submit" className={`btn btn-sm gap-2 w-fit ${singleStale ? 'btn-primary animate-pulse' : 'btn-primary'}`} disabled={loading || !ticker.trim() || !structures.length}>
+                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Coins className="w-4 h-4" />}
+                {loading ? 'Scanning options…' : deskResult ? 'Re-scan opportunities' : 'Find Income Opportunities'}
+              </button>
+              {singleStale && (
+                <span className="inline-flex items-center gap-1 text-[11px] text-warning">
+                  <Info className="w-3.5 h-3.5" /> Filters changed — results below are from the previous scan.
+                </span>
+              )}
+            </div>
           ) : (
             <button type="submit" className="btn btn-primary btn-sm gap-2 w-fit" disabled={pfLoading || !structures.length}>
               {pfLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Briefcase className="w-4 h-4" />}
@@ -724,7 +822,7 @@ export function DerivativeIncome() {
         <div className="alert alert-error text-sm"><AlertTriangle className="w-4 h-4 shrink-0" /><span>{error}</span></div>
       )}
 
-      {mode === 'single' && result && <SingleTickerResult result={result} deskParams={commonParams()} />}
+      {mode === 'single' && deskResult && <SingleTickerResult desk={deskResult} deskParams={scanParams ?? undefined} />}
 
       {/* ───────── PORTFOLIO RESULTS ───────── */}
       {mode === 'portfolio' && pfError && (

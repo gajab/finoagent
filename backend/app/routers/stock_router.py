@@ -139,7 +139,8 @@ async def get_box_market_timing(user: User = Depends(get_current_user)):
 # Derivative Income — portfolio sweep (non-parametric, must be before /{ticker})
 # =========================================================================
 
-_DI_DEFAULT_STRUCTURES = ["covered_call", "cash_secured_put", "collar", "credit_spread"]
+_DI_DEFAULT_STRUCTURES = ["covered_call", "cash_secured_put", "collar", "credit_spread",
+                          "iron_condor", "jade_lizard"]
 
 
 class DerivativeIncomePortfolioIn(BaseModel):
@@ -1810,7 +1811,8 @@ async def compute_box_spread(
 
 class DerivativeIncomeIn(BaseModel):
     target_dte: int | None = Field(default=None, ge=1, le=365, description="Target days-to-expiry; blank = monthlies ≤45d")
-    min_prob: float = Field(default=0.85, ge=0.5, le=0.99, description="Min probability of NOT being assigned")
+    target_expiration: str | None = Field(default=None, description="Exact expiry (YYYY-MM-DD); overrides target_dte")
+    min_prob: float = Field(default=0.90, ge=0.5, le=0.99, description="Min probability of NOT being assigned")
     min_income: float = Field(default=20.0, ge=0, description="Min premium ($/contract) to surface")
     structures: list[str] = Field(default_factory=lambda: list(_DI_DEFAULT_STRUCTURES))
     quote_source: str = Field(default="yfinance", description="'yfinance' or 'ibkr'")
@@ -1831,6 +1833,7 @@ async def compute_derivative_income(
         result = await run_derivative_income(
             ticker=ticker,
             target_dte=body.target_dte,
+            target_expiration=body.target_expiration,
             min_prob=body.min_prob,
             min_income=body.min_income,
             structures=body.structures,
@@ -1853,7 +1856,8 @@ async def compute_derivative_income(
 
 class DeskReviewIn(BaseModel):
     target_dte: int | None = Field(default=None, ge=1, le=365)
-    min_prob: float = Field(default=0.85, ge=0.5, le=0.99)
+    target_expiration: str | None = Field(default=None, description="Exact expiry (YYYY-MM-DD); overrides target_dte")
+    min_prob: float = Field(default=0.90, ge=0.5, le=0.99)
     min_income: float = Field(default=20.0, ge=0)
     structures: list[str] = Field(default_factory=lambda: list(_DI_DEFAULT_STRUCTURES))
     quote_source: str = Field(default="yfinance")
@@ -1888,6 +1892,7 @@ async def compute_desk_review(
             ticker, target_dte=body.target_dte, min_prob=body.min_prob,
             min_income=body.min_income, structures=body.structures,
             quote_source=body.quote_source, user=user, db=db,
+            target_expiration=body.target_expiration,
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])
@@ -1918,6 +1923,7 @@ async def compute_desk_review_agents(
             min_income=body.min_income, structures=body.structures,
             quote_source=body.quote_source, model=body.model,
             focus=body.focus.model_dump() if body.focus else None, user=user, db=db,
+            target_expiration=body.target_expiration,
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])

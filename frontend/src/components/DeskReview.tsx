@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import {
   Gauge, Loader2, AlertTriangle, Cpu, Shield, Briefcase, ChevronDown, ChevronUp,
-  Trophy, Play, Terminal, Maximize2, X, MessageSquare, Activity, LineChart, Layers, Zap,
+  Trophy, Play, Terminal, Maximize2, X, MessageSquare, Activity, LineChart, Layers, Zap, Sparkles,
 } from 'lucide-react';
 import { runDeskReview, runDeskReviewAgents } from '../api';
 import { RatingsHelpButton } from './RatingsHelp';
+import DeskDebateModal from './DeskDebateModal';
 import { OpportunitySummary, LegsTable } from './DerivativeIncome';
 import CollapsibleSection from './trades/CollapsibleSection';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
@@ -14,6 +15,10 @@ import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent } f
 const money = (n: number | null | undefined, d = 0) =>
   n == null ? '—' : `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`;
 const pct = (n: number | null | undefined, d = 1) => (n == null ? '—' : `${n.toFixed(d)}%`);
+// Win% for a sold option (probability it expires worthless). It is asymptotic to — never exactly —
+// 100%, and "100.0%" reads as a false guarantee, so cap the DISPLAY at 99.9% (one decimal, floor 0).
+const winPct = (n: number | null | undefined) =>
+  n == null ? '—' : `${Math.min(99.9, Math.max(0, n)).toFixed(1)}%`;
 const ratio = (n: number | null | undefined) =>
   n == null ? '—' : Math.abs(n) >= 1000 ? `${Math.round(n).toLocaleString()}` : n.toFixed(2);
 const annShort = (n: number | null | undefined) =>
@@ -148,9 +153,28 @@ function GroupFoot({ label, value, signed = false }: { label: string; value: num
 }
 const GROUP_LABEL = 'text-[9px] uppercase tracking-wider text-base-content/40 mb-1';
 
-function TradeExplorer({ t }: { t: DeskRankedTrade }) {
+function TradeExplorer({ t, ticker, params }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams }) {
   const dm = t.desk_metrics;
   const q = dm.quant || {};
+  // Per-trade "Run Institutional Desk" — the Quant→Risk→PM debate focused on THIS trade,
+  // presented in the dramatized boardroom modal.
+  const [debateOpen, setDebateOpen] = useState(false);
+  const [agents, setAgents] = useState<DeskAgentsResult | null>(null);
+  const [debateLoading, setDebateLoading] = useState(false);
+  const [debateErr, setDebateErr] = useState<string | null>(null);
+
+  const runDesk = async () => {
+    setDebateOpen(true); setDebateErr(null); setAgents(null); setDebateLoading(true);
+    try {
+      const a = await runDeskReviewAgents(ticker, {
+        ...params,
+        focus: { structure: t.structure, expiration: t.expiration ?? null,
+                 short_strike: t.short_strike ?? t.put_short ?? t.call_short ?? null },
+      });
+      if (a.error) setDebateErr(a.error); else setAgents(a);
+    } catch (e: any) { setDebateErr(e?.message || 'Institutional desk failed'); }
+    finally { setDebateLoading(false); }
+  };
   const sub = q.subscores;
   const base = Math.round(t.base_quality ?? q.score ?? 0);
   const adjs = t.grade_adjustments || [];
@@ -198,9 +222,9 @@ function TradeExplorer({ t }: { t: DeskRankedTrade }) {
         icon={<Cpu className="w-3 h-3" />} subtitle="base + factor + TA → desk score">
         {/* Top: the TOTAL desk score (not the base) */}
         <div className={`flex items-center gap-2 rounded-lg border p-2 mb-2.5 ${gradeTone(t.algo_grade)}`}>
-          <span className="text-sm font-bold uppercase tracking-wider">{q.verdict || 'SCORE'}</span>
-          <span className="text-xs text-base-content/50">desk score · grade {t.algo_grade || '—'}</span>
-          <span className="ml-auto text-lg font-bold">{t.desk_score}<span className="text-[10px] text-base-content/40">/100</span></span>
+          <span className="text-sm font-bold uppercase tracking-wider">{q.verdict || 'GRADE'}</span>
+          <span className="text-xs text-base-content/50">desk grade · point build-up below</span>
+          <span className="ml-auto inline-flex items-baseline gap-1 text-lg font-bold">{t.algo_grade || '—'}<span className="text-[10px] text-base-content/40">grade</span></span>
         </div>
 
         {/* Q-vs-P boundary — the implied-vs-physical read the base score is now weighted on */}
@@ -260,6 +284,25 @@ function TradeExplorer({ t }: { t: DeskRankedTrade }) {
           </ul>
         )}
       </CollapsibleSection>
+
+      {/* Run Institutional Desk — the LLM debate on THIS trade, in the boardroom modal. Right-aligned,
+          directly after the Quant Analysis section. */}
+      <div className="flex justify-end pt-1">
+        <button className="btn btn-secondary btn-sm gap-1.5" onClick={runDesk} disabled={debateLoading}>
+          {debateLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+          Run Institutional Desk
+        </button>
+      </div>
+
+      <DeskDebateModal
+        open={debateOpen}
+        onClose={() => setDebateOpen(false)}
+        loading={debateLoading}
+        error={debateErr}
+        agents={agents}
+        tradeLabel={t.label}
+        onRerun={runDesk}
+      />
     </div>
   );
 }
@@ -404,15 +447,19 @@ export function SingleTradeDeskReview({ ticker, params, trade }: {
   );
 }
 
-export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
+export function DeskReview({ ticker, params, renderTrade, renderDebate, data }: {
   ticker: string;
   params: DeskReviewParams;
   renderTrade?: (trade: DeskRankedTrade) => React.ReactNode;
   // When provided, the LLM debate renders through this instead of the inline agent
   // cards (v2 routes it into a slide-over). Omitted → original inline behavior.
   renderDebate?: (args: { agents: DeskAgentsResult; rerun: () => void; renderExplore?: () => React.ReactNode }) => React.ReactNode;
+  // PRESENTATIONAL mode: when the parent already fetched the desk payload (single-ticker one-call
+  // flow), pass it here and the component renders it directly — no own /desk-review fetch.
+  data?: DeskReviewResult;
 }) {
-  const [rev, setRev] = useState<DeskReviewResult | null>(null);
+  const controlled = data !== undefined;
+  const [rev, setRev] = useState<DeskReviewResult | null>(data ?? null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -432,8 +479,15 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
 
   const paramsKey = JSON.stringify(params);
   useEffect(() => {
-    // The RANKING is algorithmic (no LLM cost), so auto-load it with the scan — the table just
-    // appears, no extra click. The Quant·Risk·PM debate ("Ask the Desk") stays user-triggered.
+    // Controlled (single-ticker one-call flow): the parent's /desk-review payload IS the ranking —
+    // adopt it, no fetch. Reset the debate/expansion when it changes.
+    if (controlled) {
+      setRev(data ?? null); setErr(null); setLoading(false);
+      setAgents(null); setAgentsErr(null); setExpanded(null);
+      return;
+    }
+    // Uncontrolled (v2 desk tab): the RANKING is algorithmic (no LLM cost), so auto-load it with the
+    // scan — the table just appears, no extra click. The Quant·Risk·PM debate stays user-triggered.
     setRev(null); setErr(null);
     setAgents(null); setAgentsErr(null); setExpanded(null);
     let alive = true;
@@ -448,7 +502,7 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
     })();
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ticker, paramsKey]);
+  }, [ticker, paramsKey, data]);
 
   const askDesk = async () => {
     setAgentsLoading(true); setAgentsErr(null);
@@ -500,20 +554,18 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <span className="flex items-center gap-1.5 text-sm font-bold text-success">
                   <Trophy className="w-4 h-4" /> Algorithmic pick: {top.label}
-                  {top.approval_odds && (
-                    <span className={`text-[10px] font-bold rounded border px-1.5 py-0.5 ${gradeTone(top.algo_grade)}`}>
-                      {top.approval_odds} approval odds
-                    </span>
-                  )}
                 </span>
-                <span className={`text-lg font-bold ${gradeTextTone(top.algo_grade)}`} title="0–100 desk score (color = grade band)">{top.desk_score}<span className="text-xs opacity-50">/100</span></span>
+                <span className={`inline-flex items-baseline gap-1 rounded-lg border px-2 py-0.5 text-lg font-bold ${gradeTone(top.algo_grade)}`}
+                  title="Desk grade — overall trade quality (A best → F worst)">
+                  {top.algo_grade || '—'}<span className="text-[10px] font-medium opacity-60">grade</span>
+                </span>
               </div>
               {top.grade_demerits && top.grade_demerits.length > 0 && (
                 <p className="text-[10px] text-base-content/45 mt-1">Watch-outs: {top.grade_demerits.join(' · ')}</p>
               )}
               <p className="text-xs text-base-content/60 mt-0.5">
                 {strikeStr(top)}{top.short_strike_pct != null && ` (${top.short_strike_pct >= 0 ? '+' : ''}${top.short_strike_pct}%)`} · {top.dte}d · exp {top.expiration}
-                {' — '}Win {pct(top.prob_keep_pct)} · prem {money(top.premium)} · Omega {ratio(top.desk_metrics.pm.omega)} · CVaR95 {money(top.desk_metrics.risk.cvar_95)}
+                {' — '}Win {winPct(top.prob_keep_pct)} · prem {money(top.premium)} · Omega {ratio(top.desk_metrics.pm.omega)} · CVaR95 {money(top.desk_metrics.risk.cvar_95)}
               </p>
               <p className="text-[11px] text-base-content/50 mt-1">
                 Market: <b>{ts.state}</b> ({ts.bias}) · RSI {ts.rsi != null ? ts.rsi.toFixed(0) : '—'} · POC {money(ts.poc)} · trend {ts.trend}
@@ -531,10 +583,10 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
                 <thead>
                   <tr className="text-base-content/50">
                     <th>#</th>
-                    <th title="Overall quality 0–100; color = grade band (green A/B · amber C/D · red F)">Score</th>
+                    <th title="Desk grade — overall trade quality. A/B = desk would likely approve · C/D = weak · F/V = flawed or vetoed">Grade</th>
                     <th>Structure</th><th>Strike</th>
                     <th title="Net premium collected per contract">Premium</th>
-                    <th title="Chance the option you sold expires worthless — you keep the premium, not assigned">Win %</th>
+                    <th title="Chance the option you sold expires worthless — you keep the premium, not assigned (capped at 99.9%)">Win %</th>
                     <th title="Execution — pricing reliability &amp; how easily you can fill (liquidity / spread / model)">Exe.</th>
                     <th title="Annualized return on capital (premium yield, annualized)">Ret. %</th>
                     <th title="Net directional exposure (shares-equivalent)">net Δ</th>
@@ -562,13 +614,13 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
                             {vetoed
                               ? <span className="text-sm font-bold text-error border border-error/50 rounded px-1" title={`VETOED — ${vetoReason}`}>V</span>
                               : <span className={`text-sm font-bold ${gradeTextTone(t.algo_grade)}`}
-                                  title={`grade ${t.algo_grade || '—'} · ${t.approval_odds || ''} approval odds${(t.grade_demerits || []).length ? ' — ' + (t.grade_demerits || []).join('; ') : ''}`}>
-                                  {t.desk_score}</span>}
+                                  title={`grade ${t.algo_grade || '—'}${(t.grade_demerits || []).length ? ' — ' + (t.grade_demerits || []).join('; ') : ''}`}>
+                                  {t.algo_grade || '—'}</span>}
                           </td>
                           <td className="whitespace-nowrap">{t.label}</td>
                           <td className="font-mono text-[11px]">{strikeStr(t)}</td>
                           <td className="text-success whitespace-nowrap">{money(t.premium)}</td>
-                          <td>{pct(t.prob_keep_pct)}</td>
+                          <td>{winPct(t.prob_keep_pct)}</td>
                           <td className={confTextTone(t.confidence?.label)}>{t.confidence?.label ?? '—'}</td>
                           <td title="annualized">{annShort(t.premium_annualized_pct)}</td>
                           <td className="font-mono">{dm.trader.net_delta ?? '—'}</td>
@@ -578,7 +630,7 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
                           <tr className="bg-secondary/[0.05]">
                             <td colSpan={10} className="!p-0">
                               <div className="m-2 rounded-lg border border-secondary/30 bg-base-100/40 overflow-hidden">
-                                <TradeExplorer t={t} />
+                                <TradeExplorer t={t} ticker={ticker} params={params} />
                               </div>
                             </td>
                           </tr>
@@ -591,17 +643,23 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate }: {
             </div>
 
 
-            {/* Ask the Desk (LLM cascade) */}
-            {!agents && (
-              <button className="btn btn-secondary btn-sm gap-2" onClick={askDesk} disabled={agentsLoading}>
-                {agentsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                {agentsLoading ? 'Running the desk debate…' : 'Ask the Desk (run the debate)'}
-              </button>
-            )}
-            {agentsLoading && !agents && (
-              <p className="text-[11px] text-base-content/40">Quant proposes → Risk challenges → Quant rebuts → PM decides, over all {rev.n_trades} trades (~40–60s).</p>
-            )}
-            {agentsErr && <div className="alert alert-error text-xs"><AlertTriangle className="w-4 h-4" /><span>{agentsErr}</span></div>}
+            {/* Ask the Desk — GLOBAL debate across ALL trades (kept for the V2 desk tab, which supplies
+                renderDebate). The main flow now runs the Institutional Desk PER TRADE, from each row's
+                Explore panel, so here we just point users to it. */}
+            {renderDebate ? (
+              <>
+                {!agents && (
+                  <button className="btn btn-secondary btn-sm gap-2" onClick={askDesk} disabled={agentsLoading}>
+                    {agentsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                    {agentsLoading ? 'Running the desk debate…' : 'Ask the Desk (run the debate)'}
+                  </button>
+                )}
+                {agentsLoading && !agents && (
+                  <p className="text-[11px] text-base-content/40">Quant proposes → Risk challenges → Quant rebuts → PM decides, over all {rev.n_trades} trades (~40–60s).</p>
+                )}
+                {agentsErr && <div className="alert alert-error text-xs"><AlertTriangle className="w-4 h-4" /><span>{agentsErr}</span></div>}
+              </>
+            ) : null}
 
             {agents && (() => {
               const ci = agents.final_recommendation.chosen_index;

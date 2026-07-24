@@ -629,6 +629,7 @@ export async function scanBoxOpportunities(params: {
 
 export async function runDerivativeIncome(ticker: string, params: {
   target_dte?: number | null;
+  target_expiration?: string | null;
   min_prob?: number;
   min_income?: number;
   structures?: string[];
@@ -659,6 +660,7 @@ export async function runDerivativeIncomePortfolio(params: {
 
 export type DeskReviewParams = {
   target_dte?: number | null;
+  target_expiration?: string | null;
   min_prob?: number;
   min_income?: number;
   structures?: string[];

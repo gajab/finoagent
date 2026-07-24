@@ -3375,12 +3375,15 @@ export interface DerivativeIncomeQuant {
 export interface DerivativeIncomeVolStats {
   iv_atm_pct: number | null;
   hv_current_pct: number | null;
+  har_rv_pct?: number | null;       // HAR-RV forward (~1mo) realized-vol forecast
+  iv_vs_har_pts?: number | null;    // implied − HAR forecast (vol pts); + = seller edge
   iv_rank: number | null;
   iv_percentile: number | null;
   vol_rank: number | null;
   vol_percentile: number | null;
   skew_pts: number | null;
   basis: string;
+  har_basis?: string;
 }
 
 export interface DerivativeIncomeContext {
@@ -3530,6 +3533,11 @@ export interface DeskReviewResult {
   n_trades: number;
   note?: string;
   error?: string;
+  // Chrome passthrough (single-ticker one-call render): the same context / expiries / event flags
+  // the /derivative-income scan returns, so the header + volatility + events render from this payload.
+  context?: DerivativeIncomeContext | null;
+  expiry_summaries?: DerivativeIncomeExpirySummary[];
+  flag_events?: DerivativeIncomeFlag[];
 }
 
 export interface DeskReviewEvent {

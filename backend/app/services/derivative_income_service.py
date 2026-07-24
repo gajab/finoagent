@@ -128,9 +128,11 @@ def _is_monthly_expiry(d: date) -> bool:
 
 
 def _select_expirations(all_exps: list[str], target_dte: Optional[int],
-                        today: date) -> list[tuple[str, int]]:
+                        today: date, target_expiration: Optional[str] = None) -> list[tuple[str, int]]:
     """Pick the expirations to actually fetch — the API-budget gate.
 
+    Exact (``target_expiration`` set): scan ONLY that expiry — the user picked a
+    specific date, so honour it and fetch nothing else.
     Default (``target_dte`` is None): monthlies only, ``MIN_DTE ≤ DTE ≤ 45``.
     Target mode: any listing type within ``±TARGET_DTE_BAND`` of the target,
     nearest first. Both capped at ``MAX_EXPIRIES``; resilient fallbacks keep a
@@ -147,6 +149,12 @@ def _select_expirations(all_exps: list[str], target_dte: Optional[int],
             parsed.append((s, dte, d))
     if not parsed:
         return []
+
+    if target_expiration:
+        exact = [(s, dte) for (s, dte, d) in parsed if s == target_expiration]
+        if exact:
+            return exact
+        # Fall through to DTE logic if the date is stale/unlisted (don't hard-fail).
 
     if target_dte is None:
         monthly = [(s, dte) for (s, dte, d) in parsed
@@ -205,12 +213,60 @@ def _reports_earnings(stock) -> bool:
         return True
 
 
+def _har_rv_forecast(r: np.ndarray) -> Optional[float]:
+    """HAR-RV (Corsi 2009) forward realized-vol forecast, as an annualized vol %.
+
+    HV30 is BACKWARD-looking (how much the stock already moved). HAR-RV is FORWARD:
+    it regresses the next-month average realized variance on three horizons of past
+    variance — daily, weekly (5d) and monthly (22d) — capturing volatility's long
+    memory and mean-reversion. Paired with implied vol it's a sharper Volatility-Risk-
+    Premium read than trailing HV alone (are you selling vol RICH to what's coming?).
+
+    Targets the mean realized variance over the NEXT 22 trading days so the level is
+    directly comparable to HV30 and to a ~monthly option's implied. Returns None on
+    thin history or a degenerate fit (caller treats None as 'not available')."""
+    r = np.asarray(r, dtype=float)
+    r = r[np.isfinite(r)]
+    n = r.size
+    if n < 90:
+        return None
+    rv = r ** 2                                    # daily variance proxy
+
+    def _roll_mean(a: np.ndarray, w: int) -> np.ndarray:
+        c = np.cumsum(np.insert(a, 0, 0.0))
+        out = np.full(a.size, np.nan)
+        out[w - 1:] = (c[w:] - c[:-w]) / w
+        return out
+
+    H = 22
+    comp_d, comp_w, comp_m = rv, _roll_mean(rv, 5), _roll_mean(rv, H)
+    y = np.full(n, np.nan)                          # forward mean variance over next H days
+    for t in range(n - H):
+        y[t] = rv[t + 1: t + 1 + H].mean()
+
+    mask = np.isfinite(comp_d) & np.isfinite(comp_w) & np.isfinite(comp_m) & np.isfinite(y)
+    if mask.sum() < 40:
+        return None
+    X = np.column_stack([np.ones(mask.sum()), comp_d[mask], comp_w[mask], comp_m[mask]])
+    try:
+        beta, *_ = np.linalg.lstsq(X, y[mask], rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    var_fc = float(np.array([1.0, comp_d[-1], comp_w[-1], comp_m[-1]]) @ beta)
+    if not np.isfinite(var_fc) or var_fc <= 0:      # fall back to the monthly component
+        var_fc = float(comp_m[-1]) if np.isfinite(comp_m[-1]) and comp_m[-1] > 0 else 0.0
+    if var_fc <= 0:
+        return None
+    vol_pct = (var_fc * 252) ** 0.5 * 100
+    return round(vol_pct, 1) if 3.0 <= vol_pct <= 300.0 else None
+
+
 def _context_sync(ticker: str) -> dict:
     """Realized vol (20/30d, annualized), 52-week high/low and the next earnings
     date, from ONE 1-year history pull. Best-effort: returns ``None`` defaults if
     yfinance is unavailable for the name."""
     out: dict = {"hv20": None, "hv30": None, "next_earnings": None,
-                 "week52_high": None, "week52_low": None, "hv_series": None}
+                 "week52_high": None, "week52_low": None, "hv_series": None, "har_rv30": None}
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
@@ -229,6 +285,8 @@ def _context_sync(ticker: str) -> dict:
             roll = (log_ret.rolling(30).std() * math.sqrt(252)).dropna()
             if len(roll) >= 20:
                 out["hv_series"] = [round(float(x), 4) for x in roll.tolist()]
+            # HAR-RV forward realized-vol forecast (next ~1 month), a forward cross-check on HV30.
+            out["har_rv30"] = _har_rv_forecast(log_ret.values)
         # Next earnings — try the modern earnings_dates frame, then the calendar.
         # Skipped entirely for funds/indices: they never report, and asking only
         # buys two 404s and a spurious "may be delisted" line in the logs.
@@ -519,14 +577,21 @@ def _vol_stats(ctx: dict, front_summary: dict) -> dict:
     skew_dir = None
     if skew is not None:
         skew_dir = "put_skew" if skew > 0.5 else "call_skew" if skew < -0.5 else "flat"
+    har = ctx.get("har_rv30")
+    iv_vs_har = None
+    if iv_atm and har:
+        iv_vs_har = round((iv_atm * 100) - har, 1)      # + = implied rich to the forward RV forecast
     return {
         "iv_atm_pct": round(iv_atm * 100, 1) if iv_atm else None,
         "hv_current_pct": round(hv_cur * 100, 1) if hv_cur else None,
+        "har_rv_pct": har,                              # HAR-RV forward (~1mo) realized-vol forecast
+        "iv_vs_har_pts": iv_vs_har,                     # implied − HAR forecast (vol pts); + = seller edge
         "iv_rank": iv_rank, "iv_percentile": iv_pctile,
         "vol_rank": vol_rank, "vol_percentile": vol_pctile,
         "skew_pts": skew, "skew_direction": skew_dir,
         "skew_basis": "IV(90% strike) − IV(110% strike) in vol pts; positive = downside puts richer (sell puts)",
         "basis": "IV rank/percentile vs trailing 1y realized-vol range",
+        "har_basis": "HAR-RV (Corsi): forward ~1-month realized-vol forecast from daily/weekly/monthly variance; HV30 is trailing",
     }
 
 
@@ -1106,6 +1171,7 @@ async def run_derivative_income(
     quote_source: str = "yfinance",
     user: Optional["User"] = None,
     db: Optional["AsyncSession"] = None,
+    target_expiration: Optional[str] = None,
 ) -> dict:
     """Deep-scan one underlying for income opportunities (≥``min_prob`` no-assignment,
     ≥``min_income`` premium), ranked by annualized yield vs SOFR."""
@@ -1115,7 +1181,8 @@ async def run_derivative_income(
     min_prob = min(max(min_prob, 0.5), 0.99)
     today = date.today()
 
-    cache_key = (f"derivinc:{ticker}:{target_dte if target_dte else 'monthly'}:"
+    exp_key = target_expiration or (target_dte if target_dte else "monthly")
+    cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:v1")
     if db is not None:
         cached = await get_cached(db, cache_key)
@@ -1135,7 +1202,7 @@ async def run_derivative_income(
         all_exps = await provider.get_option_expirations(ticker)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"No options chain for {ticker}: {exc}"}
-    chosen = _select_expirations(all_exps, target_dte, today)
+    chosen = _select_expirations(all_exps, target_dte, today, target_expiration)
     if not chosen:
         return {"error": f"No expirations in range for {ticker}"}
 

@@ -1,24 +1,36 @@
-import React from 'react';
+import React, { lazy, Suspense } from 'react';
 import { Routes, Route, useLocation, Navigate } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import Navbar from './components/Navbar';
+import { useAuth } from './contexts/AuthContext';
+
+// Landing + login stay EAGER — they're the first paint for anonymous visitors.
 import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
-import DashboardPage from './pages/DashboardPage';
-import MarketPage from './pages/MarketPage';
-import SettingsPage from './pages/SettingsPage';
-import PortfolioPage from './pages/PortfolioPage';
-import AgentsPage from './pages/AgentsPage';
-import StrategiesPage from './pages/StrategiesPage';
-import DebtRadarPage from './pages/DebtRadarPage';
-import AIResearchPage from './pages/AIResearchPage';
-import ChannelsPage from './pages/ChannelsPage';
-import TrackingPage from './pages/TrackingPage';
-import MyTradesPage from './pages/MyTradesPage';
-import CalculatorsPage from './pages/CalculatorsPage';
-import { MetricsDashboard } from './components/MetricsDashboard';
-import { useAuth } from './contexts/AuthContext';
+
+// Everything behind auth (plus the heavy public calculators) is code-split into its own chunk,
+// loaded on navigation — so the initial bundle no longer carries every page's dependencies.
+const DashboardPage = lazy(() => import('./pages/DashboardPage'));
+const MarketPage = lazy(() => import('./pages/MarketPage'));
+const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
+const AgentsPage = lazy(() => import('./pages/AgentsPage'));
+const StrategiesPage = lazy(() => import('./pages/StrategiesPage'));
+const AIResearchPage = lazy(() => import('./pages/AIResearchPage'));
+const ChannelsPage = lazy(() => import('./pages/ChannelsPage'));
+const TrackingPage = lazy(() => import('./pages/TrackingPage'));
+const MyTradesPage = lazy(() => import('./pages/MyTradesPage'));
+const CalculatorsPage = lazy(() => import('./pages/CalculatorsPage'));
+const MetricsDashboard = lazy(() => import('./components/MetricsDashboard').then(m => ({ default: m.MetricsDashboard })));
+
+function RouteFallback() {
+  return (
+    <div className="flex items-center justify-center py-32 text-base-content/50">
+      <span className="loading loading-spinner loading-md" />
+    </div>
+  );
+}
 
 function AppLayout({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth();
@@ -38,6 +50,7 @@ export default function App() {
   return (
     <AuthProvider>
       <AppLayout>
+        <Suspense fallback={<RouteFallback />}>
         <Routes>
           <Route path="/" element={<LandingPage />} />
           <Route path="/login" element={<LoginPage />} />
@@ -150,6 +163,7 @@ export default function App() {
           <Route path="/agentic-quant" element={<Navigate to="/" replace />} />
           <Route path="/finclaw" element={<Navigate to="/" replace />} />
         </Routes>
+        </Suspense>
       </AppLayout>
     </AuthProvider>
   );

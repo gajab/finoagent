@@ -1068,6 +1068,7 @@ async def rank_desk(
     quote_source: str = "yfinance",
     user: Optional["User"] = None,
     db: Optional["AsyncSession"] = None,
+    target_expiration: Optional[str] = None,
 ) -> dict:
     """Rank ALL candidate income trades (best → worst) by a blended desk score:
     the algorithmic Quant 0–100 score adjusted for technical/regime alignment."""
@@ -1075,6 +1076,7 @@ async def rank_desk(
     scan = await run_derivative_income(
         ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
         structures=structures, quote_source=quote_source, user=user, db=db,
+        target_expiration=target_expiration,
     )
     if scan.get("error"):
         return {"error": scan["error"]}
@@ -1196,6 +1198,13 @@ async def rank_desk(
                                               "atm_iv_pct": s.get("atm_iv_pct")}
                         for s in scan.get("expiry_summaries", [])},
         "events": events_pre,
+        # Chrome passthrough — lets the single-ticker UI render the ticker header, the volatility
+        # panel and the events banner from THIS one payload instead of a second /derivative-income
+        # call. `flag_events` is the scan's UI event list (DerivativeIncomeFlag[] with scope), kept
+        # distinct from `events` above (the desk-window list the LLM agents read).
+        "context": scan.get("context"),
+        "expiry_summaries": scan.get("expiry_summaries") or [],
+        "flag_events": scan.get("events") or [],
         "ranked": ranked,
         "algo_top_pick": ranked[0] if ranked else None,
         "n_trades": len(ranked),
@@ -1675,13 +1684,15 @@ async def run_desk_agents(
     focus: Optional[dict] = None,
     user: Optional["User"] = None,
     db: Optional["AsyncSession"] = None,
+    target_expiration: Optional[str] = None,
 ) -> dict:
     """A genuine desk DEBATE: Quant proposes → Risk challenges → Quant rebuts → PM adjudicates.
     Each agent reasons explicitly, sees all prior turns + the full pre-computed JSON, and grounds
     every claim in a GIVEN field. Two modes: ranking (focus=None → pick the best of the top set)
     and single-trade (Desk Review v2 — `focus`={structure, expiration, short_strike} → rule
     EXECUTE/REJECT on THAT one trade)."""
-    desk = await rank_desk(ticker, target_dte, min_prob, min_income, structures, quote_source, user, db)
+    desk = await rank_desk(ticker, target_dte, min_prob, min_income, structures, quote_source,
+                           user, db, target_expiration=target_expiration)
     if desk.get("error"):
         return desk
     ranked = desk["ranked"]
