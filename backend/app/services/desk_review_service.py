@@ -19,13 +19,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from datetime import date, timedelta
 from typing import Optional, TYPE_CHECKING
 
 from .lifecycle_service import compute_pretrade_metrics, terminal_payoff_curve
 from .llm_service import call_llm
-from .derivative_income_service import run_derivative_income, _norm_ticker, _macro_events_in_window
+from .derivative_income_service import (
+    run_derivative_income, _norm_ticker, _macro_events_in_window, _reports_earnings,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,6 +57,21 @@ _STOCK_STRUCTURES = {"covered_call", "collar"}     # hold 100 shares/contract
 _BULLISH_INCOME = {"cash_secured_put", "put_credit_spread", "jade_lizard"}
 _BEARISH_INCOME = {"call_credit_spread", "collar"}
 _NEUTRAL_INCOME = {"iron_condor", "jade_lizard"}
+
+
+def _fin(x) -> Optional[float]:
+    """float(x) if it is finite, else None.
+
+    yfinance leaves NaN in openInterest (and occasionally IV) for illiquid contracts, and NaN
+    defeats every ordinary guard: `nan or 0` is nan (NaN is truthy) and `nan <= 0` is False, so a
+    bad row slips past both the fallback and the filter and poisons whatever it is summed into.
+    None (not 0.0) is the miss value on purpose — a NaN total must read as "unavailable", never
+    as a real zero."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
 
 
 # ---------------------------------------------------------------------------
@@ -170,20 +188,31 @@ def _ta_sync(ticker: str) -> dict:
             ta.update(compute_momentum_indicators(stock))   # MACD / Bollinger / SMA-EMA (daily)
         except Exception:  # noqa: BLE001
             pass
-        try:                                                # next ex-dividend (assignment risk near ex-div)
-            cal = stock.calendar
-            ed = cal.get("Ex-Dividend Date") if isinstance(cal, dict) else None
-            ed = ed[0] if isinstance(ed, (list, tuple)) else ed
-            if ed is not None and hasattr(ed, "isoformat"):
-                ta["_next_exdiv"] = ed.isoformat()
-        except Exception:  # noqa: BLE001
-            pass
-        try:                                                # last (≈quarterly) cash dividend per share
+        try:                                                # last cash dividend per share + its cadence
             divs = stock.dividends
             if divs is not None and len(divs) > 0:
                 ta["_last_div"] = round(float(divs.iloc[-1]), 4)
+                # The dividends series is the ONLY dividend source that works for funds
+                # (the calendar 404s for them), and it carries the ex-dates — so it also
+                # gives us the payment cadence instead of assuming quarterly. ETFs pay
+                # monthly (JEPI/QYLD), quarterly (QQQ/SPY) or annually (some sector funds).
+                dates = [ix.date() for ix in divs.index[-6:] if hasattr(ix, "date")]
+                gaps = sorted((b - a).days for a, b in zip(dates, dates[1:]) if (b - a).days > 0)
+                if gaps:
+                    ta["_div_cadence_days"] = gaps[len(gaps) // 2]      # median gap
+                if dates:
+                    ta["_next_exdiv"] = dates[-1].isoformat()           # rolled forward by the caller
         except Exception:  # noqa: BLE001
             pass
+        if _reports_earnings(stock):                        # the calendar 404s for funds/indices
+            try:                                            # scheduled ex-div beats the projection
+                cal = stock.calendar
+                ed = cal.get("Ex-Dividend Date") if isinstance(cal, dict) else None
+                ed = ed[0] if isinstance(ed, (list, tuple)) else ed
+                if ed is not None and hasattr(ed, "isoformat"):
+                    ta["_next_exdiv"] = ed.isoformat()
+            except Exception:  # noqa: BLE001
+                pass
         return ta
     except Exception as exc:  # noqa: BLE001
         logger.debug("desk-review TA fetch failed for %s: %s", ticker, exc)
@@ -235,12 +264,12 @@ def _gex_sync(ticker: str) -> dict:
         stock = yf.Ticker(_norm_ticker(ticker))
         spot = None
         try:
-            spot = float((stock.fast_info or {}).get("last_price") or 0) or None
+            spot = _fin((stock.fast_info or {}).get("last_price")) or None
         except Exception:  # noqa: BLE001
             spot = None
         if not spot:
             h = stock.history(period="1d")
-            spot = float(h["Close"].iloc[-1]) if len(h) else None
+            spot = _fin(h["Close"].iloc[-1]) if len(h) else None
         exps = list(stock.options or [])
         if not spot or not exps:
             return {}
@@ -256,7 +285,7 @@ def _gex_sync(ticker: str) -> dict:
             oc = stock.option_chain(exp)
             for df, right in ((oc.calls, "C"), (oc.puts, "P")):
                 for k, iv, oi in zip(df["strike"], df["impliedVolatility"], df["openInterest"]):
-                    k = float(k or 0); iv = float(iv or 0); oi = float(oi or 0)
+                    k, iv, oi = _fin(k) or 0.0, _fin(iv) or 0.0, _fin(oi) or 0.0
                     if k <= 0 or oi <= 0 or not (0.02 < iv < 3.0) or abs(k / spot - 1) > 0.25:
                         continue
                     rows.append((k, dte, iv, right, oi))
@@ -266,11 +295,13 @@ def _gex_sync(ticker: str) -> dict:
         def gex_at(S: float) -> float:
             tot = 0.0
             for k, dte, iv, right, oi in rows:
-                gamma = (_bs_greeks(S, k, dte, iv, right).get("gamma") or 0.0)
+                gamma = _fin(_bs_greeks(S, k, dte, iv, right).get("gamma")) or 0.0
                 tot += (1.0 if right == "C" else -1.0) * gamma * oi * 100 * S * S * 0.01
             return tot
 
-        gex = gex_at(spot)
+        gex = _fin(gex_at(spot))
+        if gex is None:
+            return {}
         flip, prev_s, prev_v = None, None, None       # zero-gamma flip — sweep spot ±12%
         for i in range(25):
             S = spot * (0.88 + 0.24 * i / 24.0)
@@ -410,7 +441,6 @@ def _stress_pnl(opp: dict, spot: float) -> dict:
 
 def _bs_price(S: float, K: float, dte_days: int, sigma: float, right: str, r: float = 0.0) -> float:
     """Plain Black–Scholes price (stdlib normal CDF) — used to mark legs to market under a shock."""
-    import math
     from statistics import NormalDist
     T = max(int(dte_days), 1) / 365.0
     intrinsic = max(0.0, (S - K) if right == "C" else (K - S))
@@ -1125,23 +1155,28 @@ async def rank_desk(
             vol_stats["term_structure"] = ts
 
     # Corporate actions (ticker-level): ex-div + dividend yield for early-exercise reasoning.
-    # yfinance's calendar often returns the LAST ex-div (a past date) — project it forward on a
-    # ~quarterly cadence to the next occurrence so the early-exercise test isn't off a stale date.
+    # yfinance's calendar often returns the LAST ex-div (a past date) — project it forward on the
+    # observed payment cadence to the next occurrence so the early-exercise test isn't off a stale
+    # date. Cadence comes from the dividends series (monthly ETFs are not quarterly payers).
+    cadence = int(ta.get("_div_cadence_days") or 91)
+    cadence = min(max(cadence, 7), 366)
     exdiv, exdiv_est = ta.get("_next_exdiv"), False
     if exdiv:
         try:
             ed, today_d = date.fromisoformat(exdiv), date.today()
             while ed < today_d:
-                ed, exdiv_est = ed + timedelta(days=91), True
+                ed, exdiv_est = ed + timedelta(days=cadence), True
             exdiv = ed.isoformat()
         except ValueError:
             pass
     last_div = ta.get("_last_div")
-    div_yield_pct = round(last_div * 4 / spot * 100, 2) if (last_div and spot) else None
+    per_year = round(365.0 / cadence)
+    div_yield_pct = round(last_div * per_year / spot * 100, 2) if (last_div and spot) else None
     corporate_actions = {
         "next_ex_dividend_date": exdiv,
-        "next_ex_dividend_estimated": exdiv_est,      # True = projected from a stale calendar date (quarterly cadence)
-        "dividend_amount": last_div,                 # last (≈quarterly) cash dividend per share
+        "next_ex_dividend_estimated": exdiv_est,     # True = projected forward from the last ex-div date
+        "dividend_amount": last_div,                 # last cash dividend per share
+        "dividend_cadence_days": cadence,            # observed gap between ex-div dates (91 = quarterly)
         "dividend_yield_pct": div_yield_pct,
         "note": "a short call faces EARLY-ASSIGNMENT if ex-div is before expiry and its extrinsic < the dividend",
     }

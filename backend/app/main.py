@@ -1,11 +1,15 @@
 """FastAPI application entry-point for the FinoAgent.ai app."""
 
 import asyncio
+import json
+import math
 import os
+import typing
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware as StarletteSessionMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -38,6 +42,46 @@ async def lifespan(app: FastAPI):
 
 
 # ---------------------------------------------------------------------------
+# JSON responses — NaN/Infinity safety net
+# ---------------------------------------------------------------------------
+
+def _finite(o):
+    """Recursively replace NaN/±Infinity with None.
+
+    Our analytics payloads are assembled from market data (yfinance option chains,
+    pandas frames, numpy reductions) where a single missing field arrives as NaN.
+    Starlette's JSONResponse serialises with ``allow_nan=False``, so ONE such float
+    anywhere in a large payload raised ``ValueError: Out of range float values are
+    not JSON compliant`` and turned an otherwise-good 200 into a 500. Emit ``null``
+    for those instead — the frontend already treats null as "not available".
+
+    This is the boundary net, not a licence to skip validation: a NaN that reaches
+    here is still a bug at its source, it just no longer takes the response with it.
+    """
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _finite(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_finite(v) for v in o]
+    return o
+
+
+class SafeJSONResponse(JSONResponse):
+    """JSONResponse that renders non-finite floats as null instead of raising."""
+
+    def render(self, content: typing.Any) -> bytes:
+        try:
+            return super().render(content)
+        except ValueError:
+            return json.dumps(
+                _finite(content),
+                ensure_ascii=False, allow_nan=False, indent=None,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -45,6 +89,7 @@ app = FastAPI(
     title="SqubeFi API",
     version="1.0.0",
     lifespan=lifespan,
+    default_response_class=SafeJSONResponse,
 )
 
 # Proxy headers middleware — trust X-Forwarded-Proto / X-Forwarded-For from

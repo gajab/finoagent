@@ -186,6 +186,25 @@ def _macro_events_in_window(start: date, end: date) -> list[str]:
 # Per-ticker context (HV + earnings) — yfinance, off-thread, best-effort
 # ---------------------------------------------------------------------------
 
+# Funds and indices have no earnings and no fundamentals — Yahoo's quoteSummary
+# 404s for them ("No fundamentals data found for symbol: QQQ").
+_NO_EARNINGS_QUOTE_TYPES = {"ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY", "FUTURE"}
+
+
+def _reports_earnings(stock) -> bool:
+    """Does this underlying report earnings at all?
+
+    `quoteType` comes from `fast_info` (the chart endpoint), so the check itself costs
+    nothing extra and avoids the quoteSummary calls that 404 for funds — which is what
+    made yfinance log "No earnings dates found, symbol may be delisted" and a pair of
+    404s on every ETF request. Fails OPEN (assume earnings) so an unknown type behaves
+    exactly as before."""
+    try:
+        return str((stock.fast_info or {}).get("quoteType") or "").upper() not in _NO_EARNINGS_QUOTE_TYPES
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _context_sync(ticker: str) -> dict:
     """Realized vol (20/30d, annualized), 52-week high/low and the next earnings
     date, from ONE 1-year history pull. Best-effort: returns ``None`` defaults if
@@ -211,26 +230,29 @@ def _context_sync(ticker: str) -> dict:
             if len(roll) >= 20:
                 out["hv_series"] = [round(float(x), 4) for x in roll.tolist()]
         # Next earnings — try the modern earnings_dates frame, then the calendar.
-        try:
-            ed = getattr(stock, "earnings_dates", None)
-            if ed is not None and not ed.empty:
-                today = date.today()
-                future = [ix.date() for ix in ed.index
-                          if hasattr(ix, "date") and ix.date() >= today]
-                if future:
-                    out["next_earnings"] = min(future).isoformat()
-        except Exception:  # noqa: BLE001
-            pass
-        if out["next_earnings"] is None:
+        # Skipped entirely for funds/indices: they never report, and asking only
+        # buys two 404s and a spurious "may be delisted" line in the logs.
+        if _reports_earnings(stock):
             try:
-                cal = stock.calendar
-                ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
-                if ed:
-                    d0 = ed[0] if isinstance(ed, (list, tuple)) else ed
-                    if hasattr(d0, "isoformat"):
-                        out["next_earnings"] = d0.isoformat()
+                ed = getattr(stock, "earnings_dates", None)
+                if ed is not None and not ed.empty:
+                    today = date.today()
+                    future = [ix.date() for ix in ed.index
+                              if hasattr(ix, "date") and ix.date() >= today]
+                    if future:
+                        out["next_earnings"] = min(future).isoformat()
             except Exception:  # noqa: BLE001
                 pass
+            if out["next_earnings"] is None:
+                try:
+                    cal = stock.calendar
+                    ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
+                    if ed:
+                        d0 = ed[0] if isinstance(ed, (list, tuple)) else ed
+                        if hasattr(d0, "isoformat"):
+                            out["next_earnings"] = d0.isoformat()
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception as exc:  # noqa: BLE001
         logger.debug("derivinc context fetch failed for %s: %s", ticker, exc)
     return out
