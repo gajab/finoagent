@@ -33,6 +33,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# net_expected_return_vs_sofr_bps is a RISK-NEUTRAL EV vs SOFR — slightly negative is NORMAL (fair pricing).
+# Only a MATERIALLY negative value signals a structural break (toxic liquidity/skew) that no VRP can save.
+_MATERIAL_FAIL_BPS = -75
+
+# short_strike_iv_premium_over_atm_bps regimes (vol-pts × 100). Normal structural skew is a few vol pts;
+# EXTREME skew (>15 vol pts) usually means the market is pricing a KNOWN tail event — challenge it, don't
+# bank it as free edge ("picking up pennies in front of a steamroller").
+_SKEW_ELEVATED_BPS = 700
+_SKEW_EXTREME_BPS = 1500
+
+# Volatility Risk Premium (implied ÷ realized). ≥1 is favourable (implied over-priced = a seller's edge).
+# Below 1 = negative VRP: penalise IN PROPORTION to the gap, and HARD-BLOCK past the ratio floor — that is
+# the "crushed implied vol vs a stock that actually moves" trap where premium selling has no edge.
+_VRP_BLOCK_RATIO = 0.70          # implied < 70% of realized → VETO the trade
+_VRP_PENALTY_K = 22              # points per 1.0 of (1 − IV/HV): 0.9→−2, 0.5→−11, 0.2→−18
+_VRP_PENALTY_CAP = 25
+
 _STOCK_STRUCTURES = {"covered_call", "collar"}     # hold 100 shares/contract
 _BULLISH_INCOME = {"cash_secured_put", "put_credit_spread", "jade_lizard"}
 _BEARISH_INCOME = {"call_credit_spread", "collar"}
@@ -90,37 +107,53 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
         (-abs(ml) if ml is not None else None), mp,
         avg_iv, int(opp.get("dte") or 0),
         stock_shares=stock_shares, sofr_pct=sofr_pct,
+        realized_vol=hv,            # P-measure — widens the payoff law when realized > implied
     )
 
 
-def _ta_alignment(opp: dict, ta: dict) -> tuple[float, str]:
-    """Does this trade fit the regime / smart-money structure? Returns (score_bonus ±, note)."""
+def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None) -> tuple[float, str, list]:
+    """Does this trade fit the regime / smart-money structure? Evaluated on the MEDIUM-TERM read
+    (6-month history, DAILY bars) — the swing horizon that governs a multi-week income option, not
+    intraday noise or multi-year lag. Returns (score_bonus ±, note, factors) where `factors` is the
+    itemized [{label, points}] breakdown of how the technicals moved the score."""
     inst = (ta or {}).get("institutional") or {}
     reg = inst.get("regime") or {}
     bias, mode = reg.get("bias"), reg.get("mode")
     s = opp.get("structure")
-    bonus, notes = 0.0, []
+    factors: list[dict] = []
+    notes: list[str] = []
+
+    def add(label: str, pts: float, note: str):
+        factors.append({"label": label, "points": pts}); notes.append(note)
+
     if bias == "bullish":
         if s in _BULLISH_INCOME:
-            bonus += 6; notes.append("with the bullish regime")
+            add("Regime fit", 6, "with the bullish regime")
         elif s in _BEARISH_INCOME:
-            bonus -= 5; notes.append("against the bullish regime")
+            add("Regime fit", -5, "against the bullish regime")
     elif bias == "bearish":
         if s in _BEARISH_INCOME:
-            bonus += 6; notes.append("with the bearish regime")
+            add("Regime fit", 6, "with the bearish regime")
         elif s in _BULLISH_INCOME:
-            bonus -= 5; notes.append("against the bearish regime")
+            add("Regime fit", -5, "against the bearish regime")
     if mode == "range" and s in _NEUTRAL_INCOME:
-        bonus += 5; notes.append("neutral premium suits the range")
+        add("Range fit", 5, "neutral premium suits the range")
     # Short strike protected by a value-area edge / order block on the safe side.
     vp = inst.get("volume_profile") or {}
     ss = opp.get("short_strike")
     if ss and vp.get("val") and vp.get("vah"):
         if s in _BULLISH_INCOME and ss <= vp["val"]:
-            bonus += 3; notes.append("short strike below the value area")
+            add("Value area", 3, "short strike below the value area")
         elif s in _BEARISH_INCOME and ss >= vp["vah"]:
-            bonus += 3; notes.append("short strike above the value area")
-    return bonus, ", ".join(notes)
+            add("Value area", 3, "short strike above the value area")
+    # Dealer gamma regime (GEX proxy) — long gamma suppresses vol (a good backdrop for selling premium);
+    # short gamma exacerbates it (dangerous). A STOCK-level positioning read applied to every trade.
+    if gex and gex.get("regime") == "long":
+        add("Gamma regime", 4, "dealers long gamma — vol-suppressed")
+    elif gex and gex.get("regime") == "short":
+        add("Gamma regime", -6, "dealers short gamma — vol-expansion risk")
+    bonus = sum(f["points"] for f in factors)
+    return bonus, ", ".join(notes), factors
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +216,73 @@ def _portfolio_fit_sync(ticker: str) -> dict:
                         "low => genuine single-name alpha"}
     except Exception as exc:  # noqa: BLE001
         logger.debug("portfolio-fit fetch failed for %s: %s", ticker, exc)
+        return {}
+
+
+def _gex_sync(ticker: str) -> dict:
+    """Dealer Gamma-Exposure (GEX) proxy from the front option chain — a POSITIONING read plain
+    price/vol TA can't see. Convention: dealers are long call gamma (+) and short put gamma (−), so
+    GEX = Σ(γ·OI, calls) − Σ(γ·OI, puts), scaled to $ per 1% move.
+      • GEX > 0 → dealers LONG gamma → they fade moves (sell rallies / buy dips) → vol SUPPRESSED,
+        mean-reverting → a GOOD backdrop for selling premium.
+      • GEX < 0 → dealers SHORT gamma → they chase moves → vol EXPANSION, trending → DANGEROUS,
+        especially for delta-neutral structures (iron condors).
+    Retail-data proxy (open interest + a modelled γ), NOT classified dealer flow — labelled as such."""
+    try:
+        import yfinance as yf
+        from datetime import datetime as _dt
+        from .hedging_service import _bs_greeks
+        stock = yf.Ticker(_norm_ticker(ticker))
+        spot = None
+        try:
+            spot = float((stock.fast_info or {}).get("last_price") or 0) or None
+        except Exception:  # noqa: BLE001
+            spot = None
+        if not spot:
+            h = stock.history(period="1d")
+            spot = float(h["Close"].iloc[-1]) if len(h) else None
+        exps = list(stock.options or [])
+        if not spot or not exps:
+            return {}
+        today = _dt.utcnow().date()
+        rows: list[tuple] = []                       # (strike, dte, iv, right, oi)
+        for exp in exps[:2]:                         # front expiries dominate dealer gamma
+            try:
+                dte = (_dt.strptime(exp, "%Y-%m-%d").date() - today).days
+            except Exception:  # noqa: BLE001
+                continue
+            if dte <= 0 or dte > 60:
+                continue
+            oc = stock.option_chain(exp)
+            for df, right in ((oc.calls, "C"), (oc.puts, "P")):
+                for k, iv, oi in zip(df["strike"], df["impliedVolatility"], df["openInterest"]):
+                    k = float(k or 0); iv = float(iv or 0); oi = float(oi or 0)
+                    if k <= 0 or oi <= 0 or not (0.02 < iv < 3.0) or abs(k / spot - 1) > 0.25:
+                        continue
+                    rows.append((k, dte, iv, right, oi))
+        if len(rows) < 6:                            # too thin to be a reliable positioning read
+            return {}
+
+        def gex_at(S: float) -> float:
+            tot = 0.0
+            for k, dte, iv, right, oi in rows:
+                gamma = (_bs_greeks(S, k, dte, iv, right).get("gamma") or 0.0)
+                tot += (1.0 if right == "C" else -1.0) * gamma * oi * 100 * S * S * 0.01
+            return tot
+
+        gex = gex_at(spot)
+        flip, prev_s, prev_v = None, None, None       # zero-gamma flip — sweep spot ±12%
+        for i in range(25):
+            S = spot * (0.88 + 0.24 * i / 24.0)
+            v = gex_at(S)
+            if prev_v is not None and (prev_v < 0 <= v or prev_v > 0 >= v):
+                flip = round((prev_s + S) / 2.0, 2); break
+            prev_s, prev_v = S, v
+
+        return {"gex_bn": round(gex / 1e9, 2), "regime": "long" if gex >= 0 else "short",
+                "flip_level": flip, "spot": round(spot, 2), "n_strikes": len(rows), "proxy": True}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("GEX proxy failed for %s: %s", ticker, exc)
         return {}
 
 
@@ -363,6 +463,179 @@ def _expected_move_pct(r: dict) -> Optional[float]:
     return round(atm * (dte / 365.0) ** 0.5, 1) if (atm and dte) else None
 
 
+# --- shared deterministic primitives (used by BOTH the ranking grade and the LLM payload) ----------
+
+def _physical_move_pct(r: dict, hv: Optional[float]) -> Optional[float]:
+    """The 1σ PHYSICAL (realized-vol) move to expiry (%) = realized vol × √(dte/365). hv is decimal."""
+    dte = int(r.get("dte") or 0)
+    return round(hv * 100 * (dte / 365.0) ** 0.5, 1) if (hv and dte) else None
+
+
+def _dual_move_pct(r: dict, hv: Optional[float]) -> tuple:
+    """(dual, implied, physical) 1σ moves (%). The DUAL boundary is the WIDER of the implied (Q-measure)
+    and physical (P-measure) expected move — a short strike must clear BOTH to be genuinely cushioned.
+    Relying on implied alone is the negative-VRP trap (crushed IV makes a close strike look 'safe')."""
+    imp = _expected_move_pct(r)
+    phys = _physical_move_pct(r, hv)
+    cands = [x for x in (imp, phys) if x]
+    return (max(cands) if cands else None), imp, phys
+
+
+def _nearest_short_sigmas(opp: dict, spot: Optional[float], em_pct: Optional[float] = None) -> Optional[float]:
+    """Closest SHORT strike to spot in 1σ expected-move units (< ~0.5 = an ATM / directional short leg).
+    Pass em_pct to gate on a specific boundary (e.g. the DUAL implied-vs-physical move); defaults to implied."""
+    em = em_pct or _expected_move_pct(opp)
+    if not (spot and em):
+        return None
+    sig = [round(abs(l["strike"] - spot) / spot * 100 / em, 2)
+           for l in (opp.get("legs") or [])
+           if str(l.get("action", "")).upper().startswith("S") and l.get("strike")]
+    return min(sig) if sig else None
+
+
+def _prob_max_profit(opp: dict) -> Optional[float]:
+    """Probability EVERY short leg expires OTM (the FULL credit), from short-leg deltas (|delta| ≈ P(ITM))."""
+    sd = [abs(l.get("delta") or 0.0) for l in (opp.get("legs") or [])
+          if str(l.get("action", "")).upper().startswith("S")]
+    return round(max(0.0, min(1.0, 1.0 - sum(sd))) * 100, 1) if sd else None
+
+
+def _bps_regime_of(bps: Optional[int]) -> Optional[str]:
+    return (None if bps is None else "positive_alpha" if bps >= 0
+            else "structurally_broken" if bps < _MATERIAL_FAIL_BPS else "marginal_fair")
+
+
+def _skew_regime_of(bps: Optional[int]) -> Optional[str]:
+    return (None if bps is None else "extreme" if bps >= _SKEW_EXTREME_BPS
+            else "elevated" if bps >= _SKEW_ELEVATED_BPS else "normal")
+
+
+def _opp_bps(opp: dict, dm: dict, sofr_pct: float) -> Optional[int]:
+    """Annualized EXPECTED (EV) return minus SOFR, in bps — the risk-neutral capital-efficiency edge."""
+    er = ((dm or {}).get("pm") or {}).get("expected_return_pct")
+    dte = int(opp.get("dte") or 0)
+    ann = er * 365.0 / dte if (er is not None and dte) else None
+    return round((ann - sofr_pct) * 100) if ann is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Algorithmic pre-vetting: fold EVERY deterministic institutional factor into the score, so the
+# trade that reaches the (expensive) LLM desk is already vetted and the top-ranked one is very
+# likely to be APPROVED. Returns a score adjustment + merits/demerits + hard BLOCKING flags.
+# ---------------------------------------------------------------------------
+
+def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: Optional[float],
+                iv_rank: Optional[float], beta: Optional[float], events_n: int,
+                hv: Optional[float] = None, gex: Optional[dict] = None) -> dict:
+    pm, rk = (dm or {}).get("pm") or {}, (dm or {}).get("risk") or {}
+    merits, demerits, blocking = [], [], []
+    # Itemized signed contributions (points) by factor — so the UI can show each adjustment as a bar
+    # and the desk score is auditable: desk_score = base_quality + regime + Σ(these).
+    comp: dict[str, float] = {"expectation": 0.0, "vrp": 0.0, "moneyness": 0.0,
+                              "skew": 0.0, "liquidity": 0.0, "beta": 0.0}
+
+    # 1) Genuinely-bad EV — DEMOTE (never auto-reject). A negative risk-neutral bps is NORMAL for income
+    #    selling (fair pricing; the real edge is the VRP), so do NOT block on it. Only flag a trade that
+    #    truly LOSES in expectation under the model — a robust signal, not the annualized-bps artifact.
+    bps = _opp_bps(opp, dm, sofr_pct)
+    omega, ev = pm.get("omega"), pm.get("expected_value")
+    if omega is not None and omega < 0.9 and ev is not None and ev < 0:
+        demerits.append(f"loses in expectation (Omega {omega}, EV {ev})"); comp["expectation"] -= 12
+    elif bps is not None and 0 <= bps <= 3000:          # a sane positive edge (guard annualization blow-ups)
+        merits.append("positive risk-neutral edge"); comp["expectation"] += 3
+
+    # 2) Volatility Risk Premium — the REAL edge, and the negative-VRP TRAP. Rich implied vs realized
+    #    rewards; cheap implied (implied << realized) is penalised IN PROPORTION to the gap and
+    #    HARD-BLOCKED past the floor — the crushed-vol case where selling premium has no edge.
+    iv_hv = opp.get("iv_hv_ratio")
+    if iv_hv is not None:
+        if iv_hv >= 1.1 and (iv_rank or 0) >= 50:
+            merits.append(f"rich VRP (IV/HV {iv_hv}, IV-rank {iv_rank})"); comp["vrp"] += 6
+        elif iv_hv < 1.0:
+            pen = min(round((1.0 - iv_hv) * _VRP_PENALTY_K), _VRP_PENALTY_CAP)   # magnitude-scaled by the gap
+            if pen > 0:
+                comp["vrp"] -= pen
+                demerits.append(f"negative VRP — implied {round(iv_hv*100)}% of realized (IV/HV {iv_hv})")
+            if iv_hv < _VRP_BLOCK_RATIO:
+                blocking.append(f"crushed vol — implied only {round(iv_hv*100)}% of realized (negative VRP, no edge)")
+
+    # 3) Moneyness — a near-ATM short leg makes 'income' a DIRECTIONAL bet. Measured against the DUAL
+    #    boundary (the WIDER of the implied Q-move and the physical P-move), so a strike that looks
+    #    'deep' under crushed IV but is physically exposed can no longer hide.
+    dual_em, imp_em, phys_em = _dual_move_pct(opp, hv)
+    nss = _nearest_short_sigmas(opp, spot, dual_em)
+    if nss is not None and nss < 0.5:
+        demerits.append(f"near-ATM short leg ({nss}σ dual) — directional, not cushioned"); comp["moneyness"] -= 12
+    elif nss is not None and nss < 1.0:
+        demerits.append(f"thin cushion ({nss}σ dual)"); comp["moneyness"] -= 4
+    elif nss is not None and nss >= 1.5:
+        merits.append(f"deep cushion ({nss}σ dual)"); comp["moneyness"] += 5
+    pmp = _prob_max_profit(opp)
+    if pmp is not None and pmp < 50:
+        demerits.append(f"full-credit prob only {pmp}%"); comp["moneyness"] -= 6
+    elif pmp is not None and pmp >= 85:
+        merits.append(f"full-credit prob {pmp}%"); comp["moneyness"] += 3
+
+    # 4) Skew — extreme = 'pennies in front of a steamroller'.
+    sliv = _short_leg_iv(opp)
+    ss_bps = round((sliv - atm_iv_pct) * 100) if (sliv is not None and atm_iv_pct is not None) else None
+    if ss_bps is not None and ss_bps >= _SKEW_EXTREME_BPS:
+        demerits.append(f"extreme skew ({ss_bps}bps)"); comp["skew"] -= 6
+
+    # 5) Execution / liquidity.
+    spreads = [l.get("bid_ask_spread_pct") for l in (opp.get("legs") or []) if l.get("bid_ask_spread_pct") is not None]
+    worst = max(spreads) if spreads else None
+    if worst is not None and worst > 15:
+        demerits.append(f"wide spread ({worst}%)"); comp["liquidity"] -= 8
+    elif worst is not None and worst > 10:
+        demerits.append(f"wide-ish spread ({worst}%)"); comp["liquidity"] -= 5
+    elif worst is not None and worst < 5:
+        merits.append("tight spreads"); comp["liquidity"] += 3
+
+    # 6) (Tail is already scored by the base quant model; a CVaR-vs-CAPITAL demerit is structure-blind —
+    #     a defined-risk spread's CVaR is ~100% of capital BY DEFINITION — so it is intentionally omitted.)
+
+    # 7) Systemic beta — a high-beta name is a LEVERAGED market bet, not idiosyncratic income.
+    if beta is not None and beta >= 2.0:
+        demerits.append(f"high beta {beta} (leveraged market bet)"); comp["beta"] -= 6
+    elif beta is not None and beta >= 1.5:
+        demerits.append(f"elevated beta {beta}"); comp["beta"] -= 3
+
+    # (Event density intentionally NOT a flat demerit — routine macro spans every multi-week trade, and an
+    #  earnings print is DOUBLE-EDGED, not simply bad; event TIMING is a qualitative call for the desk.)
+
+    # 8) Dealer gamma HARD FILTER — a SHORT-gamma tape (dealers chase moves → vol expansion) runs
+    #    DELTA-NEUTRAL premium over both ways: veto iron condors. Directional income is only penalised
+    #    (via the TA "Gamma regime" factor), not blocked.
+    if gex and gex.get("regime") == "short" and opp.get("structure") == "iron_condor":
+        blocking.append("short-gamma tape vetoes delta-neutral (iron condor) — vol expansion runs it over both ways")
+
+    adj = sum(comp.values())
+    return {"adj": adj, "merits": merits, "demerits": demerits, "blocking": blocking, "components": comp,
+            # Q-vs-P boundary read (for the number-line viz): implied vs physical 1σ moves + strike distance.
+            "qp": {"implied_move_pct": imp_em, "physical_move_pct": phys_em, "dual_move_pct": dual_em,
+                   "short_sigmas": nss, "iv_hv_ratio": iv_hv,
+                   "short_dist_pct": round(nss * dual_em, 1) if (nss is not None and dual_em) else None,
+                   "physical_wider": bool(phys_em and imp_em and phys_em > imp_em),
+                   "exposed_physical": bool(nss is not None and dual_em and phys_em
+                                            and (nss * dual_em) < phys_em)}}
+
+
+def _grade_letter(score: int, blocking: list) -> tuple[str, str]:
+    """Map the final desk score (+ any hard block) to a letter grade and an LLM-approval likelihood."""
+    if blocking:
+        return "F", "auto_reject"
+    if score >= 78:
+        return "A", "high"
+    if score >= 65:
+        return "B", "high"
+    if score >= 52:
+        return "C", "medium"
+    if score >= 38:
+        return "D", "low"
+    return "F", "low"
+
+
 def _candidate_extra(r: dict, meta: dict, max_oi_strike: Optional[float]) -> dict:
     """Institutional add-ons the desks asked for: execution slippage, ±10% capital shock
     (TERMINAL vs INSTANTANEOUS MTM), gamma-pin cushion, per-strike skew premium, stressed
@@ -386,6 +659,27 @@ def _candidate_extra(r: dict, meta: dict, max_oi_strike: Optional[float]) -> dic
     # Per-strike skew premium: how much the SHORT strike's IV sits over ATM (defends selling THIS strike).
     sliv, atm_iv = _short_leg_iv(r), meta.get("atm_iv")
     ss_iv_prem_bps = round((sliv - atm_iv) * 100) if (sliv is not None and atm_iv is not None) else None
+    skew_regime = (None if ss_iv_prem_bps is None
+                   else "extreme" if ss_iv_prem_bps >= _SKEW_EXTREME_BPS
+                   else "elevated" if ss_iv_prem_bps >= _SKEW_ELEVATED_BPS
+                   else "normal")
+    # F1/F2: per-SHORT-leg moneyness — distance in 1σ units + the BINDING cushion + prob of the FULL credit.
+    # Surfaces a near-ATM short leg that the FAR-leg cushion_pct_otm hides (e.g. a jade lizard's ATM call).
+    spot_, em_pct = meta.get("spot"), _expected_move_pct(r)
+    short_sigmas, short_cushions, short_deltas = {}, [], []
+    for l in (r.get("legs") or []):
+        if str(l.get("action", "")).upper().startswith("S"):
+            k = l.get("strike")
+            short_deltas.append(abs(l.get("delta") or 0.0))
+            if k and spot_:
+                dist_pct = round(abs(k - spot_) / spot_ * 100, 1)
+                short_cushions.append(dist_pct)
+                tag = ("C" if str(l.get("type", "")).upper().startswith("C") else "P") + str(int(round(k)))
+                if em_pct:
+                    short_sigmas[tag] = round(dist_pct / em_pct, 2)
+    nearest_short_cushion = min(short_cushions) if short_cushions else None
+    nearest_short_sigmas = min(short_sigmas.values()) if short_sigmas else None
+    prob_max_profit = round(max(0.0, min(1.0, 1.0 - sum(short_deltas))) * 100, 1) if short_deltas else None
     # Stressed liquidity: spreads widen into events; multiplier is a modeling assumption.
     vols = [l.get("vol") for l in (r.get("legs") or []) if l.get("vol")]
     thin_1lot_pct = round(1.0 / min(vols) * 100, 3) if vols else None
@@ -397,6 +691,11 @@ def _candidate_extra(r: dict, meta: dict, max_oi_strike: Optional[float]) -> dic
     dte = int(r.get("dte") or 0)
     ann_er = er * 365.0 / dte if (er is not None and dte) else None
     bps = round((ann_er - sofr_pct) * 100) if ann_er is not None else None
+    # Three-way regime (A+B): the risk-neutral bps can't show alpha; it only flags a structural break.
+    bps_regime = (None if bps is None
+                  else "positive_alpha" if bps >= 0
+                  else "structurally_broken" if bps < _MATERIAL_FAIL_BPS
+                  else "marginal_fair")
     # Kelly-based sizing options (% of capital), pre-computed so the PM never does the arithmetic.
     kelly = ((r.get("desk_metrics") or {}).get("pm") or {}).get("kelly_fraction")
     kelly_sizing = ({"full_kelly_pct": round(kelly * 100), "half_kelly_pct": round(kelly * 50),
@@ -455,8 +754,25 @@ def _candidate_extra(r: dict, meta: dict, max_oi_strike: Optional[float]) -> dic
         "volatility_skew": {
             "skew_slope_90_110_pts": meta.get("skew_pts"),
             "short_strike_iv_premium_over_atm_bps": ss_iv_prem_bps,
+            "skew_regime": skew_regime,     # normal <700 | elevated 700-1500 | extreme >=1500 bps
             "note": "a steep short-strike IV premium over ATM defends selling THIS strike even when ATM IV "
-                    "looks cheap vs HV",
+                    "looks cheap vs HV — BUT extreme skew (elevated/extreme regime) can mean the market is "
+                    "pricing a KNOWN tail event: it is edge to sell ONLY if it is STRUCTURAL skew, not a "
+                    "priced-in disaster (check events_before_expiry) or an illiquid / unreliable quote (check "
+                    "the leg's oi/volume and stressed_bid_ask_spread_pct).",
+        },
+        "moneyness": {
+            "cushion_pct_otm_reported": r.get("cushion_pct"),    # the HEADLINE cushion = the FAR short leg only
+            "nearest_short_cushion_pct": nearest_short_cushion,  # the BINDING short leg's distance from spot
+            "short_strike_sigmas_from_spot": short_sigmas,       # each short leg's distance in 1σ expected-move units
+            "nearest_short_sigmas": nearest_short_sigmas,        # < ~0.5 = the trade has an AT-THE-MONEY short leg
+            "prob_max_profit_pct": prob_max_profit,              # FULL credit (every short leg OTM), from short-leg deltas
+            "note": "cushion_pct_otm reports the FAR short leg; nearest_short_cushion_pct / nearest_short_sigmas "
+                    "are the BINDING one. A short leg within ~0.5σ is effectively AT-THE-MONEY — a DIRECTIONAL "
+                    "bet, NOT cushioned; do NOT call the trade 'cushioned' off the far leg alone. keep_prob_pct "
+                    "is a DOWNSIDE (put-not-assigned) number; prob_max_profit_pct is the probability of the FULL "
+                    "credit (EVERY short leg expires OTM). For a near-ATM short leg these diverge sharply — the "
+                    "headline max_profit is far from certain, so cite prob_max_profit_pct and expected_value.",
         },
         "liquidity_capacity": {
             "thinnest_leg_1lot_vs_today_volume_pct": thin_1lot_pct,
@@ -481,15 +797,18 @@ def _candidate_extra(r: dict, meta: dict, max_oi_strike: Optional[float]) -> dic
         },
         "capital_allocation": {
             "net_expected_return_vs_sofr_bps": bps,
-            "fails_sofr_hurdle": (bps is not None and bps < 0),               # negative alpha vs the risk-free rate
-            "requires_override_justification": (bps is not None and bps < 0),  # must justify via skew/structure or DISCARD
-            "bps_basis": "annualized EXPECTED (EV) return minus SOFR — real edge, not headline premium yield",
-            "double_dip_note": ("this is the EV-based alpha OVER the SOFR opportunity-cost hurdle. For cash-"
-                                "secured / covered structures the collateral earns ~SOFR natively, so the "
-                                "premium looks like free alpha on top — but this bps is already NET of expected "
-                                "assignment losses, so a NEGATIVE value means the expected losses exceed the "
-                                "premium's benefit: the trade is capital-INEFFICIENT vs simply holding T-bills. "
-                                "Do NOT treat the headline premium as free money."),
+            "bps_regime": bps_regime,                   # positive_alpha | marginal_fair | structurally_broken
+            "structurally_broken": (bps is not None and bps < _MATERIAL_FAIL_BPS),        # HARD reject — no VRP override
+            "requires_vrp_override": (bps is not None and _MATERIAL_FAIL_BPS <= bps < 0),  # marginal — needs a RICH VRP or pass
+            "bps_basis": ("net_expected_return_vs_sofr_bps is a RISK-NEUTRAL (Q-measure) EV minus SOFR — under "
+                          "no-arbitrage a slightly-negative value is the NORMAL cost of fair pricing, NOT alpha "
+                          "and NOT grounds to reject. The real edge is the VOLATILITY RISK PREMIUM (P-measure): "
+                          "sell only when IV is rich vs realized — iv_hv_ratio > ~1, elevated iv_rank/iv_percentile, "
+                          "steep short_strike_iv_premium_over_atm_bps. bps_regime: marginal_fair (bps >= -75) = "
+                          "fairly priced → EXECUTE only on a genuinely RICH VRP (the override), else pass; "
+                          "structurally_broken (bps < -75) = a HARD reject (toxic liquidity/skew) NO override can "
+                          "save; positive_alpha (bps >= 0) = rare, clears on its own. (Collateral earns ~SOFR "
+                          "natively, so this is the alpha ON TOP — do not treat headline premium as free money.)"),
             "kelly_sizing": kelly_sizing,               # full/half/quarter Kelly as % of capital (PM sizing input)
             "max_capital_lockup_days_est": dte + (30 if breach_prone else 0),
             "lockup_basis": ("days to expiry" + (" + ~30d defensive roll (early breach likely: cushion < 1σ move)"
@@ -514,6 +833,10 @@ def _candidate_json(i: int, r: dict, meta: dict) -> dict:
         "cushion_pct_otm": r.get("cushion_pct"),        # short strike distance from spot — bigger = safer
         "desk_score_0_100": r.get("desk_score"),
         "algo_rank": i + 1,
+        "algo_grade": r.get("algo_grade"),              # A–F after the full deterministic overlay
+        "approval_odds": r.get("approval_odds"),        # high | medium | low | auto_reject (LLM-approval likelihood)
+        "algo_demerits": r.get("grade_demerits") or [], # every deterministic mark AGAINST the trade
+        "algo_blocking": r.get("grade_blocking") or [], # hard fails — a graded trade that reached you should have none
         "algo_quant": {"score": q.get("score"), "verdict": q.get("verdict"), "reasons": q.get("reasons")},
         "ta_alignment": r.get("ta_note") or None,
         "pricing": {"net_premium": r.get("premium"), "premium_annualized_pct": r.get("premium_annualized_pct"),
@@ -532,7 +855,10 @@ def _candidate_json(i: int, r: dict, meta: dict) -> dict:
 
 
 def _reject_reason(r: dict) -> str:
-    """One line the PM can dismiss a lower-ranked trade on — so it need not reverse-engineer the algo."""
+    """One line the desk can dismiss a lower-ranked trade on — the algo grade's blocking/demerits first."""
+    graded = (r.get("grade_blocking") or []) + (r.get("grade_demerits") or [])
+    if graded:
+        return "; ".join(graded[:2])
     dm = r.get("desk_metrics") or {}
     pm, rk = dm.get("pm") or {}, dm.get("risk") or {}
     omega, ev, kelly = pm.get("omega"), pm.get("expected_value"), pm.get("kelly_fraction")
@@ -565,6 +891,8 @@ def _candidate_condensed(i: int, r: dict) -> dict:
         "expiration": r.get("expiration"),
         "dte": r.get("dte"),
         "desk_score_0_100": r.get("desk_score"),
+        "algo_grade": r.get("algo_grade"),
+        "approval_odds": r.get("approval_odds"),
         "algo_verdict": (dm.get("quant") or {}).get("verdict"),
         "reject_reason": _reject_reason(r),
         "keep_prob_pct": r.get("prob_keep_pct"),
@@ -619,20 +947,29 @@ def _desk_payload(desk: dict, focus_index: Optional[int] = None) -> dict:
                           "number or strike. Recommend ONLY a candidate from candidates[] (the detailed top "
                           f"{_TOP_N_FULL}) by its exact strikes. cushion_pct_otm = short strike's distance from "
                           "spot (bigger = safer, smaller tail). candidates[] is the algorithmic ranking; id 1 = "
-                          "algo #1 (one input, not the answer). Each candidate.institutional carries execution "
+                          "algo #1 (one input, not the answer). PRE-VETTING: every candidate carries an "
+                          "`algo_grade` (A–F), `approval_odds` and `algo_demerits` from a FULL deterministic "
+                          "screen (VRP, moneyness/near-ATM, skew, liquidity, tail, systemic beta, event "
+                          "density) — the top-ranked trade has already CLEARED every mechanical filter and its "
+                          "`algo_blocking` is empty, so your job is to CONFIRM it or find a genuinely "
+                          "QUALITATIVE reason it should not be approved (do not re-litigate the mechanical "
+                          "screen). Each candidate.institutional carries execution "
                           "slippage, the ±10% capital shock (TERMINAL vs INSTANTANEOUS overnight MTM), per-strike "
                           "skew premium, stressed liquidity, early-exercise (dividend) danger, gamma-pin "
                           "cushion, edge-vs-SOFR in bps and the capital-lockup estimate. underlying."
                           "corporate_actions (ex-div/yield) and underlying.portfolio_fit (beta & correlation vs "
                           "SPY — systemic vs idiosyncratic) are ticker-level. also_ranked[] lists lower-ranked "
                           "trades condensed, each with a reject_reason for effortless dismissal.\n"
-                          "CAPITAL EFFICIENCY (double-dip): cash-secured / covered structures earn ~SOFR on the "
-                          "collateral NATIVELY, so the premium looks like free alpha on top — but "
-                          "capital_allocation.net_expected_return_vs_sofr_bps is already EV-based (net of expected "
-                          "assignment losses). If it is NEGATIVE (fails_sofr_hurdle=true) the trade DESTROYS "
-                          "capital efficiency vs holding T-bills — it must be justified by an explicit skew/"
-                          "structure override or DISCARDED. Never wave through a negative-bps trade as "
-                          "'acceptable' just because it collects premium."),
+                          "CAPITAL EFFICIENCY & THE VOL RISK PREMIUM: capital_allocation.net_expected_return_vs_"
+                          "sofr_bps is a RISK-NEUTRAL EV vs SOFR — under no-arbitrage a slightly-negative value "
+                          "is NORMAL (the cost of fair pricing), NOT alpha and NOT grounds to reject. The real "
+                          "edge is the VOLATILITY RISK PREMIUM: sell only when IV is rich vs realized "
+                          "(iv_hv_ratio > ~1, high iv_rank, steep short_strike_iv_premium_over_atm_bps). Use "
+                          "bps_regime: marginal_fair (bps >= -75) → EXECUTE only if the VRP is genuinely rich "
+                          "(the override), else pass; structurally_broken (bps < -75) → HARD reject (toxic "
+                          "liquidity/skew), NO override; positive_alpha → clears on its own. Do NOT treat a small "
+                          "negative bps as capital destruction, and do NOT use a VRP override to buy a "
+                          "structurally_broken trade."),
         "events_before_expiry": desk.get("events") or [],
         "technical_analysis": _ta_json(desk.get("ta") or {}),
         "algo_top_pick_id": 1 if ranked else None,
@@ -716,13 +1053,22 @@ async def rank_desk(
     spot = float(ctx.get("spot") or scan.get("spot") or 0.0)
     sofr_pct = float(ctx.get("sofr_pct") or 5.0)
     hv = ((ctx.get("hv30_pct") or ctx.get("hv20_pct") or 0) / 100.0) or None
-    ta, portfolio_fit = await asyncio.gather(
+    ta, portfolio_fit, gex = await asyncio.gather(
         asyncio.to_thread(_ta_sync, ticker),
         asyncio.to_thread(_portfolio_fit_sync, ticker),
+        asyncio.to_thread(_gex_sync, ticker),
     )
 
+    opportunities = scan.get("opportunities", [])
+    max_dte = max((int(o.get("dte") or 0) for o in opportunities), default=int(target_dte or 45))
+    events_pre = _events_in_window(scan, ta, max_dte)        # computed once — also feeds the grade
+    events_n = len(events_pre)
+    vsx = ctx.get("vol_stats") or {}
+    atm_iv_pct, iv_rank = vsx.get("iv_atm_pct"), vsx.get("iv_rank")
+    beta = (portfolio_fit or {}).get("beta_1y_spx")
+
     ranked: list[dict] = []
-    for opp in scan.get("opportunities", []):
+    for opp in opportunities:
         try:
             dm = _opp_desk_metrics(opp, spot, sofr_pct, hv)
         except Exception as exc:  # noqa: BLE001 — one bad trade must not kill the desk
@@ -731,18 +1077,41 @@ async def rank_desk(
         base = (dm.get("quant") or {}).get("score")
         if base is None:
             base = (opp.get("confidence") or {}).get("score") or 50
-        bonus, note = _ta_alignment(opp, ta)
-        desk_score = int(round(max(0, min(100, base + bonus))))
-        ranked.append({**opp, "desk_metrics": dm, "desk_score": desk_score, "ta_note": note})
+        bonus, note, ta_factors = _ta_alignment(opp, ta, gex)
+        # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
+        # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
+        g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta, events_n, hv=hv, gex=gex)
+        desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
+        grade, approval = _grade_letter(desk_score, g["blocking"])
+        # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
+        # factors are their OWN group (ta_factors), kept separate from the option-math adjustments:
+        #   desk_score = base_quality + Σ(grade_adjustments) + Σ(ta_factors).
+        c = g["components"]
+        grade_adjustments = [
+            {"label": "Expectation", "points": round(c["expectation"], 1)},
+            {"label": "VRP",         "points": round(c["vrp"], 1)},
+            {"label": "Moneyness",   "points": round(c["moneyness"], 1)},
+            {"label": "Skew",        "points": round(c["skew"], 1)},
+            {"label": "Liquidity",   "points": round(c["liquidity"], 1)},
+            {"label": "Beta",        "points": round(c["beta"], 1)},
+        ]
+        ranked.append({**opp, "desk_metrics": dm, "desk_score": desk_score, "ta_note": note,
+                       "algo_grade": grade, "approval_odds": approval, "grade_merits": g["merits"],
+                       "grade_demerits": g["demerits"], "grade_blocking": g["blocking"],
+                       "base_quality": round(base, 1), "grade_adjustments": grade_adjustments,
+                       "ta_factors": ta_factors,
+                       # Q-vs-P: the boundary read (imp/phys moves + strike distance) and the vol pair
+                       # that weighted the base score — surfaced as the number-line in Quant Analysis.
+                       "qp": {**g["qp"], **(dm.get("vrp") or {})}})
 
-    # Rank by desk score, then break ties by risk-adjusted quality (Sortino) and yield —
-    # so the "single best" is deterministic even when several ultra-safe trades tie at the top.
+    # BLOCKING trades (structurally broken, etc.) sink to the bottom; then desk score, Sortino, yield —
+    # so the top-ranked trade has already cleared every mechanical filter the LLM desk applies.
     ranked.sort(key=lambda r: (
+        not r["grade_blocking"],
         r["desk_score"],
         (r["desk_metrics"].get("pm") or {}).get("sortino") or 0,
         r.get("premium_annualized_pct") or 0,
     ), reverse=True)
-    max_dte = max((int(r.get("dte") or 0) for r in ranked), default=int(target_dte or 45))
 
     # Term structure: the scan often sees a single expiry (term_structure null) — probe a back
     # month so the Quant always knows contango vs backwardation (the earnings-inversion edge).
@@ -787,10 +1156,11 @@ async def rank_desk(
         "vol_stats": vol_stats,
         "corporate_actions": corporate_actions,
         "portfolio_fit": portfolio_fit or None,
+        "gex": gex or None,             # dealer gamma-regime proxy (stock-level chip)
         "expiry_meta": {s.get("expiration"): {"max_oi_strike": s.get("max_oi_strike"),
                                               "atm_iv_pct": s.get("atm_iv_pct")}
                         for s in scan.get("expiry_summaries", [])},
-        "events": _events_in_window(scan, ta, max_dte),
+        "events": events_pre,
         "ranked": ranked,
         "algo_top_pick": ranked[0] if ranked else None,
         "n_trades": len(ranked),
@@ -844,7 +1214,10 @@ Step 1 · VOLATILITY SURFACE & VRP (Volatility Risk Premium) — Assess if the m
          Evaluate 'iv_hv_ratio' to establish baseline VRP. If < 1.0, explicitly justify the structural edge
          (e.g., extreme localized skew). Interrogate 'volatility_skew' (smile/smirk steepness) and
          'short_strike_iv_premium_over_atm_bps' to confirm you are heavily compensated for selling the fat
-         tail. Analyze the 'term_structure': if backwardated (front_iv_pct > back_iv_pct), prioritize short
+         tail — BUT if 'skew_regime' is 'extreme', do NOT bank it as automatic edge: be ready to PROVE it is
+         STRUCTURAL skew, not the market pricing a known binary event (check events_before_expiry — the Risk
+         desk WILL challenge this as a steamroller). Analyze the 'term_structure': if backwardated
+         (front_iv_pct > back_iv_pct), prioritize short
          DTE to capture aggressive theta decay and IV mean-reversion; if in contango, the absolute yield must
          aggressively clear the 'sofr_hurdle_pct'.
 Step 2 · CATALYST PRICING & FORWARD VOLATILITY — Isolate idiosyncratic risks. List 'events_before_expiry'.
@@ -854,7 +1227,12 @@ Step 2 · CATALYST PRICING & FORWARD VOLATILITY — Isolate idiosyncratic risks.
          'institutional.early_exercise' (danger / short_call_extrinsic) against 'corporate_actions'
          (ex-dividend date, dividend_amount): a short call is assigned early when ex-div is before expiry and
          its extrinsic has decayed below the dividend.
-Step 3 · MICROSTRUCTURE & AUCTION MARKET THEORY — Anchor the trade to institutional liquidity. Map the short
+Step 3 · MICROSTRUCTURE & MONEYNESS — First check EVERY short leg's distance in σ via
+         institutional.moneyness.short_strike_sigmas_from_spot: ANY short leg within ~0.5σ
+         (moneyness.nearest_short_sigmas) is effectively AT-THE-MONEY — the trade is DIRECTIONAL there and NOT
+         cushioned, no matter how far the OTHER leg sits, and its max_profit is only ~prob_max_profit_pct
+         likely (NOT keep_prob_pct, which is downside-only). Do NOT describe a multi-leg trade as 'cushioned'
+         off the FAR leg's cushion_pct_otm alone. Then anchor to institutional liquidity: map the short
          strikes against 'technical_analysis'. Institutional premium selling requires strikes positioned
          outside the Value Area (value_area_high / value_area_low) or heavily insulated behind a high-volume
          Point of Control (poc). You MUST locate the short strike relative to the 'unfilled_fair_value_gaps'
@@ -862,13 +1240,14 @@ Step 3 · MICROSTRUCTURE & AUCTION MARKET THEORY — Anchor the trade to institu
          protective WALL insulating it. Demand structural defense: the strike should be protected by an
          unmitigated Order Block or sit on the far side of an unfilled FVG. Avoid selling into a liquidity
          vacuum; ensure the strike exploits 'cushion_pct_otm' safely away from recent liquidity sweeps.
-Step 4 · RISK-ADJUSTED ALPHA & HIGHER-ORDER GREEKS — Adjudicate the top candidates. For each, weigh
-         theoretical edge vs. margin tail risk. CAPITAL EFFICIENCY FIRST: this is a cash-secured / covered
-         structure — the collateral earns ~SOFR natively, so the premium is alpha layered on top; BUT
-         'net_expected_return_vs_sofr_bps' is already EV-net-of-losses. If it is NEGATIVE ('fails_sofr_hurdle'
-         = true) the trade DESTROYS capital efficiency: you MUST explicitly justify why the volatility skew or
-         structure OVERRIDES this mathematical failure, or you MUST DISCARD the candidate — never wave a
-         negative-bps trade through as 'acceptable' merely because it collects premium. Then evaluate the net
+Step 4 · RISK-ADJUSTED ALPHA & THE VOL RISK PREMIUM — Adjudicate the top candidates. For each, weigh edge vs
+         tail. CAPITAL EFFICIENCY: net_expected_return_vs_sofr_bps is RISK-NEUTRAL, so a slightly-negative
+         value is the NORMAL cost of fair pricing — NOT a reason to reject (do not try to find arbitrage in a
+         no-arbitrage metric). Read bps_regime: if 'structurally_broken' (bps < -75), DISCARD immediately (toxic
+         liquidity/skew — no override). If 'marginal_fair' (bps >= -75), the trade is viable ONLY if the
+         VOLATILITY RISK PREMIUM is genuinely rich — your override MUST cite iv_hv_ratio > ~1, elevated
+         iv_rank, and a steep short_strike_iv_premium_over_atm_bps (you are selling expensive insurance); if IV
+         is CHEAP vs realized (iv_hv_ratio < 1) there is no edge → concede and DISCARD. Then evaluate the net
          Greeks — how does Charm (net_charm, delta decay) assist over time, and does Vanna (net_vanna, delta
          sensitivity to IV) expose the position to delta-expansion if the market gaps and vol spikes
          concurrently? Stress-test 'instantaneous_mtm' (down_pct_of_capital on a 10% gap),
@@ -892,7 +1271,9 @@ CHOICE: <structure @ exact strike(s), expiry — copied from a candidate>
 AGREES_WITH_ALGO: yes | no — <do you concur with the candidates[] order, or override, and why>
 RANK: <your top 3 best→worst on one line — your holistic order>
 EDGE: <the ONE professional insight that makes this the best pick — structure / skew / vol / event / management>
-BEST OUTCOME: <what happens if it expires as expected — read max profit / return / cushion from the fields>
+BEST OUTCOME: <the exact PRICE ZONE for max profit (e.g. "full credit only if spot expires between the short
+         put and short call") AND cite institutional.moneyness.prob_max_profit_pct + pm_ratios.expected_value —
+         NOT just max_profit, which for a near-ATM short leg is far from certain>
 WATCH: <the one move, level or event that would threaten the thesis>""",
     "guidance": ("\nWork through the five REASONING steps IN ORDER (vol/regime → events → structure → edge "
                  "vs tail → pre-mortem), then fill the template. Recommend only a candidates[] trade by its "
@@ -929,8 +1310,9 @@ Locate the Quant's chosen candidate first, then read its risk fields:
 # HARD RULES
 1. LLMs are unreliable at arithmetic — do NOT recompute, re-estimate or second-guess ANY number. READ the
    field and interpret it.
-2. Anchor EVERY objection in a SPECIFIC field. If you call the trade risky, cite the exact
-   instantaneous_mtm shock, cvar_95, or stressed_bid_ask_spread_pct.
+2. Anchor EVERY objection in a SPECIFIC field, and size it by % of capital (down_pct_of_capital, cvar as % of
+   capital), NEVER the nominal dollar figure — a large negative $ on large collateral is NOT a large risk. A
+   single-digit % paper drawdown on a 10% gap is capital preservation; never headline it as a vulnerability.
 3. Do NOT reject a trade merely because options carry inherent risk. Reject it only if the risk is
    UNCOMPENSATED (inadequate yield vs SOFR, thin skew premium, or catastrophic path dependency).
 4. Do NOT invent a brand-new trade or a strike — you evaluate the Quant's specific CHOICE. You MAY point to
@@ -943,10 +1325,12 @@ Step 1 · PAPER vs MARGIN DRAWDOWN & TAIL RISK — FIRST read capital_profile an
          For cash_secured / covered / defined_risk the collateral (or defined max loss) is FULLY posted
          (margin_requirement_shock_pct = 0): the instantaneous_mtm is a PAPER drawdown — holding pain / the
          cost of a VOLUNTARY exit or roll — NOT a forced margin liquidation, and a cash-secured put's mark
-         largely REVERSES by expiry if the strike holds. Its % is ALWAYS small because CSP capital is the full
-         collateral, so do NOT raise 'margin liquidation' from the MTM %; only margin_requirement_shock_pct > 0
-         (a leveraged book) can force a liquidation. Weigh the TRUE tail instead: cvar_95 / max_loss and — for
-         a short put — the ASSIGNMENT outcome (would the client accept owning the stock at the strike?).
+         largely REVERSES by expiry if the strike holds. JUDGE IT BY down_pct_of_capital, NEVER the nominal $:
+         a single-digit % on a 10% gap (the position losing LESS than the underlying's move) is normal delta
+         exposure / STRONG capital preservation — do NOT headline it as a MAJOR_VULNERABILITY. Only
+         margin_requirement_shock_pct > 0 (a leveraged book) can force a liquidation. Weigh the TRUE tail
+         instead: cvar_95 / max_loss and — for a short put — the ASSIGNMENT outcome (would the client accept
+         owning the stock at the strike?).
 Step 2 · GREEK VULNERABILITY (VANNA & VOLGA) — Premium sellers die by path dependency. Read the net Greeks:
          how sensitive is the position to a concurrent spot drop AND IV explosion (net_vanna)? If IV doubles
          overnight, does net_volga expand the tail exponentially? Does the Quant's EDGE survive a severe vol
@@ -955,17 +1339,27 @@ Step 3 · EXECUTION & TOXIC LIQUIDITY — What happens when everyone rushes the 
          liquidity_capacity.stressed_bid_ask_spread_pct — would panic slippage destroy the expected value
          (pm_ratios.omega / expected_value)? Check pin_risk.cushion_pts and institutional.early_exercise.danger
          — a gamma trap or a synthetic (dividend) assignment near expiry?
-Step 4 · MICROSTRUCTURE MAGNETS — Flip the Quant's TA defense. If a support level breaks, does an unfilled
-         Fair Value Gap (unfilled_fair_value_gaps) act as a gravitational magnet pulling spot THROUGH the
-         short strike? Is cushion_pct_otm truly sufficient to absorb a liquidity_sweep given
-         expected_move_pct_1sigma, or does the strike sit exposed vs the value area / poc?
-Step 5 · SOFR HURDLE & CAPITAL EFFICIENCY — The ultimate test. Read
-         capital_allocation.net_expected_return_vs_sofr_bps and fails_sofr_hurdle. Double-dip aware: the
-         collateral already earns ~SOFR, so this bps is the alpha ON TOP (net of expected losses). If
-         fails_sofr_hurdle is true (negative bps), the premium does NOT compensate — flag the trade as
-         capital-inefficient. AFTER adjusting for the tail risk from Steps 1–3, does locking up capital here
-         MEANINGFULLY beat the risk-free rate, or is the Quant taking asymmetric downside for a negligible
-         premium over T-bills?
+Step 4 · MONEYNESS & MICROSTRUCTURE MAGNETS — FIRST test for a near-ATM short leg: read
+         institutional.moneyness.nearest_short_sigmas — a short leg within ~0.5σ is a DIRECTIONAL bet dressed
+         up as income; if the Quant called the trade 'cushioned' off the FAR leg's cushion_pct_otm while a
+         near-ATM short leg drives the real exposure (its max_profit is only ~prob_max_profit_pct likely, NOT
+         keep_prob_pct), CHALLENGE that as the primary flaw. Then flip the Quant's TA defense: if a support
+         level breaks, does an unfilled Fair Value Gap (unfilled_fair_value_gaps) act as a gravitational magnet
+         pulling spot THROUGH the short strike? Is nearest_short_cushion_pct truly sufficient to absorb a
+         liquidity_sweep given expected_move_pct_1sigma, or does the strike sit exposed vs the value area / poc?
+Step 5 · VOL RISK PREMIUM & CAPITAL EFFICIENCY — Read net_expected_return_vs_sofr_bps + bps_regime. The bps is
+         RISK-NEUTRAL, so a slightly-negative value is normal fair pricing — do NOT flag that alone. If
+         'structurally_broken' (bps < -75), the trade is a structural trap — flag it hard. If 'marginal_fair',
+         the edge must come from a RICH VRP (iv_hv_ratio > ~1, high iv_rank, steep skew); if IV is CHEAP vs
+         realized (iv_hv_ratio < 1) the premium does NOT compensate — flag it as selling cheap insurance.
+         TOXIC SKEW CHECK: if volatility_skew.skew_regime is 'elevated' or 'extreme'
+         (short_strike_iv_premium_over_atm_bps ≥ ~700, and especially ≥ 1500), do NOT bank the steep skew as
+         free 'edge' — extreme skew is the classic 'pennies in front of a steamroller': the market is often
+         pricing a KNOWN catastrophic binary (an earnings/catalyst in events_before_expiry) or the strike is an
+         illiquid, unreliable quote. FORCE the Quant to PROVE it is structural skew you get paid to sell, not a
+         priced-in disaster or a liquidity trap — cross-check events_before_expiry and the leg's oi/volume /
+         stressed_bid_ask_spread_pct. AFTER adjusting for the tail from Steps 1–3, is the VRP rich enough to pay
+         for the CVaR95 tail?
 
 # OUTPUT — fill this TEMPLATE EXACTLY. Keep every KEY. The numbered block IS your chain of thought.
 RISK_ANALYSIS:
@@ -994,9 +1388,10 @@ Intellectual honesty over winning — your credibility with the PM depends on it
 
 # MISSION
 The Risk desk has either VETOed your CHOICE or APPROVED it WITH CONDITIONS, citing a specific
-MAJOR_VULNERABILITY and DEFENSE_BREACH. Address that objection HEAD-ON with the pre-computed evidence, then
-decide to HOLD (defend), ADJUST (switch to a safer LISTED candidate), or CONCEDE (Risk is right). The PM
-adjudicates next.
+MAJOR_VULNERABILITY and DEFENSE_BREACH. FIRST audit the challenge's OWN logic (spatial, directional,
+mathematical) — Risk can be wrong, and a flawed challenge is REFUTED, not conceded to. Then, for a challenge
+that survives the audit, address it HEAD-ON with the pre-computed evidence and decide to HOLD (defend),
+ADJUST (switch to a safer LISTED candidate), or CONCEDE (Risk is right). The PM adjudicates next.
 
 # INPUTS (your original proposal, the Risk desk's challenge, and the SAME JSON — all PRE-COMPUTED)
 - Risk's VERDICT, MAJOR_VULNERABILITY, DEFENSE_BREACH, MANAGEMENT_MANDATE (in the context above).
@@ -1011,7 +1406,9 @@ adjudicates next.
 # HARD RULES
 1. LLMs are unreliable at arithmetic — do NOT recompute or second-guess ANY number. READ the field.
 2. NEVER contradict a given number. If Risk cites a real, material figure you may not wave it away — either
-   show it is COMPENSATED (cite the offsetting field) or CONCEDE.
+   show it is COMPENSATED (cite the offsetting field) or CONCEDE. (But if Risk MISREAD a field — wrong sign,
+   nominal-vs-%, wrong direction/side — REFUTING that misreading is NOT contradicting the number; it is
+   correcting the desk's error, and you must.)
 3. Recommend ONLY a trade from candidates[] / also_ranked[], by its EXACT strikes. Never invent a strike.
 4. Intellectual honesty: if the risk is genuinely uncompensated, CONCEDE — do not defend the indefensible.
 5. Never discuss position size or contract count. Only WHICH trade stands.
@@ -1019,11 +1416,23 @@ adjudicates next.
 # REBUTTAL PROCESS — CHAIN OF THOUGHT (work through EVERY step, IN ORDER)
 Step 1 · ISOLATE THE CHALLENGE — In one line each, restate Risk's MAJOR_VULNERABILITY and DEFENSE_BREACH.
          Name the EXACT metric/level they weaponized, and whether they VETOed or APPROVED_WITH_CONDITIONS.
-Step 2 · TEST THE EVIDENCE — Go to the cited field. Is the claim accurate AND material? Distinguish a
-         catastrophic loss from a recoverable paper mark: does the instantaneous_mtm down_pct_of_capital
-         actually threaten the account, or is it survivable given cushion_pct_otm and keep_prob_pct? Cite the
-         exact value — do NOT deny a real number.
-Step 3 · COMPENSATION TEST — Even if the risk is real, is it PAID FOR? Weigh the offsetting edge — skew
+Step 2 · AUDIT THE CHALLENGE FIRST (spatial · directional · mathematical) — BEFORE you draft any defense,
+         AUDIT the Risk desk's OWN logic — Risk can be wrong, and a flawed challenge is REFUTED, not conceded
+         to. Check all three, citing the exact field/level that proves or disproves EACH:
+           • SPATIAL — are the strikes/levels placed correctly? Does the support / FVG / order block Risk cites
+             actually sit BETWEEN spot and the threatened short strike, on the side that matters? (A level
+             BELOW a short CALL, or a 'magnet' on the opposite side of spot, does not threaten it; a break of
+             support far below a deep-OTM short put is not imminent.)
+           • DIRECTIONAL — does the move Risk fears actually threaten THIS leg? (A gap DOWN does not threaten a
+             short CALL; 'upside risk' is moot when a jade lizard has none; a bearish break HELPS a short-call /
+             call-spread. Confirm the feared direction hits the leg Risk names.)
+           • MATHEMATICAL — judge magnitude by % of capital, NEVER nominal $ (a big negative $ on large
+             collateral is small); a single-digit % paper mark, a ≥1σ cushion (moneyness.nearest_short_sigmas),
+             or a single-digit-% CVaR is NOT 'catastrophic'; a LOWER put strike is SAFER, not riskier. Does the
+             field Risk cited actually support the claim, or did Risk misread its sign/magnitude?
+         If the challenge FAILS the audit, mark it INVALID and REFUTE it outright. Only a challenge that
+         SURVIVES the audit proceeds to the merits below.
+Step 3 · COMPENSATION TEST — Even if the (audited-valid) risk is real, is it PAID FOR? Weigh the offsetting edge — skew
          premium (short_strike_iv_premium_over_atm_bps), carry (net_expected_return_vs_sofr_bps), keep_prob &
          cushion vs expected_move_pct_1sigma. Does the compensation clear the tail Risk raised?
 Step 4 · HONEST STANCE — Conclude: HOLD (objection overstated — defend with the field that answers it),
@@ -1035,16 +1444,17 @@ Step 5 · TERMS — If you HOLD or ADJUST, accept or tighten Risk's MANAGEMENT_M
 # OUTPUT — fill this TEMPLATE EXACTLY. Keep every KEY. The numbered block IS your chain of thought.
 REBUTTAL:
 1) The challenge: <your Step 1>
-2) Evidence test: <your Step 2>
+2) Challenge audit — spatial / directional / mathematical (INVALID or survives): <your Step 2>
 3) Compensation: <your Step 3>
 4) Stance rationale: <your Step 4>
 5) Terms: <your Step 5>
 STANCE: HOLD | ADJUST | CONCEDE
 FINAL PICK: <the trade you stand behind — structure @ exact strike(s), expiry from a candidate; or PASS if you concede no trade clears>""",
-    "guidance": ("\nWork through the five REBUTTAL steps IN ORDER (isolate → test evidence → compensation → "
-                 "stance → terms), then fill the template. Answer the Risk challenge with the exact field, "
-                 "never contradict a given number, and CONCEDE if the risk is uncompensated. Only a listed "
-                 "trade by its exact strikes — never a size."),
+    "guidance": ("\nWork through the five REBUTTAL steps IN ORDER. FIRST audit the Risk challenge's spatial, "
+                 "directional and mathematical logic (a flawed challenge is REFUTED, not conceded to) — only "
+                 "then test compensation and take a stance. Answer with the exact field, never contradict a "
+                 "given number, CONCEDE if the risk is real AND uncompensated. Only a listed trade by its exact "
+                 "strikes — never a size."),
 }
 
 _PM_PERSONA = {
@@ -1068,13 +1478,16 @@ allocation decision: EXECUTE, REJECT, or EXECUTE_MODIFIED.
 1. LLMs are unreliable at arithmetic — do NOT recompute. Rely on the pre-computed JSON fields (EV, Sortino,
    kelly_sizing, beta, instantaneous_mtm, etc.).
 2. You cannot sit on the fence. Explicitly rule on whether the Quant's edge overcomes the Risk Officer's
-   MAJOR_VULNERABILITY, and FLAG any place either desk contradicted a given field.
-3. Weigh OPPORTUNITY COST (double-dip aware): the collateral of a cash-secured / covered trade already earns
-   ~SOFR, so institutional.capital_allocation.net_expected_return_vs_sofr_bps is the alpha ON TOP, already
-   net of expected losses. If fails_sofr_hurdle is true (bps NEGATIVE) the trade destroys capital efficiency
-   vs T-bills — REJECT it UNLESS you can explicitly justify a volatility-skew or structural override
-   (requires_override_justification); a high keep-probability alone is NOT justification. Earnings are
-   DOUBLE-EDGED, not an auto-reject: elevated IV can be a PRIME time to sell if the metrics pay.
+   MAJOR_VULNERABILITY, and FLAG any place either desk contradicted a given field. Size EVERY risk by its %
+   of capital, NEVER the nominal dollar figure.
+3. CAPITAL EFFICIENCY via the VOL RISK PREMIUM (not a naive SOFR gate): net_expected_return_vs_sofr_bps is
+   RISK-NEUTRAL, so a slightly-negative value is the NORMAL cost of fair pricing — do NOT reject on that
+   alone (you cannot find arbitrage in a no-arbitrage metric). Use bps_regime: 'structurally_broken'
+   (bps < -75) = automatic REJECT, no override. 'marginal_fair' (bps >= -75) = EXECUTE only if the VOLATILITY
+   RISK PREMIUM is genuinely rich (iv_hv_ratio > ~1, elevated iv_rank, steep skew) — a rich VRP IS the
+   legitimate override; if IV is cheap vs realized (iv_hv_ratio < 1) there is no edge → REJECT. A high
+   keep-probability alone is NOT an override. Earnings are DOUBLE-EDGED, not an auto-reject: elevated IV can
+   be a PRIME time to sell if the VRP pays.
 4. If EXECUTE / EXECUTE_MODIFIED you MUST state sizing as a % of capital: read
    institutional.capital_allocation.kelly_sizing (full/half/quarter %) and pick a fraction — default to HALF
    or QUARTER Kelly (full Kelly over-bets one name), then cut further for Risk's instantaneous_mtm and
@@ -1090,13 +1503,21 @@ Step 1 · CONFLICT RESOLUTION (EDGE vs TAIL) — Address the Risk Officer's MAJO
          genuine blind spot? IMPORTANT: if Risk warned of a 'margin liquidation' on a collateralized trade
          (capital_profile cash_secured/covered/defined_risk, margin_requirement_shock_pct = 0), that objection
          is INVALID — the MTM is paper only; discount it and re-center on the real tail (cvar_95 / assignment).
-         Who is right on the microstructure defense (order_blocks / unfilled_fair_value_gaps / poc)? Flag any
-         claim by EITHER desk that CONTRADICTS a given field. State explicitly whose argument wins the core
-         point of contention.
-Step 2 · EXPECTED VALUE & CAPITAL EFFICIENCY — Read pm_ratios.expected_value and pm_ratios.sortino, and
-         institutional.capital_allocation.net_expected_return_vs_sofr_bps. If fails_sofr_hurdle is true
-         (negative bps), the trade is presumptively capital-DESTRUCTIVE vs T-bills — demand the explicit
-         skew/structure override or REJECT; do NOT accept a thin premium as sufficient. If Risk is right about
+         MTM SHOCK SIZING RULE: judge instantaneous_mtm ONLY by down_pct_of_capital, NEVER the nominal $ — a
+         single-digit % drawdown on a 10% gap (e.g. −4% to −8%) is standard delta exposure and STRONG capital
+         preservation (the position lost LESS than the underlying's 10%); REJECT any Risk argument that
+         headlines a nominal dollar figure or frames a <10% paper drawdown as a 'major vulnerability'.
+         CONSISTENCY CROSS-CHECK: verify the Quant's 'cushion / safe' claim against
+         institutional.moneyness.nearest_short_sigmas — a short leg within ~0.5σ is AT-THE-MONEY and NOT
+         cushioned, so discount any 'wide cushion' framing built on the FAR leg; remember keep_prob_pct is
+         downside-only (the FULL-credit odds are prob_max_profit_pct). Also confirm the Quant did not contradict
+         a given field (e.g. claiming a trade is 'with the regime' when ta_alignment says 'against'). Who is
+         right on the microstructure defense (order_blocks / unfilled_fair_value_gaps / poc)? Flag EVERY such
+         contradiction and state explicitly whose argument wins the core point of contention.
+Step 2 · EXPECTED VALUE & THE VOL RISK PREMIUM — Read pm_ratios.expected_value / sortino and
+         net_expected_return_vs_sofr_bps WITH bps_regime. The bps is RISK-NEUTRAL: 'marginal_fair' just means
+         fairly priced — the edge must come from a rich VRP (iv_hv_ratio > ~1, iv_rank, skew), so demand that
+         override or REJECT; 'structurally_broken' is an automatic REJECT no override can save. If Risk is right about
          toxic execution slippage (institutional.liquidity_capacity.stressed_bid_ask_spread_pct), does the edge
          survive? Is the capital lockup (max_capital_lockup_days_est) justified by a real premium over the
          risk-free rate?
@@ -1105,8 +1526,11 @@ Step 3 · PORTFOLIO CONTEXT & MACRO — Zoom out. Read events_before_expiry and 
          macro event? If so, probability.keep_prob_pct must be exceptionally high (>90%) to proceed.
 Step 4 · SIZING & MANAGEMENT TRIGGER — If viable, how big? Read institutional.capital_allocation.kelly_sizing
          and choose full / half / quarter Kelly (default lower), cutting further for Risk's instantaneous_mtm.
-         Then set the exact exit: a take-profit (e.g. close at 50% of max premium) and a stop tied to a
-         CONCRETE level (a support / poc price, or an IV-rank threshold) from the JSON.
+         Cut HARD for a high-beta underlying (underlying.portfolio_fit.beta_1y_spx ≥ ~1.5 is a LEVERAGED market
+         bet, not idiosyncratic income → quarter Kelly or less) and for a near-ATM short leg
+         (moneyness.nearest_short_sigmas < ~0.5 = directional → size down). Then set the exact exit: a
+         take-profit (e.g. close at 50% of max premium) and a stop tied to a CONCRETE level (a support / poc
+         price, or an IV-rank threshold) from the JSON.
 
 # OUTPUT — fill this TEMPLATE EXACTLY. Keep every KEY. The numbered block IS your chain of thought.
 PM_REASONING:

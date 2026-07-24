@@ -363,9 +363,31 @@ a.tag:hover { background: rgba(99, 102, 241, 0.24); }
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   font-size: 1.05rem;
   color: var(--heading);
+  overflow-x: auto;           /* long equations scroll rather than break the page */
 }
 
 .formula .result { color: var(--primary-light); font-weight: 700; }
+.formula sub, .formula sup { font-size: 0.68em; opacity: 0.9; }
+.formula .eq { white-space: nowrap; }
+
+/* Legend under an equation ("where c is a constant…"). */
+.formula-note {
+  margin: -12px 0 26px;
+  text-align: center;
+  font-size: 0.84rem;
+  color: var(--text-dim);
+}
+
+/* Text label inside a .greek glyph tile, e.g. 1D / 5D / 22D. */
+.greek .glyph.text {
+  font-size: 0.95rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+/* Wrapper so wide comparison tables scroll on small screens. */
+.table-scroll { overflow-x: auto; margin: 24px 0; }
+.table-scroll .data-table { margin: 0; min-width: 520px; }
 
 /* Greek definition cards. */
 .greek {

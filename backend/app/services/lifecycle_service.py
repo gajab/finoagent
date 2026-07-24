@@ -402,12 +402,22 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
 
 
 def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_profit,
-                             avg_iv, dte_days, stock_shares=0.0, r=0.05, sofr_pct=5.0) -> dict:
+                             avg_iv, dte_days, stock_shares=0.0, r=0.05, sofr_pct=5.0,
+                             realized_vol=None) -> dict:
     """Full desk read for a PROPOSED trade: Trader Greeks + PM ratios + position
-    VaR/CVaR + the algorithmic Quant recommendation. `avg_iv` is decimal (0 = unknown)."""
+    VaR/CVaR + the algorithmic Quant recommendation. `avg_iv` (implied) is decimal (0 = unknown).
+
+    Q-vs-P: the payoff distribution is weighted by the WIDER of implied (Q, risk-neutral) and
+    realized (P, physical) vol. When implied is crushed below realized (negative VRP), this stops
+    PoP/tail/EV — and therefore the whole base-quality score — from reading falsely safe. `avg_iv`
+    is still what we DISPLAY (the trade's true implied); only the probability WEIGHTS use the wider σ.
+    """
     trader = higher_order_greeks(life_legs, spot, r, stock_shares) if life_legs else {}
 
-    w_iv = avg_iv if (avg_iv and avg_iv > 0) else 0.30   # fall back so PM still computes
+    implied = avg_iv if (avg_iv and avg_iv > 0) else None
+    realized = realized_vol if (realized_vol and realized_vol > 0) else None
+    # The physical (P) measure widens the law whenever realized > implied — the negative-VRP trap.
+    w_iv = max([v for v in (implied, realized) if v] or [0]) or 0.30
     pm = {"pop": None, "expected_value": None, "omega": None, "sortino": None,
           "calmar": None, "expected_return_pct": None, "downside_dev_pct": None}
     var95 = cvar95 = kelly = None
@@ -423,6 +433,7 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
             kelly = _kelly_fraction(pnl_mid / capital, wn)
 
     quant = algorithmic_quant(pm, cvar95, capital, max_loss, max_profit, kelly, dte_days, sofr_pct)
+    vrp_ratio = (implied / realized) if (implied and realized) else None   # < 1 = negative VRP
     return {
         "trader": {**trader, "avg_iv_pct": round(avg_iv * 100, 1) if (avg_iv and avg_iv > 0) else None},
         "pm": {**pm, "kelly_fraction": kelly},
@@ -431,4 +442,12 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
                  "max_profit": round(max_profit, 2) if max_profit is not None else None,
                  "capital": round(capital, 2) if capital else None},
         "quant": quant,
+        # Q-vs-P read — what weighted the distribution, so the desk can SEE the trap.
+        "vrp": {
+            "implied_vol_pct": round(implied * 100, 1) if implied else None,
+            "realized_vol_pct": round(realized * 100, 1) if realized else None,
+            "weight_vol_pct": round(w_iv * 100, 1),
+            "iv_hv_ratio": round(vrp_ratio, 2) if vrp_ratio else None,
+            "physical_wider": bool(realized and implied and realized > implied),
+        },
     }

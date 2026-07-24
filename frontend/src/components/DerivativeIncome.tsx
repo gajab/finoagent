@@ -2,13 +2,13 @@ import React, { useState } from 'react';
 import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
-  AlertCircle, ChevronDown, ChevronUp, Database, Zap, Activity, Landmark,
-  BarChart3, Target, Layers, Feather,
+  AlertCircle, ChevronDown, ChevronUp, Activity, Landmark,
+  BarChart3, Layers, Feather,
 } from 'lucide-react';
 import { runDerivativeIncome, runDerivativeIncomePortfolio, fetchTechnicalForTimeframe } from '../api';
 import type {
   DerivativeIncomeResult, DerivativeIncomeOpportunity, DerivativeIncomePortfolioResult,
-  DerivativeIncomePortfolioRow, DerivativeIncomeFlag, DerivativeIncomeExpirySummary,
+  DerivativeIncomePortfolioRow, DerivativeIncomeFlag,
   DerivativeIncomeContext, DerivativeIncomeQuant, DerivativeIncomeLeg, DerivativeIncomeVolStats,
   TechnicalData,
 } from '../types';
@@ -51,8 +51,10 @@ const annPct = (n: number | null | undefined) =>
   n == null ? '—' : n >= 1000 ? `${Math.round(n).toLocaleString()}%` : `${n.toFixed(0)}%`;
 
 const probTone = (p: number) => (p >= 95 ? 'text-success' : p >= 85 ? 'text-success/90' : 'text-warning');
+// rich premium (good for a seller) = green; cheap (poor) = red; fair = neutral. Kept OFF amber so it
+// never collides with the amber earnings (ER) badge — different information, different colour.
 const richnessBadge = (r: string) =>
-  r === 'rich' ? 'badge-success' : r === 'cheap' ? 'badge-warning' : 'badge-ghost';
+  r === 'rich' ? 'badge-success' : r === 'cheap' ? 'badge-error' : 'badge-ghost';
 const confTone = (l?: string) =>
   l === 'High' ? 'text-success bg-success/10 border-success/25'
     : l === 'Medium' ? 'text-warning bg-warning/10 border-warning/25'
@@ -133,6 +135,7 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
 }) {
   const gainPct = (shares != null && costBasis != null && costBasis > 0)
     ? ((ctx.spot - costBasis) / costBasis) * 100 : null;
+  const primaryExp = result.expiry_summaries?.[0];   // nearest expiry — its IV/HV richness reads at stock level
   return (
     <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4">
       <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
@@ -150,18 +153,22 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
             )}
             {ctx.next_earnings && <span className="badge badge-warning badge-sm gap-1"><Calendar className="w-3 h-3" />ER {ctx.next_earnings}</span>}
           </div>
-          <div className="flex flex-wrap items-center gap-2 mt-1">
-            <span className="text-xs text-base-content/50">{ctx.shares_per_contract} sh/contract = {money(ctx.notional_per_contract, 0)}</span>
-            {ctx.european && <span className="badge badge-success badge-xs gap-1"><Shield className="w-3 h-3" />{ctx.exercise_style}</span>}
-            <span className="badge badge-info badge-xs gap-1">
-              {result.quote_source === 'ibkr' ? <Zap className="w-3 h-3" /> : <Database className="w-3 h-3" />}{result.quote_source}
-            </span>
-          </div>
+          {ctx.european && (
+            <div className="flex flex-wrap items-center gap-2 mt-1">
+              <span className="badge badge-success badge-xs gap-1"><Shield className="w-3 h-3" />{ctx.exercise_style}</span>
+            </div>
+          )}
         </div>
         <Week52Bar ctx={ctx} />
         <div className="flex flex-wrap gap-2">
           <span className="badge badge-outline badge-sm gap-1"><Landmark className="w-3 h-3" />SOFR {pct(ctx.sofr_pct)}</span>
           {ctx.hv30_pct != null && <span className="badge badge-outline badge-sm">HV30 {pct(ctx.hv30_pct)}</span>}
+          {primaryExp?.iv_hv_ratio != null && (
+            <span className={`badge badge-sm ${richnessBadge(primaryExp.premium_richness)}`}
+              title={`Nearest expiry ${primaryExp.expiration} (${primaryExp.dte}d): ATM IV ${pct(primaryExp.atm_iv_pct)} vs HV ${pct(primaryExp.hv30_pct)} — premium is ${primaryExp.premium_richness}`}>
+              IV/HV {primaryExp.iv_hv_ratio}× {primaryExp.premium_richness}
+            </span>
+          )}
         </div>
       </div>
     </div>
@@ -173,20 +180,21 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
 export function EventsBanner({ events, title }: { events: DerivativeIncomeFlag[]; title?: string }) {
   if (!events?.length) return null;
   return (
-    <div className="rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
-      <p className="text-[10px] uppercase tracking-wider text-base-content/50 mb-2 flex items-center gap-1.5">
+    <details className="rounded-xl border border-white/[0.06] bg-base-200/20">
+      <summary className="cursor-pointer select-none px-3 py-2.5 text-[10px] uppercase tracking-wider text-base-content/50 flex items-center gap-1.5">
         <Calendar className="w-3.5 h-3.5" /> {title || 'Upcoming events · next 90 days'}
-      </p>
-      <div className="flex flex-wrap gap-1.5">
+        <span className="normal-case text-base-content/35">· {events.length}</span>
+      </summary>
+      <div className="flex flex-wrap gap-1.5 px-3 pb-3">
         {events.map((e, i) => <FlagPill key={i} flag={e} />)}
       </div>
-    </div>
+    </details>
   );
 }
 
 // Institutional quant read that builds confidence (req 6)
 // Standard app leg table (req 4)
-function LegsTable({ legs }: { legs: DerivativeIncomeLeg[] }) {
+export function LegsTable({ legs }: { legs: DerivativeIncomeLeg[] }) {
   const hasGreeks = legs.some(l => l.delta != null);
   return (
     <div className="overflow-x-auto">
@@ -271,11 +279,9 @@ export function LazyTechnicals({ ticker }: { ticker: string }) {
   );
 }
 
-export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams }: {
-  opp: DerivativeIncomeOpportunity; compact?: boolean; ticker?: string; spot?: number; quant?: DerivativeIncomeQuant | null;
-  deskParams?: { target_dte: number | null; min_prob: number; min_income: number; structures: string[]; quote_source: string };
-}) {
-  const [showLegs, setShowLegs] = useState(false);
+// The summary "hero" (header + metric tiles + multi-leg extras + flags) — reused by the ranked
+// desk-review explorer so its top matches this card exactly. No outer card wrapper: the caller frames it.
+export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }) {
   const isSpread = opp.structure.includes('spread');
   const isCollar = opp.structure === 'collar';
   const isCondor = opp.structure === 'iron_condor';
@@ -285,9 +291,8 @@ export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams 
       : isSpread ? `${opp.short_strike} / ${opp.long_strike}`
         : isCollar ? `cap ${opp.short_strike} · floor ${opp.floor_strike}`
           : `${opp.short_strike}`;
-
   return (
-    <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4 space-y-3 hover:border-secondary/30 transition-colors">
+    <div className="space-y-3">
       {/* Header */}
       <div className="flex items-start justify-between gap-2">
         <div>
@@ -345,6 +350,19 @@ export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams 
       {opp.flags?.length > 0 && (
         <div className="flex flex-wrap gap-1.5">{opp.flags.map((f, i) => <FlagPill key={i} flag={f} />)}</div>
       )}
+    </div>
+  );
+}
+
+export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams }: {
+  opp: DerivativeIncomeOpportunity; compact?: boolean; ticker?: string; spot?: number; quant?: DerivativeIncomeQuant | null;
+  deskParams?: { target_dte: number | null; min_prob: number; min_income: number; structures: string[]; quote_source: string };
+}) {
+  const [showLegs, setShowLegs] = useState(false);
+
+  return (
+    <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4 space-y-3 hover:border-secondary/30 transition-colors">
+      <OpportunitySummary opp={opp} />
 
       {/* Desk Review — lazily computed when expanded (Risk · Trader · PM · Quant) */}
       {!compact && ticker && spot ? (() => {
@@ -410,27 +428,6 @@ export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams 
   );
 }
 
-function ExpiryChips({ summaries }: { summaries: DerivativeIncomeExpirySummary[] }) {
-  return (
-    <div className="flex flex-wrap gap-2">
-      {summaries.map((s) => (
-        <div key={s.expiration} className="rounded-lg border border-white/[0.06] bg-base-200/30 px-3 py-2 text-xs">
-          <div className="flex items-center gap-2">
-            <Calendar className="w-3 h-3 text-base-content/50" />
-            <span className="font-medium">{s.expiration}</span>
-            <span className="text-base-content/50">{s.dte}d</span>
-            {s.monthly && <span className="badge badge-xs badge-outline">monthly</span>}
-          </div>
-          <div className="flex items-center gap-2 mt-1 text-[11px] text-base-content/60">
-            <span>IV {pct(s.atm_iv_pct)}</span><span>·</span><span>HV {pct(s.hv30_pct)}</span>
-            {s.iv_hv_ratio != null && <span className={`badge badge-xs ${richnessBadge(s.premium_richness)}`}>{s.iv_hv_ratio}× {s.premium_richness}</span>}
-            <span className="text-base-content/40">{s.n_opportunities} ideas</span>
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
 
 // Full single-ticker detail — reused for the Single-Ticker tab AND for each
 // expanded holding in Portfolio mode, so every ticker gets identical treatment.
@@ -490,59 +487,13 @@ function SingleTickerResult({ result, shares, costBasis, hideCommonEvents, deskP
         />
       )}
 
-      {result.expiry_summaries?.length > 0 && <ExpiryChips summaries={result.expiry_summaries} />}
-
-      {result.best_by_structure?.length > 0 ? (
-        <>
-          <h4 className="text-sm font-semibold flex items-center gap-2">
-            <Target className="w-4 h-4 text-secondary" /> Best opportunity per structure
-          </h4>
-          <div className="grid grid-cols-1 gap-3">
-            {result.best_by_structure.map((o, i) => (
-              <OpportunityCard key={i} opp={o} ticker={result.ticker} spot={spot} quant={quantForExp(o.expiration)} deskParams={deskParams} />
-            ))}
-          </div>
-        </>
-      ) : (
+      {result.opportunities.length === 0 && (
         <div className="alert alert-warning text-sm">
           <AlertTriangle className="w-4 h-4 shrink-0" />
           <span>{result.note || 'No executable opportunities cleared your filters. Try a lower probability, a longer target DTE, or a more volatile underlying.'}</span>
         </div>
       )}
 
-      {result.opportunities.length > result.best_by_structure.length && (
-        <details className="rounded-xl border border-white/[0.06] bg-base-200/20">
-          <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold flex items-center gap-2">
-            <TrendingUp className="w-4 h-4" /> All {result.opportunities.length} ranked opportunities
-          </summary>
-          <div className="overflow-x-auto px-2 pb-2">
-            <table className="table table-xs w-full">
-              <thead>
-                <tr className="text-base-content/50">
-                  <th>Structure</th><th>Strike</th><th>DTE</th><th>P(keep)</th><th>Conf</th>
-                  <th>Premium</th><th>Period</th><th>Ann.</th><th>Max loss</th><th>Spread</th>
-                </tr>
-              </thead>
-              <tbody>
-                {result.opportunities.map((o, i) => (
-                  <tr key={i}>
-                    <td className="whitespace-nowrap">{o.label}</td>
-                    <td className="font-mono">{o.short_strike}{o.long_strike ? `/${o.long_strike}` : ''}</td>
-                    <td>{o.dte}</td>
-                    <td className={probTone(o.prob_keep_pct)}>{pct(o.prob_keep_pct)}</td>
-                    <td><span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${confTone(o.confidence?.label)}`}>{o.confidence?.label ?? '—'}</span></td>
-                    <td className="text-success">{money(o.premium, 0)}</td>
-                    <td>{pct(o.static_return_pct)}</td>
-                    <td className="text-base-content/60">{annPct(o.premium_annualized_pct)}</td>
-                    <td>{o.max_loss != null ? money(o.max_loss, 0) : <span className="opacity-50">open</span>}</td>
-                    <td>{o.liquidity.spread_pct != null ? `${o.liquidity.spread_pct}%` : '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </details>
-      )}
     </div>
   );
 }

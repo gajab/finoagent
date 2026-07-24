@@ -3479,13 +3479,34 @@ export interface DeskMetrics {
     expected_value?: number | null; expected_return_pct?: number | null; kelly_fraction?: number | null;
   };
   risk: { var_95?: number | null; cvar_95?: number | null; max_loss?: number | null; max_profit?: number | null; capital?: number | null };
-  quant: { score?: number | null; verdict?: string | null; reasons?: string[] };
+  quant: {
+    score?: number | null; verdict?: string | null; reasons?: string[];
+    subscores?: { edge: number; pop: number; sortino: number; tail: number; carry: number };
+  };
 }
 
 export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   desk_metrics: DeskMetrics;
   desk_score: number;
   ta_note?: string;
+  algo_grade?: string;          // A–F after the full deterministic pre-vet
+  approval_odds?: string;       // high | medium | low | auto_reject
+  grade_demerits?: string[];    // deterministic marks against the trade
+  grade_merits?: string[];
+  grade_blocking?: string[];    // hard fails (structurally broken, etc.)
+  base_quality?: number;        // the algorithmic_quant base score BEFORE regime/factor adjustments
+  grade_adjustments?: { label: string; points: number }[];  // signed option-math contributions → desk_score
+  ta_factors?: { label: string; points: number }[];         // signed technical/regime contributions → desk_score
+  qp?: {                        // Q-vs-P: implied (risk-neutral) vs physical (realized) read
+    implied_vol_pct?: number | null; realized_vol_pct?: number | null; weight_vol_pct?: number | null;
+    iv_hv_ratio?: number | null;                     // < 1 = negative VRP (implied under-prices risk)
+    implied_move_pct?: number | null;                // ±1σ implied (Q) move to expiry
+    physical_move_pct?: number | null;               // ±1σ physical (P) move to expiry
+    dual_move_pct?: number | null;                   // the wider of the two
+    short_sigmas?: number | null;                    // nearest short strike in DUAL-σ units
+    short_dist_pct?: number | null;                  // nearest short strike distance from spot (%)
+    physical_wider?: boolean; exposed_physical?: boolean;
+  };
 }
 
 export interface DeskReviewResult {
@@ -3499,6 +3520,11 @@ export interface DeskReviewResult {
     value_area?: (number | null)[] | null; trend?: string; bos?: string | null;
   };
   events?: DeskReviewEvent[];
+  /** Dealer gamma-exposure proxy — long gamma = vol-suppressed (good for selling), short = vol-expansion. */
+  gex?: {
+    gex_bn?: number; regime?: 'long' | 'short' | string; flip_level?: number | null;
+    spot?: number; n_strikes?: number; proxy?: boolean;
+  } | null;
   ranked: DeskRankedTrade[];
   algo_top_pick: DeskRankedTrade | null;
   n_trades: number;

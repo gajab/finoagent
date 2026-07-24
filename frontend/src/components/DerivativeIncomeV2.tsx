@@ -1,12 +1,17 @@
 import React, { useState } from 'react';
 import {
   Sparkles, Search, Calendar, DollarSign, TrendingUp, Shield, ShieldCheck,
-  Layers, Feather, Loader2, AlertTriangle, Coins, ChevronRight, ListOrdered, Gauge,
+  Layers, Feather, Loader2, AlertTriangle, Coins, ChevronRight, ListOrdered, Gauge, BarChart3,
 } from 'lucide-react';
-import { runDerivativeIncome } from '../api';
-import type { DerivativeIncomeResult, DerivativeIncomeOpportunity } from '../types';
-import { OpportunityCard, VolatilityPanel, EventsBanner, LazyTechnicals } from './DerivativeIncome';
+import { runDerivativeIncome, fetchTechnicalForTimeframe } from '../api';
+import type { DerivativeIncomeResult, DerivativeIncomeOpportunity, TechnicalData } from '../types';
+import { OpportunityCard, VolatilityPanel, EventsBanner } from './DerivativeIncome';
+import { RatingsHelpButton } from './RatingsHelp';
+import { TechnicalAnalysis } from './TechnicalAnalysis';
+import { UnderlyingSummary } from './UnderlyingSummary';
+import { UnderlyingCharts } from './UnderlyingCharts';
 import { DeskReview } from './DeskReview';
+import { DeskDebate, DeskDebatePanel } from './DeskDebate';
 
 // ── Derivative Income v2 ──────────────────────────────────────────────────────
 // Same engine + same building blocks as v1, re-composed into a master–detail
@@ -70,6 +75,11 @@ export function DerivativeIncomeV2() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DerivativeIncomeResult | null>(null);
 
+  // ── underlying technicals (lazily fetched when the drawer opens) ──
+  const [tech, setTech] = useState<TechnicalData | null>(null);
+  const [techLoading, setTechLoading] = useState(false);
+  const [techErr, setTechErr] = useState<string | null>(null);
+
   // ── workspace ──
   const [tab, setTab] = useState<Tab>('opportunities');
   const [listMode, setListMode] = useState<'best' | 'all'>('best');
@@ -90,12 +100,28 @@ export function DerivativeIncomeV2() {
   const handleScan = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true); setError(null); setResult(null);
-    setSelected(0); setShowUnderlying(false); setListMode('best'); setTab('opportunities');
+    // Land on the Desk review tab — the algorithmic ranked table now auto-loads (no extra click).
+    setSelected(0); setShowUnderlying(false); setListMode('best'); setTab('desk');
+    setTech(null); setTechErr(null);
     try {
       const data = await runDerivativeIncome(ticker.trim().toUpperCase(), commonParams());
       if (data.error) setError(data.error); else setResult(data);
     } catch (err: any) { setError(err?.message || 'Failed to scan opportunities'); }
     finally { setLoading(false); }
+  };
+
+  // Toggle the underlying drawer, fetching technicals the first time it opens.
+  const toggleUnderlying = async () => {
+    const next = !showUnderlying;
+    setShowUnderlying(next);
+    if (next && !tech && !techLoading && result) {
+      setTechLoading(true); setTechErr(null);
+      try {
+        const r = await fetchTechnicalForTimeframe(result.ticker, 'medium_term');
+        setTech(r.technical as TechnicalData);
+      } catch (e: any) { setTechErr(e?.message || 'Failed to load technicals'); }
+      finally { setTechLoading(false); }
+    }
   };
 
   return (
@@ -197,7 +223,7 @@ export function DerivativeIncomeV2() {
                 {ctx.next_earnings && (
                   <span className="badge badge-warning badge-sm gap-1"><Calendar className="w-3 h-3" />ER {ctx.next_earnings}</span>
                 )}
-                <button type="button" onClick={() => setShowUnderlying(v => !v)}
+                <button type="button" onClick={toggleUnderlying}
                   className="btn btn-ghost btn-xs gap-1 text-secondary ml-auto">
                   Underlying analysis
                   <ChevronRight className={`w-3.5 h-3.5 transition-transform ${showUnderlying ? 'rotate-90' : ''}`} />
@@ -206,22 +232,48 @@ export function DerivativeIncomeV2() {
             )}
             {showUnderlying && (
               <div className="space-y-3">
+                {techLoading && (
+                  <div className="flex items-center gap-2 text-xs text-base-content/50 py-6 justify-center">
+                    <Loader2 className="w-4 h-4 animate-spin" /> Loading technicals…
+                  </div>
+                )}
+                {techErr && <div className="alert alert-error text-xs"><AlertTriangle className="w-4 h-4" /><span>{techErr}</span></div>}
+                {tech && (
+                  <UnderlyingSummary
+                    technical={tech}
+                    ticker={result.ticker}
+                    spot={spot}
+                    week52={ctx?.week52 ? { low: ctx.week52.low, high: ctx.week52.high } : undefined}
+                  />
+                )}
+                {tech && <UnderlyingCharts technical={tech} />}
                 {vs && <VolatilityPanel vs={vs} />}
                 {result.events && result.events.length > 0 && <EventsBanner events={result.events} />}
-                <LazyTechnicals ticker={result.ticker} />
+                {tech && (
+                  <details className="rounded-xl border border-white/[0.06] bg-base-200/20">
+                    <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold flex items-center gap-2">
+                      <BarChart3 className="w-4 h-4 text-secondary" /> Full technicals &amp; institutional detail
+                      <span className="text-[10px] font-normal text-base-content/40">volume profile · order blocks · Bollinger · analysis summary</span>
+                    </summary>
+                    <div className="px-3 pb-3"><TechnicalAnalysis technical={tech} ticker={result.ticker} /></div>
+                  </details>
+                )}
               </div>
             )}
 
             {/* Workspace tabs */}
-            <div className="flex gap-1 p-1 bg-base-200/40 rounded-xl border border-white/[0.03] w-fit">
-              <button type="button" className={`btn btn-sm gap-1.5 ${tab === 'opportunities' ? 'btn-primary' : 'btn-ghost'}`}
-                onClick={() => setTab('opportunities')}>
-                <ListOrdered className="w-3.5 h-3.5" /> Opportunities
-              </button>
-              <button type="button" className={`btn btn-sm gap-1.5 ${tab === 'desk' ? 'btn-primary' : 'btn-ghost'}`}
-                onClick={() => setTab('desk')}>
-                <Gauge className="w-3.5 h-3.5" /> Desk review
-              </button>
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex gap-1 p-1 bg-base-200/40 rounded-xl border border-white/[0.03] w-fit">
+                <button type="button" className={`btn btn-sm gap-1.5 ${tab === 'opportunities' ? 'btn-primary' : 'btn-ghost'}`}
+                  onClick={() => setTab('opportunities')}>
+                  <ListOrdered className="w-3.5 h-3.5" /> Opportunities
+                </button>
+                <button type="button" className={`btn btn-sm gap-1.5 ${tab === 'desk' ? 'btn-primary' : 'btn-ghost'}`}
+                  onClick={() => setTab('desk')}>
+                  <Gauge className="w-3.5 h-3.5" /> Desk review
+                </button>
+              </div>
+              <RatingsHelpButton />
             </div>
 
             {/* ── Opportunities: master list + single detail card ── */}
@@ -252,7 +304,9 @@ export function DerivativeIncomeV2() {
                             <div className="flex items-center justify-between gap-2 mt-0.5">
                               <span className="text-[11px] text-base-content/50 truncate font-mono">{strikeStr(o)} · {o.dte}d</span>
                               {o.confidence && (
-                                <span className={`text-[10px] px-1.5 py-px rounded border shrink-0 ${confTone(o.confidence.label)}`}>{o.confidence.label}</span>
+                                <span className={`text-[10px] px-1.5 py-px rounded border shrink-0 ${confTone(o.confidence.label)}`}
+                                  title="Execution — how reliable the pricing is and how easily you can fill it (liquidity, spread, model quality). Not a measure of trade quality.">
+                                  Exec: {o.confidence.label}</span>
                               )}
                             </div>
                             <div className="flex items-center justify-between gap-2 mt-1 text-[11px]">
@@ -266,11 +320,18 @@ export function DerivativeIncomeV2() {
                     <p className="text-[11px] text-base-content/40 mt-2 px-1">Pick a trade to see the full desk analysis on the right.</p>
                   </div>
 
-                  {/* Detail */}
-                  <div>
+                  {/* Detail — one card at a time; the debate opens in a slide-over, not inline */}
+                  <div className="space-y-3">
                     {sel && (
-                      <OpportunityCard opp={sel} ticker={result.ticker} spot={spot}
-                        quant={quantForExp(sel.expiration)} deskParams={commonParams()} />
+                      <>
+                        <OpportunityCard opp={sel} ticker={result.ticker} spot={spot} quant={quantForExp(sel.expiration)} />
+                        <DeskDebate
+                          ticker={result.ticker}
+                          params={commonParams()}
+                          focus={{ structure: sel.structure, expiration: sel.expiration, short_strike: sel.short_strike ?? sel.put_short ?? sel.call_short ?? null }}
+                          label="Debate this trade"
+                        />
+                      </>
                     )}
                   </div>
                 </div>
@@ -289,6 +350,9 @@ export function DerivativeIncomeV2() {
                 params={commonParams()}
                 renderTrade={(t) => (
                   <OpportunityCard opp={t} ticker={result.ticker} spot={spot} quant={quantForExp(t.expiration)} />
+                )}
+                renderDebate={({ agents, rerun, renderExplore }) => (
+                  <DeskDebatePanel agents={agents} title="Desk debate" onRerun={rerun} renderExplore={renderExplore} />
                 )}
               />
             )}

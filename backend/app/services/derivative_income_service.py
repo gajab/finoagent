@@ -61,7 +61,9 @@ MIN_DTE = 7
 MAX_DEFAULT_DTE = 45              # default-mode horizon (monthlies only)
 TARGET_DTE_BAND = 10             # ± window around a user-supplied target DTE
 MAX_EXPIRIES = 3                 # hard cap on chain fetches per ticker
-PER_STRUCTURE_CAP = 3            # CC/CSP candidates kept per expiry
+PER_STRUCTURE_CAP = 15           # CC/CSP strikes kept per expiry — effectively the WHOLE ladder above
+                                 # min_prob (cheap: the chain is fetched once; a display cap, not a scan cost),
+                                 # SAFEST-first (highest keep-prob) so the safe rungs are never truncated
 TTL_ANALYSIS = 900              # 15 min — matches _TTL_PRICE
 TTL_PORTFOLIO = 300
 EVENTS_HORIZON_DAYS = 90         # always surface events for the next 90 days …
@@ -954,14 +956,19 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
         cc = [o for k in call_strikes
               if (o := _single_leg_income("covered_call", "Covered Call", calls[k],
                                           sofr_pct=sofr_pct, **common))]
-        opps += sorted(cc, key=lambda o: o["premium_annualized_pct"], reverse=True)[:PER_STRUCTURE_CAP]
+        # Prioritize SAFER strikes (higher keep-prob) — surface the ladder above min_prob, not just the
+        # nearest-money / highest-yield strikes; yield breaks ties.
+        opps += sorted(cc, key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0),
+                       reverse=True)[:PER_STRUCTURE_CAP]
 
     # ---- Cash-secured puts (OTM puts) ----
     if "cash_secured_put" in structures:
         cp = [o for k in put_strikes
               if (o := _single_leg_income("cash_secured_put", "Cash-Secured Put", puts[k],
                                           sofr_pct=sofr_pct, **common))]
-        opps += sorted(cp, key=lambda o: o["premium_annualized_pct"], reverse=True)[:PER_STRUCTURE_CAP]
+        # Prioritize SAFER strikes (higher keep-prob) — the full ladder above min_prob; yield breaks ties.
+        opps += sorted(cp, key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0),
+                       reverse=True)[:PER_STRUCTURE_CAP]
 
     # ---- Collar — headline safe call financed by a ~min_prob-breach floor put ----
     if "collar" in structures and call_strikes and put_strikes:

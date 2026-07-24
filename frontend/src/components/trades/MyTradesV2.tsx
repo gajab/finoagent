@@ -27,7 +27,7 @@ import {
   TrendingUp, TrendingDown, Clock, BarChart3, Activity,
   Brain, Send, Bot, History, PlusCircle, X, Target,
   DollarSign, Percent, Calendar, Shield, Zap, List, ExternalLink, Trash2, Pencil, Check,
-  Layers, RotateCcw, Plus,
+  Layers, RotateCcw, Plus, Gauge,
 } from 'lucide-react';
 import {
   fetchActiveTrades, fetchTradeLivePnl, fetchTradeAdvisor,
@@ -43,6 +43,8 @@ import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
 import LifecyclePanel from './LifecyclePanel';
 import CollapsibleSection from './CollapsibleSection';
+import { DeskDebate } from '../DeskDebate';
+import type { DeskFocusTrade } from '../../api';
 import { updateTradeTransaction, deleteTradeTransaction } from '../../api';
 
 // ── Leg-action visuals (deterministic quant advisor) ─────────────────────────
@@ -199,6 +201,37 @@ function classifyTrade(trade: SavedStrategyItem): TradeGroup {
   ) return 'multi_leg';
   if (t.startsWith('options_') || t.includes('option')) return 'multi_leg';
   return 'other';
+}
+
+// Map a saved trade's legs to a Desk-Review structure + primary short strike, so
+// the desk debate can focus on THIS trade. Returns null for shapes the desk review
+// doesn't rank (pure stock, box, long-only options) — the debate is hidden there.
+function deskFocusForTrade(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): DeskFocusTrade | null {
+  const legs = (trade.legs_data || []) as any[];
+  const opts = legs.filter(l => /call|put/i.test(l.type || ''));
+  if (opts.length === 0) return null;
+  const isShort = (l: any) => /sell|short/i.test(l.action || '');
+  const isCall = (l: any) => /call/i.test(l.type || '');
+  const isPut = (l: any) => /put/i.test(l.type || '');
+  const sc = opts.filter(l => isShort(l) && isCall(l));
+  const sp = opts.filter(l => isShort(l) && isPut(l));
+  const lc = opts.filter(l => !isShort(l) && isCall(l));
+  const lp = opts.filter(l => !isShort(l) && isPut(l));
+  const hasStock = (trade.parameters?.shares || 0) > 0 || trade.strategy_type === 'covered_call';
+  const expiration = pnl?.expiration_date || opts[0]?.expiration || opts[0]?.exp || null;
+
+  let structure: string | null = null;
+  let shortStrike: number | null = null;
+  if (hasStock && sc.length === 1 && lp.length === 0) { structure = 'covered_call'; shortStrike = sc[0].strike; }
+  else if (hasStock && sc.length === 1 && lp.length === 1) { structure = 'collar'; shortStrike = sc[0].strike; }
+  else if (!hasStock && sp.length === 1 && opts.length === 1) { structure = 'cash_secured_put'; shortStrike = sp[0].strike; }
+  else if (sp.length === 1 && lp.length === 1 && sc.length === 0 && lc.length === 0) { structure = 'put_credit_spread'; shortStrike = sp[0].strike; }
+  else if (sc.length === 1 && lc.length === 1 && sp.length === 0 && lp.length === 0) { structure = 'call_credit_spread'; shortStrike = sc[0].strike; }
+  else if (sp.length === 1 && lp.length === 1 && sc.length === 1 && lc.length === 1) { structure = 'iron_condor'; shortStrike = sp[0].strike; }
+  else if (sp.length === 1 && sc.length === 1 && lc.length === 1 && lp.length === 0) { structure = 'jade_lizard'; shortStrike = sc[0].strike; }
+
+  if (!structure || shortStrike == null) return null;
+  return { structure, expiration, short_strike: Number(shortStrike) };
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -1352,6 +1385,32 @@ function TradeCard({
               <LifecyclePanel trade={trade} pnl={pnl} />
             </div>
           )}
+
+          {/* Desk Debate — Quant → Risk → Rebuttal → PM multi-agent debate on this trade */}
+          {(() => {
+            const deskFocus = deskFocusForTrade(trade, pnl);
+            if (!deskFocus) return null;
+            return (
+              <CollapsibleSection
+                title="Desk Debate" accent="secondary"
+                icon={<Gauge className="w-3 h-3" />}
+                subtitle="Quant → Risk → Rebuttal → PM"
+              >
+                <DeskDebate
+                  ticker={trade.ticker}
+                  params={{
+                    quote_source: quoteSource,
+                    target_dte: dte ?? undefined,
+                    structures: [deskFocus.structure],
+                    min_prob: 0,
+                    min_income: 0,
+                  }}
+                  focus={deskFocus}
+                  label="Run the desk debate on this trade"
+                />
+              </CollapsibleSection>
+            );
+          })()}
 
           {/* Legs table — compact, with per-leg roll/close actions */}
           {trade.legs_data && trade.legs_data.length > 0 && (
