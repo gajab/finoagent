@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from app.services.lifecycle_service import (
+    algorithmic_exit,
     higher_order_greeks,
     payoff_distribution_metrics,
     pm_ratios,
@@ -196,6 +197,46 @@ class TestPortfolioRisk:
         r = portfolio_risk(self._positions(), n_sims=5000)
         s = {x["name"]: x["pnl"] for x in r["stress_tests"]}
         assert s["Crash −20% + vol spike"] < s["Selloff −10% + vol"] < s["Drift −5% + vol"]
+
+
+class TestAlgorithmicExit:
+    """Tier-2 scored exit engine — base quality + lifecycle adjustments + overrides."""
+
+    _GOOD = {"omega": 2.5, "pop": 92, "sortino": 3.0, "expected_return_pct": 2.0}
+    _BAD = {"omega": 0.8, "pop": 45, "sortino": -0.1, "expected_return_pct": -1.5}
+
+    def test_fresh_strong_trade_strong_holds(self):
+        r = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 40, captured_pct=10, unrealized_pnl=10)
+        assert r["signal"] == "STRONG_HOLD" and r["score"] >= 70
+        assert 0 <= r["base_quality"] <= 100 and set(r["subscores"]) == {"edge", "pop", "sortino", "tail", "carry"}
+
+    def test_profit_capture_downgrades(self):
+        # Same pristine structure loses conviction as profit is banked.
+        s10 = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 20, 10, 10)["score"]
+        s60 = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 20, 60, 60)["score"]
+        assert s60 < s10
+
+    def test_85pct_capture_forces_close(self):
+        r = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 15, captured_pct=90, unrealized_pnl=90)
+        assert r["signal"] == "CLOSE" and any("captured" in o for o in r["overrides"])
+
+    def test_near_max_loss_forces_close(self):
+        r = algorithmic_exit(self._GOOD, 400, 20000, -1000, 100, 0.1, 30, captured_pct=5, unrealized_pnl=-850)
+        assert r["signal"] == "CLOSE"
+
+    def test_expiry_gamma_override(self):
+        r = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 1, captured_pct=20, unrealized_pnl=20)
+        assert r["signal"] in ("CONSIDER_CLOSE", "CLOSE")
+
+    def test_weak_trade_closes(self):
+        r = algorithmic_exit(self._BAD, 5000, 20000, -19000, 100, 0.0, 30, captured_pct=5, unrealized_pnl=5)
+        assert r["signal"] in ("CONSIDER_CLOSE", "CLOSE") and r["score"] < 45
+
+    def test_buildup_is_auditable(self):
+        r = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 20, 60, 60)
+        # hold_score = base_quality + Σ adjustment pts (before clamping/overrides)
+        expect = max(0, min(100, r["base_quality"] + sum(a["pts"] for a in r["adjustments"])))
+        assert abs(r["score"] - expect) <= 1
 
 
 if __name__ == "__main__":

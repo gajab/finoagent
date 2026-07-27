@@ -894,6 +894,49 @@ async def update_notes(
     return _to_out(strategy)
 
 
+# The user-selected purpose a trade serves; drives grouping + which lifecycle
+# view to show. Stored in parameters.purpose (no migration); absent ⇒ "income".
+_VALID_PURPOSES = {"income", "hedge", "trade", "managed_floor",
+                   "managed_buffer", "dual_directional", "other"}
+
+# hold_vs_close signal → the 4-level whole-trade EXIT vocabulary (for the paths
+# that don't warrant the full exit-timing engine — pure stock / futures).
+_EXIT_MAP = {"STRONG_HOLD": "STRONG_HOLD", "HOLD": "HOLD",
+             "CLOSE": "CONSIDER_CLOSE", "STRONG_CLOSE": "CLOSE"}
+
+
+class PurposeUpdateIn(BaseModel):
+    purpose: str = Field(...)
+
+
+@router.patch("/{strategy_id}/purpose", response_model=SavedStrategyOut)
+async def update_purpose(
+    strategy_id: int,
+    body: PurposeUpdateIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set the strategy purpose (income / hedge / trade / managed_floor /
+    managed_buffer / dual_directional / other) on a position."""
+    purpose = (body.purpose or "income").lower().strip()
+    if purpose not in _VALID_PURPOSES:
+        raise HTTPException(status_code=400, detail=f"purpose must be one of {sorted(_VALID_PURPOSES)}")
+    result = await db.execute(
+        select(SavedStrategy).where(
+            SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id,
+        )
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Position not found")
+    params = json.loads(strategy.parameters or "{}")
+    params["purpose"] = purpose
+    strategy.parameters = json.dumps(params)
+    await db.commit()
+    await db.refresh(strategy)
+    return _to_out(strategy)
+
+
 def _leg_right(type_str: str) -> str:
     """Normalize an option type to 'C' or 'P'."""
     t = str(type_str or "").upper()
@@ -1103,9 +1146,13 @@ async def get_live_pnl(
     from ..services.stock_service import bs_price, bs_delta, bs_gamma, bs_theta, bs_vega
     from ..services.trade_math import (
         classify_leg_action, summarize_trade_actions, prob_itm_lognormal, dte_from_expiry,
-        structure_payoff_extremes,
+        structure_payoff_extremes, exit_recommendation,
     )
-    from ..services.lifecycle_service import higher_order_greeks, pm_ratios, payoff_distribution_metrics
+    from ..services.lifecycle_service import (
+        higher_order_greeks, pm_ratios, payoff_distribution_metrics,
+        algorithmic_exit, _weighted_var_cvar,
+    )
+    import numpy as _np
 
     def _leg_p_itm(right, strike, exp_key, leg_dte, iv, delta, rnd_map):
         """Risk-neutral P(leg finishes ITM): market-implied RND first, then a
@@ -1421,6 +1468,9 @@ async def get_live_pnl(
                     "leg_notes": [],
                     "reasons": hold_reasons,
                 },
+                "exit_signal": _EXIT_MAP.get(hold_signal, "HOLD"),
+                "exit_reasons": hold_reasons,
+                "captured_pct": None,
             },
         }
 
@@ -1521,6 +1571,9 @@ async def get_live_pnl(
                     "leg_notes": [],
                     "reasons": hold_reasons,
                 },
+                "exit_signal": _EXIT_MAP.get(hold_signal, "HOLD"),
+                "exit_reasons": hold_reasons,
+                "captured_pct": None,
             },
         }
 
@@ -1783,6 +1836,28 @@ async def get_live_pnl(
             dte=combo_min_dte, breakevens=combo_pay["breakevens"] or ([round(avg_cost, 2)] if avg_cost > 0 else None),
             underlying_price=underlying_price, has_stock=True, stock_pnl=stock_pnl,
         )
+        # LIFECYCLE recommendation is scoped to the OPTION OVERLAY, not the stock —
+        # for a covered call / collar / hedge / managed structure the user holds the
+        # stock for its own reason; the desk manages the OPTIONS (roll/close the call,
+        # roll the hedge). So captured %, exit signal and the quant score all read the
+        # options-only payoff (opt_only_pay) + options P&L, never the equity core.
+        _opt_max_profit = opt_only_pay.get("max_profit")
+        _opt_captured = (round(options_pnl / _opt_max_profit * 100, 1)
+                         if (_opt_max_profit and _opt_max_profit > 0) else None)
+        _combo_exit = exit_recommendation(
+            hold_signal=combo_signal, pop=opt_only_pay.get("pop", combo_pop), unrealized_pnl=options_pnl,
+            max_profit=_opt_max_profit, max_loss=opt_only_pay.get("max_loss"),
+            dte=combo_min_dte, theta_per_day=combo_net_theta,
+        )
+        # Base quality reads the WHOLE covered structure (bounded — avoids scoring a
+        # covered short call as if it were naked), but the overlay + overrides manage
+        # the OPTION (captured premium, time/gamma).
+        _combo_quant_exit = algorithmic_exit(
+            pm={**combo_pm, "pop": combo_pop}, cvar95=None, capital=abs(total_entry_cost) or 1,
+            max_loss=opt_only_pay.get("max_loss"), max_profit=_opt_max_profit,
+            kelly=opt_only_pay.get("kelly_fraction"), dte_days=combo_min_dte,
+            captured_pct=_opt_captured, unrealized_pnl=options_pnl,
+        ) if combo_pm else None
 
         return {
             "strategy_id": strategy_id,
@@ -1859,6 +1934,11 @@ async def get_live_pnl(
                 "hold_vs_close_reasons": combo_rec["reasons"] or ["Combo position — stock core with option overlay"],
                 "dte_remaining": combo_min_dte,
                 "recommendation": combo_rec,
+                "exit_signal": _combo_exit["signal"],
+                "exit_reasons": _combo_exit["reasons"],
+                "captured_pct": _combo_exit["captured_pct"],
+                "quant_exit": _combo_quant_exit,
+                "exit_scope": "options_overlay",   # recommendation manages the options, stock held separately
             },
         }
 
@@ -2386,6 +2466,7 @@ async def get_live_pnl(
     pop_method = None
     expected_value = None
     _pm_metrics = {}
+    _cvar95 = None
     if exp_pnls and underlying_price > 0 and min_dte_days > 0:
         _prices = [p for p, _ in exp_pnls]
         _pnls = [pl for _, pl in exp_pnls]
@@ -2412,6 +2493,11 @@ async def get_live_pnl(
             pop = _dm["pop"]
             expected_value = _dm["expected_value"]
             _pm_metrics = {k: _dm[k] for k in ("omega", "sortino", "calmar", "expected_return_pct", "downside_dev_pct")}
+            # CVaR95 (expected shortfall) for the algorithmic tail term.
+            _wa = _np.asarray(_weights, dtype=float)
+            _pnl_mid = (_np.asarray(_pnls[:-1], dtype=float) + _np.asarray(_pnls[1:], dtype=float)) / 2.0
+            _wn = _wa / _wa.sum() if _wa.sum() > 0 else _wa
+            _, _cvar95 = _weighted_var_cvar(_pnl_mid, _wn)
 
     # Risk/Reward Ratio
     risk_reward = None
@@ -2536,6 +2622,20 @@ async def get_live_pnl(
         stock_pnl=None,
     )
 
+    _exit = exit_recommendation(
+        hold_signal=hold_signal, pop=pop, unrealized_pnl=unrealized_pnl,
+        max_profit=max_profit, max_loss=max_loss, dte=min_dte_days,
+        theta_per_day=net_greeks.get("theta", 0.0),
+    )
+    # Tier-2 QUANT ALGORITHMIC exit — scored 0-100 desk read → the 4-level signal,
+    # fully auditable (base quality + lifecycle adjustments + overrides).
+    _quant_exit = algorithmic_exit(
+        pm={**_pm_metrics, "pop": pop}, cvar95=_cvar95, capital=abs(total_capital),
+        max_loss=max_loss, max_profit=max_profit, kelly=kelly_fraction,
+        dte_days=min_dte_days, captured_pct=_exit["captured_pct"],
+        unrealized_pnl=unrealized_pnl,
+    ) if _pm_metrics else None
+
     analysis = {
         "annualized_return_to_expiry": annualized_return,
         "probability_of_profit": pop,
@@ -2550,6 +2650,11 @@ async def get_live_pnl(
         "hold_vs_close_reasons": hold_reasons,
         "dte_remaining": min_dte_days,
         "recommendation": recommendation,
+        "exit_signal": _exit["signal"],
+        "exit_reasons": _exit["reasons"],
+        "captured_pct": _exit["captured_pct"],
+        "quant_exit": _quant_exit,
+        "exit_scope": "whole_trade",
     }
 
     return {
@@ -3338,3 +3443,218 @@ Assess the BOOK now (concentration, net short-vol/gamma, tail under stress). Fol
     verdict, action_needed = _parse_verdict(response, {"WITHIN LIMITS", "THESIS INTACT", "HEDGED"})
     return {"role": "risk", "title": "Risk Desk", "verdict": verdict,
             "action_needed": action_needed, "content": response, "model": "gpt-4o"}
+
+
+# ── Institutional Lifecycle Manager — the quant PM who manages a LIVE trade ──
+
+_LIFECYCLE_MANAGER_PERSONA = """# ROLE
+You are the HEAD OF A DERIVATIVES DESK — a world-class institutional quant portfolio manager
+with two decades running an options book. A trade is ALREADY LIVE (real capital, real P&L).
+Your ONE job right now: decide how to MANAGE it from here and issue a single exit signal.
+
+# THE MANDATE — exit vocabulary (this is the deliverable)
+VERDICT is EXACTLY one of:
+  STRONG_HOLD   — edge firmly intact, hold with conviction; nothing to do
+  HOLD          — on track; hold and monitor named levels
+  CONSIDER_CLOSE— the risk/reward has tilted; begin taking it off / tighten / roll
+  CLOSE         — exit now (or defend immediately); the reason to hold is gone
+
+# HARD RULES
+- Every number below is PRE-COMPUTED and authoritative. INTERPRET it — do NOT recompute
+  (you are excellent at judgment, unreliable at arithmetic). Never restate a figure you
+  weren't given.
+- You are managing a PLACED position, not screening an entry. Weigh what's already banked,
+  what's left to earn, and the path risk to get there.
+- A deterministic engine has already proposed a signal + reasons. Treat it as a respected
+  colleague's opening view — agree, upgrade, or overrule it, and say why.
+- Be specific and institutional. No filler, no hedging language, no generic advice.
+
+# REASONING PROCESS (think in these 5 steps, then decide)
+1. EDGE STILL THERE? — VRP / IV-vs-HV, PoP, expected value vs the risk-free hurdle, Omega.
+   Is this position still being paid for its risk, or is it now dead money?
+2. PROFIT BANKED vs THETA LEFT — % of max profit captured. The take-half-early discipline:
+   once most of the premium is harvested, the marginal theta rarely justifies the gamma/pin
+   risk you keep holding. Is there enough left to earn to justify staying?
+3. PATH RISK — greeks trajectory into expiry (gamma, charm pulling delta, vanna into a vol
+   move), pin/assignment risk near the short strike, tail (max loss / CVaR), DTE.
+4. CATALYSTS — earnings / ex-div / macro inside the remaining window that change the math.
+5. CAPITAL EFFICIENCY — is this collateral working, or better redeployed?
+
+# OUTPUT (exactly this shape)
+VERDICT: <STRONG_HOLD | HOLD | CONSIDER_CLOSE | CLOSE>
+REASONING:
+1) Edge — ...
+2) Profit vs theta — ...
+3) Path risk — ...
+4) Catalysts — ...
+5) Capital — ...
+MANAGEMENT PLAN: <the concrete next action(s): hold / take profit at X / roll the short to Y /
+   defend below Z / close — with the price or % levels that trigger each>
+KEY LEVELS: <breakeven(s), the short strike, the profit-take level, the stop>
+"""
+
+
+class LifecycleManagerRequest(BaseModel):
+    pnl_snapshot: dict = Field(...)   # full LivePnlResponse (carries lifecycle + analysis)
+
+
+@router.post("/{strategy_id}/lifecycle-manager")
+async def run_lifecycle_manager(
+    strategy_id: int,
+    body: LifecycleManagerRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The institutional quant PM: reasons over the WHOLE live trade and issues a single
+    STRONG_HOLD / HOLD / CONSIDER_CLOSE / CLOSE with a concrete management plan."""
+    result = await db.execute(
+        select(SavedStrategy).where(
+            SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id,
+        )
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured. Please add it in Settings.")
+
+    pnl = body.pnl_snapshot or {}
+    a = pnl.get("analysis", {}) or {}
+    life = pnl.get("lifecycle", {}) or {}
+    trd = life.get("trader", {}) or {}
+    pm = life.get("pm", {}) or {}
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+    legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    legs_txt = "\n".join(
+        f"  {l.get('action','?')} {l.get('qty',1)}x {l.get('type','?')} ${l.get('strike','?')} "
+        f"exp {l.get('expiration', l.get('exp','?'))}" for l in legs
+    ) or "  (stock only)"
+    exit_reasons = "; ".join(a.get("exit_reasons", []) or [])
+
+    ctx = f"""## LIVE TRADE
+{strategy.name} · {strategy.ticker} · {strategy.strategy_type} · purpose={params.get('purpose','income')}
+Thesis / notes: {strategy.notes or '(none)'}
+Legs:
+{legs_txt}
+
+## P&L (already realized on paper)
+Cost basis ${pnl.get('entry_cost')} · current value ${pnl.get('current_value')} · unrealized ${pnl.get('unrealized_pnl')} ({pnl.get('pnl_pct')}%) · {pnl.get('days_held')}d held · {a.get('dte_remaining')} DTE
+Max gain ${pnl.get('max_profit')} @ ${pnl.get('max_profit_price')} · max loss ${pnl.get('max_loss')} @ ${pnl.get('max_loss_price')} · breakevens {pnl.get('breakevens')}
+% of max profit captured: {a.get('captured_pct')}%
+
+## EDGE & QUALITY
+PoP {a.get('probability_of_profit')}% ({a.get('pop_method')}) · Expected value ${a.get('expected_value')} · Kelly {a.get('kelly_fraction')}
+Omega {pm.get('omega')} · Sortino {pm.get('sortino')} · Calmar {pm.get('calmar')} · exp. return {pm.get('expected_return_pct')}% · downside σ {pm.get('downside_dev_pct')}% · avg IV {life.get('avg_iv_pct')}%
+
+## GREEKS (position)
+Δ {trd.get('net_delta')} · Γ {trd.get('net_gamma')} · ν {trd.get('net_vega')} · Θ {trd.get('net_theta')}/d · Vanna {trd.get('net_vanna')} · Charm {trd.get('net_charm')} · Volga {trd.get('net_volga')}
+
+## THE DESK'S TWO ALGORITHMIC VIEWS (respected colleagues — agree, upgrade, or overrule)
+Deterministic (rules): {a.get('exit_signal')} — {exit_reasons}
+Quant algorithmic (scored 0-100): {(a.get('quant_exit') or {}).get('signal')} @ {(a.get('quant_exit') or {}).get('score')}/100 (base quality {(a.get('quant_exit') or {}).get('base_quality')}, adjustments {[f"{x['name']} {x['pts']:+d}" for x in (a.get('quant_exit') or {}).get('adjustments', [])]}, overrides {(a.get('quant_exit') or {}).get('overrides')})
+
+Manage this trade now. Follow the output format exactly."""
+
+    messages = [
+        {"role": "system", "content": _LIFECYCLE_MANAGER_PERSONA},
+        {"role": "user", "content": ctx},
+    ]
+    try:
+        response = await call_llm(api_key=api_key, model="gpt-4o", messages=messages,
+                                  max_tokens=1100, temperature=0.25)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM lifecycle manager failed: {exc}")
+
+    # Parse the exit verdict (normalize spaces → the canonical 4-level token).
+    raw_verdict, _ = _parse_verdict(response, set())
+    v = raw_verdict.upper().replace(" ", "_")
+    signal = next((s for s in ("STRONG_HOLD", "CONSIDER_CLOSE", "CLOSE", "HOLD") if s in v), "HOLD")
+    return {
+        "role": "manager", "title": "Institutional Desk", "signal": signal,
+        "action_needed": signal in ("CONSIDER_CLOSE", "CLOSE"),
+        "content": response, "model": "gpt-4o",
+    }
+
+
+# ── Tier-2 FULL desk score for a placed trade (option-math + TA + VRP) ───────
+
+class DeskScoreRequest(BaseModel):
+    pnl_snapshot: dict = Field(...)
+    structure: str = Field(...)                 # covered_call / cash_secured_put / ...
+    expiration: Optional[str] = None
+    short_strike: Optional[float] = None
+    quote_source: str = "yfinance"
+
+
+@router.post("/{strategy_id}/desk-score")
+async def compute_lifecycle_desk_score(
+    strategy_id: int,
+    body: DeskScoreRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The FULL institutional desk score for a PLACED income trade — the same
+    deterministic engine the scan uses (base quality + option-math factors
+    VRP/Moneyness/Skew/Liquidity/Beta + TA factors + Q-vs-P), then the lifecycle
+    overlay (profit banked, time/gamma) → the 4-level exit signal. On-demand
+    (heavy: runs the scan + TA), so it never touches the live-pnl refresh path."""
+    from ..services.desk_review_service import rank_desk, _find_focus_index
+    from ..services.lifecycle_service import lifecycle_overlay
+
+    result = await db.execute(
+        select(SavedStrategy).where(
+            SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id,
+        )
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    pnl = body.pnl_snapshot or {}
+    a = pnl.get("analysis", {}) or {}
+    dte = a.get("dte_remaining")
+
+    try:
+        desk = await rank_desk(
+            strategy.ticker, target_dte=dte, min_prob=0.0, min_income=0.0,
+            structures=[body.structure], quote_source=body.quote_source,
+            user=user, db=db, target_expiration=body.expiration,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Desk scan failed: {exc}")
+    if desk.get("error"):
+        return {"matched": False, "error": desk["error"]}
+
+    ranked = desk.get("ranked", []) or []
+    idx = _find_focus_index(ranked, body.structure, body.expiration, body.short_strike)
+    if idx is None:
+        return {"matched": False,
+                "error": "This exact trade isn't among the current desk candidates "
+                         "(strike/expiry off the scanned grid). The scored Quant Algorithmic "
+                         "card above still applies."}
+
+    row = ranked[idx]
+    subscores = (((row.get("desk_metrics") or {}).get("quant") or {}).get("subscores")) or {}
+    overlay = lifecycle_overlay(
+        row.get("desk_score", 50), a.get("captured_pct"), dte,
+        pnl.get("unrealized_pnl"), pnl.get("max_loss"),
+    )
+    return {
+        "matched": True,
+        "desk_score": row.get("desk_score"),
+        "base_quality": row.get("base_quality"),
+        "subscores": subscores,
+        "grade_adjustments": row.get("grade_adjustments", []),   # OPTION MATH
+        "ta_factors": row.get("ta_factors", []),                 # TECHNICALS
+        "qp": row.get("qp", {}),                                 # Q vs P (VRP boundary)
+        "algo_grade": row.get("algo_grade"),
+        "merits": row.get("grade_merits", []),
+        "demerits": row.get("grade_demerits", []),
+        "blocking": row.get("grade_blocking", []),
+        # lifecycle overlay → the exit call
+        "lifecycle_adjustments": overlay["adjustments"],
+        "lifecycle_score": overlay["score"],
+        "signal": overlay["signal"],
+        "overrides": overlay["overrides"],
+    }

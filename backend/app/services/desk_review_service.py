@@ -53,6 +53,15 @@ _VRP_BLOCK_RATIO = 0.70          # implied < 70% of realized → VETO the trade
 _VRP_PENALTY_K = 22              # points per 1.0 of (1 − IV/HV): 0.9→−2, 0.5→−11, 0.2→−18
 _VRP_PENALTY_CAP = 25
 
+# Trend drift (P-measure DRIFT half) — the annualized EMA-slope μ becomes the SINGLE continuous
+# "Trend drift" factor (retiring the old ±6/±5 yes/no regime-fit). Points scale with the trend's
+# actual angle: a tailwind for the short side adds, a headwind subtracts. MACD *acceleration* is a
+# SEPARATE timing veto (velocity vs acceleration): if momentum is actively accelerating against the
+# short side past the threshold, the trade is vetoed regardless of the drift level.
+_DRIFT_SCALE = 15                # points per 1.0 of annualized μ (μ 0.30→+4.5, 0.53→cap 8)
+_DRIFT_CAP = 8
+_MACD_ACCEL_VETO = 0.004         # |Δhistogram over ~3 sessions| ÷ spot beyond this = accelerating counter-trend
+
 _STOCK_STRUCTURES = {"covered_call", "collar"}     # hold 100 shares/contract
 _BULLISH_INCOME = {"cash_secured_put", "put_credit_spread", "jade_lizard"}
 _BEARISH_INCOME = {"call_credit_spread", "collar"}
@@ -129,14 +138,15 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
     )
 
 
-def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None) -> tuple[float, str, list]:
+def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
+                  spot: Optional[float] = None) -> tuple[float, str, list]:
     """Does this trade fit the regime / smart-money structure? Evaluated on the MEDIUM-TERM read
     (6-month history, DAILY bars) — the swing horizon that governs a multi-week income option, not
     intraday noise or multi-year lag. Returns (score_bonus ±, note, factors) where `factors` is the
     itemized [{label, points}] breakdown of how the technicals moved the score."""
     inst = (ta or {}).get("institutional") or {}
     reg = inst.get("regime") or {}
-    bias, mode = reg.get("bias"), reg.get("mode")
+    mode = reg.get("mode")
     s = opp.get("structure")
     factors: list[dict] = []
     notes: list[str] = []
@@ -144,16 +154,22 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None) -> tuple[floa
     def add(label: str, pts: float, note: str):
         factors.append({"label": label, "points": pts}); notes.append(note)
 
-    if bias == "bullish":
+    # Trend drift (μ) — the continuous EMA-slope angle REPLACES the old yes/no ±6/±5 regime-fit. A trend
+    # that helps the short side is a tailwind (+), one that threatens it a headwind (−); neutral structures
+    # dislike ANY strong drift. Points scale with the actual angle (severity), not a binary regime label.
+    mu = (ta or {}).get("_drift_mu")
+    if mu is not None:
         if s in _BULLISH_INCOME:
-            add("Regime fit", 6, "with the bullish regime")
+            aligned = mu                 # up-trend keeps short puts OTM
         elif s in _BEARISH_INCOME:
-            add("Regime fit", -5, "against the bullish regime")
-    elif bias == "bearish":
-        if s in _BEARISH_INCOME:
-            add("Regime fit", 6, "with the bearish regime")
-        elif s in _BULLISH_INCOME:
-            add("Regime fit", -5, "against the bearish regime")
+            aligned = -mu                # down-trend keeps short calls OTM
+        elif s in _NEUTRAL_INCOME:
+            aligned = -abs(mu)           # any strong trend threatens one wing
+        else:
+            aligned = 0.0
+        pts = max(-_DRIFT_CAP, min(_DRIFT_CAP, round(aligned * _DRIFT_SCALE)))
+        if pts != 0:
+            add("Trend drift", pts, f"EMA drift {round(mu * 100)}%/yr {'tailwind' if pts > 0 else 'headwind'}")
     if mode == "range" and s in _NEUTRAL_INCOME:
         add("Range fit", 5, "neutral premium suits the range")
     # Short strike protected by a value-area edge / order block on the safe side.
@@ -164,6 +180,10 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None) -> tuple[floa
             add("Value area", 3, "short strike below the value area")
         elif s in _BEARISH_INCOME and ss >= vp["vah"]:
             add("Value area", 3, "short strike above the value area")
+    # LVN slip-through — a short strike in a thin volume node has no absorption (Phase-3 friction test).
+    lvn = _lvn_check(opp, vp, spot)
+    if lvn:
+        add(lvn["label"], lvn["points"], lvn["note"])
     # Dealer gamma regime (GEX proxy) — long gamma suppresses vol (a good backdrop for selling premium);
     # short gamma exacerbates it (dangerous). A STOCK-level positioning read applied to every trade.
     if gex and gex.get("regime") == "long":
@@ -186,6 +206,22 @@ def _ta_sync(ticker: str) -> dict:
         ta = compute_technical_block(stock, "medium_term") or {}
         try:
             ta.update(compute_momentum_indicators(stock))   # MACD / Bollinger / SMA-EMA (daily)
+        except Exception:  # noqa: BLE001
+            pass
+        try:                                                # EMA-slope drift μ + ATR (gap-aware vol) — swing read
+            import pandas as pd, numpy as np                # noqa: F401
+            h6 = stock.history(period="6mo", interval="1d").dropna()
+            closes = h6["Close"]
+            if len(closes) >= 30:
+                ema = closes.ewm(span=21, adjust=False).mean().values
+                y = np.log(ema[-21:]); x = np.arange(len(y))
+                ta["_drift_mu"] = round(float(np.polyfit(x, y, 1)[0]) * 252, 4)    # annualized log-slope drift
+            if len(h6) >= 15:                                # ATR (true range → GAP-AWARE, unlike close-to-close HV)
+                H, L, C = h6["High"].values, h6["Low"].values, h6["Close"].values
+                tr = np.maximum(H[1:] - L[1:], np.maximum(np.abs(H[1:] - C[:-1]), np.abs(L[1:] - C[:-1])))
+                atr, last = float(np.mean(tr[-14:])), float(C[-1])
+                if last > 0:
+                    ta["_atr_pct"] = round(atr / last * 100, 2)                    # daily true-range %
         except Exception:  # noqa: BLE001
             pass
         try:                                                # last cash dividend per share + its cadence
@@ -486,6 +522,80 @@ def _short_leg_iv(r: dict) -> Optional[float]:
     return None
 
 
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _macd_accel(ta: dict, spot: Optional[float]) -> Optional[dict]:
+    """MACD-histogram ACCELERATION (2nd-derivative of momentum) — is the trend's speed increasing?
+    accel = Δhistogram over ~3 sessions; accel_norm = accel ÷ spot (scale-free for the veto threshold)."""
+    hv = ((ta or {}).get("macd") or {}).get("histogramValues") or []
+    if len(hv) < 5 or not spot:
+        return None
+    accel = float(hv[-1]) - float(hv[-4])
+    return {"histogram": round(float(hv[-1]), 4), "accel": round(accel, 4),
+            "accel_norm": round(accel / spot, 5)}
+
+
+def _drift_adjusted_keep(opp: dict, spot: Optional[float], mu: Optional[float],
+                         phys_vol: Optional[float], r: float, keep_pct: Optional[float]) -> Optional[float]:
+    """Drift-adjusted (physical, P-measure) keep-prob for the NEAREST short leg: how far the real-world
+    drift μ moves the risk-neutral keep-prob. Computes P(short leg OTM) at drift=μ vs drift=r on the
+    binding strike and applies that DELTA to the trade's standard keep_pct (income keep-prob is dominated
+    by the nearest short). Returns a % (clamped 0–99.9) or None. It NEVER touches the headline Win%."""
+    if not (spot and mu is not None and phys_vol and phys_vol > 0 and keep_pct is not None):
+        return None
+    dte = int(opp.get("dte") or 0)
+    shorts = [(l.get("strike"), str(l.get("type", "")).upper())
+              for l in (opp.get("legs") or [])
+              if str(l.get("action", "")).upper().startswith("S") and l.get("strike")]
+    if dte <= 0 or not shorts:
+        return None
+    K, typ = min(shorts, key=lambda kv: abs((kv[0] or spot) - spot))
+    side_put = typ.startswith("P")
+    T, sig = dte / 365.0, phys_vol
+
+    def p_otm(drift: float) -> float:
+        d = (math.log(spot / K) + (drift - 0.5 * sig * sig) * T) / (sig * math.sqrt(T))
+        return _norm_cdf(d) if side_put else _norm_cdf(-d)     # put wants S>K; call wants S<K
+
+    delta = p_otm(mu) - p_otm(r)
+    return round(max(0.0, min(99.9, keep_pct + delta * 100.0)), 1)
+
+
+def _gap_aware_vol(hv: Optional[float], atr_pct: Optional[float]) -> tuple:
+    """Keltner/ATR cross-check → (physical_vol, atr_vol). ATR is TRUE range (includes overnight GAPS),
+    so on gappy names the ATR-implied vol exceeds close-to-close HV. The physical (P) vol used for the
+    boundaries and the base reweight becomes the WIDER of the two — a short strike must survive the
+    gap-aware range, not just the smooth close-to-close one."""
+    atr_vol = None
+    if atr_pct and atr_pct > 0:
+        atr_vol = (atr_pct / 100.0) / 1.4 * (252.0 ** 0.5)    # daily true range ≈ 1.4σ → annualized vol
+    cands = [v for v in (hv, atr_vol) if v and v > 0]
+    return (max(cands) if cands else hv), atr_vol
+
+
+def _lvn_check(opp: dict, vp: Optional[dict], spot: Optional[float]) -> Optional[dict]:
+    """Low-Volume-Node 'slip-through' test. A short strike sitting in a THIN volume node has no
+    absorption — price slips through it fast. Returns a demerit {label, points, note} or None. (Sitting
+    BEHIND a High-Volume Node is the opposite — structural friction — already rewarded by Value-area.)"""
+    bins = (vp or {}).get("bins") or []
+    if len(bins) < 8 or not spot:
+        return None
+    import statistics
+    med = statistics.median([b.get("pct", 0) for b in bins]) or 0.0
+    if med <= 0:
+        return None
+    shorts = [l.get("strike") for l in (opp.get("legs") or [])
+              if str(l.get("action", "")).upper().startswith("S") and l.get("strike")]
+    for K in shorts:
+        b = min(bins, key=lambda x: abs(x.get("price", spot) - K))
+        if b.get("pct", med) < 0.5 * med:                    # thin node at the short strike
+            return {"label": "LVN slip", "points": -5,
+                    "note": f"short strike in a low-volume node (${b.get('price')}, {b.get('pct')}% vol) — price slips through"}
+    return None
+
+
 def _expected_move_pct(r: dict) -> Optional[float]:
     """The 1σ implied move to expiry (%) = ATM IV × √(dte/365) — pre-computed so the LLM can
     compare it to cushion_pct_otm without doing the arithmetic itself."""
@@ -555,10 +665,14 @@ def _opp_bps(opp: dict, dm: dict, sofr_pct: float) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: Optional[float],
-                iv_rank: Optional[float], beta: Optional[float], events_n: int,
-                hv: Optional[float] = None, gex: Optional[dict] = None) -> dict:
-    pm, rk = (dm or {}).get("pm") or {}, (dm or {}).get("risk") or {}
+                iv_rank: Optional[float], beta: Optional[float],
+                hv: Optional[float] = None, gex: Optional[dict] = None,
+                macd: Optional[dict] = None) -> dict:
+    pm = (dm or {}).get("pm") or {}
     merits, demerits, blocking = [], [], []
+    # VRP ratio is GAP-AWARE: implied ÷ the physical vol used everywhere (max of HV and ATR), so the
+    # grade, the veto and the number-line all agree. Falls back to the scan's HV-based ratio.
+    iv_hv = round((atm_iv_pct / 100.0) / hv, 2) if (atm_iv_pct and hv and hv > 0) else opp.get("iv_hv_ratio")
     # Itemized signed contributions (points) by factor — so the UI can show each adjustment as a bar
     # and the desk score is auditable: desk_score = base_quality + regime + Σ(these).
     comp: dict[str, float] = {"expectation": 0.0, "vrp": 0.0, "moneyness": 0.0,
@@ -577,7 +691,6 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     # 2) Volatility Risk Premium — the REAL edge, and the negative-VRP TRAP. Rich implied vs realized
     #    rewards; cheap implied (implied << realized) is penalised IN PROPORTION to the gap and
     #    HARD-BLOCKED past the floor — the crushed-vol case where selling premium has no edge.
-    iv_hv = opp.get("iv_hv_ratio")
     if iv_hv is not None:
         if iv_hv >= 1.1 and (iv_rank or 0) >= 50:
             merits.append(f"rich VRP (IV/HV {iv_hv}, IV-rank {iv_rank})"); comp["vrp"] += 6
@@ -639,6 +752,16 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     #    (via the TA "Gamma regime" factor), not blocked.
     if gex and gex.get("regime") == "short" and opp.get("structure") == "iron_condor":
         blocking.append("short-gamma tape vetoes delta-neutral (iron condor) — vol expansion runs it over both ways")
+
+    # 9) MACD ACCELERATION — a SEPARATE timing veto (the Trend-drift factor is velocity; THIS is
+    #    acceleration). If momentum is actively accelerating AGAINST the short side past the threshold,
+    #    veto — you'd be stepping in front of a speeding-up move.
+    if macd and macd.get("accel_norm") is not None:
+        an, h, struct = macd["accel_norm"], (macd.get("histogram") or 0.0), opp.get("structure")
+        if struct in _BULLISH_INCOME and an < -_MACD_ACCEL_VETO and h < 0:
+            blocking.append(f"MACD accelerating down against short puts (Δhist {macd.get('accel')}) — counter-trend timing veto")
+        elif struct in _BEARISH_INCOME and an > _MACD_ACCEL_VETO and h > 0:
+            blocking.append(f"MACD accelerating up against short calls (Δhist {macd.get('accel')}) — counter-trend timing veto")
 
     adj = sum(comp.values())
     return {"adj": adj, "merits": merits, "demerits": demerits, "blocking": blocking, "components": comp,
@@ -1094,25 +1217,30 @@ async def rank_desk(
     opportunities = scan.get("opportunities", [])
     max_dte = max((int(o.get("dte") or 0) for o in opportunities), default=int(target_dte or 45))
     events_pre = _events_in_window(scan, ta, max_dte)        # computed once — also feeds the grade
-    events_n = len(events_pre)
     vsx = ctx.get("vol_stats") or {}
     atm_iv_pct, iv_rank = vsx.get("iv_atm_pct"), vsx.get("iv_rank")
     beta = (portfolio_fit or {}).get("beta_1y_spx")
+    mu = ta.get("_drift_mu")                          # EMA-slope drift (annualized) — Trend-drift + drift-adj keep
+    macd_accel = _macd_accel(ta, spot)               # MACD acceleration — the SEPARATE timing veto
+    r_free = sofr_pct / 100.0
+    phys_vol, atr_vol = _gap_aware_vol(hv, ta.get("_atr_pct"))   # Keltner/ATR gap-aware physical vol
+    gap_aware = bool(atr_vol and hv and atr_vol > hv)
 
     ranked: list[dict] = []
     for opp in opportunities:
         try:
-            dm = _opp_desk_metrics(opp, spot, sofr_pct, hv)
+            dm = _opp_desk_metrics(opp, spot, sofr_pct, phys_vol)
         except Exception as exc:  # noqa: BLE001 — one bad trade must not kill the desk
             logger.debug("desk metrics failed (%s): %s", opp.get("label"), exc)
             dm = {"trader": {}, "pm": {}, "risk": {}, "quant": {"score": None, "verdict": None, "reasons": []}}
         base = (dm.get("quant") or {}).get("score")
         if base is None:
             base = (opp.get("confidence") or {}).get("score") or 50
-        bonus, note, ta_factors = _ta_alignment(opp, ta, gex)
+        bonus, note, ta_factors = _ta_alignment(opp, ta, gex, spot)
         # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
-        g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta, events_n, hv=hv, gex=gex)
+        g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
+                        hv=phys_vol, gex=gex, macd=macd_accel)
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
         grade, approval = _grade_letter(desk_score, g["blocking"])
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
@@ -1134,7 +1262,12 @@ async def rank_desk(
                        "ta_factors": ta_factors,
                        # Q-vs-P: the boundary read (imp/phys moves + strike distance) and the vol pair
                        # that weighted the base score — surfaced as the number-line in Quant Analysis.
-                       "qp": {**g["qp"], **(dm.get("vrp") or {})}})
+                       # Drift-adjusted keep (P-measure DRIFT) is an OVERLAY only — the headline Win% stays standard.
+                       "qp": {**g["qp"], **(dm.get("vrp") or {}),
+                              "keep_standard_pct": opp.get("prob_keep_pct"),
+                              "keep_drift_pct": _drift_adjusted_keep(opp, spot, mu, phys_vol, r_free, opp.get("prob_keep_pct")),
+                              "drift_mu_pct": round(mu * 100, 1) if mu is not None else None,
+                              "atr_vol_pct": round(atr_vol * 100, 1) if atr_vol else None, "gap_aware": gap_aware}})
 
     # BLOCKING trades (structurally broken, etc.) sink to the bottom; then desk score, Sortino, yield —
     # so the top-ranked trade has already cleared every mechanical filter the LLM desk applies.

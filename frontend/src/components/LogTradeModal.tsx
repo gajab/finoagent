@@ -19,6 +19,7 @@ import {
   Sparkles, Plus, Trash2, ClipboardList, Layers, Activity,
 } from 'lucide-react';
 import { createManualTrade } from '../api';
+import type { TradePurpose } from '../api';
 import type { TrackedCompany } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -200,6 +201,7 @@ export default function LogTradeModal({ open, onClose, company, onLogged }: Prop
   const [tradeDate, setTradeDate]     = useState(today());
   const [why, setWhy]                 = useState('');
   const [basis, setBasis]             = useState<AnalysisBasis>('both');
+  const [purpose, setPurpose]         = useState<TradePurpose>('income');
   const [legs, setLegs]               = useState<OptionLeg[]>([newLeg()]);
   const [saving, setSaving]           = useState(false);
   const [err, setErr]                 = useState<string | null>(null);
@@ -215,7 +217,7 @@ export default function LogTradeModal({ open, onClose, company, onLogged }: Prop
       setKind('long');
       setTicker(company?.ticker || '');
       setShares(''); setPrice('');
-      setTradeDate(today()); setWhy(''); setBasis('both');
+      setTradeDate(today()); setWhy(''); setBasis('both'); setPurpose('income');
       setLegs([newLeg()]); setSaving(false); setErr(null);
       setFuturesExpiry('');
       setFuturesAction('long');
@@ -294,7 +296,7 @@ export default function LogTradeModal({ open, onClose, company, onLogged }: Prop
             expiration: futuresExpiry || undefined,
             margin_req: marginVal,
             why,
-            expectation_type: basis,
+            expectation_type: basis, purpose,
             ...(company ? { tracked_company_id: company.id } : {}),
           },
           legs_data: [],
@@ -315,7 +317,7 @@ export default function LogTradeModal({ open, onClose, company, onLogged }: Prop
           ticker: t,
           parameters: {
             ticker: t, name: effectiveName, shares: sh,
-            why, expectation_type: basis,
+            why, expectation_type: basis, purpose,
             ...(company ? { tracked_company_id: company.id } : {}),
           },
           legs_data: [],
@@ -342,7 +344,7 @@ export default function LogTradeModal({ open, onClose, company, onLogged }: Prop
             : `Options Spread ${t} — ${effectiveName}`,
           ticker: t,
           parameters: {
-            ticker: t, name: effectiveName, why, expectation_type: basis,
+            ticker: t, name: effectiveName, why, expectation_type: basis, purpose,
             legs_count: legs.length,
             ...(company ? { tracked_company_id: company.id } : {}),
           },
@@ -370,7 +372,7 @@ export default function LogTradeModal({ open, onClose, company, onLogged }: Prop
           ticker: t,
           parameters: {
             ticker: t, name: effectiveName, shares: sh, why,
-            expectation_type: basis,
+            expectation_type: basis, purpose,
             options_net_debit: optionsTotal,
             ...(company ? { tracked_company_id: company.id } : {}),
           },
@@ -700,6 +702,16 @@ export default function LogTradeModal({ open, onClose, company, onLogged }: Prop
               value={why}
               onChange={e => setWhy(e.target.value)}
             />
+          </div>
+
+          {/* Strategy purpose — drives My Trades grouping + the lifecycle view */}
+          <div>
+            <p className="text-xs font-medium text-base-content/60 mb-2">Strategy purpose</p>
+            <div className="flex gap-2 flex-wrap">
+              {([['income', 'Income'], ['hedge', 'Hedge'], ['managed_floor', 'Managed Floor'], ['managed_buffer', 'Managed Buffer'], ['dual_directional', 'Dual Directional'], ['trade', 'Trade']] as [TradePurpose, string][]).map(([v, label]) => (
+                <Pill key={v} active={purpose === v} onClick={() => setPurpose(v)}>{label}</Pill>
+              ))}
+            </div>
           </div>
 
           {/* Analysis basis */}

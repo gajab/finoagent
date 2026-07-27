@@ -610,3 +610,80 @@ def summarize_trade_actions(
         "leg_notes": leg_notes,
         "reasons": reasons,
     }
+
+
+# ── Whole-trade EXIT timing — Strong Hold / Hold / Consider Close / Close ──
+
+ExitSignal = Literal["STRONG_HOLD", "HOLD", "CONSIDER_CLOSE", "CLOSE"]
+
+
+def exit_recommendation(
+    *,
+    hold_signal: str,
+    pop: Optional[float],
+    unrealized_pnl: float,
+    max_profit: Optional[float],
+    max_loss: Optional[float],
+    dte: Optional[int],
+    theta_per_day: float = 0.0,
+) -> dict:
+    """When is the best time to exit the WHOLE trade? Maps the hold/close signal
+    into the 4-level exit vocabulary and layers on lifecycle *exit-timing* rules
+    a screener misses — the take-half-early rule, gamma/pin risk into expiry, and
+    profit already banked vs the theta still left to collect.
+
+    Returns {signal, reasons, captured_pct}. signal ∈
+      STRONG_HOLD | HOLD | CONSIDER_CLOSE | CLOSE.
+    """
+    signal: ExitSignal = {
+        "STRONG_HOLD": "STRONG_HOLD", "HOLD": "HOLD",
+        "CLOSE": "CONSIDER_CLOSE", "STRONG_CLOSE": "CLOSE",
+    }.get(hold_signal, "HOLD")  # type: ignore[assignment]
+    reasons: list[str] = []
+
+    captured = (unrealized_pnl / max_profit) if (max_profit and max_profit > 0) else None
+
+    # Take-profit management: the closer you are to max profit, the less theta is
+    # left to collect and the more you're just holding gamma/pin risk for pennies.
+    if captured is not None:
+        if captured >= 0.85:
+            signal = "CLOSE"
+            reasons.append(f"Captured {captured * 100:.0f}% of max profit — almost nothing left to earn; close to free capital and shed gamma/pin risk")
+        elif captured >= 0.5 and dte and dte > 7:
+            if signal in ("STRONG_HOLD", "HOLD"):
+                signal = "CONSIDER_CLOSE"
+            reasons.append(f"Captured {captured * 100:.0f}% of max profit with {dte}d left — the take-half-early exit that lifts realized returns")
+
+    # Cut losses when the structure is deep in the red.
+    if max_loss is not None and max_loss < 0 and unrealized_pnl <= max_loss * 0.8:
+        signal = "CLOSE"
+        reasons.append("Near max loss — cut it rather than hope for a reversal")
+
+    # Gamma / pin / assignment risk explodes in the last days.
+    if dte is not None and dte <= 2:
+        if unrealized_pnl > 0 and signal in ("STRONG_HOLD", "HOLD"):
+            signal = "CONSIDER_CLOSE"
+        reasons.append(f"{dte}d to expiry — gamma/pin/assignment risk elevated; realize rather than carry overnight")
+
+    # Edge gone.
+    if pop is not None and pop < 30 and signal in ("STRONG_HOLD", "HOLD"):
+        signal = "CONSIDER_CLOSE"
+        reasons.append(f"Probability of profit down to {pop:.0f}% — the edge has eroded")
+
+    # Still collecting: positive theta + plenty of runway + healthy PoP = let it work.
+    if not reasons:
+        if theta_per_day > 0 and (pop is None or pop >= 60):
+            reasons.append("Positive theta still accruing with the edge intact — let it work")
+        else:
+            reasons.append({
+                "STRONG_HOLD": "Thesis intact and edge working — hold",
+                "HOLD": "On track — hold and monitor",
+                "CONSIDER_CLOSE": "Risk/reward no longer compelling — consider trimming or closing",
+                "CLOSE": "Exit the position",
+            }.get(signal, "Monitor"))
+
+    return {
+        "signal": signal,
+        "reasons": reasons,
+        "captured_pct": round(captured * 100, 1) if captured is not None else None,
+    }

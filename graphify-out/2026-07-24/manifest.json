@@ -5,8 +5,8 @@
     "semantic_hash": "fc06d1b5df1f9723e0de3a384144c5b8"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/.claude/settings.local.json": {
-    "mtime": 1784070642.011897,
-    "ast_hash": "e92f885d6b679245ea3bc6eb008361b6",
+    "mtime": 1783062656.8896956,
+    "ast_hash": "383cffa3ce693be1d97554ea3b841004",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/.vite/deps/_metadata.json": {
@@ -45,8 +45,8 @@
     "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/auth.py": {
-    "mtime": 1783555265.8926532,
-    "ast_hash": "5db801eaadb0a7193cff9387359c3b13",
+    "mtime": 1783459049.5316432,
+    "ast_hash": "0d7226aee0a7c5bbfdd405262bac15c5",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/config.py": {
@@ -60,8 +60,8 @@
     "semantic_hash": "75f8e027a97c623835ef6969f1374c17"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/main.py": {
-    "mtime": 1784908271.694994,
-    "ast_hash": "92ccf3b8f9e50c92768c88e12526f47d",
+    "mtime": 1783290152.0180507,
+    "ast_hash": "7511f502282c3b952e205de923ab0c5a",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/middleware.py": {
@@ -150,13 +150,13 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/routers/saved_strategy_router.py": {
-    "mtime": 1784174938.257862,
-    "ast_hash": "c762b1a473298bfa75c15a0680d2fcdd",
+    "mtime": 1783402265.373732,
+    "ast_hash": "7f1aca02f2674d4ea8453dca8d60d696",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/routers/settings_router.py": {
-    "mtime": 1783896749.4553924,
-    "ast_hash": "ae6980dbbf910712fa6326b9898c8a60",
+    "mtime": 1783459069.0820456,
+    "ast_hash": "7a5e0ccc17ef44cf83da7e60c04155fe",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/routers/stock_notes_router.py": {
@@ -165,8 +165,8 @@
     "semantic_hash": "b23f4c00941a97ea58c1bf9941bf02df"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/routers/stock_router.py": {
-    "mtime": 1784930486.2262404,
-    "ast_hash": "7b9ccc446bff2d611cd8fb502f1b5834",
+    "mtime": 1783552461.3324087,
+    "ast_hash": "1f3d2bbd97f2f9a8eaa8842311fd3aeb",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/routers/tlh_portfolio_router.py": {
@@ -235,14 +235,14 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/dcf_service.py": {
-    "mtime": 1783665024.779831,
-    "ast_hash": "f0f012d60330bd804d40da44be347d98",
+    "mtime": 1781820752.9256108,
+    "ast_hash": "60e85a1b23d464e6be3683d98a838662",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/dual_direction_service.py": {
-    "mtime": 1784135582.782941,
-    "ast_hash": "fe34e1065eeb910b3d26ec1cf6184658",
-    "semantic_hash": ""
+    "mtime": 1777081647.924301,
+    "ast_hash": "e9da60d1fd0d424525401cb6f0e11fb2",
+    "semantic_hash": "e9da60d1fd0d424525401cb6f0e11fb2"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/email_service.py": {
     "mtime": 1781140270.9151309,
@@ -260,13 +260,13 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/financial_health_service.py": {
-    "mtime": 1783902851.7305121,
-    "ast_hash": "4fffa2bdadc5d9c05003a5c472f12f02",
-    "semantic_hash": ""
+    "mtime": 1777081647.912399,
+    "ast_hash": "f86c85e7b020d8fad35fc002c7129869",
+    "semantic_hash": "f86c85e7b020d8fad35fc002c7129869"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/llm_service.py": {
-    "mtime": 1783568444.2192605,
-    "ast_hash": "02767244049c2021ad018338fedd952e",
+    "mtime": 1783552469.3031447,
+    "ast_hash": "71e709b247bf40639705bc647e029429",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/long_short_service.py": {
@@ -315,8 +315,8 @@
     "semantic_hash": "4e390e9754490ed9ee466d910948148d"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/quote_providers/yfinance_provider.py": {
-    "mtime": 1784527228.7203887,
-    "ast_hash": "0a3b5e83249fa132cc8ab9c024246abe",
+    "mtime": 1783377322.2216656,
+    "ast_hash": "17532bf8a9779bd28951149ae5eacf94",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/scheduler_service.py": {
@@ -330,8 +330,8 @@
     "semantic_hash": "4554cc89bd5cc7b9672c4302359a8bcf"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/stock_service.py": {
-    "mtime": 1784940492.5477657,
-    "ast_hash": "c1eca470d098bccab051b92ee1683705",
+    "mtime": 1781820680.5362756,
+    "ast_hash": "276f48899eb7808839e50ff9e7810f1c",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/structured_trades_service.py": {
@@ -350,8 +350,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/trade_math.py": {
-    "mtime": 1784017356.7140784,
-    "ast_hash": "99c9e60482ab8fbed043d77f892d6465",
+    "mtime": 1783007921.9903986,
+    "ast_hash": "2984b4ef75ab2b5e13a79d8b0b35ab3d",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/zebra_service.py": {
@@ -395,14 +395,14 @@
     "semantic_hash": "7dc19987dc4f263a7dc1c05580352e75"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/tests/test_trade_math.py": {
-    "mtime": 1784088788.8559191,
-    "ast_hash": "e03eb1e734a46eecd1205b71ffe07f0c",
+    "mtime": 1783007517.9221406,
+    "ast_hash": "30e999e7f81e36c347bf808526a023ba",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/package.json": {
-    "mtime": 1784936708.3466012,
-    "ast_hash": "bc8c0e2964d7a42c861ff87bafd8ccb4",
-    "semantic_hash": ""
+    "mtime": 1777081647.849234,
+    "ast_hash": "476ef84279a6c6e5064d69dac4ad2e1a",
+    "semantic_hash": "476ef84279a6c6e5064d69dac4ad2e1a"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/postcss.config.js": {
     "mtime": 1777081647.849574,
@@ -410,13 +410,13 @@
     "semantic_hash": "c735540bb63936a123bc867d950c9f69"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/App.tsx": {
-    "mtime": 1784933548.2338784,
-    "ast_hash": "aa653dbc2a2d813400abf92b4b2573ae",
+    "mtime": 1783374185.0477629,
+    "ast_hash": "dfd689fbb825db5b9e17feaa27089bb7",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/api.ts": {
-    "mtime": 1784930515.959498,
-    "ast_hash": "9a76b037a63106a046db3d2bee5b3ce0",
+    "mtime": 1783468026.553501,
+    "ast_hash": "3b9d121d171c81ea98e31f9782872acc",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/AIFortressAnalysis.tsx": {
@@ -460,8 +460,8 @@
     "semantic_hash": "d242d722b776d7ad9a02d486d00a7c1f"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/AiNewsSummary.tsx": {
-    "mtime": 1783568501.5032012,
-    "ast_hash": "d7850d32046b42110c880a4b21691327",
+    "mtime": 1783468030.5246959,
+    "ast_hash": "297ced9863a9dcba2a835ab8de0964da",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/AllowlistManager.tsx": {
@@ -505,18 +505,18 @@
     "semantic_hash": "28159e01d5361d0d7bf7ec05354ae6dc"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DCFAnalysis.tsx": {
-    "mtime": 1783899344.3638206,
-    "ast_hash": "56b9a10a1768a0192531b078329f6d0e",
+    "mtime": 1781821046.5834458,
+    "ast_hash": "089c9c9beb7e2c3ab7878b34aac9a6e1",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DualDirectionBuffer.tsx": {
-    "mtime": 1784159208.7204092,
-    "ast_hash": "88060b85fb9c19d04c0a8bfb0377cb14",
+    "mtime": 1782254627.5820346,
+    "ast_hash": "ed00a904ca23296c0022a2dcebd06d82",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/EarningsSummary.tsx": {
-    "mtime": 1783897176.8699586,
-    "ast_hash": "9b18c2ca9e3a378237d216d09298763f",
+    "mtime": 1781821003.0889976,
+    "ast_hash": "44eae72522225a1b11d8d64be5be649b",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/EventImpactAnalyzer.tsx": {
@@ -535,9 +535,9 @@
     "semantic_hash": "bf0cd45a2c6970fa9e54965af795d235"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/FinancialHealth.tsx": {
-    "mtime": 1783902919.4208298,
-    "ast_hash": "3ae33420f6a759fd2c65b975a5d7e2aa",
-    "semantic_hash": ""
+    "mtime": 1777081647.858822,
+    "ast_hash": "99d9faaef394efa2b78ad7206a888495",
+    "semantic_hash": "99d9faaef394efa2b78ad7206a888495"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/GuruAnalysis.tsx": {
     "mtime": 1777081647.854764,
@@ -545,9 +545,9 @@
     "semantic_hash": "4903d75ba72f7af24ac40528ffd168b2"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/IndustryWatch.tsx": {
-    "mtime": 1783556803.2913237,
-    "ast_hash": "cacc8ed72903ddd34a137eeb5571463a",
-    "semantic_hash": ""
+    "mtime": 1777311249.2392943,
+    "ast_hash": "c7acc5896c9c1ce66f430633fb2150ac",
+    "semantic_hash": "c7acc5896c9c1ce66f430633fb2150ac"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/LogTradeModal.tsx": {
     "mtime": 1783378133.508954,
@@ -645,9 +645,9 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/TechnicalAnalysis.tsx": {
-    "mtime": 1784940366.9640558,
-    "ast_hash": "435c0930f6b935920415da8f01593b59",
-    "semantic_hash": ""
+    "mtime": 1777654718.372108,
+    "ast_hash": "d34d3debd48aced8097f15d6bbf895be",
+    "semantic_hash": "d34d3debd48aced8097f15d6bbf895be"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/TickerInput.tsx": {
     "mtime": 1781821405.827268,
@@ -750,8 +750,8 @@
     "semantic_hash": "06f4ffaab8120d385f5f4c6c51bb42d5"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/trades/MyTradesV2.tsx": {
-    "mtime": 1784937198.2280989,
-    "ast_hash": "64ddd1e5eced4294c9c5407f0e111ef5",
+    "mtime": 1783377992.6898932,
+    "ast_hash": "c8b1d5e2d378a15c41f5924e9f6a9d20",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/trades/TransactionHistoryPanel.tsx": {
@@ -795,13 +795,13 @@
     "semantic_hash": "4f85ac93346cc89f1bb2c674066e0cc5"
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/pages/DashboardPage.tsx": {
-    "mtime": 1783897209.568619,
-    "ast_hash": "dcbf1a6564b33401142f1f444b76cfc9",
+    "mtime": 1783375311.4222858,
+    "ast_hash": "eb534c5ddf87cd3d5cc199c1a322d9bf",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/pages/LandingPage.tsx": {
-    "mtime": 1784419493.222423,
-    "ast_hash": "5a313f26a77cbf591bb7fd2c6a29125c",
+    "mtime": 1783291740.4323156,
+    "ast_hash": "30adf2309e18a31ea74776ac8f5c1010",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/pages/LoginPage.tsx": {
@@ -825,13 +825,13 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/pages/SettingsPage.tsx": {
-    "mtime": 1783897273.189589,
-    "ast_hash": "5178facb05e14f58bb8eedab8162bae9",
+    "mtime": 1783460507.695731,
+    "ast_hash": "f90d60083cc4f80eaf6db4d7625920b1",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/pages/StrategiesPage.tsx": {
-    "mtime": 1784934561.0343583,
-    "ast_hash": "4783aba2559ec390ae4202e1f4fa121a",
+    "mtime": 1782758938.0008903,
+    "ast_hash": "14d7c7c295c5252ec1d55673b27ec30b",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/pages/TrackingPage.tsx": {
@@ -840,8 +840,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/types.ts": {
-    "mtime": 1784933309.9522157,
-    "ast_hash": "8e5b3b61b6ff62f0d4edb42bc84bdbcb",
+    "mtime": 1783271842.8683007,
+    "ast_hash": "6f45870745f071b065bd833c8badbcde",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/utils/tickSize.ts": {
@@ -940,8 +940,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/index.html": {
-    "mtime": 1784419495.316898,
-    "ast_hash": "18fa5894a4a373eca8bffee1ac705d4a",
+    "mtime": 1783290672.814542,
+    "ast_hash": "c2da7050fadbc50d128227eab68d5a27",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/apple-touch-icon.png": {
@@ -1075,8 +1075,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/routers/pick_shovel_v2_router.py": {
-    "mtime": 1784159116.099559,
-    "ast_hash": "8ef2c61e15b1d883257878939a9fc479",
+    "mtime": 1782166214.5075994,
+    "ast_hash": "e996bb44fa67ad37d19e3afa796b81f4",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/autocallable_service.py": {
@@ -1095,8 +1095,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/debate_service.py": {
-    "mtime": 1784268538.434717,
-    "ast_hash": "73bc201301f5a9c1c37da74946bd56a2",
+    "mtime": 1783485051.9464152,
+    "ast_hash": "4fa3487e61bd9e82756be212dd05b6c1",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/debt_entry_service.py": {
@@ -1105,8 +1105,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/derivative_income_service.py": {
-    "mtime": 1784931171.3371637,
-    "ast_hash": "e3cf2b465459e92ad70154e051b7ac6e",
+    "mtime": 1782758504.1431367,
+    "ast_hash": "486ab5bd35c92003c6c9336a2e9433e3",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/doc_ingest_service.py": {
@@ -1115,8 +1115,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/edgar_service.py": {
-    "mtime": 1783666160.8764231,
-    "ast_hash": "7f189f3a0da4ab6fa194cd1d68c019bc",
+    "mtime": 1783549484.743382,
+    "ast_hash": "788c0c2bebb8d1b00231edc2f19ac7d0",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/edinet_service.py": {
@@ -1135,8 +1135,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/pick_shovel_v2_service.py": {
-    "mtime": 1784159095.7993205,
-    "ast_hash": "1554a12387c4abfb4b48a8ae14d155ee",
+    "mtime": 1782203656.208338,
+    "ast_hash": "fc0c438c05f69fa392655a030119281d",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/portfolio_optimization_service.py": {
@@ -1170,8 +1170,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/AgentDebate.tsx": {
-    "mtime": 1784268885.8097675,
-    "ast_hash": "6a77c204f95247adb76f3ef5dc45073e",
+    "mtime": 1783271905.7213633,
+    "ast_hash": "de17754394e4146e7c7d8aed54ea6856",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/CycleSectorTA.tsx": {
@@ -1185,8 +1185,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DerivativeIncome.tsx": {
-    "mtime": 1784940168.9493523,
-    "ast_hash": "5e902a5e8648e6f7f1a6be7990ebfdee",
+    "mtime": 1782759014.0435464,
+    "ast_hash": "4ab096e5f71c669965175173c9c34a03",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/EconomicCycles.tsx": {
@@ -1195,8 +1195,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/HedgingStrategy.tsx": {
-    "mtime": 1784159229.7688446,
-    "ast_hash": "63c9825ac9a57ee1eed49738844bb99e",
+    "mtime": 1782952624.1260264,
+    "ast_hash": "7fc3e8b0754c5e4d7e3b1854aa0d886f",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/LiquidityPanel.tsx": {
@@ -1205,8 +1205,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/PickAndShovelV2.tsx": {
-    "mtime": 1784175094.360214,
-    "ast_hash": "afe71ff8d6b9cc93451c9dca8382c09b",
+    "mtime": 1782228921.5219488,
+    "ast_hash": "8f3388f4abb5cc4fb2bf28bc70ed131a",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/PortfolioOptimizer.tsx": {
@@ -1235,18 +1235,18 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/calculators/retirement/RetirementLongevity.tsx": {
-    "mtime": 1783914562.9012566,
-    "ast_hash": "a8ca05ba9c2aad9a223a23b36f1a41fd",
+    "mtime": 1783551754.614851,
+    "ast_hash": "9d3e696323826f1d3096d1bd91028b26",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/calculators/retirement/data.ts": {
-    "mtime": 1783910354.5012486,
-    "ast_hash": "878e731c37a06ff61f0be99b9a46dcb4",
+    "mtime": 1783550311.7308717,
+    "ast_hash": "d043341b64d961ce18edea1169df4755",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/calculators/retirement/engine.ts": {
-    "mtime": 1783914234.348098,
-    "ast_hash": "19438c8c7039f5600385329ba684268d",
+    "mtime": 1783485412.710049,
+    "ast_hash": "16da978ec397d978277a62c174e9bdef",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/calculators/retirement/locations.ts": {
@@ -1265,33 +1265,33 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/agentic-finance.html": {
-    "mtime": 1784419511.7207577,
-    "ast_hash": "9bb2655b2a1810782faefb0e3afe084f",
+    "mtime": 1783284135.5886064,
+    "ast_hash": "91d57086a8bc97fc9814fc28b8ca0aec",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/agentic-quant.html": {
-    "mtime": 1784419511.7248638,
-    "ast_hash": "2add30ac6d4cfa26b6544836de821713",
+    "mtime": 1783284139.447571,
+    "ast_hash": "2799e06ca686937dc2c695f73056ffd4",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/agentic-stock-research.html": {
-    "mtime": 1784419511.72235,
-    "ast_hash": "df1d771daca6c050c4a9a0c48d384741",
+    "mtime": 1783284141.7893124,
+    "ast_hash": "94da3486487c681c65d7e2fee3131231",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/agentic-trading.html": {
-    "mtime": 1784419511.7235086,
-    "ast_hash": "fd0a9c6b7511a8f904cecdd6121a7096",
+    "mtime": 1783284145.194485,
+    "ast_hash": "84c382fe480e15312a35c26300ff7436",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/finclaw.html": {
-    "mtime": 1784419511.727166,
-    "ast_hash": "1b69ae74fb318c07ccf602b0c36ddc57",
+    "mtime": 1783284147.0030744,
+    "ast_hash": "19dec21984c92de91ad23a78a091eb49",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/robots.txt": {
-    "mtime": 1784419490.2200224,
-    "ast_hash": "771257e116943d7174caa7e5933630db",
+    "mtime": 1783285720.617451,
+    "ast_hash": "a5538e62899344b66b530c52023c1b22",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/og-image.jpg": {
@@ -1305,8 +1305,8 @@
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/financial-calculators.html": {
-    "mtime": 1784419511.7286432,
-    "ast_hash": "20915fc383d792a26d2c336a06b20542",
+    "mtime": 1783290158.4155252,
+    "ast_hash": "9dd463624afc44b1c8c969ee2ece2d5d",
     "semantic_hash": ""
   },
   "/Users/rahul/ClaudeCode/stock-research-standalone/scratch/analyze_mck_mda.py": {
@@ -1397,151 +1397,6 @@
   "/Users/rahul/ClaudeCode/stock-research-standalone/scratch/nvda_mda_full.txt": {
     "mtime": 1783549387.9371495,
     "ast_hash": "6ccb085d4f8f0288d9e258463f947c30",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/desk_review_service.py": {
-    "mtime": 1784933303.0895011,
-    "ast_hash": "a7954a63afe76790adae843a2692dffe",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/earnings_insight_service.py": {
-    "mtime": 1783896813.8639705,
-    "ast_hash": "9921a7d4dfeeac32cf421e20237f6f72",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/institutional_ta_service.py": {
-    "mtime": 1784523050.0203395,
-    "ast_hash": "42bacfda93d6a699c3e8f1eb9f817922",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/lifecycle_service.py": {
-    "mtime": 1784872588.4550436,
-    "ast_hash": "30d79b8b58a181a67041adfda90c979f",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/valuation_data.py": {
-    "mtime": 1784004923.0895798,
-    "ast_hash": "a8828779bab118fc4326cd90ba36ef24",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/valuation_engine.py": {
-    "mtime": 1784267842.4135537,
-    "ast_hash": "0851b36c6f2f54d21a4a54c9266f8db5",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/app/services/valuation_priors.py": {
-    "mtime": 1784267823.6765213,
-    "ast_hash": "fa67ce4a8acb206e89475ae481919d39",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/tests/test_lifecycle.py": {
-    "mtime": 1784128119.5815566,
-    "ast_hash": "cf0347a520de5a2918a0801f00a82680",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/backend/tests/test_valuation_engine.py": {
-    "mtime": 1784267888.2573764,
-    "ast_hash": "b022b4087344c235a3f872fc7df528cf",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DcfLearn.tsx": {
-    "mtime": 1783725682.8330925,
-    "ast_hash": "85647eb51c4ae2ab8f086569d2660978",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DerivativeIncomeV2.tsx": {
-    "mtime": 1784852929.899916,
-    "ast_hash": "e8297e83401dbd5d1cfc8a4083a1aa31",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DeskDebate.tsx": {
-    "mtime": 1784617454.982432,
-    "ast_hash": "be0985d588465dab2063c173bf587c3b",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DeskDebateModal.tsx": {
-    "mtime": 1784930922.2504966,
-    "ast_hash": "8ec5376543686152c317fdfe9bb9d015",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/DeskReview.tsx": {
-    "mtime": 1784933824.4788024,
-    "ast_hash": "96e78c53e9c4b1cf1af37bd0ae9f0147",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/InstitutionalTA.tsx": {
-    "mtime": 1784937986.2387316,
-    "ast_hash": "66a74233336cbae22e85b0bbd60f5637",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/PreTradeAdvisor.tsx": {
-    "mtime": 1784175072.4550023,
-    "ast_hash": "b5470aa29c99efd42fe562330d42b0c0",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/RatingsHelp.tsx": {
-    "mtime": 1784931285.8660085,
-    "ast_hash": "84a9a53a9324b8212d74a14c60ce6b49",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/SmartMoneyChartOverlay.tsx": {
-    "mtime": 1784938492.2467468,
-    "ast_hash": "e11b25739fcf09e29b09933d92667327",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/UnderlyingCharts.tsx": {
-    "mtime": 1784618532.5646482,
-    "ast_hash": "271a737da677e503b2723b2edba72ea5",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/UnderlyingSummary.tsx": {
-    "mtime": 1784618507.389783,
-    "ast_hash": "3dfad93d2e0fc4f96effc48985053963",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/trades/CollapsibleSection.tsx": {
-    "mtime": 1784089171.321536,
-    "ast_hash": "f6d61d7676d305ee78919448a492096f",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/trades/DeskMetrics.tsx": {
-    "mtime": 1784159046.5498614,
-    "ast_hash": "c088f74ae64f495fa84aa29fec64f311",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/trades/LifecyclePanel.tsx": {
-    "mtime": 1784159281.8554566,
-    "ast_hash": "5ff0c7168ba248f8a606241884a39282",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/src/components/trades/PayoffChart.tsx": {
-    "mtime": 1783998835.8634703,
-    "ast_hash": "be620f3f9b4b8d637b02b45e0bcbe6e6",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/blog.html": {
-    "mtime": 1784931303.96848,
-    "ast_hash": "655a5a191eb4bd7f7ac73ee71c394115",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/blog/har-rv-vs-hv30-volatility-risk-premium.html": {
-    "mtime": 1784931288.407357,
-    "ast_hash": "a3245d2d976a4a3227f88cdfd2a35ea7",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/blog/net-gamma-exposure-gex.html": {
-    "mtime": 1784931231.9893823,
-    "ast_hash": "8465247daaadc2b00131c0dd72613e57",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/blog/trading-the-greeks.html": {
-    "mtime": 1784931285.391469,
-    "ast_hash": "d6e030e17bf92034126b359384fa9164",
-    "semantic_hash": ""
-  },
-  "/Users/rahul/ClaudeCode/stock-research-standalone/frontend/public/retirement-calculator.html": {
-    "mtime": 1784419511.7301738,
-    "ast_hash": "f18f75daa905af01bb6442cfdb05b0a4",
     "semantic_hash": ""
   }
 }

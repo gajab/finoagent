@@ -17,7 +17,8 @@ import {
 } from 'chart.js';
 import { Line, Bar } from 'react-chartjs-2';
 import { TechnicalData } from '../types';
-import { InstitutionalTA, makeSmartMoneyPlugin, SmartMoneyChartLegend } from './InstitutionalTA';
+import { SmartMoneyChartOverlay } from './SmartMoneyChartOverlay';
+import { InstitutionalTA, MarketStateBanner } from './InstitutionalTA';
 
 ChartJS.register(
   CategoryScale,
@@ -82,7 +83,7 @@ function PhaseIndicator({ phase }: { phase: string }) {
     icon = <ArrowDown size={14} />;
   }
   return (
-    <span className={`badge ${color} badge-lg gap-1 font-bold capitalize`}>
+    <span className={`badge ${color} badge-sm gap-1 font-semibold capitalize`}>
       {icon} {normalized}
     </span>
   );
@@ -98,18 +99,18 @@ function RsiGauge({ rsi }: { rsi: number | null }) {
 
   const pct = Math.min(100, Math.max(0, rsi));
   return (
-    <div className="flex flex-col items-center gap-1">
-      <span className={`text-3xl font-bold ${color}`}>{rsi.toFixed(1)}</span>
-      <div className="w-full bg-base-100 rounded-full h-2">
+    <div className="flex flex-col items-center gap-0.5">
+      <span className={`text-base font-bold leading-none ${color}`}>{rsi.toFixed(1)}</span>
+      <div className="w-full bg-base-100 rounded-full h-1 mt-0.5">
         <div
-          className={`h-2 rounded-full ${rsi > 70 ? 'bg-error' : rsi < 30 ? 'bg-success' : 'bg-warning'}`}
+          className={`h-1 rounded-full ${rsi > 70 ? 'bg-error' : rsi < 30 ? 'bg-success' : 'bg-warning'}`}
           style={{ width: `${pct}%` }}
         />
       </div>
-      <div className="flex justify-between w-full text-xs text-base-content/40">
-        <span>0 (Oversold)</span>
+      <div className="flex justify-between w-full text-[9px] text-base-content/40 leading-none">
+        <span>0 <span className="hidden xl:inline">(OS)</span></span>
         <span>50</span>
-        <span>100 (Overbought)</span>
+        <span>100 <span className="hidden xl:inline">(OB)</span></span>
       </div>
     </div>
   );
@@ -141,6 +142,8 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
   const [technical, setTechnical] = useState<TechnicalData>(initialTechnical);
   const [loading, setLoading] = useState(false);
   const [tfError, setTfError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<'chart' | 'text'>('chart');
+  const [activeChartTab, setActiveChartTab] = useState<'MACD' | 'RSI' | 'Price' | 'Volume'>('MACD');
 
   const handleSelect = async (newTf: string) => {
     if (newTf === timeframe || loading) return;
@@ -256,8 +259,7 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
     },
   };
 
-  // Smart-money zones overlay for the price chart (rebuilt when the read changes).
-  const smartMoneyPlugin = useMemo(() => makeSmartMoneyPlugin(technical.institutional), [technical.institutional]);
+
 
   // Volume chart data
   const volumeChartData = useMemo(() => {
@@ -469,11 +471,9 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
     <div className="glass-card">
       <div className="p-5">
         <div className="flex items-start justify-between flex-wrap gap-2 mb-3">
-          <h3 className="font-bold text-sm flex items-center gap-2">
-            <Activity size={20} /> Technical Analysis
-            <span className="badge badge-sm badge-outline ml-1">{activePreset.short}</span>
-            {loading && <Loader2 size={14} className="animate-spin text-primary ml-1" />}
-          </h3>
+          <div className="flex items-center min-w-[20px]">
+            {loading && <Loader2 size={14} className="animate-spin text-primary" />}
+          </div>
           <div className="flex flex-wrap items-center gap-2">
             {TIMEFRAME_GROUPS.map(group => (
               <div key={group.label} className="flex flex-col items-center gap-0.5">
@@ -504,34 +504,78 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
           </div>
         )}
 
-        {/* Institutional read: market structure, order flow & regime (retail-friendly) */}
+        {/* Market Regime Banner (Common) */}
         {technical.institutional && (
-          <div className="mb-4">
-            <InstitutionalTA data={technical.institutional} price={technical.prices?.[technical.prices.length - 1]} />
+          <div className="mb-2">
+            <MarketStateBanner regime={technical.institutional.regime} />
           </div>
         )}
 
+        <div className="bg-base-300 rounded-xl mb-4 overflow-hidden shadow-xl border border-white/[0.05]">
+          <div className="px-4 py-3 border-b border-white/[0.05] bg-gradient-to-r from-base-200/50 to-transparent flex flex-wrap justify-between items-center gap-4">
+            <div className="flex flex-col">
+              <h4 className="text-sm font-semibold text-base-content/90">
+                Smart-Money Analysis
+              </h4>
+              <div className="flex flex-wrap items-center gap-3 text-[10px] mt-1">
+                <div className="flex gap-2">
+                  <div className="flex items-center gap-1"><div className="w-2 h-2 rounded bg-emerald-500/50"></div> Demand</div>
+                  <div className="flex items-center gap-1"><div className="w-2 h-2 rounded bg-rose-500/50"></div> Supply</div>
+                  <div className="flex items-center gap-1"><div className="w-2 h-2 rounded bg-indigo-500/50"></div> FVG</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="join bg-base-200/80 p-0.5 rounded-lg border border-white/[0.05]">
+              <button 
+                className={`join-item btn btn-xs ${viewMode === 'chart' ? 'btn-active bg-primary/20 text-primary border-primary/30' : 'btn-ghost text-base-content/70'}`}
+                onClick={() => setViewMode('chart')}
+              >
+                Chart
+              </button>
+              <button 
+                className={`join-item btn btn-xs ${viewMode === 'text' ? 'btn-active bg-primary/20 text-primary border-primary/30' : 'btn-ghost text-base-content/70'}`}
+                onClick={() => setViewMode('text')}
+              >
+                Text
+              </button>
+            </div>
+          </div>
+          
+          <div className="p-2">
+            {viewMode === 'chart' ? (
+              <SmartMoneyChartOverlay technical={technical} timeframeShortLabel={activePreset.short} />
+            ) : (
+              technical.institutional && (
+                <div className="p-2">
+                  <InstitutionalTA data={technical.institutional} price={technical.prices?.[technical.prices.length - 1]} />
+                </div>
+              )
+            )}
+          </div>
+        </div>
+
         {/* Top indicators row */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-          <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03] text-center">
-            <div className="text-xs text-base-content/50 mb-1">RSI (14)</div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+          <div className="bg-base-200/40 rounded-xl py-1.5 px-2 border border-white/[0.03] text-center flex flex-col justify-center">
+            <div className="text-[11px] text-base-content/50 leading-none mb-1">RSI (14)</div>
             <RsiGauge rsi={technical.currentRSI} />
           </div>
-          <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03] text-center">
-            <div className="text-xs text-base-content/50 mb-1">Support</div>
-            <div className="text-2xl font-bold text-success tabular-nums">
+          <div className="bg-base-200/40 rounded-xl py-1.5 px-2 border border-white/[0.03] text-center flex flex-col justify-center">
+            <div className="text-[11px] text-base-content/50 leading-none mb-1">Support</div>
+            <div className="text-base font-bold text-success tabular-nums leading-none">
               ${technical.supportLevel.toFixed(2)}
             </div>
           </div>
-          <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03] text-center">
-            <div className="text-xs text-base-content/50 mb-1">Resistance</div>
-            <div className="text-2xl font-bold text-error tabular-nums">
+          <div className="bg-base-200/40 rounded-xl py-1.5 px-2 border border-white/[0.03] text-center flex flex-col justify-center">
+            <div className="text-[11px] text-base-content/50 leading-none mb-1">Resistance</div>
+            <div className="text-base font-bold text-error tabular-nums leading-none">
               ${technical.resistanceLevel.toFixed(2)}
             </div>
           </div>
-          <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03] text-center">
-            <div className="text-xs text-base-content/50 mb-1">Market Phase</div>
-            <div className="mt-1">
+          <div className="bg-base-200/40 rounded-xl py-1.5 px-2 border border-white/[0.03] text-center flex flex-col justify-center">
+            <div className="text-[11px] text-base-content/50 leading-none mb-1">Market Phase</div>
+            <div>
               <PhaseIndicator phase={va?.phase || 'neutral'} />
             </div>
           </div>
@@ -540,45 +584,45 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
         {/* Momentum Indicators Row */}
         {(macd || bb || ma || ema) && (
           <>
-            <h4 className="text-sm font-bold text-base-content/70 mb-2 flex items-center gap-2">
+            <h4 className="text-sm font-bold text-base-content/70 mb-1.5 flex items-center gap-2">
               <TrendingUp size={16} className="text-primary" />
               Momentum Indicators
               <span className="badge badge-sm badge-outline">Daily</span>
             </h4>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
               {/* MACD */}
               {macd && (
-                <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03]">
-                  <div className="text-xs text-base-content/50 mb-1">MACD (12,26,9)</div>
-                  <div className={`text-lg font-bold tabular-nums ${macd.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
+                <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
+                  <div className="text-xs text-base-content/50 mb-0.5">MACD (12,26,9)</div>
+                  <div className={`text-base font-bold tabular-nums ${macd.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
                     {macd.histogram > 0 ? '+' : ''}{macd.histogram.toFixed(2)}
                   </div>
-                  <div className="flex items-center gap-1 mt-1">
+                  <div className="flex items-center gap-1 mt-0.5">
                     <SignalBadge signal={macd.signal} />
                     {macd.crossover !== 'none' && (
                       <SignalBadge signal={macd.crossover} label={macd.crossover.replace('_', ' ')} />
                     )}
                   </div>
-                  <div className="text-xs text-base-content/40 mt-1 tabular-nums">
-                    MACD: {macd.macdLine.toFixed(2)} | Signal: {macd.signalLine.toFixed(2)}
+                  <div className="text-[10px] text-base-content/40 mt-1 tabular-nums">
+                    MACD: {macd.macdLine.toFixed(2)} | Sig: {macd.signalLine.toFixed(2)}
                   </div>
                 </div>
               )}
 
               {/* Bollinger Bands */}
               {bb && (
-                <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03]">
-                  <div className="text-xs text-base-content/50 mb-1">Bollinger Bands</div>
-                  <div className={`text-lg font-bold tabular-nums ${bb.position === 'overbought' ? 'text-error' : bb.position === 'oversold' ? 'text-success' : 'text-info'}`}>
+                <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
+                  <div className="text-xs text-base-content/50 mb-0.5">Bollinger Bands</div>
+                  <div className={`text-base font-bold tabular-nums ${bb.position === 'overbought' ? 'text-error' : bb.position === 'oversold' ? 'text-success' : 'text-info'}`}>
                     {(bb.percentB * 100).toFixed(0)}%B
                   </div>
-                  <div className="flex items-center gap-1 mt-1">
+                  <div className="flex items-center gap-1 mt-0.5">
                     <SignalBadge signal={bb.position} label={bb.position.replace('_', ' ')} />
                   </div>
-                  <div className="text-xs text-base-content/40 mt-1 tabular-nums">
+                  <div className="text-[10px] text-base-content/40 mt-1 tabular-nums">
                     ${bb.lower.toFixed(0)} — ${bb.middle.toFixed(0)} — ${bb.upper.toFixed(0)}
                   </div>
-                  <div className="text-xs text-base-content/40 tabular-nums">
+                  <div className="text-[10px] text-base-content/40 tabular-nums">
                     Width: {bb.bandwidthPct.toFixed(1)}%
                   </div>
                 </div>
@@ -586,24 +630,24 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
 
               {/* Moving Averages */}
               {ma && (
-                <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03]">
-                  <div className="text-xs text-base-content/50 mb-1">Moving Averages</div>
+                <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
+                  <div className="text-xs text-base-content/50 mb-0.5">Moving Averages</div>
                   {ma.sma50 && (
-                    <div className="flex items-center justify-between text-sm mb-1">
+                    <div className="flex items-center justify-between text-xs mb-0.5">
                       <span className="text-base-content/60">SMA 50:</span>
                       <span className="font-bold tabular-nums">${ma.sma50.toFixed(0)}</span>
                       {ma.priceVsSma50 && <SignalBadge signal={ma.priceVsSma50} />}
                     </div>
                   )}
                   {ma.sma200 && (
-                    <div className="flex items-center justify-between text-sm mb-1">
+                    <div className="flex items-center justify-between text-xs mb-0.5">
                       <span className="text-base-content/60">SMA 200:</span>
                       <span className="font-bold tabular-nums">${ma.sma200.toFixed(0)}</span>
                       {ma.priceVsSma200 && <SignalBadge signal={ma.priceVsSma200} />}
                     </div>
                   )}
                   {ma.goldenDeathCross && (
-                    <div className="mt-1">
+                    <div className="mt-0.5">
                       <SignalBadge signal={ma.goldenDeathCross} label={ma.goldenDeathCross.replace('_', ' ')} />
                     </div>
                   )}
@@ -612,87 +656,135 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
 
               {/* EMA Crossover */}
               {ema && (
-                <div className="bg-base-300 rounded-lg p-3">
-                  <div className="text-xs text-base-content/50 mb-1">EMA Crossover</div>
-                  <div className={`text-lg font-bold ${ema.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
-                    {ema.signal === 'bullish' ? <TrendingUp size={18} className="inline mr-1" /> : <TrendingDown size={18} className="inline mr-1" />}
+                <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
+                  <div className="text-xs text-base-content/50 mb-0.5">EMA Crossover</div>
+                  <div className={`text-base font-bold ${ema.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
+                    {ema.signal === 'bullish' ? <TrendingUp size={16} className="inline mr-1" /> : <TrendingDown size={16} className="inline mr-1" />}
                     {ema.signal.charAt(0).toUpperCase() + ema.signal.slice(1)}
                   </div>
-                  <div className="text-xs text-base-content/40 mt-1">
+                  <div className="text-[10px] text-base-content/40 mt-1">
                     EMA 12: ${ema.ema12.toFixed(2)}
                   </div>
-                  <div className="text-xs text-base-content/40">
+                  <div className="text-[10px] text-base-content/40">
                     EMA 26: ${ema.ema26.toFixed(2)}
                   </div>
                 </div>
               )}
             </div>
 
-            {/* MACD Chart */}
-            {macdChartData && (
-              <div className="bg-base-300 rounded-xl p-4 mb-3">
-                <h4 className="text-sm font-semibold text-base-content/70 mb-2">
-                  MACD (12, 26, 9)
-                  {macd && (
-                    <span className={`ml-2 text-xs ${macd.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
-                      ({macd.signal}{macd.crossover !== 'none' ? ` — ${macd.crossover.replace('_', ' ')}` : ''})
-                    </span>
-                  )}
-                </h4>
-                <div className="h-44">
-                  <Bar data={macdChartData as any} options={macdChartOptions} />
-                </div>
-              </div>
-            )}
           </>
         )}
 
-        {/* Price Chart */}
-        <div className="bg-base-300 rounded-xl p-4 mb-3">
-          <h4 className="text-sm font-semibold text-base-content/70 mb-2">
-            Price Action with Support &amp; Resistance
-          </h4>
-          <div className="h-64">
-            {priceChartData && <Line data={priceChartData} options={priceChartOptions} plugins={[smartMoneyPlugin]} />}
+        {/* Horizontal Tabs for Charts */}
+        <div className="bg-base-300 rounded-xl mb-4 overflow-hidden shadow-xl border border-white/[0.05]">
+          <div className="bg-base-200/30 p-2 border-b border-white/[0.05]">
+            <div className="join bg-base-200/80 p-0.5 rounded-lg border border-white/[0.05] w-full flex">
+              {['MACD', 'RSI', 'Price', 'Volume'].map((tab) => (
+                <button
+                  key={tab}
+                  className={`join-item btn btn-xs flex-1 ${activeChartTab === tab ? 'btn-active bg-primary/20 text-primary border-primary/30' : 'btn-ghost text-base-content/70'}`}
+                  onClick={() => setActiveChartTab(tab as any)}
+                >
+                  {tab}
+                </button>
+              ))}
+            </div>
           </div>
-          {technical.institutional && <SmartMoneyChartLegend />}
-        </div>
+          <div className="p-3">
 
-        {/* Volume Chart */}
-        <div className="bg-base-300 rounded-xl p-4 mb-3">
-          <h4 className="text-sm font-semibold text-base-content/70 mb-2">
-            Volume
-            {va && (
-              <span
-                className={`ml-2 text-xs ${va.volumeTrend === 'increasing' ? 'text-success' : va.volumeTrend === 'decreasing' ? 'text-error' : 'text-warning'}`}
-              >
-                ({va.volumeTrend} {va.volumeChangePct > 0 ? '+' : ''}
-                {va.volumeChangePct?.toFixed(1)}%)
-              </span>
-            )}
-          </h4>
-          <div className="h-40">
-            {volumeChartData && <Bar data={volumeChartData} options={volumeChartOptions} />}
-          </div>
-        </div>
+          {activeChartTab === 'MACD' && (
+            <div>
+              {macdChartData ? (
+                <>
+                  <h4 className="text-sm font-semibold text-base-content/70 mb-2">
+                    MACD (12, 26, 9)
+                    {macd && (
+                      <span className={`ml-2 text-xs ${macd.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
+                        ({macd.signal}{macd.crossover !== 'none' ? ` — ${macd.crossover.replace('_', ' ')}` : ''})
+                      </span>
+                    )}
+                  </h4>
+                  <div className="h-44">
+                    <Bar data={macdChartData as any} options={macdChartOptions} />
+                  </div>
+                </>
+              ) : (
+                <div className="text-center text-sm text-base-content/50 py-10">No MACD Data Available</div>
+              )}
+            </div>
+          )}
 
-        {/* RSI Chart */}
-        <div className="bg-base-300 rounded-xl p-4 mb-3">
-          <h4 className="text-sm font-semibold text-base-content/70 mb-2">RSI (14-Period)</h4>
-          <div className="h-40">
-            {rsiChartData && <Line data={rsiChartData} options={rsiChartOptions} />}
+          {activeChartTab === 'RSI' && (
+            <div>
+              {rsiChartData ? (
+                <>
+                  <h4 className="text-sm font-semibold text-base-content/70 mb-2">RSI (14-Period)</h4>
+                  <div className="h-40">
+                    <Line data={rsiChartData} options={rsiChartOptions} />
+                  </div>
+                </>
+              ) : (
+                <div className="text-center text-sm text-base-content/50 py-10">No RSI Data Available</div>
+              )}
+            </div>
+          )}
+
+          {activeChartTab === 'Price' && (
+            <div>
+              {priceChartData ? (
+                <>
+                  <h4 className="text-sm font-semibold text-base-content/70 mb-2">
+                    Price Action (Simplified)
+                  </h4>
+                  <div className="h-64">
+                    <Line data={priceChartData} options={priceChartOptions} />
+                  </div>
+                </>
+              ) : (
+                <div className="text-center text-sm text-base-content/50 py-10">No Price Data Available</div>
+              )}
+            </div>
+          )}
+
+          {activeChartTab === 'Volume' && (
+            <div>
+              {volumeChartData ? (
+                <>
+                  <div className="flex justify-between items-center mb-2">
+                    <h4 className="text-sm font-semibold text-base-content/70">
+                      Volume
+                    </h4>
+                    {va && (
+                      <div className={`text-xs font-semibold ${
+                        va.volumeTrend === 'increasing' ? 'text-success' 
+                        : va.volumeTrend === 'decreasing' ? 'text-error' 
+                        : 'text-warning'
+                      }`}>
+                        Volume {va.volumeTrend?.charAt(0).toUpperCase()}{va.volumeTrend?.slice(1)} {Math.abs(va.volumeChangePct || 0).toFixed(1)}%
+                      </div>
+                    )}
+                  </div>
+                  <div className="h-40">
+                    <Bar data={volumeChartData} options={volumeChartOptions} />
+                  </div>
+                </>
+              ) : (
+                <div className="text-center text-sm text-base-content/50 py-10">No Volume Data Available</div>
+              )}
+            </div>
+          )}
           </div>
         </div>
 
         {/* Analysis Summary */}
-        <div className="bg-base-300 rounded-xl p-4 border border-primary/20">
-          <h4 className="text-sm font-bold text-primary mb-2">📊 Analysis Summary</h4>
-          <div className="text-sm text-base-content/70">
-            <p className="mb-2">
+        <div className="bg-base-300 rounded-xl px-3 py-2 border border-primary/20">
+          <h4 className="text-xs font-bold text-primary mb-1">📊 Analysis Summary</h4>
+          <div className="text-xs text-base-content/70 space-y-0.5">
+            <p>
               <strong>RSI Signal:</strong> {technical.rsiSignal}
             </p>
             {macd && (
-              <p className="mb-2">
+              <p>
                 <strong>MACD:</strong>{' '}
                 <span className={macd.signal === 'bullish' ? 'text-success' : 'text-error'}>
                   {macd.signal.charAt(0).toUpperCase() + macd.signal.slice(1)}
@@ -706,7 +798,7 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
               </p>
             )}
             {bb && (
-              <p className="mb-2">
+              <p>
                 <strong>Bollinger Bands:</strong>{' '}
                 Price is{' '}
                 <span className={bb.position === 'overbought' ? 'text-error' : bb.position === 'oversold' ? 'text-success' : 'text-info'}>
@@ -716,7 +808,7 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
               </p>
             )}
             {ma && ma.goldenDeathCross && (
-              <p className="mb-2">
+              <p>
                 <strong>SMA Cross:</strong>{' '}
                 <span className={ma.goldenDeathCross === 'golden_cross' ? 'text-success' : 'text-error'}>
                   {ma.goldenDeathCross.replace('_', ' ').replace(/\b\w/g, (c) => c.toUpperCase())}
@@ -726,7 +818,7 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
             )}
             {va && (
               <>
-                <p className="mb-2">
+                <p>
                   <strong>Volume Trend:</strong>{' '}
                   {va.volumeTrend?.charAt(0).toUpperCase()}
                   {va.volumeTrend?.slice(1)} ({va.volumeChangePct > 0 ? '+' : ''}
@@ -736,10 +828,10 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
                   {va.priceTrend?.slice(1)} ({va.priceChangePct > 0 ? '+' : ''}
                   {va.priceChangePct?.toFixed(1)}%)
                 </p>
-                <div className="alert mt-2 p-3">
+                <div className="alert mt-1 p-2 bg-base-200/50 border-white/[0.05]">
                   <div>
-                    <span className="font-bold">🏦 Institutional Flow:</span>
-                    <p className="mt-1">{va.bigMoneyAnalysis}</p>
+                    <span className="font-bold text-[11px]">🏦 Institutional Flow:</span>
+                    <p className="mt-0.5 leading-snug text-[11px]">{va.bigMoneyAnalysis}</p>
                   </div>
                 </div>
               </>

@@ -19,7 +19,7 @@ const biasTone = (b: string) =>
       : 'text-warning border-warning/30 bg-warning/10';
 
 // ── 1. Market State — the plain-English, actionable capstone ──
-function MarketStateBanner({ regime }: { regime: TARegime }) {
+export function MarketStateBanner({ regime }: { regime: TARegime }) {
   const Icon = regime.bias === 'bullish' ? TrendingUp : regime.bias === 'bearish' ? TrendingDown : Minus;
   const modeLabel = regime.mode === 'mean_reversion' ? 'Mean-Reversion'
     : regime.mode === 'trend' ? 'Trend-Following' : 'Range / Balanced';
@@ -282,7 +282,6 @@ export function InstitutionalTA({ data, price }: { data: InstTA; price?: number 
   const spot = price ?? data.price;
   return (
     <div className="space-y-3">
-      <MarketStateBanner regime={data.regime} />
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
         {data.volume_profile && <VolumeProfileView vp={data.volume_profile} spot={spot} />}
         <SmartMoneyZones data={data} spot={spot} />

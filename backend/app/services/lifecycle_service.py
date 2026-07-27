@@ -401,6 +401,74 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
                           "carry": round(s_carry*100)}}
 
 
+def algorithmic_exit(pm: dict, cvar95: Optional[float], capital: float, max_loss,
+                     max_profit, kelly, dte_days: int, captured_pct: Optional[float],
+                     unrealized_pnl: Optional[float], sofr_pct: float = 5.0) -> dict:
+    """The *lifecycle* algorithmic recommendation for a PLACED trade — reliable and
+    fully transparent (no LLM). Reuses the 5-lens base-quality score (how good the
+    position still is to HOLD) and layers the two things that only matter once a
+    trade is on: how much profit is already banked, and how close expiry's
+    gamma/pin risk is. Buildup is auditable:
+
+        hold_score = base_quality + Σ(lifecycle adjustments)
+        STRONG_HOLD ≥ 70 · HOLD ≥ 45 · CONSIDER_CLOSE ≥ 25 · CLOSE < 25
+        (+ hard overrides: ≥85% captured, near max loss, ≤2 DTE)
+    """
+    base = algorithmic_quant(pm, cvar95, capital, max_loss, max_profit, kelly, dte_days, sofr_pct)
+    overlay = lifecycle_overlay(base["score"], captured_pct, dte_days, unrealized_pnl, max_loss)
+    return {
+        "signal": overlay["signal"], "score": overlay["score"], "base_quality": base["score"],
+        "subscores": base["subscores"], "adjustments": overlay["adjustments"],
+        "reasons": base["reasons"], "overrides": overlay["overrides"],
+    }
+
+
+def lifecycle_overlay(base_score: float, captured_pct: Optional[float], dte_days: Optional[int],
+                      unrealized_pnl: Optional[float], max_loss) -> dict:
+    """Turn ANY 0-100 quality score for a PLACED trade into the 4-level exit signal.
+
+    Layers the two things that only matter once a trade is on — profit already
+    banked (the take-profit discipline) and expiry's gamma/pin risk — then applies
+    hard overrides. Shared by the light 5-lens engine AND the full desk score, so
+    the exit mapping is identical no matter which base quality drives it.
+
+        hold_score = base_score + Σ(adjustments)
+        STRONG_HOLD ≥ 70 · HOLD ≥ 45 · CONSIDER_CLOSE ≥ 25 · CLOSE
+        overrides: ≥85% captured, near max loss, ≤2 DTE
+    """
+    adjustments: list[dict] = []
+    adj = 0.0
+    if captured_pct is not None:
+        cp = (-50 if captured_pct >= 85 else -35 if captured_pct >= 60
+              else -22 if captured_pct >= 40 else -10 if captured_pct >= 25 else 0)
+        if cp:
+            adjustments.append({"name": "Profit captured", "pts": cp,
+                                "note": f"{captured_pct:.0f}% of max profit banked — less left to earn"})
+            adj += cp
+    if dte_days is not None:
+        td = -25 if dte_days <= 2 else -10 if dte_days <= 7 else -3 if dte_days <= 21 else 4
+        adjustments.append({"name": "Time / gamma", "pts": td,
+                            "note": f"{dte_days} DTE" + (" — gamma/pin risk elevated" if dte_days <= 7 else " — runway to keep collecting" if td > 0 else "")})
+        adj += td
+
+    hold_score = int(max(0, min(100, round(base_score + adj))))
+    signal = ("STRONG_HOLD" if hold_score >= 70 else "HOLD" if hold_score >= 45
+              else "CONSIDER_CLOSE" if hold_score >= 25 else "CLOSE")
+
+    overrides: list[str] = []
+    if captured_pct is not None and captured_pct >= 85:
+        signal = "CLOSE"
+        overrides.append("≥85% of max profit captured — bank it")
+    if max_loss is not None and max_loss < 0 and unrealized_pnl is not None and unrealized_pnl <= max_loss * 0.8:
+        signal = "CLOSE"
+        overrides.append("near max loss — cut it")
+    if dte_days is not None and dte_days <= 2 and signal in ("STRONG_HOLD", "HOLD"):
+        signal = "CONSIDER_CLOSE"
+        overrides.append("≤2 DTE — gamma/pin/assignment risk")
+
+    return {"signal": signal, "score": hold_score, "adjustments": adjustments, "overrides": overrides}
+
+
 def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_profit,
                              avg_iv, dte_days, stock_shares=0.0, r=0.05, sofr_pct=5.0,
                              realized_vol=None) -> dict:

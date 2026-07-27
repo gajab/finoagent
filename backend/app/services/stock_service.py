@@ -167,7 +167,7 @@ def analyze_volume_price(prices, volumes):
 
     price_trend = "rising" if recent_prices[-1] > recent_prices[0] else "falling"
     price_change_pct = ((recent_prices[-1] - recent_prices[0]) / (recent_prices[0] + 1e-10)) * 100
-    vol_trend = "increasing" if vol_change > 10 else ("decreasing" if vol_change < -10 else "stable")
+    vol_trend = "increasing" if vol_change > 5 else ("decreasing" if vol_change < -5 else "stable")
 
     if price_trend == "rising" and vol_trend == "increasing":
         phase = "accumulation"

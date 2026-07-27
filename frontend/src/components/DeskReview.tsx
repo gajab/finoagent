@@ -129,7 +129,7 @@ function QpBoundary({ qp }: { qp: NonNullable<DeskRankedTrade['qp']> }) {
       </div>
       <div className="flex flex-wrap justify-between gap-x-2 text-[9px] mt-1">
         <span className="text-info">implied Q ±{imp}%</span>
-        <span className="text-warning">physical P ±{phys}%</span>
+        <span className="text-warning">physical P ±{phys}%{qp.gap_aware ? ' · gap-aware (ATR)' : ''}</span>
         <span className={exposed ? 'text-error font-semibold' : 'text-success'}>
           short {dist}% {exposed ? '· inside physical → exposed' : '· clears both'}
         </span>
@@ -229,6 +229,25 @@ function TradeExplorer({ t, ticker, params }: { t: DeskRankedTrade; ticker: stri
 
         {/* Q-vs-P boundary — the implied-vs-physical read the base score is now weighted on */}
         {t.qp && <QpBoundary qp={t.qp} />}
+
+        {/* Drift-adjusted Win % — P-measure DRIFT overlay. The headline Win% stays the standard
+            risk-neutral PoP; this shows how the trend drift μ would move it. Display only. */}
+        {t.qp?.keep_drift_pct != null && t.qp?.keep_standard_pct != null && (() => {
+          const dd = (t.qp!.keep_drift_pct! - t.qp!.keep_standard_pct!);
+          const mu = t.qp!.drift_mu_pct;
+          return (
+            <div className="mb-2.5">
+              <div className={GROUP_LABEL}>Drift-adjusted Win % — trend (P-measure)</div>
+              <div className="flex flex-wrap items-center gap-x-2 text-[11px]">
+                <span className="text-base-content/70">{winPct(t.qp!.keep_standard_pct)} <span className="opacity-50">risk-neutral</span></span>
+                <span className="opacity-40">→</span>
+                <span className={`font-semibold ${dd >= 0 ? 'text-success' : 'text-error'}`}>{winPct(t.qp!.keep_drift_pct)} drift-adjusted</span>
+                {mu != null && <span className="text-base-content/50">· EMA drift {mu > 0 ? '+' : ''}{mu}%/yr {dd >= 0 ? 'tailwind' : dd < 0 ? 'headwind' : ''}</span>}
+              </div>
+              <p className="text-[9px] text-base-content/40 mt-0.5">Headline Win% stays standard PoP; this overlay folds in the trend drift (velocity), not the score.</p>
+            </div>
+          );
+        })()}
 
         {/* 1) Base quality — bars, then the base score at the end */}
         {sub && (

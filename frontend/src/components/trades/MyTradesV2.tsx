@@ -41,11 +41,12 @@ import UpdatePositionModal from './UpdatePositionModal';
 import TransactionHistoryPanel from './TransactionHistoryPanel';
 import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
-import LifecyclePanel from './LifecyclePanel';
+import InstitutionalDesk from './InstitutionalDesk';
+import QuantExitCard from './QuantExitCard';
 import CollapsibleSection from './CollapsibleSection';
 import { DeskDebate } from '../DeskDebate';
 import type { DeskFocusTrade } from '../../api';
-import { updateTradeTransaction, deleteTradeTransaction } from '../../api';
+import { updateTradeTransaction, deleteTradeTransaction, updateTradePurpose } from '../../api';
 
 // ── Leg-action visuals (deterministic quant advisor) ─────────────────────────
 
@@ -65,6 +66,14 @@ function LegActionBadge({ advice }: { advice?: LegAdvice }) {
     </span>
   );
 }
+
+// Whole-trade exit call — the 4-level vocabulary the Quant advises on.
+const EXIT_STYLE: Record<string, { label: string; cls: string }> = {
+  STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success' },
+  HOLD:           { label: 'HOLD',           cls: 'badge-success badge-outline' },
+  CONSIDER_CLOSE: { label: 'CONSIDER CLOSE', cls: 'badge-warning' },
+  CLOSE:          { label: 'CLOSE',          cls: 'badge-error' },
+};
 
 /** Neutral intensity by magnitude — the Action badge carries the good/bad verdict. */
 function pItmColor(p: number | null): string {
@@ -133,6 +142,28 @@ const GROUP_META: Record<TradeGroup, {
     desc: 'Pair trades, custom strategies',
   },
 };
+
+// ── Purpose (what the trade is FOR — the new top-level grouping) ──────────────
+
+type TradePurpose = 'income' | 'hedge' | 'trade' | 'managed_floor' | 'managed_buffer' | 'dual_directional' | 'other';
+
+const PURPOSE_ORDER: TradePurpose[] = ['income', 'hedge', 'managed_floor', 'managed_buffer', 'dual_directional', 'trade', 'other'];
+
+const PURPOSE_META: Record<TradePurpose, { label: string; color: string; icon: React.ReactNode; desc: string }> = {
+  income:           { label: 'Income',            color: 'success',      icon: <Percent className="w-4 h-4" />,      desc: 'Premium-selling / carry — covered calls, CSPs, credit spreads' },
+  hedge:            { label: 'Hedge',             color: 'info',         icon: <Shield className="w-4 h-4" />,       desc: 'Downside protection / risk offset' },
+  managed_floor:    { label: 'Managed Floor',     color: 'primary',      icon: <TrendingUp className="w-4 h-4" />,   desc: 'Floored downside with participation' },
+  managed_buffer:   { label: 'Managed Buffer',    color: 'secondary',    icon: <Layers className="w-4 h-4" />,       desc: 'Buffered-outcome structures' },
+  dual_directional: { label: 'Dual Directional',  color: 'warning',      icon: <Activity className="w-4 h-4" />,     desc: 'Profits either direction within a band' },
+  trade:            { label: 'Trade',             color: 'error',        icon: <Zap className="w-4 h-4" />,          desc: 'Directional / tactical positions' },
+  other:            { label: 'Other',             color: 'base-content', icon: <List className="w-4 h-4" />,         desc: 'Uncategorized' },
+};
+
+/** The trade's purpose (from parameters.purpose); legacy trades default to Income. */
+function tradePurpose(trade: SavedStrategyItem): TradePurpose {
+  const p = String(trade.parameters?.purpose || '').toLowerCase();
+  return (p in PURPOSE_META) ? (p as TradePurpose) : 'income';
+}
 
 /** Infer the strategy_type to store when legs change. */
 function inferStrategyType(
@@ -268,11 +299,11 @@ function Chip({ label, value, color = '' }: { label: string; value: string; colo
 
 // ── Group summary bar ────────────────────────────────────────────────────────
 
-function GroupSummary({ trades, pnlMap, group }: {
+function GroupSummary({ trades, pnlMap }: {
   trades: SavedStrategyItem[];
   pnlMap: Record<number, LivePnlResponse>;
-  group: TradeGroup;
 }) {
+  const anyFutures = trades.some(t => t.strategy_type === 'futures');
   const totalCapital = trades.reduce((s, t) => {
     const p = pnlMap[t.id];
     if (t.strategy_type === 'futures') {
@@ -282,7 +313,7 @@ function GroupSummary({ trades, pnlMap, group }: {
     return s + Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));
   }, 0);
 
-  const totalNotional = group === 'futures' ? trades.reduce((s, t) => {
+  const totalNotional = anyFutures ? trades.reduce((s, t) => {
     const p = pnlMap[t.id];
     const contracts = t.parameters?.contracts ?? t.parameters?.shares ?? 1;
     const multiplier = t.parameters?.multiplier ?? 1.0;
@@ -307,9 +338,9 @@ function GroupSummary({ trades, pnlMap, group }: {
       <span>{trades.length} position{trades.length !== 1 ? 's' : ''}</span>
       <span className="opacity-30">·</span>
       <span>
-        {fmtMoney(totalCapital)} {group === 'futures' ? 'margin deployed' : 'deployed'}
+        {fmtMoney(totalCapital)} {anyFutures ? 'margin deployed' : 'deployed'}
       </span>
-      {group === 'futures' && totalNotional > 0 && (
+      {anyFutures && totalNotional > 0 && (
         <>
           <span className="opacity-30">·</span>
           <span>{fmtMoney(totalNotional)} notional exposure</span>
@@ -323,7 +354,7 @@ function GroupSummary({ trades, pnlMap, group }: {
           </span>
         </>
       )}
-      {avgAnn != null && group === 'income_options' && (
+      {avgAnn != null && (
         <>
           <span className="opacity-30">·</span>
           <span className={`${avgAnn >= 0 ? 'text-success' : 'text-error'} font-medium`}>
@@ -646,15 +677,11 @@ function TradeCard({
             {dte != null && dte <= 7 && (
               <span className="badge badge-xs badge-warning">⚠ {dte}d left</span>
             )}
-            {/* BOX spreads + long/short stocks: no recommendation badge — data speaks for itself */}
-            {pnl?.analysis?.hold_vs_close &&
-              trade.strategy_type !== 'box_spread' &&
-              !trade.strategy_type?.startsWith('stock_') && (
-              <span className={`badge badge-xs ${
-                pnl.analysis.hold_vs_close.includes('HOLD') ? 'badge-success' :
-                pnl.analysis.hold_vs_close === 'CLOSE' ? 'badge-warning' : 'badge-error'
-              }`}>
-                {pnl.analysis.hold_vs_close.replace('_', ' ')}
+            {/* Whole-trade exit call (Strong Hold / Hold / Consider Close / Close) */}
+            {pnl?.analysis?.exit_signal && trade.strategy_type !== 'box_spread' && (
+              <span className={`badge badge-xs font-semibold ${EXIT_STYLE[pnl.analysis.exit_signal]?.cls || 'badge-ghost'}`}
+                title={pnl.analysis.exit_reasons?.[0]}>
+                {EXIT_STYLE[pnl.analysis.exit_signal]?.label || pnl.analysis.exit_signal}
               </span>
             )}
           </div>
@@ -742,6 +769,22 @@ function TradeCard({
                 {pnlLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                 Refresh P&L
               </button>
+            </div>
+
+            {/* Strategy purpose — drives grouping + which lifecycle view to show */}
+            <div className="flex items-center gap-1" onClick={e => e.stopPropagation()} title="What is this trade for? Drives grouping.">
+              <span className="text-[9px] uppercase tracking-wider text-base-content/30">Purpose</span>
+              <select
+                className="select select-ghost select-xs h-7 min-h-0 text-[10px] border border-white/[0.06]"
+                value={tradePurpose(trade)}
+                onChange={async e => {
+                  try { await updateTradePurpose(trade.id, e.target.value as any); onPositionChanged(trade.id); } catch { /* noop */ }
+                }}
+              >
+                {(['income', 'hedge', 'managed_floor', 'managed_buffer', 'dual_directional', 'trade', 'other'] as const).map(p => (
+                  <option key={p} value={p}>{PURPOSE_META[p].label}</option>
+                ))}
+              </select>
             </div>
 
             <button
@@ -1303,24 +1346,32 @@ function TradeCard({
           )}
 
           {/* Quant advisor — overall recommendation folding per-leg + structure */}
-          {pnl?.analysis?.recommendation && (
-            <div className={`rounded-lg p-3 border ${
-              pnl.analysis.hold_vs_close.includes('HOLD') ? 'bg-success/5 border-success/20' :
-              pnl.analysis.hold_vs_close === 'CLOSE' ? 'bg-warning/5 border-warning/20' :
-              'bg-error/5 border-error/20'
-            }`}>
-              <div className="flex items-center gap-2 mb-1.5">
-                <span className={`badge badge-sm font-semibold ${
-                  pnl.analysis.hold_vs_close.includes('HOLD') ? 'badge-success' :
-                  pnl.analysis.hold_vs_close === 'CLOSE' ? 'badge-warning' : 'badge-error'
-                }`}>
-                  {pnl.analysis.hold_vs_close.replace('_', ' ')}
+          {pnl?.analysis?.recommendation && (() => {
+            const exitSig = pnl.analysis.exit_signal || 'HOLD';
+            const tone = exitSig === 'CLOSE' ? 'error' : exitSig === 'CONSIDER_CLOSE' ? 'warning' : 'success';
+            return (
+            <div className={`rounded-lg p-3 border bg-${tone}/5 border-${tone}/20`}>
+              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                <span className={`badge badge-sm font-semibold ${EXIT_STYLE[exitSig]?.cls || 'badge-ghost'}`}>
+                  {EXIT_STYLE[exitSig]?.label || exitSig}
                 </span>
-                <span className="text-[9px] uppercase tracking-wider text-base-content/40">Quant Advisor</span>
+                <span className="text-[9px] uppercase tracking-wider text-base-content/40">Deterministic rules · whole-trade exit call</span>
+                {pnl.analysis.captured_pct != null && (
+                  <span className="text-[9px] text-base-content/40">{pnl.analysis.captured_pct.toFixed(0)}% of max profit captured</span>
+                )}
                 {pnl.analysis.pop_method === 'rnd' && (
                   <span className="text-[8px] uppercase tracking-wider text-primary/60" title="Probabilities from the market-implied risk-neutral density (SVI/RND)">RND</span>
                 )}
               </div>
+              {pnl.analysis.exit_reasons && pnl.analysis.exit_reasons.length > 0 && (
+                <ul className="space-y-0.5 mb-2">
+                  {pnl.analysis.exit_reasons.map((r, i) => (
+                    <li key={i} className={`text-[10px] flex gap-1.5 ${i === 0 ? `text-${tone} font-medium` : 'text-base-content/60'}`}>
+                      <span className="opacity-40">•</span><span>{r}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
               {pnl.analysis.recommendation.outcome && (
                 <div className="text-[10px] text-base-content/50 mb-1.5">{pnl.analysis.recommendation.outcome}</div>
               )}
@@ -1342,6 +1393,17 @@ function TradeCard({
                 </div>
               )}
             </div>
+            );
+          })()}
+
+          {/* Tier 2 — QUANT ALGORITHMIC exit (scored, deterministic, auditable) */}
+          {pnl?.analysis?.quant_exit && (
+            <QuantExitCard q={pnl.analysis.quant_exit} trade={trade} pnl={pnl} deskFocus={deskFocusForTrade(trade, pnl)} />
+          )}
+
+          {/* Tier 3 — Institutional Desk (LLM quant PM manages the trade) */}
+          {pnl?.analysis && (
+            <InstitutionalDesk trade={trade} pnl={pnl} />
           )}
 
           {/* Whole-trade max gain / max loss — shown for EVERY trade type */}
@@ -1376,39 +1438,33 @@ function TradeCard({
             </CollapsibleSection>
           )}
 
-          {/* Continuous Lifecycle Management — Trader / PM metrics + agents */}
-          {pnl?.lifecycle && (
-            <div className="space-y-1.5">
-              <div className="text-[9px] uppercase tracking-wider text-base-content/40 font-semibold flex items-center gap-1.5">
-                <Activity className="w-3 h-3" /> Continuous Lifecycle Management
-              </div>
-              <LifecyclePanel trade={trade} pnl={pnl} />
-            </div>
-          )}
-
-          {/* Desk Debate — Quant → Risk → Rebuttal → PM multi-agent debate on this trade */}
+          {/* Continuous Lifecycle Management — Desk Debate (Explorer) */}
           {(() => {
             const deskFocus = deskFocusForTrade(trade, pnl);
             if (!deskFocus) return null;
             return (
-              <CollapsibleSection
-                title="Desk Debate" accent="secondary"
-                icon={<Gauge className="w-3 h-3" />}
-                subtitle="Quant → Risk → Rebuttal → PM"
-              >
-                <DeskDebate
-                  ticker={trade.ticker}
-                  params={{
-                    quote_source: quoteSource,
-                    target_dte: dte ?? undefined,
-                    structures: [deskFocus.structure],
-                    min_prob: 0,
-                    min_income: 0,
-                  }}
-                  focus={deskFocus}
-                  label="Run the desk debate on this trade"
-                />
-              </CollapsibleSection>
+              <div className="space-y-1.5 pt-2">
+                <div className="text-[9px] uppercase tracking-wider text-base-content/40 font-semibold flex items-center gap-1.5 mb-2">
+                  <Activity className="w-3 h-3" /> Continuous Lifecycle Management
+                </div>
+                <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4 hover:border-secondary/30 transition-colors">
+                  <DeskDebate
+                    ticker={trade.ticker}
+                    params={{
+                      quote_source: quoteSource,
+                      target_dte: dte ?? undefined,
+                      structures: [deskFocus.structure],
+                      min_prob: 0,
+                      min_income: 0,
+                    }}
+                    focus={deskFocus}
+                    label="Review hold or exit"
+                  />
+                  <p className="text-[11px] text-base-content/40 mt-2">
+                    Run the institutional desk (Quant → Risk → Rebuttal → PM) to evaluate whether to hold, adjust, or exit this existing position.
+                  </p>
+                </div>
+              </div>
             );
           })()}
 
@@ -2020,13 +2076,13 @@ interface SharedCardProps {
   onDeleteTrade: (id: number) => void;
 }
 
-function GroupSection({ group, trades, pnlMap, ...props }: {
-  group: TradeGroup;
+function GroupSection({ purpose, trades, pnlMap, ...props }: {
+  purpose: TradePurpose;
   trades: SavedStrategyItem[];
   pnlMap: Record<number, LivePnlResponse>;
 } & SharedCardProps) {
   const [collapsed, setCollapsed] = useState(false);
-  const meta = GROUP_META[group];
+  const meta = PURPOSE_META[purpose];
   if (trades.length === 0) return null;
 
   return (
@@ -2053,13 +2109,13 @@ function GroupSection({ group, trades, pnlMap, ...props }: {
 
       {!collapsed && (
         <div className={`border-x border-b border-${meta.color}/10 rounded-b-2xl overflow-hidden`}>
-          <GroupSummary trades={trades} pnlMap={pnlMap} group={group} />
+          <GroupSummary trades={trades} pnlMap={pnlMap} />
           <div className="px-3 pb-3 space-y-2">
             {trades.map(trade => (
               <TradeCard
                 key={trade.id}
                 trade={trade}
-                group={group}
+                group={classifyTrade(trade)}
                 pnl={pnlMap[trade.id]}
                 {...props}
                 isExpanded={props.expandedIds.has(trade.id)}
@@ -2273,17 +2329,12 @@ export default function MyTradesV2() {
   };
 
   // Group trades
-  const groups: Record<TradeGroup, SavedStrategyItem[]> = {
-    income_options: [],
-    long_stocks: [],
-    short_stocks: [],
-    covered_calls: [],
-    combo: [],
-    futures: [],
-    multi_leg: [],
-    other: [],
+  // Group by PURPOSE (what the trade is for), not structure type.
+  const groups: Record<TradePurpose, SavedStrategyItem[]> = {
+    income: [], hedge: [], managed_floor: [], managed_buffer: [],
+    dual_directional: [], trade: [], other: [],
   };
-  trades.forEach(t => { groups[classifyTrade(t)].push(t); });
+  trades.forEach(t => { groups[tradePurpose(t)].push(t); });
 
   const totalCapital = trades.reduce((s, t) => {
     const p = pnlMap[t.id];
@@ -2296,7 +2347,7 @@ export default function MyTradesV2() {
   const totalPnl = Object.values(pnlMap).reduce((s, p) => s + p.unrealized_pnl, 0);
   const hasPnl = Object.keys(pnlMap).length > 0;
 
-  const groupOrder: TradeGroup[] = ['income_options', 'covered_calls', 'combo', 'long_stocks', 'short_stocks', 'futures', 'multi_leg', 'other'];
+  const groupOrder: TradePurpose[] = PURPOSE_ORDER;
 
   const sharedProps = {
     expandedIds,
@@ -2472,7 +2523,7 @@ export default function MyTradesV2() {
           {groupOrder.map(g => (
             <GroupSection
               key={g}
-              group={g}
+              purpose={g}
               trades={groups[g]}
               pnlMap={pnlMap}
               {...sharedProps}

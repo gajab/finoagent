@@ -1175,6 +1175,21 @@ export interface TradeAnalysis {
   hold_vs_close_reasons: string[];
   dte_remaining: number;
   recommendation?: TradeRecommendation;
+  exit_signal?: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  exit_reasons?: string[];
+  captured_pct?: number | null;
+  quant_exit?: QuantExit | null;
+  exit_scope?: 'whole_trade' | 'options_overlay';   // options_overlay = manage the options, stock held separately
+}
+
+export interface QuantExit {
+  signal: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  score: number;              // 0-100 hold quality
+  base_quality: number;       // 0-100 before lifecycle adjustments
+  subscores: { edge: number; pop: number; sortino: number; tail: number; carry: number };
+  adjustments: { name: string; pts: number; note: string }[];
+  reasons: string[];
+  overrides: string[];
 }
 
 export interface LivePnlResponse {
@@ -1264,6 +1279,53 @@ export async function runLifecycleAgent(
   return apiFetch<LifecycleAgentResult>(`/api/saved-strategies/${id}/lifecycle-agent`, {
     method: 'POST',
     body: JSON.stringify({ role, pnl_snapshot: pnlSnapshot, portfolio_risk: portfolioRisk ?? null }),
+  });
+}
+
+export interface DeskFactor { label: string; points: number; }
+export interface DeskScoreResult {
+  matched: boolean;
+  error?: string;
+  desk_score?: number;
+  base_quality?: number;
+  subscores?: { edge: number; pop: number; sortino: number; tail: number; carry: number };
+  grade_adjustments?: DeskFactor[];   // option math (VRP/Moneyness/Skew/Liquidity/Beta/Expectation)
+  ta_factors?: DeskFactor[];          // technicals (regime/value-area/gamma)
+  qp?: {
+    implied_move_pct?: number | null; physical_move_pct?: number | null; dual_move_pct?: number | null;
+    short_sigmas?: number | null; short_dist_pct?: number | null; iv_hv_ratio?: number | null;
+    implied_vol_pct?: number | null; realized_vol_pct?: number | null; physical_wider?: boolean;
+  };
+  algo_grade?: string;
+  merits?: string[]; demerits?: string[]; blocking?: string[];
+  lifecycle_adjustments?: { name: string; pts: number; note: string }[];
+  lifecycle_score?: number;
+  signal?: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  overrides?: string[];
+}
+
+export async function runDeskScore(
+  id: number, pnlSnapshot: LivePnlResponse,
+  focus: { structure: string; expiration?: string | null; short_strike?: number | null },
+  quoteSource = 'yfinance',
+): Promise<DeskScoreResult> {
+  return apiFetch<DeskScoreResult>(`/api/saved-strategies/${id}/desk-score`, {
+    method: 'POST',
+    body: JSON.stringify({ pnl_snapshot: pnlSnapshot, ...focus, quote_source: quoteSource }),
+  });
+}
+
+export interface LifecycleManagerResult {
+  role: string; title: string;
+  signal: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  action_needed: boolean; content: string; model: string;
+}
+
+// The institutional quant PM managing a live trade → the 4-level exit signal + plan.
+export async function runLifecycleManager(id: number, pnlSnapshot: LivePnlResponse): Promise<LifecycleManagerResult> {
+  return apiFetch<LifecycleManagerResult>(`/api/saved-strategies/${id}/lifecycle-manager`, {
+    method: 'POST',
+    body: JSON.stringify({ pnl_snapshot: pnlSnapshot }),
   });
 }
 
@@ -1416,6 +1478,17 @@ export async function updateTradeNotes(strategyId: number, notes: string): Promi
   return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${strategyId}/notes`, {
     method: 'PATCH',
     body: JSON.stringify({ notes }),
+  });
+}
+
+// The purpose a trade serves — drives My Trades grouping + the lifecycle view.
+export type TradePurpose =
+  'income' | 'hedge' | 'trade' | 'managed_floor' | 'managed_buffer' | 'dual_directional' | 'other';
+
+export async function updateTradePurpose(strategyId: number, purpose: TradePurpose): Promise<SavedStrategyItem> {
+  return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${strategyId}/purpose`, {
+    method: 'PATCH',
+    body: JSON.stringify({ purpose }),
   });
 }
 

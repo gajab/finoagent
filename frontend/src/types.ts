@@ -3509,6 +3509,11 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
     short_sigmas?: number | null;                    // nearest short strike in DUAL-σ units
     short_dist_pct?: number | null;                  // nearest short strike distance from spot (%)
     physical_wider?: boolean; exposed_physical?: boolean;
+    keep_standard_pct?: number | null;               // headline Win% — standard risk-neutral PoP
+    keep_drift_pct?: number | null;                  // drift-adjusted Win% (P-measure overlay; display only)
+    drift_mu_pct?: number | null;                    // EMA-slope annualized drift (%/yr)
+    atr_vol_pct?: number | null;                     // ATR-implied (gap-aware) annualized vol
+    gap_aware?: boolean;                             // true when ATR-vol > close-to-close HV (gaps present)
   };
 }
 

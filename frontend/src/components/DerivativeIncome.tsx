@@ -153,13 +153,13 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
     ? ((ctx.spot - costBasis) / costBasis) * 100 : null;
   const primaryExp = result.expiry_summaries?.[0];   // nearest expiry — its IV/HV richness reads at stock level
   return (
-    <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4">
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+    <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-3">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
           {/* Heading: TICKER  $price  #shares  cost-basis  ER */}
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <span className="text-xl font-bold">{result.ticker}</span>
-            <span className="text-3xl font-bold tabular-nums">{money(ctx.spot, 2)}</span>
+            <span className="text-lg font-bold">{result.ticker}</span>
+            <span className="text-2xl font-bold tabular-nums">{money(ctx.spot, 2)}</span>
             {shares != null && <span className="text-sm text-base-content/70">{shares.toLocaleString()} sh</span>}
             {costBasis != null && (
               <span className="text-sm text-base-content/60">
@@ -174,17 +174,19 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
               <span className="badge badge-success badge-xs gap-1"><Shield className="w-3 h-3" />{ctx.exercise_style}</span>
             </div>
           )}
+          <div className="flex flex-wrap gap-2 mt-2">
+            <span className="badge badge-outline badge-sm gap-1"><Landmark className="w-3 h-3" />SOFR {pct(ctx.sofr_pct)}</span>
+            {ctx.hv30_pct != null && <span className="badge badge-outline badge-sm">HV30 {pct(ctx.hv30_pct)}</span>}
+            {primaryExp?.iv_hv_ratio != null && (
+              <span className={`badge badge-sm ${richnessBadge(primaryExp.premium_richness)}`}
+                title={`Nearest expiry ${primaryExp.expiration} (${primaryExp.dte}d): ATM IV ${pct(primaryExp.atm_iv_pct)} vs HV ${pct(primaryExp.hv30_pct)} — premium is ${primaryExp.premium_richness}`}>
+                IV/HV {primaryExp.iv_hv_ratio}× {primaryExp.premium_richness}
+              </span>
+            )}
+          </div>
         </div>
-        <Week52Bar ctx={ctx} />
-        <div className="flex flex-wrap gap-2">
-          <span className="badge badge-outline badge-sm gap-1"><Landmark className="w-3 h-3" />SOFR {pct(ctx.sofr_pct)}</span>
-          {ctx.hv30_pct != null && <span className="badge badge-outline badge-sm">HV30 {pct(ctx.hv30_pct)}</span>}
-          {primaryExp?.iv_hv_ratio != null && (
-            <span className={`badge badge-sm ${richnessBadge(primaryExp.premium_richness)}`}
-              title={`Nearest expiry ${primaryExp.expiration} (${primaryExp.dte}d): ATM IV ${pct(primaryExp.atm_iv_pct)} vs HV ${pct(primaryExp.hv30_pct)} — premium is ${primaryExp.premium_richness}`}>
-              IV/HV {primaryExp.iv_hv_ratio}× {primaryExp.premium_richness}
-            </span>
-          )}
+        <div className="w-full lg:w-[400px]">
+          <Week52Bar ctx={ctx} />
         </div>
       </div>
     </div>
@@ -196,13 +198,29 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
 export function EventsBanner({ events, title }: { events: DerivativeIncomeFlag[]; title?: string }) {
   if (!events?.length) return null;
   return (
-    <details className="rounded-xl border border-white/[0.06] bg-base-200/20">
-      <summary className="cursor-pointer select-none px-3 py-2.5 text-[10px] uppercase tracking-wider text-base-content/50 flex items-center gap-1.5">
+    <details className="rounded-xl border border-white/[0.06] bg-base-200/20 group">
+      <summary className="cursor-pointer list-none select-none px-3 py-2.5 text-[10px] uppercase tracking-wider text-base-content/50 flex items-center gap-1.5 [&::-webkit-details-marker]:hidden">
         <Calendar className="w-3.5 h-3.5" /> {title || 'Upcoming events · next 90 days'}
         <span className="normal-case text-base-content/35">· {events.length}</span>
+        <ChevronDown className="w-3.5 h-3.5 ml-auto opacity-50 transition-transform duration-200 group-open:rotate-180" />
       </summary>
-      <div className="flex flex-wrap gap-1.5 px-3 pb-3">
-        {events.map((e, i) => <FlagPill key={i} flag={e} />)}
+      <div className="px-4 pb-4 pt-1">
+        <div className="relative border-l-2 border-white/10 ml-2 pl-4 space-y-4">
+          {events.map((e, i) => {
+            const parts = e.text.split(':');
+            const dateStr = parts.length > 1 ? parts[0].trim() : '';
+            const eventStr = parts.length > 1 ? parts.slice(1).join(':').trim() : e.text;
+            return (
+              <div key={i} className="relative flex items-baseline gap-3">
+                <div className={`absolute -left-[21px] top-1.5 w-2 h-2 rounded-full border border-base-200 shadow-sm ${
+                  e.level === 'warn' ? 'bg-warning' : e.level === 'good' ? 'bg-success' : 'bg-info'
+                }`} />
+                {dateStr && <div className="text-xs font-semibold whitespace-nowrap text-base-content/60 w-16">{dateStr}</div>}
+                <div className="text-xs font-medium text-base-content/80 leading-snug">{eventStr}</div>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </details>
   );
@@ -275,9 +293,7 @@ export function LazyTechnicals({ ticker }: { ticker: string }) {
     <div className="rounded-xl border border-white/[0.06] bg-base-200/20">
       <button type="button" onClick={toggle}
         className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold">
-        <span className="flex items-center gap-2"><BarChart3 className="w-4 h-4 text-secondary" /> Technical Analysis
-          <span className="text-[10px] font-normal text-base-content/40">price · support/resistance · 20/50/200 MA · MACD · RSI</span>
-        </span>
+        <span className="flex items-center gap-2"><BarChart3 className="w-4 h-4 text-secondary" /> Technical Analysis</span>
         {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
       </button>
       {open && (
@@ -797,16 +813,16 @@ export function DerivativeIncome() {
         </div>
         <div className="form-control lg:col-span-3 gap-1">
           {mode === 'single' ? (
-            <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-2 flex-wrap justify-end">
+              {singleStale && (
+                <span className="inline-flex items-center gap-1 text-[11px] text-warning mr-auto">
+                  <Info className="w-3.5 h-3.5" /> Filters changed — results below are from the previous scan.
+                </span>
+              )}
               <button type="submit" className={`btn btn-sm gap-2 w-fit ${singleStale ? 'btn-primary animate-pulse' : 'btn-primary'}`} disabled={loading || !ticker.trim() || !structures.length}>
                 {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Coins className="w-4 h-4" />}
                 {loading ? 'Scanning options…' : deskResult ? 'Re-scan opportunities' : 'Find Income Opportunities'}
               </button>
-              {singleStale && (
-                <span className="inline-flex items-center gap-1 text-[11px] text-warning">
-                  <Info className="w-3.5 h-3.5" /> Filters changed — results below are from the previous scan.
-                </span>
-              )}
             </div>
           ) : (
             <button type="submit" className="btn btn-primary btn-sm gap-2 w-fit" disabled={pfLoading || !structures.length}>
