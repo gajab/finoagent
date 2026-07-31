@@ -28,6 +28,7 @@ from app.services.trade_math import (
     is_wide_spread,
     mid_price,
     prob_itm_lognormal,
+    realized_close_pnl,
     simple_annualized_pct,
     summarize_trade_actions,
     walk_ledger,
@@ -681,6 +682,34 @@ class TestExitRecommendation:
         r = exit_recommendation(hold_signal="HOLD", pop=75, unrealized_pnl=10,
                                 max_profit=200, max_loss=-800, dte=40, theta_per_day=3)
         assert r["signal"] == "HOLD" and r["reasons"]
+
+
+# ── realized_close_pnl — the close sign convention ───────────────────────────
+
+class TestRealizedClosePnl:
+    def test_short_option_buy_back_cheaper_is_profit(self):
+        # Sold a call for $2.00, buy it back for $0.50, 1 contract → +$150.
+        assert realized_close_pnl("SELL", 2.00, 0.50, 1, is_option=True) == pytest.approx(150.0)
+
+    def test_short_option_buy_back_richer_is_loss(self):
+        # Sold a put for $1.00, buy it back for $3.00, 2 contracts → −$400.
+        assert realized_close_pnl("SELL", 1.00, 3.00, 2, is_option=True) == pytest.approx(-400.0)
+
+    def test_long_option_sell_higher_is_profit(self):
+        # Bought a call for $1.00, sell it for $2.50, 3 contracts → +$450.
+        assert realized_close_pnl("BUY", 1.00, 2.50, 3, is_option=True) == pytest.approx(450.0)
+
+    def test_long_stock_scales_by_shares_not_100(self):
+        # Long 100 shares at $50, sold at $55 → +$500 (no ×100 for stock).
+        assert realized_close_pnl("BUY", 50.0, 55.0, 100, is_option=False) == pytest.approx(500.0)
+
+    def test_short_stock_profits_when_price_falls(self):
+        assert realized_close_pnl("SELL", 50.0, 40.0, 100, is_option=False) == pytest.approx(1000.0)
+
+    def test_short_and_long_are_mirror_images(self):
+        s = realized_close_pnl("SELL", 2.0, 1.2, 1, is_option=True)
+        l = realized_close_pnl("BUY", 2.0, 1.2, 1, is_option=True)
+        assert s == pytest.approx(-l)
 
 
 if __name__ == "__main__":

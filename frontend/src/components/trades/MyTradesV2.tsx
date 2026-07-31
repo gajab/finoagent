@@ -20,22 +20,21 @@
  *   - Ask Advisor  (type-aware inline AI analysis)
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import {
   RefreshCw, Loader2, AlertCircle, ChevronDown, ChevronUp,
   TrendingUp, TrendingDown, Clock, BarChart3, Activity,
   Brain, Send, Bot, History, PlusCircle, X, Target,
   DollarSign, Percent, Calendar, Shield, Zap, List, ExternalLink, Trash2, Pencil, Check,
-  Layers, RotateCcw, Plus, Gauge,
+  Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp,
 } from 'lucide-react';
 import {
   fetchActiveTrades, fetchTradeLivePnl, fetchTradeAdvisor,
   appendTradeTransaction, fetchTradeTransactions, createAgent,
   deleteTrade, updateSavedStrategy,
 } from '../../api';
-import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind, PortfolioRisk, RiskPositionInput, RiskTradeSummary, LifecycleAgentResult } from '../../api';
-import { computePortfolioRisk, runPortfolioRiskAgent } from '../../api';
+import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind } from '../../api';
 import { fmtMoney, fmtPct, fmtAnnualized, fmtDTE, fmtDate, fmtQty, pnlSummary } from '../../lib/tradeFormat';
 import UpdatePositionModal from './UpdatePositionModal';
 import TransactionHistoryPanel from './TransactionHistoryPanel';
@@ -43,9 +42,13 @@ import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
 import InstitutionalDesk from './InstitutionalDesk';
 import QuantExitCard from './QuantExitCard';
+import CloseTradeModal from './CloseTradeModal';
 import CollapsibleSection from './CollapsibleSection';
 import { DeskDebate } from '../DeskDebate';
-import type { DeskFocusTrade } from '../../api';
+import { TickerChrome } from '../DerivativeIncome';
+import { TraderGrid, PmGrid, RiskGrid } from './DeskMetrics';
+import { fetchUnderlyingDesk } from '../../api';
+import type { DeskFocusTrade, UnderlyingDeskResult } from '../../api';
 import { updateTradeTransaction, deleteTradeTransaction, updateTradePurpose } from '../../api';
 
 // ── Leg-action visuals (deterministic quant advisor) ─────────────────────────
@@ -261,8 +264,43 @@ function deskFocusForTrade(trade: SavedStrategyItem, pnl?: LivePnlResponse | nul
   else if (sp.length === 1 && lp.length === 1 && sc.length === 1 && lc.length === 1) { structure = 'iron_condor'; shortStrike = sp[0].strike; }
   else if (sp.length === 1 && sc.length === 1 && lc.length === 1 && lp.length === 0) { structure = 'jade_lizard'; shortStrike = sc[0].strike; }
 
-  if (!structure || shortStrike == null) return null;
-  return { structure, expiration, short_strike: Number(shortStrike) };
+  // Unrecognized multi-leg / custom structure — STILL surface the button on every
+  // options trade (the user's #1 ask). The backend prices the scan-supported
+  // structures at exact legs and, for anything else, returns the honest "not
+  // scorable — the algorithmic card above is the read" message.
+  if (!structure) {
+    structure = 'custom';
+    shortStrike = sc[0]?.strike ?? sp[0]?.strike ?? opts[0]?.strike ?? null;
+  }
+  return { structure, expiration, short_strike: shortStrike != null ? Number(shortStrike) : null };
+}
+
+// User-facing option STRUCTURE of a trade (for filtering within a group).
+function tradeStructure(trade: SavedStrategyItem): { key: string; label: string } {
+  const legs = (trade.legs_data || []) as any[];
+  const opts = legs.filter(l => /call|put/i.test(l.type || ''));
+  const hasStock = (Number(trade.parameters?.shares) || 0) > 0;
+  if (opts.length === 0) return hasStock ? { key: 'stock', label: 'Stock' } : { key: 'other', label: 'Other' };
+  const short = (l: any) => /sell|short/i.test(l.action || '');
+  const call = (l: any) => /call/i.test(l.type || '');
+  const put = (l: any) => /put/i.test(l.type || '');
+  const sc = opts.filter(l => short(l) && call(l)).length;
+  const sp = opts.filter(l => short(l) && put(l)).length;
+  const lc = opts.filter(l => !short(l) && call(l)).length;
+  const lp = opts.filter(l => !short(l) && put(l)).length;
+  const one = opts.length === 1;
+  if (hasStock && sc === 1 && lp === 0) return { key: 'covered_call', label: 'Covered Call' };
+  if (hasStock && sc === 1 && lp === 1) return { key: 'collar', label: 'Collar' };
+  if (!hasStock && sp === 1 && one) return { key: 'cash_secured_put', label: 'Cash-Secured Put' };
+  if (!hasStock && sc === 1 && one) return { key: 'naked_call', label: 'Naked Call' };
+  if (!hasStock && lp === 1 && one) return { key: 'long_put', label: 'Long Put' };
+  if (!hasStock && lc === 1 && one) return { key: 'long_call', label: 'Long Call' };
+  if (sp === 1 && lp === 1 && sc === 0 && lc === 0) return { key: 'put_credit_spread', label: 'Put Credit Spread' };
+  if (sc === 1 && lc === 1 && sp === 0 && lp === 0) return { key: 'call_credit_spread', label: 'Call Credit Spread' };
+  if (sp === 1 && lp === 1 && sc === 1 && lc === 1) return { key: 'iron_condor', label: 'Iron Condor' };
+  if (sp === 1 && sc === 1 && lc === 1 && lp === 0) return { key: 'jade_lizard', label: 'Jade Lizard' };
+  if (sp === 1 && sc === 1 && lc === 0 && lp === 0) return { key: 'short_strangle', label: 'Short Strangle' };
+  return { key: 'custom', label: 'Custom' };
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -412,6 +450,21 @@ function TradeCard({
 }: CardProps) {
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Close flow: null = closed modal; { preselect } = open, optionally with one leg pre-checked.
+  const [closeModal, setCloseModal] = useState<{ preselect: number | null } | null>(null);
+  // Underlying stock context (Income-desk chrome) — lazily fetched on first expand.
+  const [underlying, setUnderlying] = useState<UnderlyingDeskResult | null>(null);
+  const [underlyingLoading, setUnderlyingLoading] = useState(false);
+  useEffect(() => {
+    if (isExpanded && !underlying && !underlyingLoading) {
+      setUnderlyingLoading(true);
+      fetchUnderlyingDesk(trade.id, quoteSource)
+        .then(setUnderlying)
+        .catch(() => { /* chrome is best-effort; absence just hides it */ })
+        .finally(() => setUnderlyingLoading(false));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isExpanded]);
   const [rollState, setRollState] = useState<RollState | null>(null);
   const [addingLeg, setAddingLeg] = useState(false);
   const [newLegState, setNewLegState] = useState({
@@ -507,19 +560,6 @@ function TradeCard({
       onPositionChanged(trade.id);
     } catch (e: any) {
       setRollState(s => s && ({ ...s, saving: false, error: e?.message || 'Failed to roll leg' }));
-    }
-  };
-
-  const closeLeg = async (legIdx: number) => {
-    if (!trade.legs_data?.[legIdx]) return;
-    try {
-      const newLegs = (trade.legs_data || []).filter((_: any, i: number) => i !== legIdx);
-      const hasStock = !!(trade.parameters?.shares && parseFloat(trade.parameters.shares) > 0);
-      const newType = inferStrategyType(trade.strategy_type || '', newLegs, hasStock);
-      await updateSavedStrategy(trade.id, { legs_data: newLegs, strategy_type: newType });
-      onPositionChanged(trade.id);
-    } catch {
-      // silently fail — user can retry
     }
   };
 
@@ -648,6 +688,15 @@ function TradeCard({
 
   const statusColor = pnlAmt == null ? '' : pnlAmt >= 0 ? 'text-success' : 'text-error';
 
+  // Realized P&L — banked at close (whole or partial). Present on closed trades and
+  // on active trades that have had a leg/stock closed. exit_net mirrors it for legacy.
+  const isClosed = trade.trade_status === 'closed';
+  const realizedPnl: number | null =
+    trade.parameters?.realized_pnl != null ? Number(trade.parameters.realized_pnl)
+      : isClosed ? (trade.exit_net ?? null) : null;
+  const hasPartialRealized = !isClosed && realizedPnl != null && Math.abs(realizedPnl) > 0.005;
+  const closedLegs: any[] = Array.isArray(trade.parameters?.closed_legs) ? trade.parameters.closed_legs : [];
+
   // Static class strings so Tailwind's JIT actually generates them (no safelist).
   const TINT_CLASSES: Record<string, string> = {
     success: 'border-l-success/50 bg-success/[0.03] hover:bg-success/[0.06]',
@@ -713,7 +762,14 @@ function TradeCard({
               {fmtMoney(pnl!.underlying_price)}
             </div>
           )}
-          {isIncome && annReturn != null ? (
+          {isClosed ? (
+            <>
+              <div className={`font-bold text-sm ${realizedPnl != null && realizedPnl >= 0 ? 'text-success' : 'text-error'}`}>
+                {realizedPnl != null ? `${realizedPnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(realizedPnl))}` : '—'}
+              </div>
+              <div className="text-[9px] uppercase tracking-wider text-base-content/40">realized</div>
+            </>
+          ) : isIncome && annReturn != null ? (
             <>
               <div className={`font-bold text-sm ${annReturn >= 0 ? 'text-success' : 'text-error'}`}>
                 {fmtAnnualized(annReturn)}
@@ -748,6 +804,35 @@ function TradeCard({
       {/* Expanded detail */}
       {isExpanded && (
         <div className="border-t border-white/[0.04] px-4 py-4 space-y-4">
+
+          {/* Realized P&L — closed trades and partial closes bank realized here */}
+          {(isClosed || hasPartialRealized) && realizedPnl != null && (
+            <div className={`rounded-xl border px-3 py-2.5 flex items-center gap-3 ${realizedPnl >= 0 ? 'border-success/25 bg-success/[0.05]' : 'border-error/25 bg-error/[0.05]'}`}>
+              <LogOut className={`w-4 h-4 shrink-0 ${realizedPnl >= 0 ? 'text-success' : 'text-error'}`} />
+              <div className="min-w-0">
+                <div className="text-[9px] uppercase tracking-wider text-base-content/40">
+                  {isClosed ? `Realized P&L · closed${trade.exit_date ? ` ${fmtDate(trade.exit_date)}` : ''}` : 'Realized so far · partial close'}
+                </div>
+                <div className={`text-lg font-bold ${realizedPnl >= 0 ? 'text-success' : 'text-error'}`}>
+                  {realizedPnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(realizedPnl))}
+                </div>
+              </div>
+              {closedLegs.length > 0 && (
+                <div className="ml-auto text-right text-[10px] text-base-content/50 max-w-[55%] space-y-0.5">
+                  {closedLegs.slice(-4).map((c, i) => (
+                    <div key={i} className="truncate">
+                      {c.type === 'stock' ? `Stock ${fmtQty(c.qty)}sh` : `${c.action} ${c.type} $${c.strike}`}
+                      {' @ '}{fmtMoney(c.exit_price)}{' → '}
+                      <span className={Number(c.realized) >= 0 ? 'text-success' : 'text-error'}>
+                        {Number(c.realized) >= 0 ? '+' : ''}{fmtMoney(Math.abs(Number(c.realized)))}
+                      </span>
+                    </div>
+                  ))}
+                  {!isClosed && <div className="text-base-content/30">remaining legs still open</div>}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Action bar */}
           <div className="flex items-center gap-2 flex-wrap">
@@ -828,10 +913,21 @@ function TradeCard({
               <Bot className="w-3 h-3" /> Create Agent
             </button>
 
+            {/* Close position — priced close (records realized P&L); partial or full */}
+            {trade.trade_status !== 'closed' && (hasOptionLegsNow || hasStockLeg) && (
+              <button
+                className="btn btn-ghost btn-xs gap-1 text-[10px] border border-white/[0.06] hover:border-error/30 hover:text-error ml-auto"
+                onClick={e => { e.stopPropagation(); setCloseModal({ preselect: null }); }}
+                title="Close all or part of this trade at a price (records realized P&L)"
+              >
+                <LogOut className="w-3 h-3" /> Close
+              </button>
+            )}
+
             {/* Delete trade — with inline 2-step confirmation */}
             {!deleteConfirm ? (
               <button
-                className="btn btn-ghost btn-xs gap-1 text-[10px] border border-white/[0.06] hover:border-error/30 hover:text-error ml-auto"
+                className={`btn btn-ghost btn-xs gap-1 text-[10px] border border-white/[0.06] hover:border-error/30 hover:text-error ${(trade.trade_status !== 'closed' && (hasOptionLegsNow || hasStockLeg)) ? '' : 'ml-auto'}`}
                 onClick={e => { e.stopPropagation(); setDeleteConfirm(true); }}
                 title="Delete this trade"
               >
@@ -839,7 +935,7 @@ function TradeCard({
               </button>
             ) : (
               <div
-                className="ml-auto flex items-center gap-1.5 bg-error/10 border border-error/20 rounded-lg px-2 py-1"
+                className="flex items-center gap-1.5 bg-error/10 border border-error/20 rounded-lg px-2 py-1"
                 onClick={e => e.stopPropagation()}
               >
                 <span className="text-[10px] text-error font-medium">Delete trade?</span>
@@ -862,11 +958,27 @@ function TradeCard({
             )}
           </div>
 
+          {/* Underlying stock context — the SAME chrome the Income desk shows
+              (price / earnings / SOFR / HV · IV rank·percentile·skew · events · TA) */}
+          {underlyingLoading && !underlying && (
+            <div className="flex items-center gap-2 text-xs text-base-content/40 py-3">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading underlying context…
+            </div>
+          )}
+          {underlying?.context && (
+            <TickerChrome
+              ticker={underlying.ticker}
+              context={underlying.context}
+              events={underlying.events}
+              expirySummaries={underlying.expiry_summaries}
+            />
+          )}
+
           {/* P&L metrics grid */}
           {pnl && (
             <div className="space-y-3">
-              {/* Main metrics — BOX gets its own detailed panel below, skip redundant chips */}
-              {trade.strategy_type !== 'box_spread' && (
+              {/* Main metrics — BOX + income get their own detailed panels below */}
+              {trade.strategy_type !== 'box_spread' && !isIncome && (
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   <Chip label="Cost Basis" value={fmtMoney(Math.abs(pnl.entry_cost))} />
                   <Chip label="Current Value" value={fmtMoney(pnl.current_value)} />
@@ -875,15 +987,7 @@ function TradeCard({
                     value={`${pnl.unrealized_pnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(pnl.unrealized_pnl))}`}
                     color={pnl.unrealized_pnl >= 0 ? 'text-success' : 'text-error'}
                   />
-                  {isIncome && annReturn != null ? (
-                    <Chip
-                      label="Ann. Return"
-                      value={fmtAnnualized(annReturn)}
-                      color={annReturn >= 0 ? 'text-success' : 'text-error'}
-                    />
-                  ) : (
-                    <Chip label="Days Held" value={`${pnl.days_held}d`} />
-                  )}
+                  <Chip label="Days Held" value={`${pnl.days_held}d`} />
                 </div>
               )}
 
@@ -967,39 +1071,35 @@ function TradeCard({
                   );
                 }
 
-                // Non-BOX income (CSP, credit spreads): keep existing layout
+                // Non-BOX income (CSP, credit spreads, covered calls): two clean metric lines
+                const spot = pnl.underlying_price;
+                const be = pnl.breakevens?.[0] ?? null;
+                const cushionPct = (be != null && spot > 0) ? Math.abs((spot - be) / spot) * 100 : null;
+                const capital = pnl.total_capital || pnl.margin_required || Math.abs(pnl.entry_cost) || 0;
+                const returnAtExpiry = (guaranteedPnl != null && capital > 0) ? (guaranteedPnl / capital) * 100 : null;
                 return (
                   <div className="bg-success/5 border border-success/10 rounded-xl p-3 space-y-2">
-                    <div className="text-[9px] uppercase tracking-wider text-success/60 font-semibold">Income Analysis</div>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                      {guaranteedPnl != null && <Chip label="Max Profit" value={`+${fmtMoney(guaranteedPnl)}`} color="text-success" />}
-                      {pnl.max_loss != null && pnl.max_loss < 0 && (
-                        <Chip label="Max Loss" value={fmtMoney(Math.abs(pnl.max_loss))} color="text-error" />
-                      )}
-                      {dte != null && <Chip label="DTE" value={fmtDTE(dte)} color={dte <= 7 ? 'text-warning' : ''} />}
-                      {annReturn != null && (
-                        <Chip label="Ann. Return" value={fmtAnnualized(annReturn)} color={annReturn >= 5 ? 'text-success' : 'text-warning'} />
-                      )}
+                    {/* Line 1 — position economics */}
+                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                      <Chip label="Cost Basis" value={fmtMoney(costBasis)} />
+                      <Chip label="Current Value" value={fmtMoney(pnl.current_value)} />
+                      <Chip label="Unrealized P&L" value={`${mtmPnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(mtmPnl))}`} color={mtmPnl >= 0 ? 'text-success' : 'text-error'} />
+                      <Chip label="Margin" value={pnl.margin_required > 0 ? fmtMoney(pnl.margin_required) : '—'} />
+                      <Chip label="Ann. Return" value={annReturn != null ? fmtAnnualized(annReturn) : '—'} color={annReturn != null && annReturn >= 5 ? 'text-success' : 'text-warning'} />
+                      <Chip label="Trade Date" value={trade.entry_date ? fmtDate(trade.entry_date) : '—'} />
                     </div>
-                    {pnl.analysis?.hold_vs_close && (
-                      <div className={`rounded-lg px-3 py-2 text-center ${
-                        pnl.analysis.hold_vs_close.includes('HOLD') ? 'bg-success/10 border border-success/20' :
-                        pnl.analysis.hold_vs_close === 'CLOSE' ? 'bg-warning/10 border border-warning/20' :
-                        'bg-error/10 border border-error/20'
-                      }`}>
-                        <div className={`text-xs font-bold ${
-                          pnl.analysis.hold_vs_close.includes('HOLD') ? 'text-success' :
-                          pnl.analysis.hold_vs_close === 'CLOSE' ? 'text-warning' : 'text-error'
-                        }`}>
-                          {pnl.analysis.hold_vs_close.replace('_', ' ')}
-                        </div>
-                        <div className="mt-1 space-y-0.5">
-                          {pnl.analysis.hold_vs_close_reasons?.map((r, i) => (
-                            <div key={i} className="text-[9px] text-base-content/50">{r}</div>
-                          ))}
-                        </div>
+                    {/* Line 2 — payoff at expiry */}
+                    <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+                      <Chip label="Max Profit" value={guaranteedPnl != null ? `+${fmtMoney(guaranteedPnl)}` : '—'} color="text-success" />
+                      <Chip label="Max Loss" value={(pnl.max_loss != null && pnl.max_loss < 0) ? fmtMoney(Math.abs(pnl.max_loss)) : (pnl.unbounded_loss ? 'Unbounded' : '—')} color="text-error" />
+                      <Chip label="DTE" value={dte != null ? fmtDTE(dte) : '—'} color={dte != null && dte <= 7 ? 'text-warning' : ''} />
+                      <div className="flex flex-col items-center px-3 py-1.5 rounded-lg bg-base-300/30 min-w-[72px]">
+                        <span className="text-[9px] uppercase tracking-wider text-base-content/40">Breakeven</span>
+                        <span className="text-xs font-semibold mt-0.5">{be != null ? fmtMoney(be) : '—'}</span>
+                        {cushionPct != null && <span className="text-[9px] text-base-content/40 mt-0.5">{cushionPct.toFixed(1)}% cushion</span>}
                       </div>
-                    )}
+                      <Chip label="Return at Expiry" value={returnAtExpiry != null ? `${returnAtExpiry.toFixed(1)}%` : '—'} color={returnAtExpiry != null && returnAtExpiry >= 0 ? 'text-success' : ''} />
+                    </div>
                   </div>
                 );
               })()}
@@ -1249,20 +1349,6 @@ function TradeCard({
                 );
               })()}
 
-              {/* Greeks — hide for pure stocks, BOX, and futures */}
-              {!isStock && !isComboLike && trade.strategy_type !== 'box_spread' && trade.strategy_type !== 'futures' && pnl.net_greeks && (
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  <Chip
-                    label="Net Delta"
-                    value={`${pnl.net_greeks.delta >= 0 ? '+' : ''}${pnl.net_greeks.delta.toFixed(2)}`}
-                    color={pnl.net_greeks.delta >= 0 ? 'text-success/80' : 'text-error/80'}
-                  />
-                  <Chip label="Net Theta" value={`$${pnl.net_greeks.theta.toFixed(2)}/d`} color="text-success/80" />
-                  <Chip label="Net Vega" value={pnl.net_greeks.vega.toFixed(2)} />
-                  <Chip label="Net Gamma" value={pnl.net_greeks.gamma.toFixed(4)} />
-                </div>
-              )}
-
               {/* Futures Metrics — show only for futures */}
               {trade.strategy_type === 'futures' && (
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -1292,181 +1378,9 @@ function TradeCard({
                 </div>
               )}
 
-              {/* Quant metrics — hide for BOX, pure stocks, stock+options combos, and futures */}
-              {pnl.analysis && trade.strategy_type !== 'box_spread' && trade.strategy_type !== 'futures' && !isStock && !isComboLike && (
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                  {pnl.analysis.probability_of_profit != null && (
-                    <div className="bg-base-300/20 rounded-lg p-2 text-center">
-                      <div className="text-[9px] uppercase text-base-content/30">Prob of Profit</div>
-                      <div className={`text-xs font-semibold mt-0.5 ${
-                        pnl.analysis.probability_of_profit >= 60 ? 'text-success' :
-                        pnl.analysis.probability_of_profit >= 40 ? 'text-warning' : 'text-error'
-                      }`}>{pnl.analysis.probability_of_profit.toFixed(1)}%</div>
-                      <div className="w-full bg-base-300/50 rounded-full h-0.5 mt-1">
-                        <div
-                          className={`h-0.5 rounded-full transition-all ${
-                            pnl.analysis.probability_of_profit >= 60 ? 'bg-success' :
-                            pnl.analysis.probability_of_profit >= 40 ? 'bg-warning' : 'bg-error'
-                          }`}
-                          style={{ width: `${Math.min(100, pnl.analysis.probability_of_profit)}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
-                  {pnl.analysis.expected_value != null && (
-                    <div className="bg-base-300/20 rounded-lg p-2 text-center">
-                      <div className="text-[9px] uppercase text-base-content/30">Expected Value</div>
-                      <div className={`text-xs font-semibold mt-0.5 ${pnl.analysis.expected_value >= 0 ? 'text-success' : 'text-error'}`}>
-                        {fmtMoney(pnl.analysis.expected_value)}
-                      </div>
-                    </div>
-                  )}
-                  {pnl.analysis.kelly_fraction != null && (
-                    <div className="bg-base-300/20 rounded-lg p-2 text-center">
-                      <div className="text-[9px] uppercase text-base-content/30">Kelly Size</div>
-                      <div className="text-xs font-semibold mt-0.5">
-                        {(pnl.analysis.kelly_fraction * 100).toFixed(1)}%
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Breakevens */}
-              {pnl.breakevens?.length > 0 && (
-                <div className="flex items-center gap-2 text-xs text-base-content/50">
-                  <Target className="w-3.5 h-3.5" />
-                  Breakevens:{' '}
-                  <span className="font-medium text-base-content">
-                    {pnl.breakevens.map(b => fmtMoney(b)).join(', ')}
-                  </span>
-                </div>
-              )}
             </div>
           )}
 
-          {/* Quant advisor — overall recommendation folding per-leg + structure */}
-          {pnl?.analysis?.recommendation && (() => {
-            const exitSig = pnl.analysis.exit_signal || 'HOLD';
-            const tone = exitSig === 'CLOSE' ? 'error' : exitSig === 'CONSIDER_CLOSE' ? 'warning' : 'success';
-            return (
-            <div className={`rounded-lg p-3 border bg-${tone}/5 border-${tone}/20`}>
-              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
-                <span className={`badge badge-sm font-semibold ${EXIT_STYLE[exitSig]?.cls || 'badge-ghost'}`}>
-                  {EXIT_STYLE[exitSig]?.label || exitSig}
-                </span>
-                <span className="text-[9px] uppercase tracking-wider text-base-content/40">Deterministic rules · whole-trade exit call</span>
-                {pnl.analysis.captured_pct != null && (
-                  <span className="text-[9px] text-base-content/40">{pnl.analysis.captured_pct.toFixed(0)}% of max profit captured</span>
-                )}
-                {pnl.analysis.pop_method === 'rnd' && (
-                  <span className="text-[8px] uppercase tracking-wider text-primary/60" title="Probabilities from the market-implied risk-neutral density (SVI/RND)">RND</span>
-                )}
-              </div>
-              {pnl.analysis.exit_reasons && pnl.analysis.exit_reasons.length > 0 && (
-                <ul className="space-y-0.5 mb-2">
-                  {pnl.analysis.exit_reasons.map((r, i) => (
-                    <li key={i} className={`text-[10px] flex gap-1.5 ${i === 0 ? `text-${tone} font-medium` : 'text-base-content/60'}`}>
-                      <span className="opacity-40">•</span><span>{r}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {pnl.analysis.recommendation.outcome && (
-                <div className="text-[10px] text-base-content/50 mb-1.5">{pnl.analysis.recommendation.outcome}</div>
-              )}
-              <div className="text-xs text-base-content/90 mb-2 font-medium">{pnl.analysis.recommendation.headline}</div>
-              {pnl.analysis.recommendation.leg_notes.length > 0 && (
-                <ul className="space-y-1 mb-2">
-                  {pnl.analysis.recommendation.leg_notes.map((n, i) => (
-                    <li key={i} className="text-[10px] text-base-content/60 flex gap-1.5">
-                      <span className="text-base-content/30">•</span><span>{n}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {pnl.analysis.recommendation.reasons.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {pnl.analysis.recommendation.reasons.map((rsn, i) => (
-                    <span key={i} className="badge badge-ghost badge-xs text-[9px] text-base-content/50">{rsn}</span>
-                  ))}
-                </div>
-              )}
-            </div>
-            );
-          })()}
-
-          {/* Tier 2 — QUANT ALGORITHMIC exit (scored, deterministic, auditable) */}
-          {pnl?.analysis?.quant_exit && (
-            <QuantExitCard q={pnl.analysis.quant_exit} trade={trade} pnl={pnl} deskFocus={deskFocusForTrade(trade, pnl)} />
-          )}
-
-          {/* Tier 3 — Institutional Desk (LLM quant PM manages the trade) */}
-          {pnl?.analysis && (
-            <InstitutionalDesk trade={trade} pnl={pnl} />
-          )}
-
-          {/* Whole-trade max gain / max loss — shown for EVERY trade type */}
-          {pnl && (pnl.unbounded_profit || pnl.max_profit != null || pnl.unbounded_loss || pnl.max_loss != null) && (
-            <div className="grid grid-cols-2 gap-2">
-              <div className="bg-success/5 border border-success/15 rounded-lg p-2 text-center">
-                <div className="text-[9px] uppercase text-base-content/30">Max Gain (whole trade)</div>
-                <div className="text-sm font-semibold mt-0.5 text-success">
-                  {pnl.unbounded_profit ? 'Unlimited' : pnl.max_profit != null ? fmtMoney(pnl.max_profit) : '—'}
-                </div>
-                {!pnl.unbounded_profit && pnl.max_profit_price != null && (
-                  <div className="text-[8px] text-base-content/30 mt-0.5">at ${pnl.max_profit_price.toFixed(2)}</div>
-                )}
-              </div>
-              <div className="bg-error/5 border border-error/15 rounded-lg p-2 text-center">
-                <div className="text-[9px] uppercase text-base-content/30">Max Loss (whole trade)</div>
-                <div className="text-sm font-semibold mt-0.5 text-error">
-                  {pnl.unbounded_loss ? 'Unlimited' : pnl.max_loss != null ? fmtMoney(pnl.max_loss) : '—'}
-                </div>
-                {!pnl.unbounded_loss && pnl.max_loss_price != null && (
-                  <div className="text-[8px] text-base-content/30 mt-0.5">at ${pnl.max_loss_price.toFixed(2)}</div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Payoff diagram — P&L vs underlying (all trade types), collapsed by default */}
-          {pnl && pnl.scenarios && pnl.scenarios.length > 1 && (
-            <CollapsibleSection title="Payoff diagram" accent="base-content"
-              icon={<BarChart3 className="w-3 h-3" />} subtitle="P&L across underlying moves">
-              <PayoffChart pnl={pnl} />
-            </CollapsibleSection>
-          )}
-
-          {/* Continuous Lifecycle Management — Desk Debate (Explorer) */}
-          {(() => {
-            const deskFocus = deskFocusForTrade(trade, pnl);
-            if (!deskFocus) return null;
-            return (
-              <div className="space-y-1.5 pt-2">
-                <div className="text-[9px] uppercase tracking-wider text-base-content/40 font-semibold flex items-center gap-1.5 mb-2">
-                  <Activity className="w-3 h-3" /> Continuous Lifecycle Management
-                </div>
-                <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4 hover:border-secondary/30 transition-colors">
-                  <DeskDebate
-                    ticker={trade.ticker}
-                    params={{
-                      quote_source: quoteSource,
-                      target_dte: dte ?? undefined,
-                      structures: [deskFocus.structure],
-                      min_prob: 0,
-                      min_income: 0,
-                    }}
-                    focus={deskFocus}
-                    label="Review hold or exit"
-                  />
-                  <p className="text-[11px] text-base-content/40 mt-2">
-                    Run the institutional desk (Quant → Risk → Rebuttal → PM) to evaluate whether to hold, adjust, or exit this existing position.
-                  </p>
-                </div>
-              </div>
-            );
-          })()}
 
           {/* Legs table — compact, with per-leg roll/close actions */}
           {trade.legs_data && trade.legs_data.length > 0 && (
@@ -1644,10 +1558,10 @@ function TradeCard({
                                     </button>
                                     <button
                                       className="btn btn-ghost btn-xs h-5 min-h-0 gap-0.5 text-[9px] text-base-content/40 hover:text-error"
-                                      onClick={e => { e.stopPropagation(); closeLeg(i); }}
-                                      title="Close this leg (remove from trade)"
+                                      onClick={e => { e.stopPropagation(); setCloseModal({ preselect: i }); }}
+                                      title="Close this leg at a price (records realized P&L)"
                                     >
-                                      <X className="w-2.5 h-2.5" /> Close
+                                      <LogOut className="w-2.5 h-2.5" /> Close
                                     </button>
                                   </div>
                                 </td>
@@ -1830,6 +1744,138 @@ function TradeCard({
               )}
             </div>
           )}
+
+          {/* Quant advisor — overall recommendation folding per-leg + structure */}
+          {pnl?.analysis?.recommendation && (() => {
+            const exitSig = pnl.analysis.exit_signal || 'HOLD';
+            const tone = exitSig === 'CLOSE' ? 'error' : exitSig === 'CONSIDER_CLOSE' ? 'warning' : 'success';
+            return (
+            <div className={`rounded-lg p-3 border bg-${tone}/5 border-${tone}/20`}>
+              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                <span className={`badge badge-sm font-semibold ${EXIT_STYLE[exitSig]?.cls || 'badge-ghost'}`}>
+                  {EXIT_STYLE[exitSig]?.label || exitSig}
+                </span>
+                <span className="text-[9px] uppercase tracking-wider text-base-content/40">Deterministic rules · whole-trade exit call</span>
+                {pnl.analysis.captured_pct != null && (
+                  <span className="text-[9px] text-base-content/40">{pnl.analysis.captured_pct.toFixed(0)}% of max profit captured</span>
+                )}
+                {pnl.analysis.pop_method === 'rnd' && (
+                  <span className="text-[8px] uppercase tracking-wider text-primary/60" title="Probabilities from the market-implied risk-neutral density (SVI/RND)">RND</span>
+                )}
+              </div>
+              {pnl.analysis.exit_reasons && pnl.analysis.exit_reasons.length > 0 && (
+                <ul className="space-y-0.5 mb-2">
+                  {pnl.analysis.exit_reasons.map((r, i) => (
+                    <li key={i} className={`text-[10px] flex gap-1.5 ${i === 0 ? `text-${tone} font-medium` : 'text-base-content/60'}`}>
+                      <span className="opacity-40">•</span><span>{r}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {pnl.analysis.recommendation.outcome && (
+                <div className="text-[10px] text-base-content/50 mb-1.5">{pnl.analysis.recommendation.outcome}</div>
+              )}
+              <div className="text-xs text-base-content/90 mb-2 font-medium">{pnl.analysis.recommendation.headline}</div>
+              {pnl.analysis.recommendation.leg_notes.length > 0 && (
+                <ul className="space-y-1 mb-2">
+                  {pnl.analysis.recommendation.leg_notes.map((n, i) => (
+                    <li key={i} className="text-[10px] text-base-content/60 flex gap-1.5">
+                      <span className="text-base-content/30">•</span><span>{n}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {pnl.analysis.recommendation.reasons.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {pnl.analysis.recommendation.reasons.map((rsn, i) => (
+                    <span key={i} className="badge badge-ghost badge-xs text-[9px] text-base-content/50">{rsn}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+            );
+          })()}
+
+          {/* Tier 2 — QUANT ALGORITHMIC exit (scored, deterministic, auditable) */}
+          {pnl?.analysis?.quant_exit && (
+            <QuantExitCard q={pnl.analysis.quant_exit} trade={trade} pnl={pnl} deskFocus={deskFocusForTrade(trade, pnl)} />
+          )}
+
+          {/* Tier 3 — Institutional Desk (LLM quant PM manages the trade) */}
+          {pnl?.analysis && (
+            <InstitutionalDesk trade={trade} pnl={pnl} />
+          )}
+
+          {/* Desk sections — the SAME layout as the Income desk single-ticker view:
+              Dynamic Greeks · Capital Risk · Risk-Adjusted Quality */}
+          {pnl?.lifecycle && hasOptionLegsNow && (() => {
+            const lc = pnl.lifecycle!;
+            return (
+              <div className="space-y-2">
+                {lc.trader && (
+                  <CollapsibleSection title="Dynamic Greeks" accent="info"
+                    icon={<Activity className="w-3 h-3" />} subtitle="Δ · Γ · ν · Θ · Vanna · Charm · Volga">
+                    <TraderGrid t={{ ...(lc.trader as any), avg_iv_pct: lc.avg_iv_pct }} />
+                  </CollapsibleSection>
+                )}
+                {lc.risk && (
+                  <CollapsibleSection title="Capital Risk" accent="warning"
+                    icon={<Shield className="w-3 h-3" />} subtitle="VaR · CVaR · max loss · sizing">
+                    <RiskGrid r={lc.risk} />
+                  </CollapsibleSection>
+                )}
+                {lc.pm && (
+                  <CollapsibleSection title="Risk Adjusted Quality" accent="success"
+                    icon={<LineChart className="w-3 h-3" />} subtitle="Omega · Sortino · Calmar · PoP · EV · Kelly">
+                    <PmGrid pm={{
+                      ...(lc.pm as any),
+                      pop: pnl.analysis?.probability_of_profit,
+                      expected_value: pnl.analysis?.expected_value,
+                      kelly_fraction: pnl.analysis?.kelly_fraction,
+                    }} />
+                  </CollapsibleSection>
+                )}
+              </div>
+            );
+          })()}
+
+          {/* Payoff diagram — P&L vs underlying (all trade types), collapsed by default */}
+          {pnl && pnl.scenarios && pnl.scenarios.length > 1 && (
+            <CollapsibleSection title="Payoff diagram" accent="base-content"
+              icon={<BarChart3 className="w-3 h-3" />} subtitle="P&L across underlying moves">
+              <PayoffChart pnl={pnl} />
+            </CollapsibleSection>
+          )}
+
+          {/* Continuous Lifecycle Management — Desk Debate (Explorer) */}
+          {(() => {
+            const deskFocus = deskFocusForTrade(trade, pnl);
+            if (!deskFocus) return null;
+            return (
+              <div className="space-y-1.5 pt-2">
+                <div className="text-[9px] uppercase tracking-wider text-base-content/40 font-semibold flex items-center gap-1.5 mb-2">
+                  <Activity className="w-3 h-3" /> Continuous Lifecycle Management
+                </div>
+                <div className="rounded-xl border border-white/[0.06] bg-base-200/30 p-4 hover:border-secondary/30 transition-colors">
+                  <DeskDebate
+                    ticker={trade.ticker}
+                    params={{
+                      quote_source: quoteSource,
+                      target_dte: dte ?? undefined,
+                      structures: [deskFocus.structure],
+                      min_prob: 0,
+                      min_income: 0,
+                    }}
+                    focus={deskFocus}
+                    label="Review hold or exit"
+                  />
+                  <p className="text-[11px] text-base-content/40 mt-2">
+                    Run the institutional desk (Quant → Risk → Rebuttal → PM) to evaluate whether to hold, adjust, or exit this existing position.
+                  </p>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Add stock inline form — for pure options trades adopting a stock leg */}
           {addingStock && (
@@ -2051,6 +2097,16 @@ function TradeCard({
 
         </div>
       )}
+
+      {closeModal && (
+        <CloseTradeModal
+          trade={trade}
+          pnl={pnl}
+          preselectLeg={closeModal.preselect}
+          onClose={() => setCloseModal(null)}
+          onClosed={() => { setCloseModal(null); onPositionChanged(trade.id); }}
+        />
+      )}
     </div>
   );
 }
@@ -2082,8 +2138,41 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
   pnlMap: Record<number, LivePnlResponse>;
 } & SharedCardProps) {
   const [collapsed, setCollapsed] = useState(false);
+  const [structFilter, setStructFilter] = useState<string>('all');
+  const [sortBy, setSortBy] = useState<string>('added');
   const meta = PURPOSE_META[purpose];
+
+  // Structures present in this group (for the filter chips) + counts.
+  const structCounts = useMemo(() => {
+    const m = new Map<string, { label: string; n: number }>();
+    trades.forEach(t => {
+      const s = tradeStructure(t);
+      const cur = m.get(s.key);
+      m.set(s.key, { label: s.label, n: (cur?.n ?? 0) + 1 });
+    });
+    return Array.from(m.entries()).map(([key, v]) => ({ key, ...v }));
+  }, [trades]);
+
+  const shown = useMemo(() => {
+    const expMs = (t: SavedStrategyItem) => {
+      const e = expiryFrom(t, pnlMap[t.id]);
+      return e ? new Date(e).getTime() : Infinity;   // undated → sorts last on expiry
+    };
+    const n = (v: number | null | undefined) => (v == null ? -Infinity : v);
+    const added = (t: SavedStrategyItem) => new Date(t.entry_date || 0).getTime();
+    const list = structFilter === 'all' ? trades : trades.filter(t => tradeStructure(t).key === structFilter);
+    const sorters: Record<string, (a: SavedStrategyItem, b: SavedStrategyItem) => number> = {
+      added: (a, b) => added(b) - added(a),
+      expiry: (a, b) => expMs(a) - expMs(b),
+      pnl: (a, b) => n(pnlMap[b.id]?.unrealized_pnl) - n(pnlMap[a.id]?.unrealized_pnl),
+      ann: (a, b) => n(pnlMap[b.id]?.analysis?.annualized_return_to_expiry) - n(pnlMap[a.id]?.analysis?.annualized_return_to_expiry),
+      ticker: (a, b) => (a.ticker || '').localeCompare(b.ticker || ''),
+    };
+    return [...list].sort(sorters[sortBy] || sorters.added);
+  }, [trades, structFilter, sortBy, pnlMap]);
+
   if (trades.length === 0) return null;
+  const showFilters = trades.length > 2 && structCounts.length > 1;
 
   return (
     <section>
@@ -2110,8 +2199,37 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
       {!collapsed && (
         <div className={`border-x border-b border-${meta.color}/10 rounded-b-2xl overflow-hidden`}>
           <GroupSummary trades={trades} pnlMap={pnlMap} />
-          <div className="px-3 pb-3 space-y-2">
-            {trades.map(trade => (
+
+          {/* Filter by structure + sort — shown when the group holds a mix of types */}
+          {showFilters && (
+            <div className="flex items-center gap-1.5 flex-wrap px-3 pt-2.5">
+              <Filter className="w-3 h-3 text-base-content/30 shrink-0" />
+              <button
+                className={`badge badge-sm cursor-pointer ${structFilter === 'all' ? `badge-${meta.color}` : 'badge-ghost'}`}
+                onClick={() => setStructFilter('all')}>All {trades.length}</button>
+              {structCounts.map(s => (
+                <button key={s.key}
+                  className={`badge badge-sm cursor-pointer ${structFilter === s.key ? `badge-${meta.color}` : 'badge-ghost'}`}
+                  onClick={() => setStructFilter(s.key)}>{s.label} {s.n}</button>
+              ))}
+              <label className="flex items-center gap-1 ml-auto text-[10px] text-base-content/40">
+                <ArrowDownUp className="w-3 h-3" />
+                <select className="select select-bordered select-xs" value={sortBy} onChange={e => setSortBy(e.target.value)}>
+                  <option value="added">Newest</option>
+                  <option value="expiry">Expiry (soonest)</option>
+                  <option value="pnl">Unrealized P&amp;L</option>
+                  <option value="ann">Ann. return</option>
+                  <option value="ticker">Ticker A–Z</option>
+                </select>
+              </label>
+            </div>
+          )}
+
+          <div className="px-3 pb-3 pt-2 space-y-2">
+            {shown.length === 0 && (
+              <div className="text-center text-xs text-base-content/40 py-4">No {structCounts.find(s => s.key === structFilter)?.label} trades in this group.</div>
+            )}
+            {shown.map(trade => (
               <TradeCard
                 key={trade.id}
                 trade={trade}
@@ -2162,49 +2280,6 @@ export default function MyTradesV2() {
   const [pnlLoadingMap, setPnlLoadingMap] = useState<Record<number, boolean>>({});
   const [quoteSource, setQuoteSource] = useState('yfinance');
   const [advisorMap, setAdvisorMap] = useState<Record<number, AdvisorState>>({});
-  const [portfolioRisk, setPortfolioRisk] = useState<PortfolioRisk | null>(null);
-  const [riskAgent, setRiskAgent] = useState<LifecycleAgentResult | null>(null);
-  const [riskAgentLoading, setRiskAgentLoading] = useState(false);
-
-  const askRiskDesk = async () => {
-    if (!portfolioRisk) return;
-    setRiskAgentLoading(true);
-    try {
-      const summary: RiskTradeSummary[] = Object.entries(pnlMap)
-        .filter(([, p]) => p?.lifecycle)
-        .map(([id, p]) => ({
-          ticker: p.ticker,
-          name: trades.find(t => t.id === Number(id))?.name || p.ticker,
-          unrealized_pnl: p.unrealized_pnl,
-          net_delta: p.lifecycle!.trader.net_delta ?? 0,
-          net_vega: p.lifecycle!.trader.net_vega ?? 0,
-        }));
-      setRiskAgent(await runPortfolioRiskAgent(portfolioRisk, summary));
-    } catch { /* surfaced by absence of result */ } finally {
-      setRiskAgentLoading(false);
-    }
-  };
-
-  // Risk Desk — aggregate the greeks of every loaded derivative trade into a
-  // book-level VaR/CVaR/stress. Recomputes whenever any trade's P&L refreshes.
-  useEffect(() => {
-    const positions: RiskPositionInput[] = Object.values(pnlMap)
-      .filter(p => p?.lifecycle?.trader && (p.underlying_price ?? 0) > 0)
-      .map(p => ({
-        ticker: p.ticker,
-        spot: p.underlying_price,
-        net_delta: p.lifecycle!.trader.net_delta ?? 0,
-        net_gamma: p.lifecycle!.trader.net_gamma ?? 0,
-        net_vega: p.lifecycle!.trader.net_vega ?? 0,
-        iv: p.avg_iv ?? 0.3,
-      }));
-    if (positions.length === 0) { setPortfolioRisk(null); return; }
-    let cancelled = false;
-    computePortfolioRisk(positions, 1)
-      .then(r => { if (!cancelled) setPortfolioRisk(r); })
-      .catch(() => { if (!cancelled) setPortfolioRisk(null); });
-    return () => { cancelled = true; };
-  }, [pnlMap]);
 
   // Modals
   const [updateTrade, setUpdateTrade] = useState<SavedStrategyItem | null>(null);
@@ -2445,75 +2520,6 @@ export default function MyTradesV2() {
               ? 'Use the Log Trade button above to record your first trade.'
               : 'Closed trades will appear here.'}
           </p>
-        </div>
-      )}
-
-      {/* Risk Desk — book-level VaR/CVaR/stress across all derivative trades */}
-      {portfolioRisk && (portfolioRisk.n_positions ?? 0) > 0 && (
-        <div className="bg-warning/5 border border-warning/15 rounded-2xl p-3 space-y-2">
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <Shield className="w-3.5 h-3.5 text-warning" />
-            <span className="text-[11px] uppercase tracking-wider text-warning/80 font-semibold">Risk Desk — Derivatives Book</span>
-            <span className="text-[10px] text-base-content/40">
-              {portfolioRisk.n_positions} trades · {portfolioRisk.n_underlyings} underlyings · 1-day horizon
-            </span>
-            <button
-              className={`btn btn-xs gap-1 ml-auto ${riskAgent ? (riskAgent.action_needed ? 'btn-warning' : 'btn-success') : 'btn-outline btn-warning'}`}
-              disabled={riskAgentLoading}
-              onClick={askRiskDesk}
-              title="Run the Risk Desk agent over the whole derivatives book"
-            >
-              {riskAgentLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Brain className="w-3 h-3" />}
-              {riskAgent ? 'Re-run Risk Desk' : 'Ask Risk Desk'}
-            </button>
-          </div>
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-            <div className="bg-base-300/20 rounded-lg p-2 text-center">
-              <div className="text-[9px] uppercase text-base-content/30">VaR 95% (1d)</div>
-              <div className="text-sm font-bold mt-0.5 text-error">{portfolioRisk.var_95 != null ? fmtMoney(portfolioRisk.var_95) : '—'}</div>
-            </div>
-            <div className="bg-base-300/20 rounded-lg p-2 text-center">
-              <div className="text-[9px] uppercase text-base-content/30">CVaR 95%</div>
-              <div className="text-sm font-bold mt-0.5 text-error">{portfolioRisk.cvar_95 != null ? fmtMoney(portfolioRisk.cvar_95) : '—'}</div>
-            </div>
-            <div className="bg-base-300/20 rounded-lg p-2 text-center">
-              <div className="text-[9px] uppercase text-base-content/30">VaR 99%</div>
-              <div className="text-sm font-bold mt-0.5 text-error">{portfolioRisk.var_99 != null ? fmtMoney(portfolioRisk.var_99) : '—'}</div>
-            </div>
-            <div className="bg-base-300/20 rounded-lg p-2 text-center">
-              <div className="text-[9px] uppercase text-base-content/30">Book Net Vega</div>
-              <div className="text-sm font-bold mt-0.5">{fmtMoney(portfolioRisk.net_vega)}</div>
-            </div>
-            <div className="bg-base-300/20 rounded-lg p-2 text-center">
-              <div className="text-[9px] uppercase text-base-content/30">Δ Notional</div>
-              <div className="text-sm font-bold mt-0.5">{fmtMoney(portfolioRisk.net_delta_notional)}</div>
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {portfolioRisk.stress_tests.map(s => (
-              <span key={s.name} className={`badge badge-sm text-[10px] ${s.pnl < 0 ? 'badge-error badge-outline' : 'badge-success badge-outline'}`}
-                title={`${(s.dS_pct * 100).toFixed(0)}% spot, ${s.dVol_pts >= 0 ? '+' : ''}${s.dVol_pts} vol pts`}>
-                {s.name}: {s.pnl >= 0 ? '+' : ''}{fmtMoney(s.pnl)}
-              </span>
-            ))}
-          </div>
-          <div className="text-[9px] text-base-content/30">
-            Delta-gamma-vega Monte Carlo, aggregated by underlying. Expand a trade to run the PM / Trader agents.
-          </div>
-          {riskAgent && (
-            <div className={`rounded-lg border p-2 ${riskAgent.action_needed ? 'border-warning/30 bg-warning/5' : 'border-success/30 bg-success/5'}`}>
-              <div className="flex items-center gap-1.5 mb-1">
-                {riskAgent.action_needed ? <AlertCircle className="w-3 h-3 text-warning" /> : <Check className="w-3 h-3 text-success" />}
-                <span className={`text-[10px] font-semibold uppercase tracking-wider ${riskAgent.action_needed ? 'text-warning' : 'text-success'}`}>
-                  {riskAgent.verdict || (riskAgent.action_needed ? 'Action needed' : 'Within limits')}
-                </span>
-                <span className="text-[9px] text-base-content/30">· Risk Desk · {riskAgent.model}</span>
-              </div>
-              <div className="text-[11px] text-base-content/80 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">
-                {riskAgent.content}
-              </div>
-            </div>
-          )}
         </div>
       )}
 

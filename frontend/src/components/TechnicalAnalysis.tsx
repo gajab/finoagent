@@ -56,7 +56,7 @@ const TIMEFRAME_GROUPS: { label: string; keys: string[] }[] = [
   { label: 'Position',    keys: ['medium_term', 'long_term'] },
 ];
 
-const DEFAULT_TIMEFRAME = 'short_term';
+const DEFAULT_TIMEFRAME = 'medium_term';
 
 function formatVolume(val: number): string {
   if (val >= 1e9) return `${(val / 1e9).toFixed(1)}B`;

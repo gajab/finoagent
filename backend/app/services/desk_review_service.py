@@ -24,7 +24,7 @@ import re
 from datetime import date, timedelta
 from typing import Optional, TYPE_CHECKING
 
-from .lifecycle_service import compute_pretrade_metrics, terminal_payoff_curve
+from .lifecycle_service import compute_pretrade_metrics, terminal_payoff_curve, horizon_payoff_curve
 from .llm_service import call_llm
 from .derivative_income_service import (
     run_derivative_income, _norm_ticker, _macro_events_in_window, _reports_earnings,
@@ -62,10 +62,10 @@ _DRIFT_SCALE = 15                # points per 1.0 of annualized μ (μ 0.30→+4
 _DRIFT_CAP = 8
 _MACD_ACCEL_VETO = 0.004         # |Δhistogram over ~3 sessions| ÷ spot beyond this = accelerating counter-trend
 
-_STOCK_STRUCTURES = {"covered_call", "collar"}     # hold 100 shares/contract
+_STOCK_STRUCTURES = {"covered_call"}               # hold 100 shares/contract
 _BULLISH_INCOME = {"cash_secured_put", "put_credit_spread", "jade_lizard"}
-_BEARISH_INCOME = {"call_credit_spread", "collar"}
-_NEUTRAL_INCOME = {"iron_condor", "jade_lizard"}
+_BEARISH_INCOME = {"call_credit_spread"}
+_NEUTRAL_INCOME = {"iron_condor", "jade_lizard", "short_strangle"}
 
 
 def _fin(x) -> Optional[float]:
@@ -88,16 +88,32 @@ def _fin(x) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 def _opp_legs(opp: dict) -> list[dict]:
-    """Combined leg dicts usable by BOTH terminal_payoff_curve and higher_order_greeks."""
-    dte_years = max(int(opp.get("dte") or 0), 1) / 365.0
+    """Combined leg dicts usable by BOTH the payoff curves and higher_order_greeks.
+
+    When the legs span MULTIPLE expirations (a calendar / diagonal) each leg carries its
+    OWN dte_years — so per-leg greeks and the horizon payoff are correct. Single-expiry
+    structures keep the opp-level dte for every leg (identical to the prior behavior)."""
+    opp_dte = max(int(opp.get("dte") or 0), 1)
+    raw = opp.get("legs", [])
+    multi_exp = len({l.get("expiration") for l in raw if l.get("expiration")}) > 1
+    today = date.today()
+
+    def _dte_years(exp) -> float:
+        if multi_exp and exp:
+            try:
+                return max((date.fromisoformat(str(exp)) - today).days, 1) / 365.0
+            except ValueError:
+                pass
+        return opp_dte / 365.0
+
     contracts = int(opp.get("contracts") or 1)
     legs = []
-    for l in opp.get("legs", []):
+    for l in raw:
         right = "C" if str(l.get("type", "")).upper().startswith("C") else "P"
         sign = 1 if str(l.get("action", "")).upper().startswith("B") else -1
         legs.append({
             "strike": l.get("strike"), "right": right, "sign": sign,
-            "qty": contracts, "iv": l.get("iv"), "dte_years": dte_years,
+            "qty": contracts, "iv": l.get("iv"), "dte_years": _dte_years(l.get("expiration")),
             "price": l.get("mid"),
         })
     return legs
@@ -117,21 +133,39 @@ def _robust_iv(opp: dict, hv: Optional[float]) -> float:
     return 0.30
 
 
-def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[float] = None) -> dict:
-    """Full desk read (trader/pm/risk/quant) for one income opportunity."""
+def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[float] = None,
+                      overwrite: bool = False) -> dict:
+    """Full desk read (trader/pm/risk/quant) for one income opportunity. `overwrite`=True means the
+    user ALREADY holds the shares (a covered-call OVERWRITE): score the INCREMENTAL short-call overlay
+    (stock_shares=0) rather than a fresh buy-write — the stock leg is a sunk position, so the only new
+    risk is capping upside. The stock notional stays the yield denominator (return = yield on held stock)."""
     legs = _opp_legs(opp)
     contracts = int(opp.get("contracts") or 1)
-    stock_shares = 100.0 * contracts if opp.get("structure") in _STOCK_STRUCTURES else 0.0
-    scenarios = terminal_payoff_curve(legs, stock_shares, spot)
+    # An evaluate trade carries its exact signed shares (collars / stock-bearing combos); otherwise
+    # infer the buy-write's 100 sh/contract from the structure. Overwrite zeroes the (already-held) stock.
+    if opp.get("stock_shares") is not None:
+        stock_shares = 0.0 if overwrite else float(opp.get("stock_shares") or 0.0)
+    else:
+        stock_shares = 100.0 * contracts if (opp.get("structure") in _STOCK_STRUCTURES and not overwrite) else 0.0
 
     ml = opp.get("max_loss")
     mp = opp.get("max_profit")
-    capital = abs(ml) if ml is not None else float(opp.get("collateral") or 0.0)
+    # On an overwrite the "loss" above the strike is OPPORTUNITY cost, not cash — capital is the held
+    # stock notional (the position being overwritten), not a fresh buy-write max loss.
+    capital = float(opp.get("collateral") or 0.0) if overwrite else (abs(ml) if ml is not None else float(opp.get("collateral") or 0.0))
+    # Calendars / diagonals: legs expire at different times, so an intrinsic-only terminal curve
+    # would misprice a still-alive leg. Use a HORIZON curve at the nearest expiry (BS-marking the
+    # longer-dated legs); single-expiry structures keep the exact terminal curve.
+    if len({round(float(l.get("dte_years") or 0.0), 6) for l in legs}) > 1:
+        horizon = min((float(l.get("dte_years") or 0.0) for l in legs), default=0.0)
+        scenarios = horizon_payoff_curve(legs, stock_shares, spot, horizon, iv_fallback=(hv or 0.30))
+    else:
+        scenarios = terminal_payoff_curve(legs, stock_shares, spot)
     avg_iv = _robust_iv(opp, hv)
 
     return compute_pretrade_metrics(
         legs, spot, scenarios, capital,
-        (-abs(ml) if ml is not None else None), mp,
+        (None if overwrite else (-abs(ml) if ml is not None else None)), mp,
         avg_iv, int(opp.get("dte") or 0),
         stock_shares=stock_shares, sofr_pct=sofr_pct,
         realized_vol=hv,            # P-measure — widens the payoff law when realized > implied
@@ -667,7 +701,7 @@ def _opp_bps(opp: dict, dm: dict, sofr_pct: float) -> Optional[int]:
 def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: Optional[float],
                 iv_rank: Optional[float], beta: Optional[float],
                 hv: Optional[float] = None, gex: Optional[dict] = None,
-                macd: Optional[dict] = None) -> dict:
+                macd: Optional[dict] = None, overwrite: bool = False) -> dict:
     pm = (dm or {}).get("pm") or {}
     merits, demerits, blocking = [], [], []
     # VRP ratio is GAP-AWARE: implied ÷ the physical vol used everywhere (max of HV and ATR), so the
@@ -738,8 +772,13 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     # 6) (Tail is already scored by the base quant model; a CVaR-vs-CAPITAL demerit is structure-blind —
     #     a defined-risk spread's CVaR is ~100% of capital BY DEFINITION — so it is intentionally omitted.)
 
-    # 7) Systemic beta — a high-beta name is a LEVERAGED market bet, not idiosyncratic income.
-    if beta is not None and beta >= 2.0:
+    # 7) Systemic beta — a high-beta name is a LEVERAGED market bet, not idiosyncratic income. But on an
+    #    OVERWRITE (shares already held) the exposure is pre-existing and the short call REDUCES it, so
+    #    credit the overlay instead of penalising beta.
+    if overwrite:
+        merits.append("income overlay on held shares — no new capital; the short call caps existing downside")
+        comp["beta"] += 3
+    elif beta is not None and beta >= 2.0:
         demerits.append(f"high beta {beta} (leveraged market bet)"); comp["beta"] -= 6
     elif beta is not None and beta >= 1.5:
         demerits.append(f"elevated beta {beta}"); comp["beta"] -= 3
@@ -1192,18 +1231,32 @@ async def rank_desk(
     user: Optional["User"] = None,
     db: Optional["AsyncSession"] = None,
     target_expiration: Optional[str] = None,
+    focus: Optional[dict] = None,
+    owns_underlying: bool = False,
 ) -> dict:
     """Rank ALL candidate income trades (best → worst) by a blended desk score:
-    the algorithmic Quant 0–100 score adjusted for technical/regime alignment."""
+    the algorithmic Quant 0–100 score adjusted for technical/regime alignment.
+
+    ``focus`` injects the caller's exact placed trade as a candidate so lifecycle
+    scoring works even when its strike/expiry is off the scan grid."""
     ticker = _norm_ticker(ticker)
     scan = await run_derivative_income(
         ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
         structures=structures, quote_source=quote_source, user=user, db=db,
-        target_expiration=target_expiration,
+        target_expiration=target_expiration, focus=focus,
     )
     if scan.get("error"):
         return {"error": scan["error"]}
+    return await _finalize_desk(scan, scan.get("opportunities", []), ticker,
+                                quote_source, owns_underlying, user, db, target_dte)
 
+
+async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quote_source: str,
+                         owns_underlying: bool, user: Optional["User"], db: Optional["AsyncSession"],
+                         target_dte: Optional[int] = None) -> dict:
+    """Score a set of candidate opportunities against the ticker's TA / regime / vol context and
+    assemble the desk-review payload (chrome passthrough + ranked trades). Shared by ``rank_desk``
+    (the full scan) and ``evaluate_desk_trade`` (one user-supplied trade)."""
     ctx = scan.get("context") or {}
     spot = float(ctx.get("spot") or scan.get("spot") or 0.0)
     sofr_pct = float(ctx.get("sofr_pct") or 5.0)
@@ -1214,7 +1267,6 @@ async def rank_desk(
         asyncio.to_thread(_gex_sync, ticker),
     )
 
-    opportunities = scan.get("opportunities", [])
     max_dte = max((int(o.get("dte") or 0) for o in opportunities), default=int(target_dte or 45))
     events_pre = _events_in_window(scan, ta, max_dte)        # computed once — also feeds the grade
     vsx = ctx.get("vol_stats") or {}
@@ -1228,8 +1280,11 @@ async def rank_desk(
 
     ranked: list[dict] = []
     for opp in opportunities:
+        # Overwrite: the user already holds the shares → a covered call is an income overlay, not a
+        # fresh buy-write (re-based capital + no beta penalty).
+        overwrite = bool(owns_underlying and opp.get("structure") == "covered_call")
         try:
-            dm = _opp_desk_metrics(opp, spot, sofr_pct, phys_vol)
+            dm = _opp_desk_metrics(opp, spot, sofr_pct, phys_vol, overwrite=overwrite)
         except Exception as exc:  # noqa: BLE001 — one bad trade must not kill the desk
             logger.debug("desk metrics failed (%s): %s", opp.get("label"), exc)
             dm = {"trader": {}, "pm": {}, "risk": {}, "quant": {"score": None, "verdict": None, "reasons": []}}
@@ -1240,7 +1295,7 @@ async def rank_desk(
         # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
         g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
-                        hv=phys_vol, gex=gex, macd=macd_accel)
+                        hv=phys_vol, gex=gex, macd=macd_accel, overwrite=overwrite)
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
         grade, approval = _grade_letter(desk_score, g["blocking"])
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
@@ -1323,6 +1378,7 @@ async def rank_desk(
         "as_of": scan.get("as_of"),
         "ta": ta,
         "ta_summary": _ta_summary(ta),
+        "ta_timeframe": ta.get("timeframeLabel"),   # which TA read scores the trade (medium-term swing)
         "vol_stats": vol_stats,
         "corporate_actions": corporate_actions,
         "portfolio_fit": portfolio_fit or None,
@@ -1342,7 +1398,120 @@ async def rank_desk(
         "algo_top_pick": ranked[0] if ranked else None,
         "n_trades": len(ranked),
         "note": scan.get("note"),
+        "data_source_note": scan.get("data_source_note"),   # IBKR→yfinance fallback flag, if any
     }
+
+
+async def evaluate_desk_trade(
+    ticker: str,
+    legs: list[dict],
+    stock_shares: float = 0.0,
+    cost_basis: Optional[float] = None,
+    quote_source: str = "yfinance",
+    owns_underlying: bool = False,
+    user: Optional["User"] = None,
+    db: Optional["AsyncSession"] = None,
+) -> dict:
+    """Evaluate ONE user-supplied multi-leg trade (options and/or stock) on the FULL desk
+    pipeline — identical chrome + metrics + grade as the single-ticker scan, but for the user's
+    EXACT trade instead of scanned candidates. Returns a ``rank_desk``-shaped payload with
+    ``ranked=[the trade]`` so the frontend renders it exactly like the Single-Ticker tab.
+
+    Recognized single-expiry income structures (CSP / covered call / vertical spreads) are priced
+    at the user's exact strikes via the scan's focus mechanism; strangles / condors / jade lizards /
+    collars / calendars / custom combos are built generically and flagged ``is_custom`` (indicative
+    grade)."""
+    from .derivative_income_service import (
+        _classify_structure, _build_evaluate_opp, _split_chain, _build_rnd, _atm_iv,
+        _is_european, _EXACT_FOCUS_STRUCTURES,
+    )
+    from .quote_providers import get_provider
+
+    ticker = _norm_ticker(ticker)
+    norm: list[dict] = []
+    for l in legs or []:
+        try:
+            norm.append({
+                "action": "BUY" if str(l["action"]).upper().startswith("B") else "SELL",
+                "type": "CALL" if str(l["type"]).upper().startswith("C") else "PUT",
+                "strike": float(l["strike"]),
+                "expiration": str(l["expiration"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            return {"error": "Each option leg needs action, type, strike and expiration."}
+    has_stock = abs(float(stock_shares or 0.0)) > 0
+    if not norm and not has_stock:
+        return {"error": "Enter at least one option leg or a stock position to evaluate."}
+
+    exps = sorted({l["expiration"] for l in norm})
+    today = date.today()
+
+    def _dte(e: str) -> int:
+        try:
+            return max((date.fromisoformat(e) - today).days, 0)
+        except ValueError:
+            return 0
+
+    near_exp = min(exps, key=_dte) if exps else None
+    single_exp = len(exps) <= 1
+    structure_id, label, is_custom = _classify_structure(norm, has_stock)
+
+    # Chrome (+ the exact-strike opp for recognized single-expiry income structures) via the scanner.
+    focus = None
+    if single_exp and structure_id in _EXACT_FOCUS_STRUCTURES and near_exp:
+        focus = {"structure": structure_id, "expiration": near_exp,
+                 "legs": [{"strike": l["strike"], "right": "C" if l["type"] == "CALL" else "P",
+                           "action": l["action"]} for l in norm]}
+    known = {"covered_call", "cash_secured_put", "short_strangle", "put_credit_spread",
+             "call_credit_spread", "iron_condor", "jade_lizard"}
+    scan_structures = [structure_id] if structure_id in known else ["cash_secured_put"]
+    scan = await run_derivative_income(
+        ticker, target_expiration=near_exp, min_prob=0.0, min_income=0.0,
+        structures=scan_structures, quote_source=quote_source, user=user, db=db, focus=focus,
+    )
+    if scan.get("error"):
+        return {"error": scan["error"]}
+    ctx = scan.get("context") or {}
+    spot = float(ctx.get("spot") or scan.get("spot") or 0.0)
+    sofr_pct = float(ctx.get("sofr_pct") or 5.0)
+    hv = ((ctx.get("hv30_pct") or ctx.get("hv20_pct") or 0) / 100.0) or None
+    r_free = sofr_pct / 100.0
+
+    # The ONE opportunity to score.
+    opp = None
+    if focus:
+        opp = next((o for o in scan.get("opportunities", []) if o.get("_is_focus")), None)
+    if opp is None:
+        provider = get_provider(quote_source, user=user, db=db)
+        chains_by_exp: dict[str, dict] = {}
+        for e in exps:
+            try:
+                chain = await provider.get_option_chain(ticker, e)
+            except Exception as exc:  # noqa: BLE001 — one bad expiry must not kill the eval
+                logger.debug("evaluate chain fetch failed %s %s: %s", ticker, e, exc)
+                continue
+            calls, puts = _split_chain(chain)
+            strikes_all = sorted(set(calls) | set(puts))
+            rnd = _build_rnd(calls, puts, strikes_all, spot, _dte(e))
+            chains_by_exp[e] = {"calls": calls, "puts": puts, "rnd": rnd,
+                                "atm_iv": _atm_iv(rnd, calls, puts, spot),
+                                "dte": _dte(e), "strikes": strikes_all}
+        if not chains_by_exp:
+            return {"error": f"No option chain available for {ticker} at the requested expiries."}
+        stock = {"shares": stock_shares, "cost_basis": cost_basis} if has_stock else None
+        opp = _build_evaluate_opp(norm, stock, chains_by_exp, spot, sofr_pct, hv,
+                                  _is_european(ticker), ticker, r_free, structure_id, label, is_custom)
+    if opp is None:
+        return {"error": "Could not price this trade from the live chain — check the strikes and expiries."}
+    opp["is_custom"] = bool(is_custom)
+    opp.setdefault("label", label)
+
+    desk = await _finalize_desk(scan, [opp], ticker, quote_source, owns_underlying, user, db)
+    desk["note"] = (f"Evaluated a user-supplied {label}."
+                    + (" Custom / calendar structure — the desk grade is indicative." if is_custom else ""))
+    desk["evaluate"] = {"structure": structure_id, "label": label, "is_custom": is_custom,
+                        "expirations": exps, "stock_shares": stock_shares}
+    return desk
 
 
 # ---------------------------------------------------------------------------
@@ -1818,14 +1987,23 @@ async def run_desk_agents(
     user: Optional["User"] = None,
     db: Optional["AsyncSession"] = None,
     target_expiration: Optional[str] = None,
+    evaluate: Optional[dict] = None,
 ) -> dict:
     """A genuine desk DEBATE: Quant proposes → Risk challenges → Quant rebuts → PM adjudicates.
     Each agent reasons explicitly, sees all prior turns + the full pre-computed JSON, and grounds
-    every claim in a GIVEN field. Two modes: ranking (focus=None → pick the best of the top set)
-    and single-trade (Desk Review v2 — `focus`={structure, expiration, short_strike} → rule
-    EXECUTE/REJECT on THAT one trade)."""
-    desk = await rank_desk(ticker, target_dte, min_prob, min_income, structures, quote_source,
-                           user, db, target_expiration=target_expiration)
+    every claim in a GIVEN field. Three modes: ranking (focus=None → pick the best of the top set),
+    single-trade (Desk Review v2 — `focus`={structure, expiration, short_strike} → rule
+    EXECUTE/REJECT on THAT scanned trade), and evaluate (`evaluate`={legs, stock_shares, …} → debate
+    the user's own bring-your-own trade — works for custom/calendar trades the focus selector can't
+    rebuild)."""
+    if evaluate:
+        desk = await evaluate_desk_trade(
+            ticker, legs=evaluate.get("legs") or [], stock_shares=evaluate.get("stock_shares") or 0.0,
+            cost_basis=evaluate.get("cost_basis"), quote_source=quote_source,
+            owns_underlying=bool(evaluate.get("owns_underlying")), user=user, db=db)
+    else:
+        desk = await rank_desk(ticker, target_dte, min_prob, min_income, structures, quote_source,
+                               user, db, target_expiration=target_expiration)
     if desk.get("error"):
         return desk
     ranked = desk["ranked"]
@@ -1833,7 +2011,9 @@ async def run_desk_agents(
         return {"error": desk.get("note") or "No candidate trades to review."}
 
     focus_index = None
-    if focus:
+    if evaluate:
+        focus_index = 0                    # the evaluated trade IS candidates[0]
+    elif focus:
         focus_index = _find_focus_index(ranked, focus.get("structure"), focus.get("expiration"),
                                         focus.get("short_strike"))
         if focus_index is None:

@@ -86,6 +86,23 @@ class CloseTradeIn(BaseModel):
     exit_net: float = Field(...)           # total exit net
 
 
+class ClosePositionLegIn(BaseModel):
+    """One option leg to close, at the price the user actually got out at."""
+    leg_index: int = Field(..., ge=0)
+    exit_price: float = Field(..., ge=0)   # per-share option premium paid/received at close
+
+
+class ClosePositionIn(BaseModel):
+    """Close SOME or ALL of a placed trade. Records realized P&L per leg so the
+    long-term ledger is correct; a partial close keeps the trade active with the
+    remaining legs, a full close (all legs + stock) flips it to 'closed'."""
+    legs: list[ClosePositionLegIn] = Field(default_factory=list)
+    close_stock: bool = False
+    stock_exit_price: Optional[float] = Field(None, ge=0)
+    executed_at: Optional[str] = None
+    note: Optional[str] = None
+
+
 class ManualTradeIn(BaseModel):
     strategy_type: str = Field(..., min_length=1, max_length=50)
     name: str = Field(..., min_length=1, max_length=200)
@@ -475,6 +492,261 @@ async def close_trade(
     await db.commit()
     await db.refresh(strategy)
     return _to_out(strategy)
+
+
+@router.post("/{strategy_id}/close-position", response_model=SavedStrategyOut)
+async def close_position(
+    strategy_id: int,
+    body: ClosePositionIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Close SOME or ALL of a placed trade at the prices the user actually got.
+
+    Computes realized P&L per leg (authoritative, banked into
+    parameters.realized_pnl + parameters.closed_legs), writes a 'close' ledger row
+    per leg for the audit trail, drops the closed legs from legs_data, and — only
+    when nothing is left (no option legs AND no stock) — flips trade_status to
+    'closed' so the trade moves to the Closed tab. A partial close leaves the trade
+    active with its remaining legs.
+
+    Sign convention (mirrors trade P&L math): a SHORT option earns (entry − exit),
+    a LONG option earns (exit − entry); stock earns (exit − entry) long / (entry −
+    exit) short. All option amounts are ×100×contracts.
+    """
+    import datetime as dt
+    from ..services.trade_math import realized_close_pnl
+    result = await db.execute(
+        select(SavedStrategy).where(
+            SavedStrategy.id == strategy_id,
+            SavedStrategy.user_id == user.id,
+            SavedStrategy.trade_status == "active",
+        )
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Active trade not found")
+
+    legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+    entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
+    shares = float(params.get("shares") or 0)
+    is_short_stock = "short" in (strategy.strategy_type or "").lower()
+
+    # entry-price index convention: on a combo (stock + options), the stock's entry
+    # sits at entry_prices[0] and option leg i is at entry_prices[i+1].
+    offset = 1 if (shares > 0 and len(entry_prices) == len(legs) + 1) else 0
+
+    def _leg_entry(i: int, leg: dict) -> float:
+        j = i + offset
+        ep = (entry_prices[j] or {}).get("price") if 0 <= j < len(entry_prices) else None
+        if ep in (None, ""):
+            ep = leg.get("premium") or leg.get("mid") or leg.get("price")
+        try:
+            return float(ep or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    executed = dt.datetime.now(dt.timezone.utc)
+    if body.executed_at:
+        try:
+            executed = dt.datetime.fromisoformat(body.executed_at)
+        except (ValueError, TypeError):
+            pass
+
+    close_idx = {l.leg_index for l in body.legs if 0 <= l.leg_index < len(legs)}
+    exit_of = {l.leg_index: float(l.exit_price) for l in body.legs}
+    closed_records = list(params.get("closed_legs") or [])
+    realized_total = 0.0
+
+    # ---- option legs ----
+    for i in sorted(close_idx):
+        leg = legs[i]
+        qty = float(leg.get("qty") or leg.get("contracts") or 1)
+        entry = _leg_entry(i, leg)
+        exitp = exit_of[i]
+        is_short = any(k in str(leg.get("action", "")).upper() for k in ("SELL", "SHORT"))
+        realized = realized_close_pnl(leg.get("action", ""), entry, exitp, qty, is_option=True)
+        realized_total += realized
+        closed_records.append({
+            "leg_index": i, "action": leg.get("action"), "type": leg.get("type"),
+            "strike": leg.get("strike"), "qty": qty, "entry_price": round(entry, 4),
+            "exit_price": round(exitp, 4), "realized": round(realized, 2),
+            "closed_at": executed.isoformat(),
+        })
+        db.add(TradeTransaction(
+            strategy_id=strategy.id, action="close", leg_index=i,
+            quantity=(qty if is_short else -qty),      # flatten: buy-to-close short / sell-to-close long
+            price=exitp, fees=0.0, executed_at=executed, source="manual",
+            note=body.note or f"Close {leg.get('action')} {leg.get('type')} ${leg.get('strike')} @ ${exitp}",
+        ))
+
+    remaining_legs = [l for i, l in enumerate(legs) if i not in close_idx]
+
+    # ---- stock ----
+    if body.close_stock and shares > 0:
+        entry_stock = (entry_prices[0] or {}).get("price") if (offset == 1 and entry_prices) else None
+        if entry_stock in (None, ""):
+            entry_stock = params.get("avg_cost")
+        try:
+            entry_stock = float(entry_stock or 0)
+        except (TypeError, ValueError):
+            entry_stock = 0.0
+        exitp = float(body.stock_exit_price or 0)
+        realized = realized_close_pnl("SELL" if is_short_stock else "BUY", entry_stock, exitp, shares, is_option=False)
+        realized_total += realized
+        closed_records.append({
+            "leg_index": None, "type": "stock", "qty": shares,
+            "entry_price": round(entry_stock, 4), "exit_price": round(exitp, 4),
+            "realized": round(realized, 2), "closed_at": executed.isoformat(),
+        })
+        db.add(TradeTransaction(
+            strategy_id=strategy.id, action="close", leg_index=None,
+            quantity=(shares if is_short_stock else -shares), price=exitp, fees=0.0,
+            executed_at=executed, source="manual",
+            note=body.note or f"Close {int(shares)} shares @ ${exitp}",
+        ))
+        params["shares"] = 0
+
+    if not close_idx and not (body.close_stock and shares > 0):
+        raise HTTPException(status_code=400, detail="Nothing selected to close")
+
+    params["realized_pnl"] = round(float(params.get("realized_pnl") or 0.0) + realized_total, 2)
+    params["closed_legs"] = closed_records
+    strategy.legs_data = json.dumps(remaining_legs)
+    strategy.parameters = json.dumps(params)
+
+    fully_closed = len(remaining_legs) == 0 and float(params.get("shares") or 0) == 0
+    if fully_closed:
+        strategy.trade_status = "closed"
+        strategy.exit_date = executed
+        strategy.exit_prices = json.dumps(
+            [{"leg_index": r.get("leg_index"), "exit_price": r.get("exit_price")} for r in closed_records]
+        )
+        strategy.exit_net = params["realized_pnl"]   # realized P&L (legacy field kept populated)
+
+    await db.commit()
+    await db.refresh(strategy)
+    return _to_out(strategy)
+
+
+class ImportOrderIn(BaseModel):
+    text: str = Field(..., min_length=3)
+    purpose: Optional[str] = None
+
+
+def _import_suggest_name(legs: list, underlying: str) -> str:
+    opt = [l for l in legs if l.get("kind") == "option"]
+    if not opt:
+        return f"{underlying} stock"
+    if len(opt) == 1:
+        l = opt[0]
+        return f"{underlying} {'Short' if l['action'] == 'SELL' else 'Long'} {l['type'].title()} ${l['strike']:g}"
+    return f"{underlying} {len(opt)}-leg options"
+
+
+def _import_build_payload(legs: list, underlying: str, purpose: Optional[str]) -> dict:
+    """Parsed legs → a ManualTradeIn-shaped payload the frontend can POST as-is."""
+    opt = [l for l in legs if l.get("kind") == "option"]
+    stock = [l for l in legs if l.get("kind") == "stock"]
+    legs_data = [{"action": l["action"].lower(), "type": l["type"].lower(),
+                  "strike": l["strike"], "expiration": l["expiration"],
+                  "qty": l["qty"], "premium": l["price"]} for l in opt]
+    # combo entry_prices put the stock at index 0, then the option legs (the app's convention).
+    entry_prices = ([{"price": stock[0].get("price")}] if stock else []) + [{"price": l["price"]} for l in opt]
+    # BUY-negative / SELL-positive, matching option_legs_net_debit.
+    net_debit = sum((-1 if l["action"] == "BUY" else 1) * (l["price"] or 0) * l["qty"] * 100 for l in opt)
+    params: dict = {"purpose": purpose or "income"}
+    if opt:
+        params["contracts"] = max(l["qty"] for l in opt)
+    if stock:
+        params["shares"] = stock[0]["qty"]
+        params["avg_cost"] = stock[0].get("price")
+    stype = ("options_spread" if len(opt) > 1
+             else "covered_call" if (stock and opt and opt[0]["type"] == "CALL" and opt[0]["action"] == "SELL")
+             else "cash_secured_put" if (opt and opt[0]["type"] == "PUT" and opt[0]["action"] == "SELL")
+             else "stock" if (stock and not opt) else "options")
+    return {
+        "strategy_type": stype, "name": _import_suggest_name(legs, underlying),
+        "ticker": underlying, "parameters": params, "legs_data": legs_data,
+        "result_snapshot": {}, "entry_prices": entry_prices,
+        "entry_net_debit": round(net_debit, 2), "order_source": "import",
+        "notes": "Imported from pasted broker order",
+    }
+
+
+@router.post("/import-order")
+async def import_order(
+    body: ImportOrderIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Parse a pasted broker order (Fidelity label/value rows, single or multi-leg)
+    and decide what it means against the user's OPEN trades:
+      • opposite side of an existing leg (same symbol/strike/expiry) → it CLOSES it,
+      • SAME side of an existing leg → a warning (adding to a position; log manually),
+      • otherwise → a brand-new trade (payload returned ready to POST).
+    Read-only — the frontend applies via the existing create / close-position endpoints."""
+    from ..services.order_parser import parse_pasted_orders
+    legs = parse_pasted_orders(body.text)
+    if not legs:
+        raise HTTPException(status_code=400,
+                            detail="Couldn't recognize an order in that text. Paste the broker rows "
+                                   "(Symbol, Contracts, Price …).")
+    underlyings = sorted({l["underlying"] for l in legs})
+    if len(underlyings) > 1:
+        raise HTTPException(status_code=400,
+                            detail=f"Found multiple underlyings ({', '.join(underlyings)}). Paste one trade at a time.")
+    underlying = underlyings[0]
+
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.user_id == user.id, SavedStrategy.ticker == underlying,
+        SavedStrategy.trade_status == "active"))
+    active = result.scalars().all()
+
+    def _nexp(e) -> str:
+        return str(e or "")[:10]
+
+    close_matches: list[dict] = []
+    warnings: list[str] = []
+    n_opt = 0
+    for pi, pl in enumerate(legs):
+        if pl["kind"] != "option":
+            continue
+        n_opt += 1
+        for t in active:
+            for li, el in enumerate(json.loads(t.legs_data or "[]")):
+                er = "C" if ("CALL" in str(el.get("type", "")).upper()
+                             or str(el.get("type", "")).upper() == "C") else "P"
+                if not (er == pl["right"]
+                        and abs(float(el.get("strike", 0) or 0) - pl["strike"]) < 0.01
+                        and _nexp(el.get("expiration") or el.get("expiry")) == pl["expiration"]):
+                    continue
+                ea = "SELL" if "SELL" in str(el.get("action", "")).upper() else "BUY"
+                if ea != pl["action"]:
+                    close_matches.append({
+                        "parsed_idx": pi, "trade_id": t.id, "trade_name": t.name,
+                        "leg_index": li, "exit_price": pl["price"],
+                        "label": f"{pl['type']} ${pl['strike']:g} exp {pl['expiration']}",
+                    })
+                else:
+                    warnings.append(
+                        f'You already hold {ea} {el.get("type")} ${el.get("strike")} exp {pl["expiration"]} '
+                        f'in "{t.name}" — this order is the SAME side, so it was NOT auto-added. '
+                        f'Use Log Trade to add to the position manually if that\'s intended.')
+
+    if warnings:
+        intent = "duplicate"
+    elif close_matches and n_opt > 0:
+        intent = "close"
+    else:
+        intent = "new"
+
+    return {
+        "legs": legs, "underlying": underlying, "intent": intent,
+        "close_matches": close_matches, "warnings": warnings,
+        "manual_trade": _import_build_payload(legs, underlying, body.purpose),
+    }
 
 
 @router.post("/manual-trade", response_model=SavedStrategyOut, status_code=201)
@@ -1134,6 +1406,7 @@ def build_payoff(
 async def get_live_pnl(
     strategy_id: int,
     quote_source: str = "yfinance",
+    margin_mode: str = "reg_t",           # 'reg_t' (default) | 'portfolio' — from Settings
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1150,7 +1423,7 @@ async def get_live_pnl(
     )
     from ..services.lifecycle_service import (
         higher_order_greeks, pm_ratios, payoff_distribution_metrics,
-        algorithmic_exit, _weighted_var_cvar,
+        algorithmic_quant, management_exit, _weighted_var_cvar,
     )
     import numpy as _np
 
@@ -1632,7 +1905,7 @@ async def get_live_pnl(
             def _record_combo_quote(lm: dict, q: object) -> None:
                 opt_quotes.append({
                     "leg": lm["i"], "strike": lm["strike"], "type": lm["type"],
-                    "bid": q.bid, "ask": q.ask, "mid": q.mid,
+                    "bid": q.bid, "ask": q.ask, "mid": q.mid, "oi": q.oi, "volume": q.volume,
                 })
                 opt_greeks.append({
                     "leg": lm["i"], "strike": lm["strike"], "type": lm["type"],
@@ -1849,15 +2122,23 @@ async def get_live_pnl(
             max_profit=_opt_max_profit, max_loss=opt_only_pay.get("max_loss"),
             dte=combo_min_dte, theta_per_day=combo_net_theta,
         )
-        # Base quality reads the WHOLE covered structure (bounded — avoids scoring a
-        # covered short call as if it were naked), but the overlay + overrides manage
-        # the OPTION (captured premium, time/gamma).
-        _combo_quant_exit = algorithmic_exit(
-            pm={**combo_pm, "pop": combo_pop}, cvar95=None, capital=abs(total_entry_cost) or 1,
-            max_loss=opt_only_pay.get("max_loss"), max_profit=_opt_max_profit,
-            kelly=opt_only_pay.get("kelly_fraction"), dte_days=combo_min_dte,
-            captured_pct=_opt_captured, unrealized_pnl=options_pnl,
-        ) if combo_pm else None
+        # MANAGEMENT read on the OPTION OVERLAY — anchored on the overlay's PoP
+        # (probability the short options keep their edge), then take-profit + time.
+        # The whole-structure 5-lens is kept as reference only, not the anchor.
+        _combo_quant_exit = None
+        if combo_pm:
+            _combo_aq = algorithmic_quant(
+                pm={**combo_pm, "pop": combo_pop}, cvar95=None, capital=abs(total_entry_cost) or 1,
+                max_loss=opt_only_pay.get("max_loss"), max_profit=_opt_max_profit,
+                kelly=opt_only_pay.get("kelly_fraction"), dte_days=combo_min_dte,
+            )
+            _combo_quant_exit = management_exit(
+                pop_pct=opt_only_pay.get("pop", combo_pop), captured_pct=_opt_captured,
+                dte_days=combo_min_dte, unrealized_pnl=options_pnl, max_profit=_opt_max_profit,
+                max_loss=opt_only_pay.get("max_loss"),
+                iv_pct=(_combo_avg_iv * 100) if _combo_avg_iv else None, theta_per_day=combo_net_theta,
+                quality_subscores=_combo_aq["subscores"], quality_score=_combo_aq["score"],
+            )
 
         return {
             "strategy_id": strategy_id,
@@ -2033,7 +2314,7 @@ async def get_live_pnl(
                         continue
                     current_values.append({
                         "leg": idx, "strike": lm["strike"], "type": lm["type"],
-                        "bid": q.bid, "ask": q.ask, "mid": q.mid,
+                        "bid": q.bid, "ask": q.ask, "mid": q.mid, "oi": q.oi, "volume": q.volume,
                     })
                     greeks_data.append({
                         "leg": idx, "strike": lm["strike"], "type": lm["type"],
@@ -2068,7 +2349,7 @@ async def get_live_pnl(
                 q = matching[0]
                 current_values.append({
                     "leg": lm["i"], "strike": lm["strike"], "type": lm["type"],
-                    "bid": q.bid, "ask": q.ask, "mid": q.mid,
+                    "bid": q.bid, "ask": q.ask, "mid": q.mid, "oi": q.oi, "volume": q.volume,
                 })
                 # yfinance doesn't return Greeks — compute from BS when IV is available
                 _giv = q.iv
@@ -2218,8 +2499,23 @@ async def get_live_pnl(
         })
 
     # --- Margin calculation (IBKR-style spread margin) ---
-    def _calc_margin(leg_list):
-        """Calculate margin requirement for the position (mirrors frontend calcSpreadMargin)."""
+    def _calc_margin(leg_list, U: float = 0.0, mode: str = "reg_t"):
+        """Margin requirement for the position. Defined-risk spreads = width (both
+        regimes). Naked shorts depend on the regime:
+          • Reg T (default): max(20%·underlying − out-of-the-money, 10%·strike[put]/
+            underlying[call]) — the standard broker rule.
+          • Portfolio Margin: risk-based ≈ a 15% adverse move on the underlying
+            (lower than Reg T for naked shorts; requires broker approval).
+        """
+        def _naked(strike: float, qty: float, right: str) -> float:
+            if mode == "portfolio" and U > 0:
+                return 0.15 * U * qty * 100
+            if U > 0:
+                otm = max(0.0, U - strike) if right == "P" else max(0.0, strike - U)
+                floor_base = strike if right == "P" else U
+                return max(0.20 * U - otm, 0.10 * floor_base) * qty * 100
+            return 0.20 * strike * qty * 100   # no spot → legacy 20%-of-strike fallback
+
         puts = [l for l in leg_list if l.get("right") == "P" or "PUT" in (l.get("type") or "").upper()]
         calls = [l for l in leg_list if l.get("right") == "C" or "CALL" in (l.get("type") or "").upper()]
         margin = 0.0
@@ -2253,7 +2549,7 @@ async def get_live_pnl(
                 sp["rem"] -= paired
                 bp["rem"] -= paired
             if sp["rem"] > 0:
-                margin += 0.20 * sp["strike"] * sp["rem"] * 100
+                margin += _naked(sp["strike"], sp["rem"], "P")
 
         # Process call spreads
         sell_calls = sorted(
@@ -2282,11 +2578,11 @@ async def get_live_pnl(
                 sc["rem"] -= paired
                 bc["rem"] -= paired
             if sc["rem"] > 0:
-                margin += 0.20 * sc["strike"] * sc["rem"] * 100
+                margin += _naked(sc["strike"], sc["rem"], "C")
 
         return round(margin, 2)
 
-    margin_required = _calc_margin(legs)
+    margin_required = _calc_margin(legs, underlying_price, margin_mode)
     # For debit spreads: capital = entry cost + margin
     # For credit spreads: capital at risk = margin (or abs(entry_cost) if larger)
     if entry_cost > 0:
@@ -2467,6 +2763,7 @@ async def get_live_pnl(
     expected_value = None
     _pm_metrics = {}
     _cvar95 = None
+    _var95 = None
     if exp_pnls and underlying_price > 0 and min_dte_days > 0:
         _prices = [p for p, _ in exp_pnls]
         _pnls = [pl for _, pl in exp_pnls]
@@ -2497,7 +2794,7 @@ async def get_live_pnl(
             _wa = _np.asarray(_weights, dtype=float)
             _pnl_mid = (_np.asarray(_pnls[:-1], dtype=float) + _np.asarray(_pnls[1:], dtype=float)) / 2.0
             _wn = _wa / _wa.sum() if _wa.sum() > 0 else _wa
-            _, _cvar95 = _weighted_var_cvar(_pnl_mid, _wn)
+            _var95, _cvar95 = _weighted_var_cvar(_pnl_mid, _wn)
 
     # Risk/Reward Ratio
     risk_reward = None
@@ -2604,7 +2901,16 @@ async def get_live_pnl(
         for la in leg_analysis if la.get("strike", 0) > 0
     ]
     _trader = higher_order_greeks(_life_legs, underlying_price) if _life_legs else {}
-    lifecycle = {"trader": _trader, "pm": _pm_metrics, "avg_iv_pct": round(avg_iv * 100, 1)}
+    lifecycle = {
+        "trader": _trader, "pm": _pm_metrics, "avg_iv_pct": round(avg_iv * 100, 1),
+        # Position-level Capital Risk (VaR/CVaR are positive-loss $) — the same tiles
+        # the Income desk's "Capital Risk" section shows.
+        "risk": {
+            "var_95": _var95, "cvar_95": _cvar95,
+            "max_profit": max_profit, "max_loss": max_loss,
+            "capital": abs(total_capital) if total_capital else (margin_required or None),
+        },
+    }
 
     # Fold per-leg verdicts + structure metrics into one headline recommendation.
     recommendation = summarize_trade_actions(
@@ -2627,14 +2933,23 @@ async def get_live_pnl(
         max_profit=max_profit, max_loss=max_loss, dte=min_dte_days,
         theta_per_day=net_greeks.get("theta", 0.0),
     )
-    # Tier-2 QUANT ALGORITHMIC exit — scored 0-100 desk read → the 4-level signal,
-    # fully auditable (base quality + lifecycle adjustments + overrides).
-    _quant_exit = algorithmic_exit(
-        pm={**_pm_metrics, "pop": pop}, cvar95=_cvar95, capital=abs(total_capital),
-        max_loss=max_loss, max_profit=max_profit, kelly=kelly_fraction,
-        dte_days=min_dte_days, captured_pct=_exit["captured_pct"],
-        unrealized_pnl=unrealized_pnl,
-    ) if _pm_metrics else None
+    # Tier-2 QUANT ALGORITHMIC exit — a MANAGEMENT read for a trade you already
+    # hold: anchored on the position's probability of KEEPING its edge (PoP here;
+    # the on-demand desk score refines with drift-adjusted keep prob), then the
+    # take-profit + time/gamma overlay. The entry-flavoured 5-lens is computed only
+    # as a reference readout — it no longer drives the hold/close signal.
+    _quant_exit = None
+    if _pm_metrics:
+        _aq = algorithmic_quant(
+            pm={**_pm_metrics, "pop": pop}, cvar95=_cvar95, capital=abs(total_capital),
+            max_loss=max_loss, max_profit=max_profit, kelly=kelly_fraction, dte_days=min_dte_days,
+        )
+        _quant_exit = management_exit(
+            pop_pct=pop, captured_pct=_exit["captured_pct"], dte_days=min_dte_days,
+            unrealized_pnl=unrealized_pnl, max_profit=max_profit, max_loss=max_loss,
+            iv_pct=(avg_iv * 100) if avg_iv else None, theta_per_day=net_greeks.get("theta", 0.0),
+            quality_subscores=_aq["subscores"], quality_score=_aq["score"],
+        )
 
     analysis = {
         "annualized_return_to_expiry": annualized_return,
@@ -3577,6 +3892,53 @@ Manage this trade now. Follow the output format exactly."""
     }
 
 
+@router.get("/{strategy_id}/underlying-desk")
+async def underlying_desk(
+    strategy_id: int,
+    quote_source: str = "yfinance",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The underlying's stock context for a PLACED trade — the SAME chrome the Income
+    desk shows: price / earnings / SOFR / HV, the IV rank·percentile·skew vol panel,
+    and upcoming events. Reuses the income scan with NO opportunity builders (chrome
+    only), targeted at the trade's own horizon, so it's cheap (one expiry)."""
+    import datetime as dt
+    result = await db.execute(
+        select(SavedStrategy).where(
+            SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id,
+        )
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    exp = next((l.get("expiration") or l.get("expiry") for l in legs
+                if l.get("expiration") or l.get("expiry")), None)
+    trade_dte = None
+    if exp:
+        try:
+            trade_dte = max(1, (dt.date.fromisoformat(str(exp)[:10]) - dt.date.today()).days)
+        except (ValueError, TypeError):
+            trade_dte = None
+    target = min(max(trade_dte, 7), 45) if trade_dte else 30
+
+    from ..services.derivative_income_service import run_derivative_income
+    try:
+        res = await run_derivative_income(
+            strategy.ticker, structures=["__chrome_only__"], min_prob=0.0, min_income=0.0,
+            quote_source=quote_source, user=user, db=db, target_dte=target,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Underlying context failed: {exc}")
+    return {
+        "ticker": res.get("ticker"), "spot": res.get("spot"),
+        "context": res.get("context"), "events": res.get("events", []),
+        "expiry_summaries": res.get("expiry_summaries", []),
+    }
+
+
 # ── Tier-2 FULL desk score for a placed trade (option-math + TA + VRP) ───────
 
 class DeskScoreRequest(BaseModel):
@@ -3599,8 +3961,8 @@ async def compute_lifecycle_desk_score(
     VRP/Moneyness/Skew/Liquidity/Beta + TA factors + Q-vs-P), then the lifecycle
     overlay (profit banked, time/gamma) → the 4-level exit signal. On-demand
     (heavy: runs the scan + TA), so it never touches the live-pnl refresh path."""
-    from ..services.desk_review_service import rank_desk, _find_focus_index
-    from ..services.lifecycle_service import lifecycle_overlay
+    from ..services.desk_review_service import rank_desk, _find_focus_index, _json_default
+    from ..services.lifecycle_service import management_desk_score
 
     result = await db.execute(
         select(SavedStrategy).where(
@@ -3615,11 +3977,34 @@ async def compute_lifecycle_desk_score(
     a = pnl.get("analysis", {}) or {}
     dte = a.get("dte_remaining")
 
+    # A fresh-chain full desk score is only well-defined for the income structures
+    # the scan can price at exact legs. For anything else (collar, calendars, ratios,
+    # custom multi-leg, plain stock) the always-present Quant Algorithmic card above is
+    # the read — say so plainly instead of pricing something we can't stand behind.
+    _SCORABLE = {"covered_call", "cash_secured_put", "put_credit_spread",
+                 "call_credit_spread", "short_strangle", "iron_condor", "jade_lizard"}
+    if body.structure not in _SCORABLE:
+        return {"matched": False,
+                "error": "A fresh-chain desk score isn't defined for this structure — "
+                         "the scored Quant Algorithmic card above is the read for this trade."}
+
+    # Build the FOCUS from the trade's ACTUAL legs so the scan prices THIS exact
+    # trade (fresh chain: price/bid-ask/greeks/IV/OI/vol) even when its strike/expiry
+    # is off the normal grid — no more "not among candidates".
+    _legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    focus_legs = [
+        {"strike": float(l["strike"]),
+         "right": "C" if "CALL" in str(l.get("type", "")).upper() or str(l.get("type", "")).upper() == "C" else "P",
+         "action": "SELL" if "SELL" in str(l.get("action", "")).upper() else "BUY"}
+        for l in _legs if l.get("strike")
+    ]
+    focus = {"structure": body.structure, "expiration": body.expiration, "legs": focus_legs}
+
     try:
         desk = await rank_desk(
             strategy.ticker, target_dte=dte, min_prob=0.0, min_income=0.0,
             structures=[body.structure], quote_source=body.quote_source,
-            user=user, db=db, target_expiration=body.expiration,
+            user=user, db=db, target_expiration=body.expiration, focus=focus,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Desk scan failed: {exc}")
@@ -3627,18 +4012,33 @@ async def compute_lifecycle_desk_score(
         return {"matched": False, "error": desk["error"]}
 
     ranked = desk.get("ranked", []) or []
-    idx = _find_focus_index(ranked, body.structure, body.expiration, body.short_strike)
+    # Prefer the injected focus candidate; fall back to the strike/expiry matcher.
+    idx = next((i for i, rr in enumerate(ranked) if rr.get("_is_focus")), None)
+    if idx is None:
+        idx = _find_focus_index(ranked, body.structure, body.expiration, body.short_strike)
     if idx is None:
         return {"matched": False,
-                "error": "This exact trade isn't among the current desk candidates "
-                         "(strike/expiry off the scanned grid). The scored Quant Algorithmic "
+                "error": "Couldn't price this trade's exact legs from the current chain "
+                         "(illiquid/unlisted strike or expiry). The scored Quant Algorithmic "
                          "card above still applies."}
 
     row = ranked[idx]
     subscores = (((row.get("desk_metrics") or {}).get("quant") or {}).get("subscores")) or {}
-    overlay = lifecycle_overlay(
-        row.get("desk_score", 50), a.get("captured_pct"), dte,
-        pnl.get("unrealized_pnl"), pnl.get("max_loss"),
+    qp = row.get("qp") or {}
+    # DEEP MANAGEMENT read — reuses the SCAN's whole factor engine (VRP / Moneyness /
+    # Liquidity / Expectation / TA regime/value-area/gamma), but RE-SIGNS + RE-WEIGHTS
+    # every factor for a HOLDER (cheap implied vol flips to a positive, EV downweighted
+    # to a remote tail, liquidity = cost-to-close, …), anchored on the drift-adjusted
+    # keep prob, then the take-profit / time overlay → the hold-vs-close signal. The
+    # raw ENTRY desk_score / grade are still returned for the reference breakdown.
+    mgmt = management_desk_score(
+        keep_drift_pct=qp.get("keep_drift_pct"),
+        keep_standard_pct=qp.get("keep_standard_pct") or row.get("prob_keep_pct"),
+        subscores=subscores, grade_adjustments=row.get("grade_adjustments"),
+        ta_factors=row.get("ta_factors"), captured_pct=a.get("captured_pct"), dte_days=dte,
+        unrealized_pnl=pnl.get("unrealized_pnl"),
+        max_profit=pnl.get("max_profit"), max_loss=pnl.get("max_loss"),
+        cushion_pct=row.get("cushion_pct"),
     )
     return {
         "matched": True,
@@ -3652,9 +4052,26 @@ async def compute_lifecycle_desk_score(
         "merits": row.get("grade_merits", []),
         "demerits": row.get("grade_demerits", []),
         "blocking": row.get("grade_blocking", []),
-        # lifecycle overlay → the exit call
-        "lifecycle_adjustments": overlay["adjustments"],
-        "lifecycle_score": overlay["score"],
-        "signal": overlay["signal"],
-        "overrides": overlay["overrides"],
+        # The full opportunity → render the SAME OpportunityCard as the scan.
+        "opp": json.loads(json.dumps(row, default=_json_default)),
+        "spot": desk.get("spot") or (desk.get("context") or {}).get("spot"),
+        # DEEP MANAGEMENT read → the hold-vs-close call (scan factors re-signed for the
+        # holder + take-profit/time overlay). This is the recommendation the UI leads on.
+        "signal": mgmt["signal"],
+        "lifecycle_score": mgmt["score"],
+        "overrides": mgmt["overrides"],
+        "management_analysis": {
+            "anchor": mgmt["anchor"],
+            "anchor_label": mgmt["anchor_label"],
+            "contributions": mgmt["contributions"],   # re-signed scan factors (holder view)
+            "factors_net": mgmt["factors_net"],
+            "overlay": mgmt["overlay"],               # take-profit / time-gamma
+            "score": mgmt["score"],
+            "signal": mgmt["signal"],
+            "overrides": mgmt["overrides"],
+        },
+        # keep for back-compat with the light card's buildup line:
+        "lifecycle_adjustments": mgmt["overlay"],
+        "hold_base": mgmt["anchor"],
+        "base_source": "keep_prob_drift" if qp.get("keep_drift_pct") is not None else "pop",
     }

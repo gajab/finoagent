@@ -61,6 +61,14 @@ def _normalize_symbol(symbol: str) -> str:
     return s.upper()
 
 
+def _third_friday(year: int, month: int) -> str:
+    """The standard monthly option expiry — the 3rd Friday of the month, as YYYY-MM-DD."""
+    import calendar
+    fridays = [d for d in calendar.Calendar().itermonthdates(year, month)
+               if d.month == month and d.weekday() == 4]
+    return fridays[2].strftime("%Y-%m-%d")
+
+
 class IBKRProvider(QuoteProvider):
     """Real-time option quotes from Interactive Brokers Web API."""
 
@@ -177,18 +185,27 @@ class IBKRProvider(QuoteProvider):
                 raise ValueError(f"IBKR: no conid returned for {clean_symbol}")
             self._underlying_conid_cache[clean_symbol] = conid
 
-        # Snapshot
-        snap = await self._run_sync(
-            self._client.live_marketdata_snapshot,
-            [conid], _UNDERLYING_FIELDS,
-        )
-        snap_data = snap.data if hasattr(snap, "data") else snap
-        if isinstance(snap_data, list) and snap_data:
-            row = snap_data[0]
-        elif isinstance(snap_data, dict):
-            row = snap_data
-        else:
-            row = {}
+        # IBKR's live snapshot INITIATES the market-data subscription on the first call and usually returns
+        # EMPTY — the data lands on a follow-up call. Retry until a price shows. Log every RAW response so
+        # the exact IBKR payload (or lack of it) is visible in the logs for triage.
+        row: dict = {}
+        for attempt in range(4):
+            snap = await self._run_sync(
+                self._client.live_marketdata_snapshot,
+                [conid], _UNDERLYING_FIELDS,
+            )
+            snap_data = snap.data if hasattr(snap, "data") else snap
+            logger.info("IBKR underlying snapshot %s attempt %d (conid=%s) → %r",
+                        clean_symbol, attempt + 1, conid, snap_data)
+            if isinstance(snap_data, list) and snap_data:
+                row = snap_data[0]
+            elif isinstance(snap_data, dict):
+                row = snap_data
+            else:
+                row = {}
+            if _safe(row.get("31")) > 0 or _safe(row.get("84")) > 0 or _safe(row.get("86")) > 0:
+                break
+            await asyncio.sleep(0.6)
 
         last = _safe(row.get("31"))
         bid = _safe(row.get("84"))
@@ -196,6 +213,16 @@ class IBKRProvider(QuoteProvider):
         vol = int(_safe(row.get("7762")))
 
         price = last or ((bid + ask) / 2 if bid and ask else 0)
+        if price <= 0:
+            # Descriptive error so the UI + logs show EXACTLY what IBKR returned (empty snapshot, error
+            # code, or a payload without price fields — usually a missing market-data subscription for the
+            # symbol, or delayed/closed-market data with no live fields).
+            raise ValueError(
+                f"IBKR returned no price for {clean_symbol} (conid={conid}) after 4 snapshots. "
+                f"Requested fields {_UNDERLYING_FIELDS}; last payload keys={list(row.keys())}, row={row!r}. "
+                f"Common cause: no live market-data subscription for {clean_symbol} on this IBKR account, "
+                f"or the market is closed (live snapshot has no fields)."
+            )
 
         return UnderlyingQuote(
             symbol=clean_symbol,
@@ -243,18 +270,19 @@ class IBKRProvider(QuoteProvider):
                 if m:
                     months.add(m)
 
-        # Convert MMMYY to YYYY-MM-DD (first of month as placeholder)
+        # IBKR's search returns available MONTHS (MMMYY), not exact dates. Standard monthly options expire
+        # the 3rd Friday — resolve to that real date so DTE is correct and the expiry matches what the
+        # frontend (and _select_expirations' exact-date match) expects. (Weeklies aren't in the month list.)
         expiration_dates = []
         for m in sorted(months):
-            try:
-                dt = datetime.strptime(m, "%b%y")
-                expiration_dates.append(dt.strftime("%Y-%m-01"))
-            except Exception:
+            dt = None
+            for fmt in ("%b%y", "%Y%m"):
                 try:
-                    dt = datetime.strptime(m, "%Y%m")
-                    expiration_dates.append(dt.strftime("%Y-%m-01"))
+                    dt = datetime.strptime(m, fmt); break
                 except Exception:
                     continue
+            if dt is not None:
+                expiration_dates.append(_third_friday(dt.year, dt.month))
 
         return sorted(expiration_dates)
 
@@ -614,30 +642,41 @@ class IBKRProvider(QuoteProvider):
         conids = list(conid_to_meta.keys())
         # Process in batches of 50 to avoid timeout
         batch_size = 50
+        n_batches = (len(conids) + batch_size - 1) // batch_size
         for i in range(0, len(conids), batch_size):
             batch = conids[i:i + batch_size]
             try:
-                snap = await self._run_sync(
-                    self._client.live_marketdata_snapshot,
-                    batch, _OPTION_FIELDS,
-                )
-                snap_data = snap.data if hasattr(snap, "data") else []
-
-                # First snapshot call may return empty — retry once
-                if isinstance(snap_data, list) and snap_data:
-                    first = snap_data[0] if snap_data else {}
-                    if not first.get("31") and not first.get("84"):
-                        await asyncio.sleep(1)
-                        snap = await self._run_sync(
-                            self._client.live_marketdata_snapshot,
-                            batch, _OPTION_FIELDS,
-                        )
-                        snap_data = snap.data if hasattr(snap, "data") else []
-
-                if not isinstance(snap_data, list):
-                    snap_data = [snap_data] if isinstance(snap_data, dict) else []
+                # IBKR computes IV + greeks (7633, 7308-7311) ASYNCHRONOUSLY: the first snapshot(s)
+                # routinely come back EMPTY, then price-only, with IV landing a few polls later. The old
+                # code only retried when a NON-empty first response lacked price — so an empty first call
+                # (the common warm-up case) was never retried, and IV (which lags price) was never waited
+                # for → every quote had iv=0 → the smile couldn't fit → the whole vol panel went blank.
+                # Poll until at least one contract reports IV, logging every attempt's shape so the raw
+                # IBKR behaviour (empty / priced-but-no-IV / full) is visible for triage.
+                snap_data: list = []
+                n_iv = n_px = 0
+                for attempt in range(5):
+                    snap = await self._run_sync(
+                        self._client.live_marketdata_snapshot,
+                        batch, _OPTION_FIELDS,
+                    )
+                    raw = snap.data if hasattr(snap, "data") else snap
+                    snap_data = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
+                    rows = [r for r in snap_data if isinstance(r, dict)]
+                    n_iv = sum(1 for r in rows if _safe(r.get("7633")) > 0)
+                    n_px = sum(1 for r in rows if _safe(r.get("31")) > 0 or _safe(r.get("84")) > 0)
+                    logger.info(
+                        "IBKR option batch %s [%d/%d] attempt %d → %d rows, %d priced, %d with IV(7633); sample=%r",
+                        clean_symbol, i // batch_size + 1, n_batches, attempt + 1,
+                        len(rows), n_px, n_iv, (rows[0] if rows else None),
+                    )
+                    if n_iv > 0:
+                        break
+                    await asyncio.sleep(0.8)
 
                 for row in snap_data:
+                    if not isinstance(row, dict):
+                        continue
                     conid = str(row.get("conid", row.get("6008", "")))
                     meta = conid_to_meta.get(conid)
                     if not meta:

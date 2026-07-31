@@ -37,7 +37,7 @@ from ..services.concentration_service import run_concentration_management
 from ..services.pmcc_service import run_pmcc_pmcp
 from ..services.zebra_service import run_zebra
 from ..services.derivative_income_service import run_derivative_income, run_portfolio_derivative_income
-from ..services.desk_review_service import rank_desk, run_desk_agents
+from ..services.desk_review_service import rank_desk, run_desk_agents, evaluate_desk_trade
 from ..services.cppi_service import run_cppi_simulation
 from ..services.tax_loss_harvesting_service import run_portfolio_tax_loss_harvesting
 from ..services.market_impact_service import analyze_market_impact
@@ -1861,6 +1861,7 @@ class DeskReviewIn(BaseModel):
     min_income: float = Field(default=20.0, ge=0)
     structures: list[str] = Field(default_factory=lambda: list(_DI_DEFAULT_STRUCTURES))
     quote_source: str = Field(default="yfinance")
+    owns_underlying: bool = Field(default=False, description="User already holds the shares → score covered calls as an income overlay, not a fresh buy-write")
 
 
 class FocusTrade(BaseModel):
@@ -1870,9 +1871,27 @@ class FocusTrade(BaseModel):
     short_strike: float | None = None
 
 
+class EvaluateLegIn(BaseModel):
+    """One leg of a user-supplied ('bring-your-own') trade to evaluate."""
+    action: str = Field(..., description="BUY or SELL")
+    type: str = Field(..., description="CALL or PUT")
+    strike: float = Field(..., gt=0)
+    expiration: str = Field(..., description="Leg expiry (YYYY-MM-DD); legs may differ (calendars)")
+
+
+class DeskEvaluateIn(BaseModel):
+    """Evaluate a user-entered multi-leg trade (options and/or stock) on the desk pipeline."""
+    legs: list[EvaluateLegIn] = Field(default_factory=list)
+    stock_shares: float = Field(default=0.0, description="Signed shares (+long / −short); 0 = none")
+    cost_basis: float | None = Field(default=None, description="Stock cost basis / share (optional)")
+    quote_source: str = Field(default="yfinance")
+    owns_underlying: bool = Field(default=False, description="Already hold the shares → score covered calls as an income overlay")
+
+
 class DeskReviewAgentsIn(DeskReviewIn):
     model: str = Field(default="gpt-4o", description="LLM for the Quant/Risk/PM cascade")
-    focus: FocusTrade | None = Field(default=None, description="v2: review ONE trade instead of ranking all")
+    focus: FocusTrade | None = Field(default=None, description="v2: review ONE scanned trade instead of ranking all")
+    evaluate: DeskEvaluateIn | None = Field(default=None, description="Debate the user's own bring-your-own trade")
 
 
 @router.post("/{ticker}/desk-review")
@@ -1892,7 +1911,7 @@ async def compute_desk_review(
             ticker, target_dte=body.target_dte, min_prob=body.min_prob,
             min_income=body.min_income, structures=body.structures,
             quote_source=body.quote_source, user=user, db=db,
-            target_expiration=body.target_expiration,
+            target_expiration=body.target_expiration, owns_underlying=body.owns_underlying,
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])
@@ -1901,6 +1920,34 @@ async def compute_desk_review(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Desk review failed: {exc}")
+
+
+@router.post("/{ticker}/desk-review/evaluate")
+async def compute_desk_evaluate(
+    ticker: str,
+    body: DeskEvaluateIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Evaluate a USER-ENTERED multi-leg trade (bring-your-own) on the full desk pipeline —
+    same chrome (price / volatility / events / TA) + Desk Review (metrics + grade) as the
+    single-ticker scan, but for the exact trade the user provides. No LLM — instant."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    try:
+        result = await evaluate_desk_trade(
+            ticker, legs=[l.model_dump() for l in body.legs],
+            stock_shares=body.stock_shares, cost_basis=body.cost_basis,
+            quote_source=body.quote_source, owns_underlying=body.owns_underlying,
+            user=user, db=db,
+        )
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Trade evaluation failed: {exc}")
 
 
 @router.post("/{ticker}/desk-review/agents")
@@ -1924,6 +1971,7 @@ async def compute_desk_review_agents(
             quote_source=body.quote_source, model=body.model,
             focus=body.focus.model_dump() if body.focus else None, user=user, db=db,
             target_expiration=body.target_expiration,
+            evaluate=body.evaluate.model_dump() if body.evaluate else None,
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])

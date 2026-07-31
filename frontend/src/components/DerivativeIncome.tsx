@@ -3,9 +3,10 @@ import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
   AlertCircle, ChevronDown, ChevronUp, Activity, Landmark,
-  BarChart3, Layers, Feather,
+  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2,
 } from 'lucide-react';
-import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, fetchTechnicalForTimeframe, fetchOptionExpirations } from '../api';
+import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations } from '../api';
+import type { DeskEvaluateParams, EvaluateLeg } from '../api';
 import type {
   DerivativeIncomeResult, DerivativeIncomeOpportunity, DerivativeIncomePortfolioResult,
   DerivativeIncomePortfolioRow, DerivativeIncomeFlag,
@@ -17,7 +18,7 @@ import { TechnicalAnalysis } from './TechnicalAnalysis';
 import PreTradeAdvisor, { type AdvisorMetric, type QuantSignal } from './PreTradeAdvisor';
 import { DeskReview, SingleTradeDeskReview } from './DeskReview';
 
-type Mode = 'single' | 'portfolio';
+type Mode = 'single' | 'portfolio' | 'evaluate';
 
 /** Build the pricing-confidence signals (RND/SVI/chain/expected move/Heston) that
  * now live inside each opportunity's Quant desk card. */
@@ -37,7 +38,7 @@ function buildQuantSignals(quant?: DerivativeIncomeQuant | null): QuantSignal[] 
 const STRUCTURE_OPTIONS = [
   { id: 'covered_call', label: 'Covered Call', icon: <TrendingUp className="w-3.5 h-3.5" /> },
   { id: 'cash_secured_put', label: 'Cash-Secured Put', icon: <DollarSign className="w-3.5 h-3.5" /> },
-  { id: 'collar', label: 'Collar', icon: <Shield className="w-3.5 h-3.5" /> },
+  { id: 'short_strangle', label: 'Short Strangle', icon: <Activity className="w-3.5 h-3.5" /> },
   { id: 'credit_spread', label: 'Credit Spreads', icon: <ShieldCheck className="w-3.5 h-3.5" /> },
   { id: 'iron_condor', label: 'Iron Condor', icon: <Layers className="w-3.5 h-3.5" /> },
   { id: 'jade_lizard', label: 'Jade Lizard', icon: <Feather className="w-3.5 h-3.5" /> },
@@ -57,6 +58,24 @@ const dteFromExpiry = (iso: string): number => {
   const now = new Date();
   const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   return Math.round((exp - today) / 86400000);
+};
+
+// Standard monthly option expiries (3rd Friday) for the next `n` months, ISO yyyy-mm-dd, today forward.
+// The Portfolio scan has no single ticker, so it offers these; a picked date is sent as a target DTE and
+// each holding maps to its own nearest listed expiry (±10-day band on the backend).
+const upcomingMonthlyExpiries = (n = 6): string[] => {
+  const out: string[] = [];
+  const now = new Date();
+  const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  let y = now.getUTCFullYear(), m = now.getUTCMonth();
+  while (out.length < n) {
+    const firstDow = new Date(Date.UTC(y, m, 1)).getUTCDay();
+    const thirdFriday = 1 + ((5 - firstDow + 7) % 7) + 14;   // first Friday of month + 2 weeks
+    const d = Date.UTC(y, m, thirdFriday);
+    if (d >= todayUTC) out.push(new Date(d).toISOString().slice(0, 10));
+    m++; if (m > 11) { m = 0; y++; }
+  }
+  return out;
 };
 // Geometric annualization is the repo standard but explodes for short-dated, high-ROC
 // trades — format compactly; the period (static) return is the honest anchor.
@@ -315,13 +334,13 @@ export function LazyTechnicals({ ticker }: { ticker: string }) {
 // desk-review explorer so its top matches this card exactly. No outer card wrapper: the caller frames it.
 export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }) {
   const isSpread = opp.structure.includes('spread');
-  const isCollar = opp.structure === 'collar';
+  const isStrangle = opp.structure === 'short_strangle';
   const isCondor = opp.structure === 'iron_condor';
   const isJade = opp.structure === 'jade_lizard';
   const strikeStr = isCondor ? `${opp.put_long}/${opp.put_short} – ${opp.call_short}/${opp.call_long}`
     : isJade ? `put ${opp.put_short} · call ${opp.call_short}/${opp.call_long}`
-      : isSpread ? `${opp.short_strike} / ${opp.long_strike}`
-        : isCollar ? `cap ${opp.short_strike} · floor ${opp.floor_strike}`
+      : isStrangle ? `put ${opp.put_short} · call ${opp.call_short}`
+        : isSpread ? `${opp.short_strike} / ${opp.long_strike}`
           : `${opp.short_strike}`;
   return (
     <div className="space-y-3">
@@ -366,12 +385,12 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
           sub={<span className={`badge badge-xs ${richnessBadge(opp.premium_richness)}`}>{opp.premium_richness}</span>} />
       </div>
 
-      {/* multi-leg extras (collar / spread / condor / jade lizard) */}
-      {(isCollar || isSpread || isCondor || isJade) && (
+      {/* multi-leg extras (strangle / spread / condor / jade lizard) */}
+      {(isStrangle || isSpread || isCondor || isJade) && (
         <div className="flex flex-wrap gap-3 text-[11px] text-base-content/60">
           {opp.prob_in_band_pct != null && <span>P(in band): <b>{pct(opp.prob_in_band_pct)}</b></span>}
-          {isCondor && opp.band_low != null && <span>Profit band: <b>${opp.band_low}–${opp.band_high}</b></span>}
-          {isCollar && opp.floor_pct != null && <span>Floor: <b>{pct(opp.floor_pct)}</b></span>}
+          {(isCondor || isStrangle) && opp.band_low != null && <span>Profit band: <b>${opp.band_low}–${opp.band_high}</b></span>}
+          {isStrangle && <span className="text-warning">⚠ undefined risk (naked)</span>}
           {opp.max_profit != null && <span>Max profit: <b>{money(opp.max_profit, 0)}</b></span>}
           {opp.width != null && <span>Width: <b>${opp.width}</b></span>}
           {opp.expected_pnl != null && <span>E[P&amp;L]: <b>{money(opp.expected_pnl, 0)}</b></span>}
@@ -400,7 +419,7 @@ export function OpportunityCard({ opp, compact, ticker, spot, quant, deskParams 
       {!compact && ticker && spot ? (() => {
         const m0 = (v: number) => money(v, 0);
         const contracts = opp.contracts || 1;
-        const hasStock = opp.structure === 'covered_call' || opp.structure === 'collar';
+        const hasStock = opp.structure === 'covered_call';
         const capital = opp.max_loss != null ? Math.abs(opp.max_loss) : opp.collateral;
         const beats = opp.beats_sofr;
         const llmMetrics = {
@@ -478,7 +497,8 @@ export function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
         </span>
       </p>
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2">
-        <MetricTile label="ATM IV" value={pct(vs.iv_atm_pct)} sub={`HV ${pct(vs.hv_current_pct)}`} />
+        <MetricTile label="ATM IV" value={pct(vs.iv_atm_pct)}
+          sub={vs.iv_atm_pct != null && vs.hv30_pct ? `${(vs.iv_atm_pct / vs.hv30_pct).toFixed(2)}× HV30` : 'implied'} />
         {vs.har_rv_pct != null && (
           <MetricTile label="Fwd RV · HAR" value={pct(vs.har_rv_pct)}
             tone={vs.iv_vs_har_pts != null ? (vs.iv_vs_har_pts >= 0 ? 'text-success' : 'text-error') : ''}
@@ -490,6 +510,16 @@ export function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
         <MetricTile label="Vol Percentile" tone={rankTone(vs.vol_percentile)} value={vs.vol_percentile != null ? `${vs.vol_percentile}%` : '—'} sub="realized" />
         <MetricTile label="Skew" value={vs.skew_pts != null ? `${vs.skew_pts}vp` : '—'} sub={skewSub} />
       </div>
+      {/* Realized-vol term structure in one line — HV10/20/30 (trading-day windows, annualized).
+          HV30 is the desk baseline every IV/HV comparison (ATM-IV tile, richness, rank) keys off. */}
+      <div className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[11px] text-base-content/60"
+        title="Historical (realized) volatility over 10/20/30 trading days, annualized. IV is compared against HV30.">
+        <span className="text-[9px] uppercase tracking-wider text-base-content/40">Realized HV</span>
+        <span>10d <b className="font-mono text-base-content/80">{pct(vs.hv10_pct)}</b></span>
+        <span>20d <b className="font-mono text-base-content/80">{pct(vs.hv20_pct)}</b></span>
+        <span>30d <b className="font-mono text-base-content/80">{pct(vs.hv30_pct)}</b></span>
+        <span className="text-base-content/35">annualized · IV/HV vs 30d</span>
+      </div>
     </div>
   );
 }
@@ -499,9 +529,33 @@ export function VolatilityPanel({ vs }: { vs: DerivativeIncomeVolStats }) {
 //     second /derivative-income call, and DeskReview renders it presentationally (`data`).
 //   • PORTFOLIO EXPAND: `result` = a /derivative-income scan (no desk ranking); shows chrome + the
 //     empty-state note only.
-function SingleTickerResult({ result, desk, shares, costBasis, hideCommonEvents, deskParams }: {
+// The underlying "chrome" — ticker header (price/ER/SOFR/HV/IV-HV/52W) + the vol
+// panel + events + lazy TA. Exported so My Trades shows the SAME stock context the
+// Income desk does, above a placed trade.
+export function TickerChrome({ ticker, context, events = [], expirySummaries = [], shares, costBasis, hideCommonEvents }: {
+  ticker: string;
+  context: DerivativeIncomeContext | null;
+  events?: DerivativeIncomeFlag[];
+  expirySummaries?: DerivativeIncomeExpirySummary[];
+  shares?: number; costBasis?: number | null; hideCommonEvents?: boolean;
+}) {
+  if (!context) return null;
+  const shown = hideCommonEvents ? events.filter(e => e.scope !== 'common') : events;
+  return (
+    <div className="space-y-4">
+      <TickerHeader result={{ ticker, expiry_summaries: expirySummaries }} ctx={context} shares={shares} costBasis={costBasis} />
+      {context.vol_stats && <VolatilityPanel vs={context.vol_stats} />}
+      {shown.length > 0 && <EventsBanner events={shown} title={hideCommonEvents ? `${ticker} events` : undefined} />}
+      <LazyTechnicals ticker={ticker} />
+    </div>
+  );
+}
+
+function SingleTickerResult({ result, desk, shares, costBasis, hideCommonEvents, deskParams, evaluate }: {
   result?: DerivativeIncomeResult; desk?: DeskReviewResult;
   shares?: number; costBasis?: number | null; hideCommonEvents?: boolean; deskParams?: DiParams;
+  // EVALUATE tab: the user's bring-your-own legs, so each trade's LLM desk re-evaluates that exact trade.
+  evaluate?: DeskEvaluateParams;
 }) {
   const ticker = desk?.ticker ?? result?.ticker ?? '';
   const context = desk?.context ?? result?.context ?? null;
@@ -514,23 +568,17 @@ function SingleTickerResult({ result, desk, shares, costBasis, hideCommonEvents,
   const spot = context?.spot;
   // Pricing-confidence signals are per-expiration; fall back to the primary one.
   const quantForExp = (exp: string) => expirySummaries.find(s => s.expiration === exp)?.quant ?? primaryQuant;
-  // In portfolio mode the market-wide (common) events are shown once at the top,
-  // so a holding's expanded view only repeats its ticker-specific events.
-  const shownEvents = hideCommonEvents ? events.filter(e => e.scope !== 'common') : events;
   return (
     <div className="space-y-4">
-      {context && <TickerHeader result={{ ticker, expiry_summaries: expirySummaries }} ctx={context} shares={shares} costBasis={costBasis} />}
-      {context?.vol_stats && <VolatilityPanel vs={context.vol_stats} />}
-      {shownEvents.length > 0 && (
-        <EventsBanner events={shownEvents} title={hideCommonEvents ? `${ticker} events` : undefined} />
-      )}
-      <LazyTechnicals ticker={ticker} />
+      <TickerChrome ticker={ticker} context={context} events={events} expirySummaries={expirySummaries}
+        shares={shares} costBasis={costBasis} hideCommonEvents={hideCommonEvents} />
 
       {desk && deskParams && (
         <DeskReview
           ticker={ticker}
           params={deskParams}
           data={desk}
+          evaluate={evaluate}
           renderTrade={(t) => (
             <OpportunityCard opp={t} ticker={ticker} spot={spot} quant={quantForExp(t.expiration)} />
           )}
@@ -557,6 +605,7 @@ interface DiParams {
   min_income: number;
   structures: string[];
   quote_source: string;
+  owns_underlying?: boolean;
 }
 
 // One portfolio holding: compact best-opportunity summary + an expandable, lazily
@@ -564,9 +613,11 @@ interface DiParams {
 // mode is consistent with the Single-Ticker tab.
 function PortfolioHoldingRow({ row, params }: { row: DerivativeIncomePortfolioRow; params: DiParams }) {
   const [expanded, setExpanded] = useState(false);
-  const [full, setFull] = useState<DerivativeIncomeResult | null>(null);
+  const [full, setFull] = useState<DeskReviewResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Holdings are owned → covered calls score as an income overlay; identical desk surface to Single Ticker.
+  const holdingParams: DiParams = { ...params, owns_underlying: true };
 
   const toggle = async () => {
     const next = !expanded;
@@ -574,7 +625,7 @@ function PortfolioHoldingRow({ row, params }: { row: DerivativeIncomePortfolioRo
     if (next && !full && !loading) {
       setLoading(true); setErr(null);
       try {
-        const r = await runDerivativeIncome(row.ticker, params);   // cached from the sweep
+        const r = await runDeskReview(row.ticker, holdingParams);   // full desk surface, cached from the sweep
         if (r.error) setErr(r.error); else setFull(r);
       } catch (e: any) { setErr(e?.message || 'Failed to load analysis'); }
       finally { setLoading(false); }
@@ -619,10 +670,215 @@ function PortfolioHoldingRow({ row, params }: { row: DerivativeIncomePortfolioRo
                 </div>
               )}
               {err && <div className="alert alert-error text-xs"><AlertTriangle className="w-4 h-4" /><span>{err}</span></div>}
-              {full && !loading && <SingleTickerResult result={full} shares={row.shares} costBasis={row.cost_basis} hideCommonEvents />}
+              {full && !loading && <SingleTickerResult desk={full} deskParams={holdingParams} shares={row.shares} costBasis={row.cost_basis} hideCommonEvents />}
             </div>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────── Evaluate (bring-your-own trade) ───────────────────────────
+
+// A client-side mirror of the backend `_classify_structure`, for a LIVE "detected structure" hint
+// as the user builds legs. The backend classification in the result is authoritative.
+function detectStructure(legs: EvaluateLeg[], hasStock: boolean): { label: string; custom: boolean } {
+  const valid = legs.filter(l => l.strike > 0 && l.expiration);
+  if (!valid.length) return hasStock ? { label: 'Stock only', custom: true } : { label: '—', custom: false };
+  const multi = new Set(valid.map(l => l.expiration)).size > 1;
+  const sc = valid.filter(l => l.type === 'CALL' && l.action === 'SELL').map(l => l.strike).sort((a, b) => a - b);
+  const lc = valid.filter(l => l.type === 'CALL' && l.action === 'BUY').map(l => l.strike).sort((a, b) => a - b);
+  const sp = valid.filter(l => l.type === 'PUT' && l.action === 'SELL').map(l => l.strike).sort((a, b) => a - b);
+  const lp = valid.filter(l => l.type === 'PUT' && l.action === 'BUY').map(l => l.strike).sort((a, b) => a - b);
+  const k = (a: number, b: number, c: number, d: number) => sc.length === a && lc.length === b && sp.length === c && lp.length === d;
+  if (!multi) {
+    if (hasStock && k(1, 0, 0, 0)) return { label: 'Covered Call', custom: false };
+    if (hasStock && k(1, 0, 0, 1)) return { label: 'Collar', custom: false };
+    if (!hasStock) {
+      if (k(0, 0, 1, 0)) return { label: 'Cash-Secured Put', custom: false };
+      if (k(0, 0, 1, 1) && lp[0] < sp[0]) return { label: 'Put Credit Spread', custom: false };
+      if (k(1, 1, 0, 0) && lc[0] > sc[0]) return { label: 'Call Credit Spread', custom: false };
+      if (k(1, 0, 1, 0)) return { label: 'Short Strangle', custom: false };
+      if (k(1, 1, 1, 1)) return { label: 'Iron Condor', custom: false };
+      if (k(1, 1, 1, 0) && lc[0] > sc[0]) return { label: 'Jade Lizard', custom: false };
+    }
+  }
+  if (multi && valid.length === 2 && new Set(valid.map(l => l.type)).size === 1) {
+    return valid[0].strike === valid[1].strike
+      ? { label: 'Calendar Spread', custom: true } : { label: 'Diagonal Spread', custom: true };
+  }
+  return { label: 'Custom Multi-Leg', custom: true };
+}
+
+function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' | 'ibkr' }) {
+  const [ticker, setTicker] = useState('AAPL');
+  const [expiries, setExpiries] = useState<string[]>([]);
+  const [expiryLoading, setExpiryLoading] = useState(false);
+  const [quoteSource, setQuoteSource] = useState<'yfinance' | 'ibkr'>(defaultQuoteSource);
+  const [legs, setLegs] = useState<EvaluateLeg[]>([{ action: 'SELL', type: 'PUT', strike: 0, expiration: '' }]);
+  const [shares, setShares] = useState(0);
+  const [costBasis, setCostBasis] = useState('');
+  const [owns, setOwns] = useState(false);
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<DeskReviewResult | null>(null);
+  const [submitted, setSubmitted] = useState<DeskEvaluateParams | null>(null);
+
+  // Load the option-expiry calendar for the ticker (metadata only). Seed empty leg expiries with
+  // the nearest listed one so the dropdowns start ready.
+  useEffect(() => {
+    const sym = ticker.trim().toUpperCase();
+    if (!sym) { setExpiries([]); return; }
+    let alive = true;
+    setExpiryLoading(true);
+    const id = setTimeout(async () => {
+      try {
+        const r = await fetchOptionExpirations(sym);
+        if (!alive) return;
+        const exps = r.expirations || [];
+        setExpiries(exps);
+        if (exps.length) setLegs(ls => ls.map(l => (l.expiration ? l : { ...l, expiration: exps[0] })));
+      } catch { if (alive) setExpiries([]); }
+      finally { if (alive) setExpiryLoading(false); }
+    }, 350);
+    return () => { alive = false; clearTimeout(id); };
+  }, [ticker]);
+
+  const validExpiries = expiries
+    .map(d => [d, dteFromExpiry(d)] as const)
+    .filter(([, dte]) => dte >= 1 && dte <= 366);
+
+  const setLeg = (i: number, patch: Partial<EvaluateLeg>) =>
+    setLegs(ls => ls.map((l, idx) => (idx === i ? { ...l, ...patch } : l)));
+  // New legs inherit the FIRST leg's expiry — multi-leg income trades almost always share one expiration,
+  // so the user rarely has to touch it (they can still change any leg to a different date).
+  const addLeg = () => setLegs(ls => [...ls, { action: 'SELL', type: 'CALL', strike: 0, expiration: ls[0]?.expiration || expiries[0] || '' }]);
+  const removeLeg = (i: number) => setLegs(ls => ls.filter((_, idx) => idx !== i));
+
+  const hasStock = shares !== 0;
+  const detected = detectStructure(legs, hasStock);
+  const legsReady = legs.every(l => l.strike > 0 && !!l.expiration);
+  const canSubmit = !!ticker.trim() && (legs.length > 0 || hasStock) && legsReady && !loading;
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const payload: DeskEvaluateParams = {
+      legs: legs.filter(l => l.strike > 0 && l.expiration),
+      stock_shares: shares,
+      cost_basis: costBasis ? Number(costBasis) : null,
+      quote_source: quoteSource,
+      owns_underlying: owns,
+    };
+    setLoading(true); setError(null); setResult(null); setSubmitted(null);
+    try {
+      const r = await evaluateDeskTrade(ticker.trim().toUpperCase(), payload);
+      if (r.error) setError(r.error); else { setResult(r); setSubmitted(payload); }
+    } catch (err: any) { setError(err?.message || 'Failed to evaluate the trade'); }
+    finally { setLoading(false); }
+  };
+
+  // Filler params for the DeskReview LLM call — evaluate mode routes through `evaluate`, so the
+  // scan filters (min_prob / structures) are ignored; only quote_source / owns_underlying matter.
+  const deskParams: DiParams = {
+    target_dte: null, target_expiration: null, min_prob: 0, min_income: 0,
+    structures: [], quote_source: quoteSource, owns_underlying: owns,
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03] text-sm text-base-content/70 flex items-start gap-2">
+        <Info className="w-4 h-4 text-secondary mt-0.5 shrink-0" />
+        <span>Built a trade elsewhere? Enter the exact legs (and any stock) and the desk runs the <b>same read as Single Ticker</b> — price, volatility, technicals and the full Desk Review — on <b>your</b> trade. Live quotes; the structure is auto-detected (calendars &amp; custom combos welcome).</span>
+      </div>
+
+      <form onSubmit={submit} className="space-y-3">
+        {/* ticker + quote source + detected structure */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <div className="form-control">
+            <label className="label py-1"><span className="label-text text-xs font-medium">Ticker (ETF / stock / index)</span></label>
+            <input type="text" className="input input-bordered input-sm w-full" value={ticker}
+              onChange={(e) => setTicker(e.target.value.toUpperCase())} placeholder="AAPL, SPY, .SPX" required />
+          </div>
+          <div className="form-control">
+            <label className="label py-1"><span className="label-text text-xs font-medium">Detected structure</span></label>
+            <div className="h-8 flex items-center">
+              <span className={`badge badge-sm ${detected.custom ? 'badge-warning' : 'badge-secondary'}`}>{detected.label}</span>
+              {detected.custom && detected.label !== '—' && (
+                <span className="text-[10px] text-base-content/40 ml-2">grade is indicative</span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* option legs */}
+        <div className="rounded-xl border border-white/[0.06] bg-base-200/20 p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold flex items-center gap-1.5"><Layers className="w-4 h-4 text-secondary" /> Option legs</span>
+            <button type="button" className="btn btn-ghost btn-xs gap-1" onClick={addLeg}><Plus className="w-3 h-3" /> Add leg</button>
+          </div>
+          {legs.map((l, i) => (
+            <div key={i} className="grid grid-cols-2 sm:grid-cols-[5rem_5rem_1fr_1.6fr_auto] gap-2 items-center">
+              <select className="select select-bordered select-xs" value={l.action} onChange={e => setLeg(i, { action: e.target.value as 'BUY' | 'SELL' })}>
+                <option value="SELL">Sell</option><option value="BUY">Buy</option>
+              </select>
+              <select className="select select-bordered select-xs" value={l.type} onChange={e => setLeg(i, { type: e.target.value as 'CALL' | 'PUT' })}>
+                <option value="CALL">Call</option><option value="PUT">Put</option>
+              </select>
+              <input type="number" step="0.5" min={0} className="input input-bordered input-xs" placeholder="Strike"
+                value={l.strike || ''} onChange={e => setLeg(i, { strike: Number(e.target.value) })} />
+              <select className="select select-bordered select-xs" value={l.expiration} onChange={e => setLeg(i, { expiration: e.target.value })}>
+                <option value="">{expiryLoading ? 'Loading…' : 'Expiry…'}</option>
+                {validExpiries.map(([d, dte]) => <option key={d} value={d}>{d} · {dte}d</option>)}
+              </select>
+              <button type="button" className="btn btn-ghost btn-xs btn-square text-error"
+                onClick={() => removeLeg(i)} disabled={legs.length <= 1 && !hasStock} title="Remove leg">
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+          {!legs.length && <p className="text-[11px] text-base-content/40">No option legs — stock-only position.</p>}
+        </div>
+
+        {/* stock leg */}
+        <div className="rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 items-end">
+            <div className="form-control">
+              <label className="label py-1"><span className="label-text text-xs font-medium">Stock shares (+ long / − short)</span></label>
+              <input type="number" step="1" className="input input-bordered input-sm" placeholder="0"
+                value={shares || ''} onChange={e => setShares(Number(e.target.value))} />
+            </div>
+            <div className="form-control">
+              <label className="label py-1"><span className="label-text text-xs font-medium">Cost basis / share (optional)</span></label>
+              <input type="number" step="0.01" className="input input-bordered input-sm" placeholder="—"
+                value={costBasis} onChange={e => setCostBasis(e.target.value)} />
+            </div>
+            <label className="flex items-start gap-2 cursor-pointer text-[11px] text-base-content/70 pb-2">
+              <input type="checkbox" className="checkbox checkbox-xs checkbox-secondary mt-0.5" checked={owns} onChange={e => setOwns(e.target.checked)} />
+              <span>I already hold the shares — score covered calls as an <b>income overlay</b> (no fresh-capital / beta penalty).</span>
+            </label>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 justify-end flex-wrap">
+          <span className="text-[11px] text-base-content/45 mr-auto">Filters off — the desk scores exactly the trade you enter.</span>
+          <button type="submit" className="btn btn-primary btn-sm gap-2" disabled={!canSubmit}>
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ClipboardCheck className="w-4 h-4" />}
+            {loading ? 'Evaluating…' : 'Run Desk Evaluation'}
+          </button>
+        </div>
+      </form>
+
+      {error && <div className="alert alert-error text-sm"><AlertTriangle className="w-4 h-4 shrink-0" /><span>{error}</span></div>}
+      {result && submitted && (
+        <SingleTickerResult
+          desk={result}
+          deskParams={deskParams}
+          evaluate={submitted}
+          shares={hasStock ? Math.abs(shares) : undefined}
+          costBasis={costBasis ? Number(costBasis) : undefined}
+        />
       )}
     </div>
   );
@@ -639,8 +895,11 @@ export function DerivativeIncome() {
   const [minProb, setMinProb] = useState(90);
   const [minIncome, setMinIncome] = useState(20);
   const [structures, setStructures] = useState<string[]>(
-    ['covered_call', 'cash_secured_put', 'collar', 'credit_spread', 'iron_condor', 'jade_lizard']);
-  const [quoteSource, setQuoteSource] = useState<'yfinance' | 'ibkr'>('yfinance');
+    ['covered_call', 'cash_secured_put', 'credit_spread', 'iron_condor', 'jade_lizard', 'short_strangle']);
+  // Data source is chosen once in Settings (functionality-level), not per-scan. Default Yahoo Finance.
+  const [quoteSource] = useState<'yfinance' | 'ibkr'>(
+    () => (localStorage.getItem('incomeDesk.quoteSource') === 'ibkr' ? 'ibkr' : 'yfinance'));
+  const [ownsShares, setOwnsShares] = useState(false);   // already hold the stock → covered call = overlay
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -658,7 +917,16 @@ export function DerivativeIncome() {
   // Load the option-expiry calendar for the current ticker (metadata only — NOT a scan), so the
   // date dropdown is ready to pick from. Debounced; resets the picked date when the ticker changes.
   useEffect(() => {
-    if (mode !== 'single') return;
+    if (mode === 'portfolio') {
+      // No single ticker in Portfolio mode — offer STANDARD monthly expiries so a portfolio-wide date can
+      // be picked; it's sent as a target DTE and each holding maps to its own nearest listed expiry.
+      const monthlies = upcomingMonthlyExpiries();
+      setExpiryLoading(false);
+      setExpiries(monthlies);
+      setSelectedExpiry(prev => (monthlies.includes(prev) ? prev : ''));
+      return;
+    }
+    if (mode !== 'single') return;   // 'evaluate' has its own child form + expiry logic
     const sym = ticker.trim().toUpperCase();
     if (!sym) { setExpiries([]); return; }
     let alive = true;
@@ -679,16 +947,17 @@ export function DerivativeIncome() {
     setStructures(s => (s.includes(id) ? s.filter(x => x !== id) : [...s, id]));
 
   const commonParams = (): DiParams => {
-    // The exact expiry only applies to a single ticker; portfolio scans many names (a specific date
-    // won't exist for all), so it falls back to auto monthlies.
-    const useExp = mode === 'single' && !!selectedExpiry;
+    // Single ticker: scan the EXACT picked expiry. Portfolio: that exact date won't be listed for every
+    // holding, so send it as a target DTE — each name maps to its nearest listed expiry (±10-day band).
+    const useExp = !!selectedExpiry;
     return {
       target_dte: useExp ? dteFromExpiry(selectedExpiry) : null,
-      target_expiration: useExp ? selectedExpiry : null,
+      target_expiration: (mode === 'single' && useExp) ? selectedExpiry : null,
       min_prob: minProb / 100,
       min_income: minIncome,
       structures,
       quote_source: quoteSource,
+      owns_underlying: mode === 'portfolio' ? true : ownsShares,   // holdings are owned by definition
     };
   };
 
@@ -728,12 +997,12 @@ export function DerivativeIncome() {
         <div className="flex items-start gap-3">
           <Coins className="w-5 h-5 text-secondary mt-0.5 shrink-0" />
           <div className="text-sm text-base-content/70">
-            <p className="font-semibold text-base-content mb-1">Derivative Income</p>
+            <p className="font-semibold text-base-content mb-1">Income Desk</p>
             <p>
-              Sell option premium with a high probability of <b>not being exercised</b> — covered calls,
-              cash-secured puts, collars and defined-risk credit spreads — ranked by annualized yield over SOFR.
-              Probabilities come from the market-implied <b>risk-neutral density</b> (SVI smile), and only
-              <b> executable</b> quotes (real bid, tight spread, live book) are shown.
+              Every option-selling trade — covered calls, cash-secured puts, spreads, condors, strangles —
+              <b> graded A–F</b> on volatility-risk-premium, dealer gamma &amp; technicals, then the
+              Quant · Risk · PM desk debates the best. Probabilities from the market-implied
+              <b> risk-neutral density</b>; only <b>executable</b> quotes are shown.
             </p>
           </div>
         </div>
@@ -747,11 +1016,17 @@ export function DerivativeIncome() {
         <button type="button" className={`btn btn-sm gap-1.5 ${mode === 'portfolio' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('portfolio')}>
           <Briefcase className="w-3.5 h-3.5" /> My Portfolio
         </button>
+        <button type="button" className={`btn btn-sm gap-1.5 ${mode === 'evaluate' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('evaluate')}>
+          <ClipboardCheck className="w-3.5 h-3.5" /> Evaluate
+        </button>
       </div>
 
+      {mode === 'evaluate' && <EvaluateForm defaultQuoteSource={quoteSource} />}
+
       {/* Form */}
+      {mode !== 'evaluate' && (<>
       <form onSubmit={mode === 'single' ? handleSingle : (e) => { e.preventDefault(); handlePortfolio(0); }}
-        className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         {mode === 'single' && (
           <div className="form-control">
             <label className="label py-1"><span className="label-text text-xs font-medium">Ticker (ETF / stock / index)</span></label>
@@ -764,7 +1039,7 @@ export function DerivativeIncome() {
           <div className="relative">
             <Calendar className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40 pointer-events-none z-10" />
             <select className="select select-bordered select-sm w-full pl-7" value={selectedExpiry}
-              onChange={(e) => setSelectedExpiry(e.target.value)} disabled={mode !== 'single'}>
+              onChange={(e) => setSelectedExpiry(e.target.value)} disabled={mode === 'single' && expiryLoading}>
               <option value="">Auto — monthlies ≤45d</option>
               {expiries
                 .map(d => [d, dteFromExpiry(d)] as const)
@@ -774,8 +1049,9 @@ export function DerivativeIncome() {
           </div>
           <span className="text-[10px] text-base-content/45 mt-1 h-3">
             {expiryLoading ? 'Loading expiry dates…'
-              : selectedExpiry ? `${dteFromExpiry(selectedExpiry)} DTE`
-                : 'Nearest monthlies within 45 days'}
+              : selectedExpiry
+                ? (mode === 'portfolio' ? `~${dteFromExpiry(selectedExpiry)} DTE · nearest listed per holding` : `${dteFromExpiry(selectedExpiry)} DTE`)
+                : (mode === 'portfolio' ? 'Auto — nearest monthlies per holding' : 'Nearest monthlies within 45 days')}
           </span>
         </div>
         <div className="form-control">
@@ -793,15 +1069,7 @@ export function DerivativeIncome() {
               onChange={(e) => setMinIncome(Number(e.target.value))} min={0} step={5} />
           </div>
         </div>
-        <div className="form-control">
-          <label className="label py-1"><span className="label-text text-xs font-medium">Quote source</span></label>
-          <select className="select select-bordered select-sm w-full" value={quoteSource}
-            onChange={(e) => setQuoteSource(e.target.value as 'yfinance' | 'ibkr')}>
-            <option value="yfinance">Yahoo Finance (free, delayed)</option>
-            <option value="ibkr">IBKR (real-time, Greeks)</option>
-          </select>
-        </div>
-        <div className="form-control lg:col-span-3">
+        <div className="form-control lg:col-span-4">
           <label className="label py-1"><span className="label-text text-xs font-medium">Structures to evaluate</span></label>
           <div className="flex flex-wrap gap-2">
             {STRUCTURE_OPTIONS.map((s) => (
@@ -810,8 +1078,15 @@ export function DerivativeIncome() {
                 onClick={() => toggleStructure(s.id)}>{s.icon}{s.label}</button>
             ))}
           </div>
+          {mode === 'single' && structures.includes('covered_call') && (
+            <label className="flex items-start gap-2 mt-2 cursor-pointer text-[11px] text-base-content/70">
+              <input type="checkbox" className="checkbox checkbox-xs checkbox-secondary mt-0.5" checked={ownsShares}
+                onChange={e => setOwnsShares(e.target.checked)} />
+              <span>I already hold the shares — score covered calls as an <b>income overlay</b> on the position (returns as yield on held stock, no fresh-capital or beta penalty), not a buy-write.</span>
+            </label>
+          )}
         </div>
-        <div className="form-control lg:col-span-3 gap-1">
+        <div className="form-control lg:col-span-4 gap-1">
           {mode === 'single' ? (
             <div className="flex items-center gap-2 flex-wrap justify-end">
               {singleStale && (
@@ -825,7 +1100,7 @@ export function DerivativeIncome() {
               </button>
             </div>
           ) : (
-            <button type="submit" className="btn btn-primary btn-sm gap-2 w-fit" disabled={pfLoading || !structures.length}>
+            <button type="submit" className="btn btn-primary btn-sm gap-2 w-fit self-end" disabled={pfLoading || !structures.length}>
               {pfLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Briefcase className="w-4 h-4" />}
               {pfLoading ? 'Scanning holdings…' : 'Scan Top Holdings'}
             </button>
@@ -884,6 +1159,8 @@ export function DerivativeIncome() {
             <Clock className="w-3 h-3" /> Top {pfResult.limit} holdings per page are scanned to spare the quote provider. Results cached briefly.
           </p>
         </div>
+      )}
+      </>
       )}
     </div>
   );

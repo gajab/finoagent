@@ -6,10 +6,85 @@ import pytest
 from app.services.lifecycle_service import (
     algorithmic_exit,
     higher_order_greeks,
+    management_desk_score,
+    management_exit,
     payoff_distribution_metrics,
     pm_ratios,
     portfolio_risk,
 )
+
+
+class TestManagementDeskScore:
+    """The DEEP management read must LEVERAGE the scan's factors — re-signed for a
+    holder — not discard them. Poor ENTRY (desk score 21) but a clear HOLD live."""
+
+    def _scan_like(self, **over):
+        base = dict(
+            keep_drift_pct=98.3, keep_standard_pct=97.3,
+            subscores={"edge": 0, "pop": 93, "sortino": 0, "tail": 72, "carry": 31},
+            grade_adjustments=[{"label": "Expectation", "points": -12}, {"label": "VRP", "points": -9},
+                               {"label": "Moneyness", "points": 3}, {"label": "Liquidity", "points": -8}],
+            ta_factors=[{"label": "Trend drift", "points": 3}, {"label": "Value area", "points": 3},
+                        {"label": "Gamma regime", "points": 4}],
+            captured_pct=30.0, dte_days=25, unrealized_pnl=50, max_profit=200, max_loss=-1200,
+            cushion_pct=17.1)
+        base.update(over)
+        return management_desk_score(**base)
+
+    def test_poor_entry_is_a_hold_when_held(self):
+        r = self._scan_like()
+        assert r["signal"] in ("STRONG_HOLD", "HOLD")
+        assert r["anchor"] == pytest.approx(98.3)
+
+    def test_vrp_flips_to_a_holder_positive(self):
+        # Entry VRP demerit (-9 for cheap implied) becomes a holder POSITIVE (vol decay).
+        r = self._scan_like()
+        vol = next(c for c in r["contributions"] if c["label"] == "Vol decay")
+        assert vol["pts"] > 0 and vol["favorable"] is True
+
+    def test_liquidity_reframed_as_exit_cost(self):
+        r = self._scan_like()
+        assert any(c["label"] == "Exit cost" for c in r["contributions"])
+
+    def test_banked_winner_still_closes(self):
+        r = self._scan_like(captured_pct=90.0)
+        assert r["signal"] == "CLOSE"
+
+    def test_tested_strike_forces_at_least_consider_close(self):
+        r = self._scan_like(cushion_pct=-1.0)
+        assert r["signal"] in ("CONSIDER_CLOSE", "CLOSE")
+
+
+class TestManagementExit:
+    """The MANAGEMENT recommendation must be anchored on the position's chance of
+    KEEPING its edge — NOT the entry desk score (which marks every short-premium
+    trade poorly). A high-keep-prob winner is a HOLD, never a CLOSE."""
+
+    def test_high_keep_prob_winner_holds_not_closes(self):
+        # The Intel regression: entry desk score was 33/F → CLOSE. Management,
+        # anchored on drift-adjusted keep prob 82.7 with only 30% captured, HOLDS.
+        r = management_exit(pop_pct=96.2, keep_drift_pct=82.7, captured_pct=30.0,
+                            dte_days=12, unrealized_pnl=150, max_profit=500, max_loss=-3000,
+                            iv_pct=84.8, hv_pct=97.6, cushion_pct=32.6, theta_per_day=5.0)
+        assert r["signal"] in ("STRONG_HOLD", "HOLD")
+        assert r["base_source"] == "keep_prob_drift" and r["hold_base"] == pytest.approx(82.7)
+
+    def test_take_profit_override_still_closes_a_banked_winner(self):
+        # 90% of max profit captured → bank it regardless of keep prob.
+        r = management_exit(pop_pct=95.0, keep_drift_pct=95.0, captured_pct=90.0,
+                            dte_days=20, unrealized_pnl=450, max_profit=500, max_loss=-3000)
+        assert r["signal"] == "CLOSE"
+
+    def test_falling_iv_is_favorable_for_the_holder(self):
+        # IV below realized is an ENTRY demerit but FAVORABLE for someone short premium.
+        r = management_exit(pop_pct=90.0, captured_pct=20.0, dte_days=30,
+                            iv_pct=40.0, hv_pct=55.0, theta_per_day=3.0)
+        vol = next(f for f in r["factors"] if f["label"] == "Vol decay")
+        assert vol["favorable"] is True
+
+    def test_falls_back_to_pop_when_no_drift(self):
+        r = management_exit(pop_pct=88.0, captured_pct=10.0, dte_days=30, theta_per_day=2.0)
+        assert r["base_source"] == "pop" and r["hold_base"] == pytest.approx(88.0)
 
 
 class TestHigherOrderGreeks:

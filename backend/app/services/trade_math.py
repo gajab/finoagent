@@ -129,6 +129,20 @@ def simple_annualized_pct(profit: float, cost: float, days: int) -> float:
     return (profit / cost) * (365.0 / days) * 100.0
 
 
+def realized_close_pnl(action: str, entry_price: float, exit_price: float,
+                       qty: float, *, is_option: bool = True) -> float:
+    """Realized P&L from closing a leg (or the stock) at ``exit_price``.
+
+    Single source of the close sign convention, mirroring the trade P&L math:
+    a SHORT leg earns (entry − exit) — you sold to open, buy back cheaper to keep
+    the difference; a LONG leg earns (exit − entry). Options scale ×100×contracts;
+    stock scales ×shares. ``qty`` is always the magnitude (contracts / shares).
+    """
+    is_short = any(k in str(action).upper() for k in ("SELL", "SHORT"))
+    per = (entry_price - exit_price) if is_short else (exit_price - entry_price)
+    return per * (100.0 if is_option else 1.0) * float(qty)
+
+
 # ── Quote staleness ─────────────────────────────────────────────────────
 
 def is_stale(ts: Optional[datetime], now: Optional[datetime] = None, max_age_seconds: int = 300) -> bool:

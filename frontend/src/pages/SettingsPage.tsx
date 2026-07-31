@@ -20,6 +20,7 @@ import {
   Cpu,
   Mail,
   ActivitySquare,
+  Database,
   Crown,
   Wifi,
   Sparkles,
@@ -94,6 +95,13 @@ export default function SettingsPage() {
   // Display preferences state
   const [showAiSections, setShowAiSections] = useState(false);
   const [savingDisplayPref, setSavingDisplayPref] = useState(false);
+
+  // Per-functionality data source (localStorage). Today only the Income Desk uses it.
+  const [incomeSource, setIncomeSource] = useState<'yfinance' | 'ibkr'>(
+    () => (localStorage.getItem('incomeDesk.quoteSource') === 'ibkr' ? 'ibkr' : 'yfinance'));
+  // Margin regime used for capital / margin on My Trades. Reg T (default) vs Portfolio Margin.
+  const [marginMode, setMarginMode] = useState<'reg_t' | 'portfolio'>(
+    () => (localStorage.getItem('margin.mode') === 'portfolio' ? 'portfolio' : 'reg_t'));
 
   const loadKeys = useCallback(async () => {
     try {
@@ -299,6 +307,54 @@ export default function SettingsPage() {
           </div>
         </div>
       </div>}
+
+      {/* Data Sources — per-functionality quote source */}
+      <div className="glass-card">
+        <div className="card-body">
+          <div className="flex items-center gap-3">
+            <div className="metric-card p-2"><Database className="w-5 h-5 text-secondary" /></div>
+            <div className="flex-1">
+              <h2 className="card-title text-lg">Data Sources</h2>
+              <p className="text-sm text-base-content/60 mt-0.5">
+                Market-data provider per feature. IBKR gives real-time quotes &amp; Greeks but needs the IBKR
+                connection configured below and a running TWS/Gateway.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 mt-3">
+            <label className="text-sm font-medium w-32 shrink-0">Income Desk</label>
+            <select className="select select-bordered flex-1 rounded-xl" value={incomeSource}
+              onChange={(e) => {
+                const v = e.target.value === 'ibkr' ? 'ibkr' : 'yfinance';
+                setIncomeSource(v); localStorage.setItem('incomeDesk.quoteSource', v);
+              }}>
+              <option value="yfinance">Yahoo Finance — free, delayed (default)</option>
+              <option value="ibkr">Interactive Brokers — real-time, Greeks</option>
+            </select>
+          </div>
+          {incomeSource === 'ibkr' && (
+            <p className="text-[12px] text-warning mt-2">
+              Requires the IBKR connection (below) with a running TWS / Gateway — otherwise scans error out.
+            </p>
+          )}
+          <div className="flex items-center gap-3 mt-4">
+            <label className="text-sm font-medium w-32 shrink-0">Margin</label>
+            <select className="select select-bordered flex-1 rounded-xl" value={marginMode}
+              onChange={(e) => {
+                const v = e.target.value === 'portfolio' ? 'portfolio' : 'reg_t';
+                setMarginMode(v); localStorage.setItem('margin.mode', v);
+              }}>
+              <option value="reg_t">Regulation T (Reg T) &amp; house rules — default</option>
+              <option value="portfolio">Portfolio Margin — risk-based (~15% stress)</option>
+            </select>
+          </div>
+          <p className="text-[12px] text-base-content/50 mt-2">
+            How margin / capital-at-risk is computed for My Trades. <b>Reg T</b>: naked shorts held at
+            max(20%·underlying − out-of-the-money, 10%·strike); spreads at their width. <b>Portfolio Margin</b>:
+            risk-based ≈ a 15% adverse move on the underlying — lower for hedged books, needs broker approval.
+          </p>
+        </div>
+      </div>
 
       {/* AI Model Selector */}
       {availableModels.length > 0 && (

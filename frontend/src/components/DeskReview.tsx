@@ -9,7 +9,7 @@ import DeskDebateModal from './DeskDebateModal';
 import { OpportunitySummary, LegsTable } from './DerivativeIncome';
 import CollapsibleSection from './trades/CollapsibleSection';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
-import type { DeskReviewParams } from '../api';
+import type { DeskReviewParams, DeskEvaluateParams } from '../api';
 import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent } from '../types';
 
 const money = (n: number | null | undefined, d = 0) =>
@@ -64,30 +64,37 @@ const confTextTone = (l?: string) => {
   return 'text-base-content/40';
 };
 
-// A 0–100 subscore bar (base-quality terms: Edge/PoP/Sortino/Tail/Carry).
-function SubBar({ label, v }: { label: string; v: number }) {
+// A 0–100 subscore bar (base-quality terms) in a bounded cell so each metric is clearly separated.
+function SubBar({ label, v, hint }: { label: string; v: number; hint?: string }) {
   const col = v >= 66 ? 'bg-success' : v >= 45 ? 'bg-warning' : 'bg-error';
   return (
-    <div className="flex-1 min-w-[52px]">
-      <div className="flex justify-between text-[9px] text-base-content/40 mb-0.5"><span>{label}</span><span>{v}</span></div>
-      <div className="h-1 rounded bg-base-300/40 overflow-hidden"><div className={`h-full ${col}`} style={{ width: `${Math.max(2, Math.min(100, v))}%` }} /></div>
+    <div className="flex-1 min-w-[70px] rounded-md border border-white/[0.07] bg-base-200/40 px-2 py-1.5"
+      title={hint}>
+      <div className="flex justify-between items-baseline mb-1.5">
+        <span className="text-[10px] text-base-content/55 cursor-help">{label}</span>
+        <span className="text-[11px] font-mono font-semibold text-base-content/75">{v}</span>
+      </div>
+      <div className="h-2 rounded-full bg-base-300/50 overflow-hidden">
+        <div className={`h-full rounded-full ${col}`} style={{ width: `${Math.max(3, Math.min(100, v))}%` }} />
+      </div>
     </div>
   );
 }
 
-// A SIGNED adjustment bar centred at zero: green extends right (+), red left (−).
+// A SIGNED adjustment cell centred at zero: green extends right (+), red left (−). Bounded + valued
+// so magnitude and where each metric starts are both unambiguous.
 function AdjBar({ label, v }: { label: string; v: number }) {
   const MAX = 12;                                   // largest single-factor magnitude
   const mag = (Math.min(Math.abs(v), MAX) / MAX) * 50;
   const pos = v >= 0;
   return (
-    <div className="flex-1 min-w-[64px]">
-      <div className="flex justify-between text-[9px] text-base-content/40 mb-0.5">
-        <span>{label}</span>
-        <span className={v > 0 ? 'text-success' : v < 0 ? 'text-error' : 'text-base-content/30'}>{v > 0 ? '+' : ''}{v}</span>
+    <div className={`flex-1 min-w-[82px] rounded-md border px-2 py-1.5 ${v === 0 ? 'border-white/[0.06] bg-base-200/30' : pos ? 'border-success/25 bg-success/[0.05]' : 'border-error/25 bg-error/[0.05]'}`}>
+      <div className="flex justify-between items-baseline mb-1.5">
+        <span className="text-[10px] text-base-content/55">{label}</span>
+        <span className={`text-[11px] font-mono font-semibold ${v > 0 ? 'text-success' : v < 0 ? 'text-error' : 'text-base-content/40'}`}>{v > 0 ? '+' : ''}{v}</span>
       </div>
-      <div className="relative h-1 rounded bg-base-300/40 overflow-hidden">
-        <div className="absolute left-1/2 top-0 h-full w-px bg-base-content/25" />
+      <div className="relative h-2 rounded-full bg-base-300/50 overflow-hidden">
+        <div className="absolute left-1/2 top-0 h-full w-px bg-base-content/35 z-10" />
         {v !== 0 && (
           <div className={`absolute top-0 h-full ${pos ? 'bg-success' : 'bg-error'}`}
             style={pos ? { left: '50%', width: `${mag}%` } : { right: '50%', width: `${mag}%` }} />
@@ -102,7 +109,7 @@ function AdjBar({ label, v }: { label: string; v: number }) {
 // base-quality bars + the signed regime/factor adjustments that sum to the desk score.
 // The Q-vs-P number-line: spot at centre, the implied (Q) band, the wider physical (P) band, and the
 // short-strike marker — so you SEE whether the strike clears the physical boundary or is exposed to it.
-function QpBoundary({ qp }: { qp: NonNullable<DeskRankedTrade['qp']> }) {
+export function QpBoundary({ qp }: { qp: NonNullable<DeskRankedTrade['qp']> }) {
   const imp = qp.implied_move_pct ?? 0;
   const phys = qp.physical_move_pct ?? 0;
   const dist = qp.short_dist_pct ?? 0;
@@ -111,34 +118,42 @@ function QpBoundary({ qp }: { qp: NonNullable<DeskRankedTrade['qp']> }) {
   const exposed = !!qp.exposed_physical;
   const ratio = qp.iv_hv_ratio;
   return (
-    <div className="mb-2.5">
-      <div className={GROUP_LABEL}>VRP — implied (Q) vs realized (P) boundary</div>
-      <div className="relative h-9 rounded bg-base-300/30 overflow-hidden">
-        {phys > 0 && <div className="absolute inset-y-0 bg-warning/20 border-x border-warning/40"
-          style={{ left: `${50 - half(phys)}%`, width: `${2 * half(phys)}%` }} title={`physical ±${phys}%`} />}
-        {imp > 0 && <div className="absolute inset-y-0 bg-info/25 border-x border-info/50"
-          style={{ left: `${50 - half(imp)}%`, width: `${2 * half(imp)}%` }} title={`implied ±${imp}%`} />}
-        <div className="absolute inset-y-0 left-1/2 w-px bg-base-content/50" />
-        <div className="absolute top-0.5 left-1/2 -translate-x-1/2 text-[8px] text-base-content/50">spot</div>
+    <div className="mb-3">
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <span className={GROUP_LABEL + ' mb-0'}>VRP — implied (Q) vs realized (P) boundary</span>
+        {ratio != null && (
+          <span className={`text-[10.5px] font-mono font-semibold ${ratio >= 1 ? 'text-success' : 'text-error'}`}
+            title="Volatility risk premium: how far implied over/under-prices the physical move. Positive = you're paid to sell.">
+            VRP {ratio >= 1 ? '+' : ''}{Math.round((ratio - 1) * 100)}%
+          </span>
+        )}
+      </div>
+      <div className="relative h-11 rounded-lg bg-base-300/25 border border-white/[0.06] overflow-hidden">
+        {phys > 0 && <div className="absolute inset-y-0 bg-warning/[0.16] border-x-2 border-warning/50"
+          style={{ left: `${50 - half(phys)}%`, width: `${2 * half(phys)}%` }} title={`physical (realized) ±${phys}%`} />}
+        {imp > 0 && <div className="absolute inset-y-2 rounded bg-info/[0.28] border-x-2 border-info/60"
+          style={{ left: `${50 - half(imp)}%`, width: `${2 * half(imp)}%` }} title={`implied (market) ±${imp}%`} />}
+        <div className="absolute inset-y-0 left-1/2 w-px bg-base-content/45" />
+        <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[8px] uppercase tracking-wide text-base-content/50 bg-base-100/70 px-1 rounded">spot</span>
         {dist > 0 && (
-          <div className="absolute bottom-0.5 -translate-x-1/2 text-[10px] leading-none"
-            style={{ left: `${Math.max(2, 50 - half(dist))}%` }} title={`short strike ${dist}% away`}>
-            <span className={exposed ? 'text-error' : 'text-success'}>▲</span>
+          <div className="absolute inset-y-0 -translate-x-1/2 flex flex-col items-center justify-end pb-0.5"
+            style={{ left: `${Math.max(2, Math.min(98, 50 - half(dist)))}%` }} title={`short strike ${dist}% from spot`}>
+            <div className={`w-px flex-1 ${exposed ? 'bg-error/50' : 'bg-success/50'}`}></div>
+            <span className={`text-[11px] leading-none ${exposed ? 'text-error' : 'text-success'}`}>▲</span>
           </div>
         )}
       </div>
-      <div className="flex flex-wrap justify-between gap-x-2 text-[9px] mt-1">
-        <span className="text-info">implied Q ±{imp}%</span>
-        <span className="text-warning">physical P ±{phys}%{qp.gap_aware ? ' · gap-aware (ATR)' : ''}</span>
+      <div className="flex flex-wrap justify-between gap-x-3 gap-y-1 text-[9.5px] mt-1.5">
+        <span className="inline-flex items-center gap-1.5 text-info"><i className="w-2.5 h-2.5 rounded-sm bg-info/40 border border-info/60"></i>implied Q ±{imp}%</span>
+        <span className="inline-flex items-center gap-1.5 text-warning"><i className="w-2.5 h-2.5 rounded-sm bg-warning/30 border border-warning/60"></i>physical P ±{phys}%{qp.gap_aware ? ' · gap-aware' : ''}</span>
         <span className={exposed ? 'text-error font-semibold' : 'text-success'}>
-          short {dist}% {exposed ? '· inside physical → exposed' : '· clears both'}
+          ▲ short {dist}% {exposed ? '· inside physical → exposed' : '· clears both'}
         </span>
       </div>
-      {(qp.implied_vol_pct != null || ratio != null) && (
-        <div className="text-[10px] text-base-content/55 mt-0.5">
+      {qp.implied_vol_pct != null && (
+        <div className="text-[10px] text-base-content/55 mt-1">
           IV {qp.implied_vol_pct}% vs HV {qp.realized_vol_pct}%
-          {ratio != null && <> · VRP <b className={ratio >= 1 ? 'text-success' : 'text-error'}>{ratio >= 1 ? '+' : ''}{Math.round((ratio - 1) * 100)}%</b>
-            {ratio < 1 && imp > 0 ? ` · physical ${(phys / imp).toFixed(1)}× wider (premium under-priced)` : ''}</>}
+          {ratio != null && ratio < 1 && imp > 0 ? ` · physical ${(phys / imp).toFixed(1)}× wider — premium under-priced` : ''}
         </div>
       )}
     </div>
@@ -153,7 +168,139 @@ function GroupFoot({ label, value, signed = false }: { label: string; value: num
 }
 const GROUP_LABEL = 'text-[9px] uppercase tracking-wider text-base-content/40 mb-1';
 
-function TradeExplorer({ t, ticker, params }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams }) {
+// The QUANT ANALYSIS section on its own — base quality + option-math factor
+// adjustments + TA factors + the Q-vs-P boundary → desk score. Exported so the
+// placed-trade lifecycle read (My Trades → Quant algorithmic → full desk score)
+// renders the IDENTICAL section the Derivative Income scan shows, fed by the
+// /desk-score payload. `t` carries the grade fields; `q` is desk_metrics.quant.
+export function QuantAnalysisSection({ t, q, defaultOpen = false }: {
+  t: DeskRankedTrade; q: any; defaultOpen?: boolean;
+}) {
+  const sub = q?.subscores;
+  const base = Math.round(t.base_quality ?? q?.score ?? 0);
+  const adjs = t.grade_adjustments || [];
+  const tas = t.ta_factors || [];
+  const r1 = (n: number) => Math.round(n * 10) / 10;
+  const adjNet = r1(adjs.reduce((s, a) => s + a.points, 0));
+  const taNet = r1(tas.reduce((s, a) => s + a.points, 0));
+  const sgn = (n: number) => `${n > 0 ? '+' : ''}${n}`;
+  const rawSum = r1(base + adjNet + taNet);        // the true arithmetic sum (pre-clamp)
+  const clamped = rawSum !== t.desk_score;         // desk_score is clamped to [0, 100]
+  return (
+    <CollapsibleSection title="Quant Analysis" accent="secondary" defaultOpen={defaultOpen}
+      icon={<Cpu className="w-3 h-3" />} subtitle="base + factor + TA → desk score">
+      {/* Top: the TOTAL desk score (not the base) */}
+      <div className={`flex items-center gap-2 rounded-lg border p-2 mb-2.5 ${gradeTone(t.algo_grade)}`}>
+        <span className="text-sm font-bold uppercase tracking-wider">{q?.verdict || 'GRADE'}</span>
+        <span className="text-xs text-base-content/50">desk grade · point build-up below</span>
+        <span className="ml-auto inline-flex items-baseline gap-1 text-lg font-bold">{t.algo_grade || '—'}<span className="text-[10px] text-base-content/40">grade</span></span>
+      </div>
+
+      {/* Q-vs-P boundary — the implied-vs-physical read the base score is now weighted on */}
+      {t.qp && <QpBoundary qp={t.qp} />}
+
+      {/* Drift-adjusted Win % — P-measure DRIFT overlay. The headline Win% stays the standard
+          risk-neutral PoP; this shows how the trend drift μ would move it. Display only. */}
+      {t.qp?.keep_drift_pct != null && t.qp?.keep_standard_pct != null && (() => {
+        const dd = (t.qp!.keep_drift_pct! - t.qp!.keep_standard_pct!);
+        const mu = t.qp!.drift_mu_pct;
+        return (
+          <div className="mb-2.5">
+            <div className={GROUP_LABEL}>Drift-adjusted Win % — trend (P-measure)</div>
+            <div className="flex flex-wrap items-center gap-x-2 text-[11px]">
+              <span className="text-base-content/70">{winPct(t.qp!.keep_standard_pct)} <span className="opacity-50">risk-neutral</span></span>
+              <span className="opacity-40">→</span>
+              <span className={`font-semibold ${dd >= 0 ? 'text-success' : 'text-error'}`}>{winPct(t.qp!.keep_drift_pct)} drift-adjusted</span>
+              {mu != null && <span className="text-base-content/50">· EMA drift {mu > 0 ? '+' : ''}{mu}%/yr {dd >= 0 ? 'tailwind' : dd < 0 ? 'headwind' : ''}</span>}
+            </div>
+            <p className="text-[9px] text-base-content/40 mt-0.5">Headline Win% stays standard PoP; this overlay folds in the trend drift (velocity), not the score.</p>
+          </div>
+        );
+      })()}
+
+      {/* 1) Base quality — bars, then the base score at the end */}
+      {sub && (
+        <div className="mb-2.5">
+          <div className={GROUP_LABEL}>Base quality — payoff distribution</div>
+          <div className="flex flex-wrap gap-2">
+            <SubBar label="Edge" v={sub.edge} hint="Modeled pricing edge — expected value vs. the option's market price. Higher = you're paid more than fair value." />
+            <SubBar label="PoP" v={sub.pop} hint="Probability of profit at expiry (risk-neutral). Higher = more likely to finish in the money." />
+            <SubBar label="Sortino" v={sub.sortino} hint="Reward per unit of downside risk — penalizes losses, not upside volatility. Higher = better." />
+            <SubBar label="Tail" v={sub.tail} hint="Tail-risk quality — how contained the worst-case (CVaR) loss is. Higher = smaller, safer left tail." />
+            <SubBar label="Carry" v={sub.carry} hint="Premium/theta carry earned vs. the risk-free rate. Higher = better paid to hold the risk." />
+          </div>
+          <GroupFoot label="Base quality" value={base} />
+        </div>
+      )}
+
+      {/* 2) Option-math factor adjustments — bars, then the net at the end */}
+      {adjs.length > 0 && (
+        <div className="mb-2.5">
+          <div className={GROUP_LABEL}>Regime &amp; factor adjustments — option math (± on base)</div>
+          <div className="flex flex-wrap gap-2">
+            {adjs.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
+          </div>
+          <GroupFoot label="Net adjustment" value={adjNet} signed />
+        </div>
+      )}
+
+      {/* 3) TA factors — the technical read (6-mo daily) that tilts the score */}
+      <div className="mb-2">
+        <div className={GROUP_LABEL}>TA factors — regime &amp; structure · 6-mo daily (± on base)</div>
+        {tas.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {tas.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
+          </div>
+        ) : (
+          <p className="text-[10px] text-base-content/40">Neutral to the current regime — no technical tilt on this structure.</p>
+        )}
+        <GroupFoot label="Net TA" value={taNet} signed />
+      </div>
+
+      {/* Reconciliation — how the pieces sum to the desk score */}
+      <p className="text-[10px] text-base-content/45 pt-1.5 border-t border-white/[0.06]">
+        {base} base {sgn(adjNet)} factors {sgn(taNet)} TA = {rawSum}
+        {clamped
+          ? <> → <b className={gradeTextTone(t.algo_grade)}>{t.desk_score}</b> <span className="opacity-70">({rawSum > 100 ? 'capped at 100' : 'floored at 0'})</span></>
+          : <> <b className={gradeTextTone(t.algo_grade)}>desk score</b></>}
+      </p>
+
+      {/* Key drivers — EVERY non-zero factor (option-math + technical), biggest mover first, so the
+          highly positive and highly negative contributions are both explicit. */}
+      {(() => {
+        const drivers = [...adjs, ...tas].filter(d => d.points !== 0)
+          .sort((a, b) => Math.abs(b.points) - Math.abs(a.points));
+        if (!drivers.length) return null;
+        return (
+          <div className="mt-2.5 pt-2 border-t border-white/[0.06]">
+            <div className={GROUP_LABEL}>Key drivers — biggest movers first</div>
+            <div className="grid sm:grid-cols-2 gap-x-5 gap-y-1">
+              {drivers.map((d, i) => (
+                <div key={i} className="flex items-center justify-between gap-2 text-[11.5px]">
+                  <span className="text-base-content/70 truncate">{d.label}</span>
+                  <span className={`font-mono font-semibold shrink-0 ${d.points > 0 ? 'text-success' : 'text-error'}`}>{d.points > 0 ? '+' : ''}{d.points}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* The detailed 'why' — option-math reasons, then the technical read. */}
+      {((t.grade_merits && t.grade_merits.length > 0) || (t.grade_demerits && t.grade_demerits.length > 0)) && (
+        <ul className="text-[11px] space-y-0.5 mt-2.5">
+          {(t.grade_merits || []).map((r, i) => <li key={`m${i}`} className="flex gap-1.5 text-success/80"><span className="opacity-50">+</span>{r}</li>)}
+          {(t.grade_demerits || []).map((r, i) => <li key={`d${i}`} className="flex gap-1.5 text-warning/80"><span className="opacity-50">−</span>{r}</li>)}
+        </ul>
+      )}
+      {t.ta_note && (
+        <p className="text-[11px] text-base-content/55 mt-1.5"><span className="text-base-content/40">Technical read:</span> {t.ta_note}</p>
+      )}
+    </CollapsibleSection>
+  );
+}
+
+function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams; evaluate?: DeskEvaluateParams }) {
   const dm = t.desk_metrics;
   const q = dm.quant || {};
   // Per-trade "Run Institutional Desk" — the Quant→Risk→PM debate focused on THIS trade,
@@ -166,25 +313,19 @@ function TradeExplorer({ t, ticker, params }: { t: DeskRankedTrade; ticker: stri
   const runDesk = async () => {
     setDebateOpen(true); setDebateErr(null); setAgents(null); setDebateLoading(true);
     try {
-      const a = await runDeskReviewAgents(ticker, {
-        ...params,
-        focus: { structure: t.structure, expiration: t.expiration ?? null,
-                 short_strike: t.short_strike ?? t.put_short ?? t.call_short ?? null },
-      });
+      // Evaluate tab: rebuild the user's exact bring-your-own trade (works for custom/calendar
+      // trades the focus selector can't reconstruct). Scan flow: focus the selected candidate.
+      const a = await runDeskReviewAgents(ticker, evaluate
+        ? { ...params, evaluate }
+        : {
+            ...params,
+            focus: { structure: t.structure, expiration: t.expiration ?? null,
+                     short_strike: t.short_strike ?? t.put_short ?? t.call_short ?? null },
+          });
       if (a.error) setDebateErr(a.error); else setAgents(a);
     } catch (e: any) { setDebateErr(e?.message || 'Institutional desk failed'); }
     finally { setDebateLoading(false); }
   };
-  const sub = q.subscores;
-  const base = Math.round(t.base_quality ?? q.score ?? 0);
-  const adjs = t.grade_adjustments || [];
-  const tas = t.ta_factors || [];
-  const r1 = (n: number) => Math.round(n * 10) / 10;
-  const adjNet = r1(adjs.reduce((s, a) => s + a.points, 0));
-  const taNet = r1(tas.reduce((s, a) => s + a.points, 0));
-  const sgn = (n: number) => `${n > 0 ? '+' : ''}${n}`;
-  const rawSum = r1(base + adjNet + taNet);        // the true arithmetic sum (pre-clamp)
-  const clamped = rawSum !== t.desk_score;         // desk_score is clamped to [0, 100]
   return (
     <div className="p-3 space-y-2">
       {(t.grade_blocking && t.grade_blocking.length > 0) && (
@@ -218,91 +359,7 @@ function TradeExplorer({ t, ticker, params }: { t: DeskRankedTrade; ticker: stri
         <PmGrid pm={dm.pm} />
       </CollapsibleSection>
 
-      <CollapsibleSection title="Quant Analysis" accent="secondary"
-        icon={<Cpu className="w-3 h-3" />} subtitle="base + factor + TA → desk score">
-        {/* Top: the TOTAL desk score (not the base) */}
-        <div className={`flex items-center gap-2 rounded-lg border p-2 mb-2.5 ${gradeTone(t.algo_grade)}`}>
-          <span className="text-sm font-bold uppercase tracking-wider">{q.verdict || 'GRADE'}</span>
-          <span className="text-xs text-base-content/50">desk grade · point build-up below</span>
-          <span className="ml-auto inline-flex items-baseline gap-1 text-lg font-bold">{t.algo_grade || '—'}<span className="text-[10px] text-base-content/40">grade</span></span>
-        </div>
-
-        {/* Q-vs-P boundary — the implied-vs-physical read the base score is now weighted on */}
-        {t.qp && <QpBoundary qp={t.qp} />}
-
-        {/* Drift-adjusted Win % — P-measure DRIFT overlay. The headline Win% stays the standard
-            risk-neutral PoP; this shows how the trend drift μ would move it. Display only. */}
-        {t.qp?.keep_drift_pct != null && t.qp?.keep_standard_pct != null && (() => {
-          const dd = (t.qp!.keep_drift_pct! - t.qp!.keep_standard_pct!);
-          const mu = t.qp!.drift_mu_pct;
-          return (
-            <div className="mb-2.5">
-              <div className={GROUP_LABEL}>Drift-adjusted Win % — trend (P-measure)</div>
-              <div className="flex flex-wrap items-center gap-x-2 text-[11px]">
-                <span className="text-base-content/70">{winPct(t.qp!.keep_standard_pct)} <span className="opacity-50">risk-neutral</span></span>
-                <span className="opacity-40">→</span>
-                <span className={`font-semibold ${dd >= 0 ? 'text-success' : 'text-error'}`}>{winPct(t.qp!.keep_drift_pct)} drift-adjusted</span>
-                {mu != null && <span className="text-base-content/50">· EMA drift {mu > 0 ? '+' : ''}{mu}%/yr {dd >= 0 ? 'tailwind' : dd < 0 ? 'headwind' : ''}</span>}
-              </div>
-              <p className="text-[9px] text-base-content/40 mt-0.5">Headline Win% stays standard PoP; this overlay folds in the trend drift (velocity), not the score.</p>
-            </div>
-          );
-        })()}
-
-        {/* 1) Base quality — bars, then the base score at the end */}
-        {sub && (
-          <div className="mb-2.5">
-            <div className={GROUP_LABEL}>Base quality — payoff distribution</div>
-            <div className="flex flex-wrap gap-2">
-              <SubBar label="Edge" v={sub.edge} />
-              <SubBar label="PoP" v={sub.pop} />
-              <SubBar label="Sortino" v={sub.sortino} />
-              <SubBar label="Tail" v={sub.tail} />
-              <SubBar label="Carry" v={sub.carry} />
-            </div>
-            <GroupFoot label="Base quality" value={base} />
-          </div>
-        )}
-
-        {/* 2) Option-math factor adjustments — bars, then the net at the end */}
-        {adjs.length > 0 && (
-          <div className="mb-2.5">
-            <div className={GROUP_LABEL}>Regime &amp; factor adjustments — option math (± on base)</div>
-            <div className="flex flex-wrap gap-2">
-              {adjs.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
-            </div>
-            <GroupFoot label="Net adjustment" value={adjNet} signed />
-          </div>
-        )}
-
-        {/* 3) TA factors — the technical read (6-mo daily) that tilts the score */}
-        <div className="mb-2">
-          <div className={GROUP_LABEL}>TA factors — regime &amp; structure · 6-mo daily (± on base)</div>
-          {tas.length > 0 ? (
-            <div className="flex flex-wrap gap-2">
-              {tas.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
-            </div>
-          ) : (
-            <p className="text-[10px] text-base-content/40">Neutral to the current regime — no technical tilt on this structure.</p>
-          )}
-          <GroupFoot label="Net TA" value={taNet} signed />
-        </div>
-
-        {/* Reconciliation — how the pieces sum to the desk score */}
-        <p className="text-[10px] text-base-content/45 pt-1.5 border-t border-white/[0.06]">
-          {base} base {sgn(adjNet)} factors {sgn(taNet)} TA = {rawSum}
-          {clamped
-            ? <> → <b className={gradeTextTone(t.algo_grade)}>{t.desk_score}</b> <span className="opacity-70">({rawSum > 100 ? 'capped at 100' : 'floored at 0'})</span></>
-            : <> <b className={gradeTextTone(t.algo_grade)}>desk score</b></>}
-        </p>
-
-        {((t.grade_merits && t.grade_merits.length > 0) || (t.grade_demerits && t.grade_demerits.length > 0)) && (
-          <ul className="text-[11px] space-y-0.5 mt-1.5">
-            {(t.grade_merits || []).map((r, i) => <li key={`m${i}`} className="flex gap-1.5 text-success/80"><span className="opacity-50">+</span>{r}</li>)}
-            {(t.grade_demerits || []).map((r, i) => <li key={`d${i}`} className="flex gap-1.5 text-warning/80"><span className="opacity-50">−</span>{r}</li>)}
-          </ul>
-        )}
-      </CollapsibleSection>
+      <QuantAnalysisSection t={t} q={q} />
 
       {/* Run Institutional Desk — the LLM debate on THIS trade, in the boardroom modal. Right-aligned,
           directly after the Quant Analysis section. */}
@@ -466,7 +523,7 @@ export function SingleTradeDeskReview({ ticker, params, trade }: {
   );
 }
 
-export function DeskReview({ ticker, params, renderTrade, renderDebate, data }: {
+export function DeskReview({ ticker, params, renderTrade, renderDebate, data, evaluate }: {
   ticker: string;
   params: DeskReviewParams;
   renderTrade?: (trade: DeskRankedTrade) => React.ReactNode;
@@ -476,6 +533,9 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data }: 
   // PRESENTATIONAL mode: when the parent already fetched the desk payload (single-ticker one-call
   // flow), pass it here and the component renders it directly — no own /desk-review fetch.
   data?: DeskReviewResult;
+  // EVALUATE mode: the user's bring-your-own trade legs, so each row's LLM debate re-evaluates
+  // THAT exact trade (custom/calendar trades can't be rebuilt via the focus selector).
+  evaluate?: DeskEvaluateParams;
 }) {
   const controlled = data !== undefined;
   const [rev, setRev] = useState<DeskReviewResult | null>(data ?? null);
@@ -535,21 +595,35 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data }: 
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2 flex-wrap">
-        {rev?.gex?.regime ? (
-          <span
-            className={`text-[11px] px-2 py-1 rounded-lg border inline-flex items-center gap-1.5 ${
-              rev.gex.regime === 'long'
-                ? 'border-success/30 bg-success/[0.08] text-success'
-                : 'border-error/30 bg-error/[0.08] text-error'}`}
-            title={`Dealer gamma proxy from open interest × modelled gamma (${rev.gex.n_strikes ?? '—'} strikes). LONG gamma = dealers fade moves → volatility suppressed, mean-reverting → a good backdrop for selling premium. SHORT gamma = dealers chase moves → volatility expansion, trending → dangerous, and delta-neutral structures are vetoed.`}>
-            <Zap className="w-3.5 h-3.5" />
-            Gamma: {rev.gex.regime === 'long' ? 'LONG · vol-suppressed' : 'SHORT · vol-expansion'}
-            {rev.gex.flip_level != null && <span className="opacity-70">· flip ${rev.gex.flip_level}</span>}
-            <span className="opacity-50 text-[9px]">proxy</span>
-          </span>
-        ) : <span />}
+        <div className="flex items-center gap-2 flex-wrap">
+          {rev?.gex?.regime && (
+            <span
+              className={`text-[11px] px-2 py-1 rounded-lg border inline-flex items-center gap-1.5 ${
+                rev.gex.regime === 'long'
+                  ? 'border-success/30 bg-success/[0.08] text-success'
+                  : 'border-error/30 bg-error/[0.08] text-error'}`}
+              title={`Dealer gamma proxy from open interest × modelled gamma (${rev.gex.n_strikes ?? '—'} strikes). LONG gamma = dealers fade moves → volatility suppressed, mean-reverting → a good backdrop for selling premium. SHORT gamma = dealers chase moves → volatility expansion, trending → dangerous, and delta-neutral structures are vetoed.`}>
+              <Zap className="w-3.5 h-3.5" />
+              Gamma: {rev.gex.regime === 'long' ? 'LONG · vol-suppressed' : 'SHORT · vol-expansion'}
+              {rev.gex.flip_level != null && <span className="opacity-70">· flip ${rev.gex.flip_level}</span>}
+              <span className="opacity-50 text-[9px]">proxy</span>
+            </span>
+          )}
+          {rev?.ta_timeframe && (
+            <span className="text-[11px] px-2 py-1 rounded-lg border border-white/[0.08] bg-base-200/50 text-base-content/60 inline-flex items-center gap-1.5"
+              title="The technical read that scores every trade — a swing horizon (daily bars, ~6 months of context) matched to a multi-week option. Short/intraday would be noise; long/weekly would lag the trade.">
+              <Activity className="w-3.5 h-3.5" /> TA · {rev.ta_timeframe}
+            </span>
+          )}
+        </div>
         <RatingsHelpButton />
       </div>
+
+      {rev?.data_source_note && (
+        <div className="rounded-lg border border-warning/30 bg-warning/[0.08] px-3 py-2 text-[11px] text-warning flex items-center gap-1.5">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0" /> {rev.data_source_note}
+        </div>
+      )}
 
       {loading && (
         <div className="flex items-center gap-2 text-xs text-base-content/50 py-6 justify-center">
@@ -649,7 +723,7 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data }: 
                           <tr className="bg-secondary/[0.05]">
                             <td colSpan={10} className="!p-0">
                               <div className="m-2 rounded-lg border border-secondary/30 bg-base-100/40 overflow-hidden">
-                                <TradeExplorer t={t} ticker={ticker} params={params} />
+                                <TradeExplorer t={t} ticker={ticker} params={params} evaluate={evaluate} />
                               </div>
                             </td>
                           </tr>

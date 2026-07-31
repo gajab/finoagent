@@ -1,6 +1,6 @@
 import React, { useState, lazy, Suspense } from 'react';
 import {
-  Layers, Box, ArrowLeftRight, Building, Shield, Target, ArrowDownRight, Crown, Lock, Briefcase, ClipboardList, ShieldCheck, Coins, Sparkles
+  Layers, Box, ArrowLeftRight, Building, Shield, Target, ArrowDownRight, Crown, Lock, Briefcase, ClipboardList, ShieldCheck, Coins
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -17,23 +17,16 @@ const TaxLossHarvesting = lazy(() => import('../components/TaxLossHarvesting').t
 const CppiStrategy = lazy(() => import('../components/CppiStrategy').then(m => ({ default: m.CppiStrategy })));
 const HedgingStrategy = lazy(() => import('../components/HedgingStrategy').then(m => ({ default: m.HedgingStrategy })));
 const DerivativeIncome = lazy(() => import('../components/DerivativeIncome').then(m => ({ default: m.DerivativeIncome })));
-const DerivativeIncomeV2 = lazy(() => import('../components/DerivativeIncomeV2').then(m => ({ default: m.DerivativeIncomeV2 })));
 
-type Strategy = 'box' | 'longshort' | 'structured' | 'dual_direction' | 'concentration' | 'poormans' | 'zebra' | 'tax_loss_harvesting' | 'cppi' | 'hedging' | 'derivative_income' | 'derivative_income_v2';
+type Strategy = 'box' | 'longshort' | 'structured' | 'dual_direction' | 'concentration' | 'poormans' | 'zebra' | 'tax_loss_harvesting' | 'cppi' | 'hedging' | 'derivative_income';
 
 const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; description: string }[] = [
 
   {
     id: 'derivative_income',
-    label: 'Derivative Income',
+    label: 'Income Desk',
     icon: <Coins className="w-5 h-5" />,
-    description: 'Covered calls, cash-secured puts, collars & credit spreads with ≥85% probability of not being exercised — ranked vs SOFR.',
-  },
-  {
-    id: 'derivative_income_v2',
-    label: 'Derivative Income v2',
-    icon: <Sparkles className="w-5 h-5" />,
-    description: 'New master–detail workspace for the income scanner — same engine, calmer layout.',
+    description: 'Grades every option-selling trade on volatility-risk-premium, dealer gamma & technicals — then the Quant · Risk · PM desk debates the best.',
   },
   {
     id: 'box',
@@ -176,7 +169,6 @@ export default function StrategiesPage() {
               <Suspense fallback={<div className="flex items-center justify-center py-24 text-base-content/50"><span className="loading loading-spinner loading-md" /></div>}>
                 {activeStrategy === 'box' && <BoxStrategy />}
                 {activeStrategy === 'derivative_income' && <DerivativeIncome />}
-                {activeStrategy === 'derivative_income_v2' && <DerivativeIncomeV2 />}
                 {activeStrategy === 'hedging' && <HedgingStrategy />}
                 {activeStrategy === 'longshort' && <LongShortStrategy />}
                 {activeStrategy === 'tax_loss_harvesting' && <TaxLossHarvesting />}

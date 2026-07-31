@@ -12,7 +12,9 @@
 import { useState } from 'react';
 import { Loader2, Cpu, AlertTriangle } from 'lucide-react';
 import { runDeskScore } from '../../api';
-import type { QuantExit, LivePnlResponse, SavedStrategyItem, DeskScoreResult, DeskFactor } from '../../api';
+import type { QuantExit, LivePnlResponse, SavedStrategyItem, DeskScoreResult } from '../../api';
+import { QuantAnalysisSection } from '../DeskReview';
+import ManagementAnalysis from './ManagementAnalysis';
 
 const SIGNAL: Record<string, { label: string; cls: string; tone: string }> = {
   STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success',               tone: 'success' },
@@ -35,60 +37,6 @@ function Lens({ label, v }: { label: string; v: number }) {
   );
 }
 
-// A group of signed factor contributions (option-math or TA) as ±chips + net.
-function FactorGroup({ title, factors }: { title: string; factors: DeskFactor[] }) {
-  const active = factors.filter(f => Math.abs(f.points) >= 0.5);
-  const net = factors.reduce((s, f) => s + f.points, 0);
-  return (
-    <div>
-      <div className="flex items-center justify-between text-[9px] uppercase tracking-wider text-base-content/30 mb-1">
-        <span>{title}</span>
-        <span className={net >= 0 ? 'text-success/70' : 'text-error/70'}>net {net >= 0 ? '+' : ''}{net.toFixed(0)}</span>
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {active.length === 0 && <span className="text-[9px] text-base-content/25">no material factors</span>}
-        {active.map((f, i) => (
-          <span key={i} className={`badge badge-xs text-[9px] ${f.points >= 0 ? 'badge-success badge-outline' : 'badge-error badge-outline'}`}>
-            {f.label} {f.points >= 0 ? '+' : ''}{f.points}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// Q-vs-P boundary — implied (risk-neutral) vs realized (physical) 1σ move bands,
-// with the short strike marked. A wider physical band = the negative-VRP exposure.
-function VrpBoundary({ qp }: { qp: NonNullable<DeskScoreResult['qp']> }) {
-  const imp = Math.abs(qp.implied_move_pct ?? 0);
-  const phys = Math.abs(qp.physical_move_pct ?? 0);
-  const sd = Math.abs(qp.short_dist_pct ?? 0);
-  const span = Math.max(phys, imp, sd, 5) * 1.2;
-  const L = (p: number) => 50 + (p / span) * 50;           // 0 → center
-  const ratio = qp.iv_hv_ratio;
-  return (
-    <div>
-      <div className="text-[9px] uppercase tracking-wider text-base-content/30 mb-1">VRP — implied (Q) vs realized (P) boundary</div>
-      <div className="relative h-7 rounded bg-base-300/25 overflow-hidden">
-        <div className="absolute inset-y-0 bg-error/15" style={{ left: `${L(-phys)}%`, right: `${100 - L(phys)}%` }} title={`physical P ±${phys}%`} />
-        <div className="absolute inset-y-1.5 bg-info/30" style={{ left: `${L(-imp)}%`, right: `${100 - L(imp)}%` }} title={`implied Q ±${imp}%`} />
-        <div className="absolute inset-y-0 w-px bg-base-content/50" style={{ left: '50%' }} title="spot" />
-        {sd > 0 && <div className="absolute inset-y-0 w-0.5 bg-success" style={{ left: `${L(-sd)}%` }} title="short strike" />}
-      </div>
-      <div className="flex justify-between text-[9px] mt-0.5">
-        <span className="text-info/70">implied Q ±{imp}%</span>
-        <span className="text-error/70">physical P ±{phys}%</span>
-        {sd > 0 && <span className="text-success/70">short {sd}% {qp.short_sigmas != null ? `(${qp.short_sigmas}σ)` : ''}</span>}
-      </div>
-      {qp.implied_vol_pct != null && qp.realized_vol_pct != null && (
-        <div className="text-[9px] text-base-content/40 mt-0.5">
-          IV {qp.implied_vol_pct}% vs HV {qp.realized_vol_pct}%
-          {ratio != null && <> · VRP {ratio}× <span className={ratio >= 1 ? 'text-success/70' : 'text-error/70'}>{ratio >= 1 ? '(rich)' : '(cheap — premium under-priced)'}</span></>}
-        </div>
-      )}
-    </div>
-  );
-}
 
 export default function QuantExitCard({ q, trade, pnl, deskFocus }: {
   q: QuantExit;
@@ -111,83 +59,113 @@ export default function QuantExitCard({ q, trade, pnl, deskFocus }: {
     finally { setLoading(false); }
   };
 
-  // The full desk score, when fetched, drives the signal + buildup; else the light quant_exit.
+  // The full desk score, when fetched, refines the drift-adjusted anchor; else the
+  // light quant_exit (PoP anchor). BOTH are MANAGEMENT reads — anchored on the
+  // position's chance of keeping its edge, NOT the entry desk score.
   const sig = full?.signal || q.signal;
   const s = SIGNAL[sig] || SIGNAL.HOLD;
   const ss = full?.subscores || q.subscores;
   const lifeAdj = full?.lifecycle_adjustments || q.adjustments;
   const score = full?.lifecycle_score ?? q.score;
   const baseQ = full?.base_quality ?? q.base_quality;
+  const holdBase = full?.hold_base ?? q.hold_base;
+  const baseSrc = full?.base_source ?? q.base_source;
+  const baseLabel = baseSrc === 'keep_prob_drift' ? 'keep-prob (drift-adj)' : 'keep-prob';
+  const factors = q.factors ?? [];   // light narrative reads (shown until the deep read loads)
 
   return (
     <div className={`rounded-lg border p-3 bg-${s.tone}/5 border-${s.tone}/20 space-y-2`}>
       <div className="flex items-center gap-2 flex-wrap">
         <span className={`badge badge-sm font-semibold ${s.cls}`}>{s.label}</span>
         <span className="text-[9px] uppercase tracking-wider text-base-content/40">
-          Quant algorithmic{full ? ' · full desk score' : ''}
+          Quant · manage this trade{full ? ' · drift-adjusted' : ''}
         </span>
         {pnl.analysis?.exit_scope === 'options_overlay' && (
           <span className="badge badge-ghost badge-xs text-[8px] text-info/70" title="Manages the OPTION overlay — the underlying stock is held separately for its own purpose">
             options overlay
           </span>
         )}
-        {full?.algo_grade && <span className="text-[9px] text-base-content/40">grade {full.algo_grade}</span>}
-        <span className="ml-auto text-sm font-bold">{score}<span className="text-[10px] text-base-content/40">/100</span></span>
+        <span className="ml-auto text-sm font-bold" title="Hold conviction — high = let it work, low = close">{score}<span className="text-[10px] text-base-content/40">/100</span></span>
         {deskFocus && !full && (
-          <button className="btn btn-outline btn-secondary btn-xs gap-1" disabled={loading} onClick={(e) => { e.stopPropagation(); runFull(); }}>
+          <button className="btn btn-outline btn-secondary btn-xs gap-1" disabled={loading} onClick={(e) => { e.stopPropagation(); runFull(); }}
+            title="Run the full scan engine on THIS trade and re-read every factor for a holder (VRP/Moneyness/Liquidity/TA)">
             {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Cpu className="w-3 h-3" />}
-            {loading ? 'Scoring…' : 'Run full desk score'}
+            {loading ? 'Analyzing…' : 'Deep quant analysis'}
           </button>
         )}
       </div>
-      {err && <div className="text-[10px] text-warning flex items-center gap-1"><AlertTriangle className="w-3 h-3" />{err}</div>}
-
-      {/* Base quality — the 5 payoff-distribution lenses */}
-      {ss && (
-        <div>
-          <div className="text-[9px] uppercase tracking-wider text-base-content/30 mb-1">
-            Base quality · payoff distribution {baseQ != null && <span className="text-base-content/40">({baseQ})</span>}
-          </div>
-          <div className="flex gap-2">
-            <Lens label="Edge" v={ss.edge} /><Lens label="PoP" v={ss.pop} /><Lens label="Sortino" v={ss.sortino} />
-            <Lens label="Tail" v={ss.tail} /><Lens label="Carry" v={ss.carry} />
-          </div>
+      {err && (
+        <div className="text-[10px] text-base-content/50 flex items-start gap-1">
+          <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0 text-base-content/40" />
+          <span>Deep factor analysis isn't available for this structure — the management read above is the recommendation.</span>
         </div>
       )}
 
-      {/* Full-desk-only factor groups + VRP boundary */}
-      {full && (
+      {/* ── LIGHT view — the quick read, shown until the deep analysis is loaded ── */}
+      {!full && (
         <>
-          {full.grade_adjustments && full.grade_adjustments.length > 0 && (
-            <FactorGroup title="Option math · regime & factor adjustments" factors={full.grade_adjustments} />
+          {/* Holder-framed narrative reads (vol decay, trend vs YOUR strike, theta left) */}
+          {factors.length > 0 && (
+            <div className="space-y-1 rounded-md bg-base-100/30 p-2">
+              <div className="text-[9px] uppercase tracking-wider text-base-content/30">Management read · your position</div>
+              {factors.map((f, i) => (
+                <div key={i} className="flex items-start gap-1.5 text-[10px] leading-snug">
+                  <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${f.favorable === true ? 'bg-success' : f.favorable === false ? 'bg-error' : 'bg-base-content/30'}`} />
+                  <span className="text-base-content/70"><b className="text-base-content/90">{f.label}:</b> {f.note}</span>
+                </div>
+              ))}
+            </div>
           )}
-          {full.ta_factors && full.ta_factors.length > 0 && (
-            <FactorGroup title="Technicals · regime & structure" factors={full.ta_factors} />
+
+          {ss && ss.edge != null && (
+            <details className="group">
+              <summary className="text-[9px] uppercase tracking-wider text-base-content/30 cursor-pointer list-none flex items-center gap-1">
+                <span className="group-open:hidden">▸</span><span className="hidden group-open:inline">▾</span>
+                Position risk/reward · reference {baseQ != null && <span className="text-base-content/40">({baseQ})</span>}
+              </summary>
+              <div className="flex gap-2 mt-1">
+                <Lens label="Edge" v={ss.edge} /><Lens label="PoP" v={ss.pop} /><Lens label="Sortino" v={ss.sortino} />
+                <Lens label="Tail" v={ss.tail} /><Lens label="Carry" v={ss.carry} />
+              </div>
+            </details>
           )}
-          {full.qp && (full.qp.physical_move_pct != null || full.qp.iv_hv_ratio != null) && <VrpBoundary qp={full.qp} />}
+
+          {lifeAdj.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {lifeAdj.map((a, i) => (
+                <span key={i} className={`badge badge-xs text-[9px] ${a.pts >= 0 ? 'badge-success badge-outline' : 'badge-error badge-outline'}`} title={a.note}>
+                  {a.name} {a.pts >= 0 ? '+' : ''}{a.pts}
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="text-[10px] text-base-content/50 font-mono">
+            {holdBase != null ? `${holdBase} ${baseLabel}` : `${baseQ ?? ''} base`}
+            {lifeAdj.map((a, i) => <span key={i}> {a.pts >= 0 ? '+' : '−'}{Math.abs(a.pts)} {a.name.split(' ')[0].toLowerCase()}</span>)}
+            {' '}= {score} → <span className={`text-${s.tone} font-semibold`}>{s.label}</span>
+          </div>
+
+          {q.overrides.length > 0 && (
+            <div className="text-[10px] text-warning/80">Override: {q.overrides.join('; ')}</div>
+          )}
         </>
       )}
 
-      {/* Lifecycle adjustments (± on the quality score) */}
-      {lifeAdj.length > 0 && (
-        <div className="flex flex-wrap gap-1.5">
-          {lifeAdj.map((a, i) => (
-            <span key={i} className={`badge badge-xs text-[9px] ${a.pts >= 0 ? 'badge-success badge-outline' : 'badge-error badge-outline'}`} title={a.note}>
-              {a.name} {a.pts >= 0 ? '+' : ''}{a.pts}
-            </span>
-          ))}
+      {/* ── DEEP view — the scan's quant engine, every factor RE-SIGNED for a holder ── */}
+      {full?.management_analysis && (
+        <div className="pt-1" onClick={(e) => e.stopPropagation()}>
+          <ManagementAnalysis ma={full.management_analysis} qp={full.qp} />
+          {full.opp && (
+            <details className="group mt-2">
+              <summary className="text-[9px] uppercase tracking-wider text-base-content/30 cursor-pointer list-none flex items-center gap-1">
+                <span className="group-open:hidden">▸</span><span className="hidden group-open:inline">▾</span>
+                Raw entry factors · how this would score as a NEW trade (reference)
+              </summary>
+              <div className="mt-1"><QuantAnalysisSection t={full.opp} q={full.opp?.desk_metrics?.quant} /></div>
+            </details>
+          )}
         </div>
-      )}
-
-      {/* Auditable buildup */}
-      <div className="text-[10px] text-base-content/50 font-mono">
-        {full ? `desk ${full.desk_score}` : `${baseQ} base`}
-        {lifeAdj.map((a, i) => <span key={i}> {a.pts >= 0 ? '+' : '−'}{Math.abs(a.pts)} {a.name.split(' ')[0].toLowerCase()}</span>)}
-        {' '}= {score} → <span className={`text-${s.tone} font-semibold`}>{s.label}</span>
-      </div>
-
-      {(full?.overrides || q.overrides).length > 0 && (
-        <div className="text-[10px] text-warning/80">Override: {(full?.overrides || q.overrides).join('; ')}</div>
       )}
     </div>
   );

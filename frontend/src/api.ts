@@ -665,6 +665,7 @@ export type DeskReviewParams = {
   min_income?: number;
   structures?: string[];
   quote_source?: string;
+  owns_underlying?: boolean;   // already hold the shares → covered calls scored as an income overlay
 };
 
 export async function runDeskReview(ticker: string, params: DeskReviewParams): Promise<DeskReviewResult> {
@@ -676,11 +677,30 @@ export async function runDeskReview(ticker: string, params: DeskReviewParams): P
 
 export type DeskFocusTrade = { structure: string; expiration?: string | null; short_strike?: number | null };
 
+// Bring-your-own trade: the user's exact legs (+ optional stock) to evaluate on the desk.
+export type EvaluateLeg = { action: 'BUY' | 'SELL'; type: 'CALL' | 'PUT'; strike: number; expiration: string };
+export type DeskEvaluateParams = {
+  legs: EvaluateLeg[];
+  stock_shares?: number;
+  cost_basis?: number | null;
+  quote_source?: string;
+  owns_underlying?: boolean;
+};
+
 export async function runDeskReviewAgents(
   ticker: string,
-  params: DeskReviewParams & { model?: string; focus?: DeskFocusTrade },
+  params: DeskReviewParams & { model?: string; focus?: DeskFocusTrade; evaluate?: DeskEvaluateParams },
 ): Promise<DeskAgentsResult> {
   return apiFetch<DeskAgentsResult>(`/api/stock/${encodeURIComponent(ticker)}/desk-review/agents`, {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+// Evaluate a user-entered multi-leg trade — returns the same DeskReviewResult shape as the
+// single-ticker scan (chrome + ranked=[the one trade]) so the UI renders it identically.
+export async function evaluateDeskTrade(ticker: string, params: DeskEvaluateParams): Promise<DeskReviewResult> {
+  return apiFetch<DeskReviewResult>(`/api/stock/${encodeURIComponent(ticker)}/desk-review/evaluate`, {
     method: 'POST',
     body: JSON.stringify(params),
   });
@@ -1068,6 +1088,48 @@ export async function closeTrackedTrade(id: number, data: {
   });
 }
 
+// Parse pasted broker order text → what it means vs the user's open trades.
+export interface ImportedLeg {
+  kind: 'option' | 'stock';
+  underlying: string;
+  type: string;                 // CALL | PUT | STOCK
+  right?: string; strike?: number; expiration?: string;
+  action: 'BUY' | 'SELL';
+  qty: number;
+  price: number | null;
+  raw_symbol: string;
+}
+export interface ImportOrderResult {
+  legs: ImportedLeg[];
+  underlying: string;
+  intent: 'new' | 'close' | 'duplicate';
+  close_matches: { parsed_idx: number; trade_id: number; trade_name: string; leg_index: number; exit_price: number | null; label: string }[];
+  warnings: string[];
+  manual_trade: any;            // ManualTradeIn-shaped payload, ready to POST as a new trade
+}
+export async function importOrder(text: string, purpose?: string): Promise<ImportOrderResult> {
+  return apiFetch<ImportOrderResult>(`/api/saved-strategies/import-order`, {
+    method: 'POST',
+    body: JSON.stringify({ text, purpose }),
+  });
+}
+
+// Close SOME or ALL of a placed trade at the prices actually received. The backend
+// banks realized P&L per leg (parameters.realized_pnl + closed_legs), and only flips
+// the trade to 'closed' when no legs and no stock remain (partial closes stay active).
+export async function closePosition(id: number, data: {
+  legs: { leg_index: number; exit_price: number }[];
+  close_stock?: boolean;
+  stock_exit_price?: number | null;
+  executed_at?: string;
+  note?: string | null;
+}): Promise<SavedStrategyItem> {
+  return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${id}/close-position`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
 export async function createManualTrade(data: {
   strategy_type: string;
   name: string;
@@ -1145,6 +1207,7 @@ export interface LifecycleMetrics {
   trader: Partial<TraderGreeks>;
   pm: Partial<PmRatios>;
   avg_iv_pct: number;
+  risk?: { var_95: number | null; cvar_95: number | null; max_profit: number | null; max_loss: number | null; capital: number | null };
 }
 
 export interface StressTest { name: string; pnl: number; dS_pct: number; dVol_pts: number; }
@@ -1182,13 +1245,24 @@ export interface TradeAnalysis {
   exit_scope?: 'whole_trade' | 'options_overlay';   // options_overlay = manage the options, stock held separately
 }
 
+// A market factor read for someone ALREADY in the position (holder perspective),
+// where the entry sign is often inverted (e.g. falling IV is good when you're short).
+export interface ManagementFactor {
+  label: string;
+  favorable: boolean | null;   // true = good for the holder · false = a risk · null = context
+  note: string;
+}
+
 export interface QuantExit {
   signal: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
-  score: number;              // 0-100 hold quality
-  base_quality: number;       // 0-100 before lifecycle adjustments
-  subscores: { edge: number; pop: number; sortino: number; tail: number; carry: number };
+  score: number;              // 0-100 hold conviction
+  hold_base: number;          // the MANAGEMENT anchor (keep-prob / PoP) — drives the buildup
+  base_source: 'keep_prob_drift' | 'pop';
+  base_quality?: number | null; // entry 5-lens score — REFERENCE only, not the anchor
+  subscores?: { edge: number; pop: number; sortino: number; tail: number; carry: number };
   adjustments: { name: string; pts: number; note: string }[];
-  reasons: string[];
+  factors?: ManagementFactor[]; // holder-framed reads (vol decay, trend vs strike, cushion…)
+  reasons?: string[];
   overrides: string[];
 }
 
@@ -1248,8 +1322,21 @@ export interface LivePnlResponse {
   };
 }
 
-export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance'): Promise<LivePnlResponse> {
-  return apiFetch<LivePnlResponse>(`/api/saved-strategies/${id}/live-pnl?quote_source=${encodeURIComponent(quoteSource)}`);
+// The underlying's stock context for a placed trade — same chrome the Income desk shows.
+export interface UnderlyingDeskResult {
+  ticker: string;
+  spot: number;
+  context: import('./types').DerivativeIncomeContext | null;
+  events: import('./types').DerivativeIncomeFlag[];
+  expiry_summaries: import('./types').DerivativeIncomeExpirySummary[];
+}
+export async function fetchUnderlyingDesk(id: number, quoteSource = 'yfinance'): Promise<UnderlyingDeskResult> {
+  return apiFetch<UnderlyingDeskResult>(`/api/saved-strategies/${id}/underlying-desk?quote_source=${encodeURIComponent(quoteSource)}`);
+}
+
+export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance', marginMode?: string): Promise<LivePnlResponse> {
+  const mm = marginMode || (typeof localStorage !== 'undefined' && localStorage.getItem('margin.mode') === 'portfolio' ? 'portfolio' : 'reg_t');
+  return apiFetch<LivePnlResponse>(`/api/saved-strategies/${id}/live-pnl?quote_source=${encodeURIComponent(quoteSource)}&margin_mode=${encodeURIComponent(mm)}`);
 }
 
 export async function fetchTradeAdvisor(id: number, pnlSnapshot: LivePnlResponse, userQuestion?: string): Promise<{ content: string; model: string }> {
@@ -1298,10 +1385,34 @@ export interface DeskScoreResult {
   };
   algo_grade?: string;
   merits?: string[]; demerits?: string[]; blocking?: string[];
+  opp?: any;                    // full ranked candidate → render the scan's OpportunityCard
+  spot?: number;
   lifecycle_adjustments?: { name: string; pts: number; note: string }[];
   lifecycle_score?: number;
   signal?: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
   overrides?: string[];
+  hold_base?: number;                    // MANAGEMENT anchor (drift-adjusted keep-prob)
+  base_source?: string;                  // 'keep_prob_drift' | 'pop'
+  management_analysis?: ManagementAnalysis; // deep read: scan factors re-signed for the holder
+}
+
+// One re-signed scan factor, read for a HOLDER (e.g. entry VRP demerit → "Vol decay" positive).
+export interface ManagementContribution {
+  label: string;
+  pts: number;
+  favorable: boolean;
+  note: string;
+}
+// The deep management read — scan factors re-signed + take-profit/time overlay → hold/close.
+export interface ManagementAnalysis {
+  anchor: number;                 // keep-prob (drift-adjusted) — the base
+  anchor_label: string;
+  contributions: ManagementContribution[]; // re-signed scan factors (VRP/Moneyness/TA/…)
+  factors_net: number;
+  overlay: { name: string; pts: number; note: string }[]; // take-profit / time-gamma
+  score: number;
+  signal: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  overrides: string[];
 }
 
 export async function runDeskScore(

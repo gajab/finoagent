@@ -32,7 +32,7 @@ from typing import Optional
 
 import numpy as np
 
-from .stock_service import bs_delta, bs_gamma, bs_vega, bs_theta
+from .stock_service import bs_delta, bs_gamma, bs_vega, bs_theta, bs_price
 
 
 # ── Trader desk — dynamic Greeks (Delta, Vanna, Charm, Volga) ───────────
@@ -316,6 +316,40 @@ def terminal_payoff_curve(legs, stock_shares, spot, lo=-0.5, hi=0.5, step=0.025)
     return out
 
 
+def horizon_payoff_curve(legs, stock_shares, spot, horizon_years, r=0.05,
+                         iv_fallback=0.30, lo=-0.5, hi=0.5, step=0.025):
+    """P&L curve at a HORIZON date (the nearest leg's expiry) for a trade whose legs
+    expire at DIFFERENT times (calendars / diagonals). At the horizon a leg with
+    ``dte_years <= horizon`` is expired → pays intrinsic; a still-alive leg is repriced
+    with Black-Scholes on its remaining life (``T = dte_years − horizon``) at its own IV.
+    Same ``[{price, pnl}]`` shape as ``terminal_payoff_curve`` so ``compute_pretrade_metrics``
+    consumes it unchanged.
+
+    legs: [{strike, right('C'/'P'), sign(+1/−1), qty, price, iv, dte_years}] — `price` is
+    the entry mid per share; `iv` may be percent or decimal.
+    """
+    out = []
+    n = int(round((hi - lo) / step))
+    for i in range(n + 1):
+        P = spot * (1 + lo + i * step)
+        pnl = stock_shares * (P - spot)
+        for lg in legs:
+            K = float(lg.get("strike") or 0)
+            otype = "call" if str(lg.get("right", "")).upper().startswith("C") else "put"
+            t_rem = float(lg.get("dte_years") or 0.0) - horizon_years
+            iv = lg.get("iv")
+            sigma = (iv / 100.0 if iv > 3 else float(iv)) if iv else iv_fallback
+            if not sigma or sigma <= 0:
+                sigma = iv_fallback
+            if t_rem <= 1e-6:                       # expired at the horizon → intrinsic only
+                val = max(0.0, P - K) if otype == "call" else max(0.0, K - P)
+            else:                                    # still alive → BS mark at the horizon
+                val = bs_price(P, K, t_rem, r, sigma, otype)
+            pnl += lg["sign"] * float(lg.get("qty") or 1) * 100.0 * (val - float(lg.get("price") or 0.0))
+        out.append({"price": round(P, 2), "pnl": round(pnl, 2)})
+    return out
+
+
 def _weighted_var_cvar(pnl_mid: np.ndarray, w: np.ndarray, alpha: float = 0.05) -> tuple:
     """Weighted VaR/CVaR (positive-loss $) at the alpha tail of the terminal P&L."""
     if len(pnl_mid) == 0 or w.sum() <= 0:
@@ -467,6 +501,202 @@ def lifecycle_overlay(base_score: float, captured_pct: Optional[float], dte_days
         overrides.append("≤2 DTE — gamma/pin/assignment risk")
 
     return {"signal": signal, "score": hold_score, "adjustments": adjustments, "overrides": overrides}
+
+
+def _management_factors(*, iv_pct, hv_pct, pop_pct, keep_drift_pct, cushion_pct,
+                        captured_pct, dte_days, is_income: bool) -> list[dict]:
+    """Holder-framed reading of the SAME market factors the entry desk score uses,
+    but interpreted for someone ALREADY in the position — where the entry sign is
+    often inverted. Display only; the signal comes from the overlay. `favorable`
+    is True (good for the holder) / False (a risk) / None (context).
+
+    The canonical example the entry score gets 'backwards' for a holder: negative
+    VRP (implied < realized) is an entry DEMERIT (you'd be selling cheap vol) but
+    for someone SHORT premium it means the options are decaying cheaply in their
+    favour — a REASON THE POSITION IS WORKING, not a reason to bail.
+    """
+    f: list[dict] = []
+
+    if is_income and iv_pct is not None and hv_pct is not None:
+        if iv_pct <= hv_pct:
+            f.append({"label": "Vol decay", "favorable": True,
+                      "note": (f"IV {iv_pct:.0f}% ≤ realized {hv_pct:.0f}% — the market isn't pricing a big "
+                               "move; your short premium is bleeding out in your favour and is cheap to buy back. "
+                               "(The entry score marks this DOWN because you'd be selling cheap vol — irrelevant once you're short.)")})
+        else:
+            f.append({"label": "Vol premium", "favorable": None,
+                      "note": (f"IV {iv_pct:.0f}% > realized {hv_pct:.0f}% — extra extrinsic still in your shorts; "
+                               "a vol drop accelerates your gain, a spike works against you.")})
+
+    if keep_drift_pct is not None and pop_pct is not None:
+        d = keep_drift_pct - pop_pct
+        if d <= -5:
+            f.append({"label": "Trend", "favorable": False,
+                      "note": (f"Recent trend is a headwind toward your short strike — keep-prob "
+                               f"{pop_pct:.0f}% → {keep_drift_pct:.0f}% once velocity is folded in.")})
+        elif d >= 5:
+            f.append({"label": "Trend", "favorable": True,
+                      "note": (f"Trend is drifting AWAY from your short strike (tailwind) — keep-prob "
+                               f"lifts {pop_pct:.0f}% → {keep_drift_pct:.0f}%.")})
+        else:
+            f.append({"label": "Trend", "favorable": None,
+                      "note": f"Trend broadly neutral to your strike — keep-prob ~{keep_drift_pct:.0f}%."})
+
+    if cushion_pct is not None:
+        if cushion_pct <= 0:
+            f.append({"label": "Strike tested", "favorable": False,
+                      "note": "Spot has reached your short strike — defend (roll) or close; gamma is against you here."})
+        elif cushion_pct < 5:
+            f.append({"label": "Cushion", "favorable": False,
+                      "note": f"Only {cushion_pct:.1f}% between spot and your short strike — thin buffer, watch closely."})
+        else:
+            f.append({"label": "Cushion", "favorable": True,
+                      "note": f"{cushion_pct:.1f}% buffer to your short strike — comfortably out-of-the-money."})
+
+    if captured_pct is not None:
+        if captured_pct >= 50:
+            f.append({"label": "Take profit", "favorable": None,
+                      "note": (f"{captured_pct:.0f}% of max profit banked — most of the juice is gone; the "
+                               "remainder isn't worth the gamma/assignment risk of holding on.")})
+        else:
+            f.append({"label": "Theta left", "favorable": True,
+                      "note": f"Only {captured_pct:.0f}% of max profit captured — meaningful premium still to decay in your favour."})
+
+    if dte_days is not None and dte_days <= 7:
+        f.append({"label": "Gamma clock", "favorable": False,
+                  "note": f"{dte_days} DTE — gamma/pin/assignment risk climbs into expiry; small moves swing P&L hard."})
+
+    return f
+
+
+def management_exit(*, pop_pct: Optional[float], captured_pct: Optional[float],
+                    dte_days: Optional[int], unrealized_pnl: Optional[float] = None,
+                    max_profit=None, max_loss=None, keep_drift_pct: Optional[float] = None,
+                    iv_pct: Optional[float] = None, hv_pct: Optional[float] = None,
+                    cushion_pct: Optional[float] = None, theta_per_day: float = 0.0,
+                    quality_subscores: Optional[dict] = None,
+                    quality_score: Optional[float] = None) -> dict:
+    """The MANAGEMENT recommendation for a trade you ALREADY hold — stay in to keep
+    the edge decaying, or close to bank it / shed risk.
+
+    Anchored on the position's probability of KEEPING its edge (drift-adjusted keep
+    prob when the scan supplies it, else PoP), then the take-profit + time/gamma
+    overlay + hard overrides. This is deliberately NOT the entry desk score: a
+    short-premium winner rates poorly on entry risk/reward (small reward, fat tail,
+    low Sortino) yet is a clear HOLD — anchoring a HOLD decision on an ENTRY score
+    is the category error this fixes. The entry desk score / 5-lens are still shown
+    as reference (`base_quality` / `subscores`) but no longer drive the signal.
+    """
+    base = keep_drift_pct if keep_drift_pct is not None else (pop_pct if pop_pct is not None else 50.0)
+    overlay = lifecycle_overlay(base, captured_pct, dte_days, unrealized_pnl, max_loss)
+    return {
+        "signal": overlay["signal"], "score": overlay["score"],
+        "hold_base": round(float(base), 1),
+        "base_source": "keep_prob_drift" if keep_drift_pct is not None else "pop",
+        "adjustments": overlay["adjustments"], "overrides": overlay["overrides"],
+        "factors": _management_factors(
+            iv_pct=iv_pct, hv_pct=hv_pct, pop_pct=pop_pct, keep_drift_pct=keep_drift_pct,
+            cushion_pct=cushion_pct, captured_pct=captured_pct, dte_days=dte_days,
+            is_income=(theta_per_day or 0.0) > 0),
+        # entry-flavoured 5-lens, reference only (NOT the anchor):
+        "subscores": quality_subscores or {},
+        "base_quality": quality_score,
+    }
+
+
+# How each ENTRY desk factor is re-read for someone ALREADY holding the trade.
+# (weight, holder-note). weight 1.0 = keep · 0 = drop · negative = FLIP the sign
+# (the entry demerit becomes a holder positive, or vice-versa).
+_MGMT_FACTOR_POLICY: dict = {
+    # ── does the short strike survive? — keep, same sign ───────────────────
+    "Trend drift":  (1.0,  "trend relative to your short strike"),
+    "Value area":   (1.0,  "spot's location within the value area"),
+    "Gamma regime": (1.0,  "dealer-gamma vol regime (suppressed = your strike holds)"),
+    "Moneyness":    (1.0,  "cushion from spot to your short strike"),
+    # ── vol — FLIP: cheap implied is an entry demerit but a holder's friend ─
+    "VRP":          (-0.6, "cheap implied vol is GOOD once you're short (it's decaying / cheap to buy back)"),
+    # ── exit mechanics — reframed, downweighted ────────────────────────────
+    "Liquidity":    (0.5,  "bid/ask width is the cost to CLOSE now, not to enter"),
+    # ── expected value — a loss at high keep-prob is a remote tail ──────────
+    "Expectation":  (0.4,  "a losing expectation here is the remote tail, not the base case"),
+    # ── entry-only, irrelevant once held ───────────────────────────────────
+    "Skew":         (0.0,  ""),
+    "Beta":         (0.0,  ""),
+}
+
+
+def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct: Optional[float],
+                          subscores: Optional[dict], grade_adjustments: Optional[list],
+                          ta_factors: Optional[list], captured_pct: Optional[float],
+                          dte_days: Optional[int], unrealized_pnl: Optional[float] = None,
+                          max_profit=None, max_loss=None, cushion_pct: Optional[float] = None) -> dict:
+    """The DEEP management read — reuses the SCAN's factor engine (VRP / Moneyness /
+    Liquidity / Expectation / Skew / Beta + TA regime/value-area/gamma) but RE-SIGNS
+    and RE-WEIGHTS each factor for someone who ALREADY holds the trade, then anchors
+    on the drift-adjusted probability of KEEPING the edge and layers the take-profit /
+    time-gamma overlay. Same auditable build-up as the scan, but the answer is
+    hold-vs-close (STRONG_HOLD / HOLD / CONSIDER_CLOSE / CLOSE), not enter-vs-skip.
+
+        score = keep-prob + Σ(re-signed factors) + Σ(take-profit / time overlay)
+    """
+    anchor = (keep_drift_pct if keep_drift_pct is not None
+              else keep_standard_pct if keep_standard_pct is not None else 50.0)
+    contribs: list[dict] = []
+
+    # TA factors — kept as-is; they already read "does the position hold?".
+    for f in (ta_factors or []):
+        pts = round(float(f.get("points", 0) or 0))
+        if pts:
+            contribs.append({"label": f.get("label"), "pts": pts, "favorable": pts > 0,
+                             "note": "supports your strike holding" if pts > 0 else "pressures your short strike"})
+
+    # Option-math factors — re-signed / re-weighted per the holder policy.
+    for a in (grade_adjustments or []):
+        label = a.get("label")
+        pol = _MGMT_FACTOR_POLICY.get(label)
+        if pol is None:
+            continue
+        w, note = pol
+        pts = round(float(a.get("points", 0) or 0) * w)
+        if pts == 0:
+            continue
+        if label == "VRP":
+            disp = "Vol decay" if pts > 0 else "Vol premium"
+            note = ("cheap implied vol — your shorts are decaying / cheap to buy back" if pts > 0
+                    else "rich implied vol still in your shorts — a vol spike would hurt")
+        elif label == "Liquidity":
+            disp = "Exit cost"
+        else:
+            disp = label
+        contribs.append({"label": disp, "pts": pts, "favorable": pts > 0, "note": note})
+
+    # Downside severity — a fat left tail (low Tail sub-score) is real once you're in:
+    # don't give back a win to a remote-but-costly break.
+    tail = (subscores or {}).get("tail")
+    if tail is not None and tail < 50:
+        pts = -round((50 - tail) * 0.15)   # up to ~-7
+        if pts:
+            contribs.append({"label": "Tail risk", "pts": pts, "favorable": False,
+                             "note": "fat left tail — costly if the strike breaks; don't over-hold a winner into it"})
+
+    factors_net = sum(c["pts"] for c in contribs)
+    ov = lifecycle_overlay(anchor + factors_net, captured_pct, dte_days, unrealized_pnl, max_loss)
+    signal, overrides = ov["signal"], list(ov["overrides"])
+
+    # Tested short strike — defend or close regardless of the score.
+    if cushion_pct is not None and cushion_pct <= 0 and signal in ("STRONG_HOLD", "HOLD"):
+        signal = "CONSIDER_CLOSE"
+        overrides.append("short strike tested — defend (roll) or close")
+
+    return {
+        "signal": signal, "score": ov["score"],
+        "anchor": round(float(anchor), 1),
+        "anchor_label": "keep-prob (drift-adj)" if keep_drift_pct is not None else "keep-prob",
+        "contributions": contribs,          # the re-signed scan factors (holder view)
+        "factors_net": round(factors_net, 1),
+        "overlay": ov["adjustments"],        # take-profit / time-gamma
+        "overrides": overrides,
+    }
 
 
 def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_profit,

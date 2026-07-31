@@ -3374,7 +3374,10 @@ export interface DerivativeIncomeQuant {
 
 export interface DerivativeIncomeVolStats {
   iv_atm_pct: number | null;
-  hv_current_pct: number | null;
+  hv_current_pct: number | null;    // = HV30 (kept for back-compat)
+  hv10_pct?: number | null;         // realized vol, 10 trading-day window
+  hv20_pct?: number | null;         // realized vol, 20 trading-day window
+  hv30_pct?: number | null;         // realized vol, 30 trading-day window (desk baseline for IV/HV)
   har_rv_pct?: number | null;       // HAR-RV forward (~1mo) realized-vol forecast
   iv_vs_har_pts?: number | null;    // implied − HAR forecast (vol pts); + = seller edge
   iv_rank: number | null;
@@ -3528,6 +3531,10 @@ export interface DeskReviewResult {
     value_area?: (number | null)[] | null; trend?: string; bos?: string | null;
   };
   events?: DeskReviewEvent[];
+  /** Which technical read scores the trade (e.g. "Medium Term (6mo / 1d)"). */
+  ta_timeframe?: string | null;
+  /** Set when a requested data source (e.g. IBKR) was unavailable and the scan fell back to Yahoo. */
+  data_source_note?: string | null;
   /** Dealer gamma-exposure proxy — long gamma = vol-suppressed (good for selling), short = vol-expansion. */
   gex?: {
     gex_bn?: number; regime?: 'long' | 'short' | string; flip_level?: number | null;
