@@ -170,6 +170,182 @@ export interface InstitutionalTA {
   regime: TARegime;
 }
 
+// ── Microstructure & multi-timeframe volume profile ──
+export interface LowVolumeNode { price: number | null; pct: number | null }
+export interface VolumeProfileTF {
+  label: string;
+  period: string;
+  interval: string;
+  poc: number;
+  vah: number;
+  val: number;
+  value_area_pct: number;
+  lvns: LowVolumeNode[];
+  bins: VolumeProfileBin[];
+}
+export interface NakedPOC {
+  price: number;
+  date: string;
+  age_days: number | null;
+  distance_pct: number | null;
+  side: 'above' | 'below' | null;
+}
+export interface AnchoredVWAP {
+  label: string;
+  anchor_date: string | null;
+  value: number;
+  distance_pct: number | null;
+  side: 'above' | 'below' | null;
+}
+export interface MicrostructureData {
+  price: number | null;
+  as_of: string;
+  timeframe_profiles: {
+    macro: VolumeProfileTF | null;
+    swing: VolumeProfileTF | null;
+    micro: VolumeProfileTF | null;
+  };
+  naked_pocs: NakedPOC[];
+  avwap: {
+    ytd: AnchoredVWAP | null;
+    earnings: AnchoredVWAP | null;
+    high_52w: AnchoredVWAP | null;
+    low_52w: AnchoredVWAP | null;
+  };
+  price_series: { timestamps: string[]; closes: number[] } | null;
+}
+export interface MicrostructureResponse {
+  ticker: string;
+  microstructure: MicrostructureData;
+  cached?: boolean;
+}
+export interface MicroChatMessage { role: 'user' | 'assistant'; content: string }
+
+// ── Multi-timeframe market structure & liquidity ──
+export interface StructureEvent { type: 'BOS' | 'CHOCH'; direction: 'bullish' | 'bearish'; level: number; index: number }
+export interface TFStructure {
+  trend: 'up' | 'down' | 'range' | string;
+  last_event: StructureEvent | null;
+  events: StructureEvent[];
+  recent_swing_high: number | null;
+  recent_swing_low: number | null;
+}
+export interface LiquidityPool {
+  type: 'BSL' | 'SSL';
+  price: number;
+  swept: boolean;
+  equal_count: number;
+  side?: 'above' | 'below';
+  distance_pct?: number;
+  strength?: 'strong' | 'normal';
+  index: number;
+}
+export interface TimeframeBlock {
+  label: string;
+  trend: string;
+  atr: number | null;
+  structure: TFStructure;
+  order_blocks: OrderBlock[];
+  fair_value_gaps: FairValueGap[];
+  liquidity_pools: LiquidityPool[];
+}
+export interface Confluence {
+  bias: 'bullish' | 'bearish';
+  timeframes: string[];
+  zone: [number, number];
+  score: number;
+  components: { tf: string; kind: string }[];
+  summary: string;
+}
+export interface MarketStructureData {
+  price: number | null;
+  as_of: string;
+  bias: { overall: 'bullish' | 'bearish' | 'mixed' | string; aligned: boolean; score: number; note: string };
+  timeframes: { daily: TimeframeBlock | null; h4: TimeframeBlock | null; h1: TimeframeBlock | null };
+  confluence: Confluence[];
+  price_series: { timestamps: string[]; closes: number[] } | null;
+}
+export interface MarketStructureResponse { ticker: string; market_structure: MarketStructureData; cached?: boolean }
+
+// ── Market regime & statistical extremes ──
+export interface RegimeTF {
+  label: string;
+  hurst: number | null;
+  efficiency_ratio: number | null;
+  regime: string;
+  confidence: string;
+  playbook: string;
+  favored: string[];
+}
+export interface RegimeZScore { window: number; vwap: number | null; z: number; state: string; distance_pct: number | null }
+export interface RegimeData {
+  price: number | null;
+  as_of: string;
+  regime: { overall: string; confidence: string; hurst_daily: number | null; er_daily: number | null; aligned: boolean; playbook: string; favored: string[] };
+  timeframes: { daily: RegimeTF | null; h4: RegimeTF | null };
+  zscore: RegimeZScore | null;
+  price_series: { timestamps: string[]; closes: number[] } | null;
+}
+export interface RegimeResponse { ticker: string; regime: RegimeData; cached?: boolean }
+
+// ── Dealer positioning (option mechanics overlay) ──
+export interface GexWall { strike: number | null; gex_millions: number | null }
+export interface ExpectedMove { dte: number; iv_atm_pct: number | null; move: number | null; move_pct: number | null; upper: number | null; lower: number | null }
+export interface DealerPositioningData {
+  price: number | null;
+  as_of: string;
+  net_gex: { value: number | null; value_millions: number | null; sign: 'long' | 'short' | string; label: string };
+  gamma_flip: { level: number | null; distance_pct: number | null; side: 'above' | 'below' | string; note: string } | null;
+  walls: { call_wall: GexWall | null; put_wall: GexWall | null; by_strike: { strike: number | null; gex_millions: number | null }[] };
+  expected_move: { em_30d: ExpectedMove | null; em_45d: ExpectedMove | null };
+  expirations_used: string[];
+  price_series: { timestamps: string[]; closes: number[] } | null;
+}
+export interface DealerPositioningResponse { ticker: string; dealer_positioning: DealerPositioningData; cached?: boolean }
+
+// ── Trade-setup engine (fusion of all four TA families) ──
+export interface SetupBias { direction: string; strength: string; score: number; rationale: string; regime: string }
+export interface SetupContext {
+  bias: SetupBias;
+  regime: { label: string | null; confidence: string | null; hurst: number | null; note: string | null; favored: string[] | null };
+  expected_move: { pct_30d: number | null; upper: number | null; lower: number | null; iv: number | null } | null;
+  dealer: { gamma: string | null; flip: number | null; note: string | null } | null;
+  trend_alignment: { daily: string | null; h4: string | null; h1: string | null } | null;
+}
+export interface ConfluenceZone {
+  center: number; low: number; high: number; kind: string; score: number;
+  n_sources: number; has_magnet?: boolean;
+  sources: { label: string; price: number; weight: number }[];
+  distance_pct: number | null;
+}
+export interface SetupTarget { level: number | null; label: string; rr: number | null }
+export interface TradeSetup {
+  rank?: number;
+  type: string;
+  direction: 'long' | 'short' | 'neutral' | string;
+  regime_fit: string;
+  confidence: 'high' | 'medium' | 'low' | string;
+  score: number;
+  entry: { low: number | null; high: number | null; level: number | null; label: string };
+  stop: { level: number | null; label: string };
+  targets: SetupTarget[];
+  risk_reward: number | null;
+  sizing: { risk_per_share: number | null; target_move_pct: number | null; within_expected_move: boolean; note: string | null };
+  options: { structure: string; detail: string; bias: string; strikes?: Record<string, number | null>; expiry?: { date: string; dte: number | null } | null };
+  thesis: string;
+  evidence: string[];
+}
+export interface TradeSetupsData {
+  price: number | null;
+  as_of: string;
+  context: SetupContext;
+  confluence_zones: ConfluenceZone[];
+  setups: TradeSetup[];
+  price_series: { timestamps: string[]; closes: number[] } | null;
+  meta: { sources_ok: Record<string, boolean> };
+}
+export interface TradeSetupsResponse { ticker: string; trade_setups: TradeSetupsData; cached?: boolean }
+
 export interface QuarterlyEarningsHistory {
   quarter: string;
   epsActual: number | null;
@@ -3518,6 +3694,38 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
     atr_vol_pct?: number | null;                     // ATR-implied (gap-aware) annualized vol
     gap_aware?: boolean;                             // true when ATR-vol > close-to-close HV (gaps present)
   };
+  // Strike de-dup: this row is the best-in-band representative; near-adjacent same-structure strikes
+  // with a near-identical score are folded in here rather than flooding the ranking.
+  nearby_strikes?: { strike: number | null; premium_per_share?: number | null;
+                     premium_annualized_pct?: number | null; short_strike_pct?: number | null;
+                     desk_score?: number | null }[];
+  nearby_count?: number;                             // how many adjacent strikes this row stands in for
+  nearby_range?: [number, number];                   // [min, max] strike span it represents
+  risk_triggers?: RiskTrigger[];                     // WATCH→DEFEND→EXIT price ladder (TA + geometry)
+}
+
+// One rung of the tail-risk management plan — a price level + the corrective action to take there.
+export interface RiskTrigger {
+  side: 'down' | 'up';                               // which exposed side (short puts vs short calls)
+  tier: 'watch' | 'defend' | 'exit' | 'cap';         // escalation: monitor → adjust → cut · cap = covered-call upside
+  price: number;
+  pct_from_spot: number;
+  atr_units?: number | null;                         // distance in daily-ATR units (imminence)
+  sigma?: number | null;                             // distance in expected-move (σ) units
+  action: string;                                    // the corrective action at this level
+  basis: string;                                     // the technical level / σ band it's anchored to
+  why?: string;                                      // the TA reasoning for THIS level
+}
+
+// On-demand live monitoring plan — real advanced-TA structures (order blocks, POCs, liquidity pools,
+// gamma flip/walls, swings, VWAP) mapped onto the trade's short strikes. Fetched when the panel opens.
+export interface MonitorPlan {
+  triggers: RiskTrigger[];                           // watch → defend → exit(/cap), each a REAL named structure
+  strike_rationale: string[];                        // why the strikes were chosen (the TA cushion behind them)
+  gamma_note?: string | null;                        // dealer gamma-flip backdrop
+  regime?: string | null;
+  levels_found?: number;
+  error?: string;
 }
 
 export interface DeskReviewResult {

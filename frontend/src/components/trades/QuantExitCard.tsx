@@ -19,8 +19,8 @@ import ManagementAnalysis from './ManagementAnalysis';
 const SIGNAL: Record<string, { label: string; cls: string; tone: string }> = {
   STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success',               tone: 'success' },
   HOLD:           { label: 'HOLD',           cls: 'badge-success badge-outline',  tone: 'success' },
-  CONSIDER_CLOSE: { label: 'CONSIDER CLOSE', cls: 'badge-warning',                tone: 'warning' },
-  CLOSE:          { label: 'CLOSE',          cls: 'badge-error',                  tone: 'error' },
+  CLOSE:          { label: 'CLOSE',          cls: 'badge-warning',                tone: 'warning' },
+  STRONG_CLOSE:   { label: 'STRONG CLOSE',   cls: 'badge-error',                  tone: 'error' },
 };
 
 function Lens({ label, v }: { label: string; v: number }) {
@@ -70,7 +70,7 @@ export default function QuantExitCard({ q, trade, pnl, deskFocus }: {
   const baseQ = full?.base_quality ?? q.base_quality;
   const holdBase = full?.hold_base ?? q.hold_base;
   const baseSrc = full?.base_source ?? q.base_source;
-  const baseLabel = baseSrc === 'keep_prob_drift' ? 'keep-prob (drift-adj)' : 'keep-prob';
+  const baseLabel = baseSrc === 'neutral' ? 'neutral baseline' : 'position baseline';
   const factors = q.factors ?? [];   // light narrative reads (shown until the deep read loads)
 
   return (
@@ -97,7 +97,7 @@ export default function QuantExitCard({ q, trade, pnl, deskFocus }: {
       {err && (
         <div className="text-[10px] text-base-content/50 flex items-start gap-1">
           <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0 text-base-content/40" />
-          <span>Deep factor analysis isn't available for this structure — the management read above is the recommendation.</span>
+          <span>{err}</span>
         </div>
       )}
 

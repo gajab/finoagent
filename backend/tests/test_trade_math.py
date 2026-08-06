@@ -655,28 +655,28 @@ class TestExitRecommendation:
         assert exit_recommendation(hold_signal="STRONG_HOLD", pop=80, unrealized_pnl=5,
                                    max_profit=200, max_loss=-800, dte=40)["signal"] == "STRONG_HOLD"
         assert exit_recommendation(hold_signal="STRONG_CLOSE", pop=10, unrealized_pnl=-500,
-                                   max_profit=200, max_loss=-800, dte=30)["signal"] == "CLOSE"
+                                   max_profit=200, max_loss=-800, dte=30)["signal"] == "STRONG_CLOSE"
 
     def test_take_half_early_rule(self):
         # 60% of max profit banked with plenty of time → consider closing early.
         r = exit_recommendation(hold_signal="HOLD", pop=95, unrealized_pnl=60,
                                 max_profit=100, max_loss=-2000, dte=20, theta_per_day=4)
-        assert r["signal"] == "CONSIDER_CLOSE" and r["captured_pct"] == 60.0
+        assert r["signal"] == "CLOSE" and r["captured_pct"] == 60.0
 
     def test_near_max_profit_closes(self):
         r = exit_recommendation(hold_signal="HOLD", pop=98, unrealized_pnl=90,
                                 max_profit=100, max_loss=-2000, dte=15)
-        assert r["signal"] == "CLOSE"
+        assert r["signal"] == "STRONG_CLOSE"
 
     def test_near_max_loss_closes(self):
         r = exit_recommendation(hold_signal="HOLD", pop=20, unrealized_pnl=-700,
                                 max_profit=200, max_loss=-800, dte=30)
-        assert r["signal"] == "CLOSE"
+        assert r["signal"] == "STRONG_CLOSE"
 
     def test_expiry_gamma_downgrades_hold(self):
         r = exit_recommendation(hold_signal="HOLD", pop=80, unrealized_pnl=30,
                                 max_profit=200, max_loss=-800, dte=1)
-        assert r["signal"] == "CONSIDER_CLOSE"
+        assert r["signal"] == "CLOSE"
 
     def test_healthy_position_holds_with_reason(self):
         r = exit_recommendation(hold_signal="HOLD", pop=75, unrealized_pnl=10,

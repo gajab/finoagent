@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from 'react';
-import { Activity, ArrowDown, ArrowUp, Minus, TrendingUp, TrendingDown, Loader2 } from 'lucide-react';
-import { fetchTechnicalForTimeframe } from '../api';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, ArrowDown, ArrowUp, Minus, TrendingUp, TrendingDown, Loader2, Crosshair, Layers } from 'lucide-react';
+import { fetchTechnicalForTimeframe, fetchTradeSetups } from '../api';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -19,6 +19,14 @@ import { Line, Bar } from 'react-chartjs-2';
 import { TechnicalData } from '../types';
 import { SmartMoneyChartOverlay } from './SmartMoneyChartOverlay';
 import { InstitutionalTA, MarketStateBanner } from './InstitutionalTA';
+import MicrostructurePanel from './MicrostructurePanel';
+import MarketStructurePanel from './MarketStructurePanel';
+import RegimePanel from './RegimePanel';
+import DealerPositioningPanel from './DealerPositioningPanel';
+import MarketContextHero from './MarketContextHero';
+import TradeSetupCards from './TradeSetupCards';
+import { SectionIntro } from './taUi';
+import type { TradeSetupsData } from '../types';
 
 ChartJS.register(
   CategoryScale,
@@ -144,6 +152,38 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
   const [tfError, setTfError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'chart' | 'text'>('chart');
   const [activeChartTab, setActiveChartTab] = useState<'MACD' | 'RSI' | 'Price' | 'Volume'>('MACD');
+
+  // Setups-first sub-navigation
+  const [activeSection, setActiveSection] = useState<'setups' | 'indicators' | 'advanced'>('setups');
+  const [setups, setSetups] = useState<TradeSetupsData | null>(null);
+  const [setupsLoading, setSetupsLoading] = useState(false);
+  const [setupsError, setSetupsError] = useState<string | null>(null);
+
+  // Ref-guarded lazy load. NOTE: do NOT gate on setupsLoading in an effect that also
+  // calls setSetupsLoading — that re-triggers the effect and (with a cleanup) cancels the
+  // in-flight request, leaving the spinner stuck forever. The ref tracks the ticker we've
+  // fetched so we fetch exactly once per ticker (and on explicit reload).
+  const setupsFetchedRef = useRef<string | null>(null);
+  const loadSetups = useCallback(() => {
+    setupsFetchedRef.current = ticker;
+    setSetups(null);
+    setSetupsError(null);
+    setSetupsLoading(true);
+    fetchTradeSetups(ticker)
+      .then(r => setSetups(r.trade_setups))
+      .catch(e => setSetupsError(e?.message || 'Failed to load trade setups'))
+      .finally(() => setSetupsLoading(false));
+  }, [ticker]);
+
+  useEffect(() => {
+    if (activeSection === 'setups' && setupsFetchedRef.current !== ticker) loadSetups();
+  }, [activeSection, ticker, loadSetups]);
+
+  const SECTIONS = [
+    { key: 'setups' as const, label: 'Setups', Icon: Crosshair },
+    { key: 'indicators' as const, label: 'Indicators', Icon: Activity },
+    { key: 'advanced' as const, label: 'Advanced', Icon: Layers },
+  ];
 
   const handleSelect = async (newTf: string) => {
     if (newTf === timeframe || loading) return;
@@ -466,10 +506,53 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
   const bb = technical.bollingerBands;
   const ma = technical.movingAverages;
   const ema = technical.emaCrossover;
+  const spot = technical.prices?.[technical.prices.length - 1];
 
   return (
     <div className="glass-card">
       <div className="p-5">
+        {/* Setups-first sub-navigation */}
+        <div className="flex items-center gap-1 mb-4 bg-base-200/40 p-1 rounded-xl w-fit">
+          {SECTIONS.map(({ key, label, Icon }) => (
+            <button
+              key={key}
+              onClick={() => setActiveSection(key)}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 ${
+                activeSection === key ? 'bg-primary/15 text-primary shadow-sm shadow-primary/10' : 'text-base-content/50 hover:text-base-content hover:bg-base-100/40'
+              }`}
+            >
+              <Icon className="w-3.5 h-3.5" /> {label}
+            </button>
+          ))}
+        </div>
+
+        {activeSection === 'setups' && (
+          <div className="space-y-4 animate-fade-in">
+            {setupsLoading && (
+              <div className="flex items-center gap-2 justify-center py-12 text-sm text-base-content/60">
+                <Loader2 className="w-5 h-5 animate-spin" /> Fusing volume, structure, regime &amp; dealer flow into trade setups…
+              </div>
+            )}
+            {setupsError && !setupsLoading && (
+              <div className="alert alert-error text-sm flex items-center justify-between">
+                <span>{setupsError}</span>
+                <button className="btn btn-ghost btn-xs" onClick={loadSetups}>Retry</button>
+              </div>
+            )}
+            {setups && !setupsLoading && (
+              <>
+                <MarketContextHero context={setups.context} spot={setups.price} ticker={ticker} />
+                <SectionIntro icon={<Crosshair size={16} className="text-primary" />} title="Trade setups">
+                  Ranked, concrete plans — entry, stop, target and reward-to-risk — built from where the four institutional reads line up. Highest-conviction first.
+                </SectionIntro>
+                <TradeSetupCards data={setups} ticker={ticker} />
+              </>
+            )}
+          </div>
+        )}
+
+        {activeSection === 'indicators' && (
+        <>
         <div className="flex items-start justify-between flex-wrap gap-2 mb-3">
           <div className="flex items-center min-w-[20px]">
             {loading && <Loader2 size={14} className="animate-spin text-primary" />}
@@ -838,6 +921,20 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
             )}
           </div>
         </div>
+        </>
+        )}
+
+        {activeSection === 'advanced' && (
+          <div className="space-y-2 animate-fade-in">
+            <SectionIntro icon={<Layers size={16} className="text-secondary" />} title="Advanced — the evidence">
+              The institutional reads the setups are built from. Expand any panel to drill into the data behind a signal.
+            </SectionIntro>
+            <MicrostructurePanel ticker={ticker} price={spot} />
+            <MarketStructurePanel ticker={ticker} price={spot} />
+            <RegimePanel ticker={ticker} price={spot} />
+            <DealerPositioningPanel ticker={ticker} price={spot} />
+          </div>
+        )}
       </div>
     </div>
   );

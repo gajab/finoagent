@@ -1042,6 +1042,9 @@ def _candidate_json(i: int, r: dict, meta: dict) -> dict:
         "net_greeks": dm.get("trader") or {},           # Δ/Γ/Θ/ν + Vanna/Charm/Volga + avg_iv
         "institutional": _candidate_extra(r, meta, max_oi_strike),
         "flags": [f.get("text") for f in (r.get("flags") or [])],
+        # WATCH→DEFEND→EXIT price ladder from the TA levels + trade geometry — the pre-committed management
+        # plan the desk should endorse/refine (each rung: side, tier, price, pct_from_spot, atr_units, action).
+        "management": {"risk_triggers": r.get("risk_triggers") or []},
         "legs": r.get("legs") or [],                    # per-leg bid/ask/spread/iv/oi/vol/greeks/prob_reach
     }
 
@@ -1248,15 +1251,499 @@ async def rank_desk(
     if scan.get("error"):
         return {"error": scan["error"]}
     return await _finalize_desk(scan, scan.get("opportunities", []), ticker,
-                                quote_source, owns_underlying, user, db, target_dte)
+                                quote_source, owns_underlying, user, db, target_dte,
+                                collapse_strikes=True)
+
+
+# ── Risk triggers — the price-level management plan ──────────────────────
+def _risk_triggers(opp: dict, spot: Optional[float], ta: dict, phys_vol: Optional[float] = None) -> list[dict]:
+    """WATCH → DEFEND → EXIT price levels, each with the TA reason. The rungs track the UNDERLYING'S
+    STRUCTURE deteriorating toward — but NOT at — the short strike: a deep-OTM short put must be defended
+    when a lower structure forms on the chart, not 30% away at the strike itself (by then it's far too
+    late). Levels snap to the real technical read (support/resistance, value area, order blocks) and fall
+    back to volatility (σ / measured-move) bands where the chart has no listed level; imminence is sized in
+    ATR and σ. Near-the-money trades keep the intuitive strike-anchored ladder."""
+    if not spot or spot <= 0:
+        return []
+    inst = (ta or {}).get("institutional") or {}
+    vp = inst.get("volume_profile") or {}
+    obs = inst.get("order_blocks") or []
+    atr_pct = ta.get("_atr_pct")
+    atr_abs = spot * (atr_pct / 100.0) if atr_pct else None
+    mu = ta.get("_drift_mu") or 0.0
+    trend = "up-trend" if mu > 0.05 else "down-trend" if mu < -0.05 else "range-bound tape"
+    struct = opp.get("structure")
+    credit = float(opp.get("premium_per_share") or 0.0)
+    dte = int(opp.get("dte") or 30)
+    iv = opp.get("atm_iv_pct")
+    horizon = math.sqrt(max(dte, 1) / 365.0)
+    # 1σ expected move to expiry — take the WIDER of implied and physical (realized/ATR) so a crushed or
+    # MISSING IV can't collapse the ladder to a meaningless ±1% band (the GLD covered-call bug). phys_vol is
+    # the gap-aware max(HV, ATR-vol) the desk already computes; ATR is the last-ditch realized proxy.
+    moves = []
+    if iv and float(iv) > 0:
+        moves.append(spot * (float(iv) / 100.0) * horizon)
+    if phys_vol and phys_vol > 0:
+        moves.append(spot * float(phys_vol) * horizon)
+    if atr_abs:
+        moves.append((atr_abs / 1.4) * math.sqrt(max(dte, 1)))     # ATR → daily σ, scaled to the horizon
+    em1 = max(moves) if moves else spot * 0.05
+    em1 = max(em1, spot * 0.10 * horizon)                # floor at ~10% annualized vol — never a noise band
+
+    def levels(direction: str) -> list[tuple]:
+        out: list[tuple] = []
+        if direction == "down":
+            for v, lbl in ((ta.get("supportLevel"), "support"), (vp.get("val"), "value-area low"),
+                           (vp.get("poc"), "point of control")):
+                if v and float(v) < spot:
+                    out.append((round(float(v), 2), lbl))
+            out += [(round(float(o["bottom"]), 2), f"{o.get('type', '') or ''} order block".strip())
+                    for o in obs if o.get("bottom") and float(o["bottom"]) < spot]
+            return sorted({p: l for p, l in out}.items(), key=lambda x: -x[0])
+        for v, lbl in ((ta.get("resistanceLevel"), "resistance"), (vp.get("vah"), "value-area high"),
+                       (vp.get("poc"), "point of control")):
+            if v and float(v) > spot:
+                out.append((round(float(v), 2), lbl))
+        out += [(round(float(o["top"]), 2), f"{o.get('type', '') or ''} order block".strip())
+                for o in obs if o.get("top") and float(o["top"]) > spot]
+        return sorted({p: l for p, l in out}.items(), key=lambda x: x[0])
+
+    trg: list[dict] = []
+
+    def emit(side, tier, price, basis, action, why):
+        if price is None or price <= 0:
+            return
+        trg.append({"side": side, "tier": tier, "price": round(float(price), 2),
+                    "pct_from_spot": round((price - spot) / spot * 100, 1),
+                    "atr_units": round(abs(spot - price) / atr_abs, 1) if atr_abs else None,
+                    "sigma": round(abs(spot - price) / em1, 1), "basis": basis, "action": action, "why": why})
+
+    def build(side: str, short: float, covered: bool = False):
+        down = side == "down"
+        lv = levels(side)
+        toward = (lambda p: spot - p) if down else (lambda p: p - spot)   # +ve = toward the SHORT strike (danger)
+        px_at = (lambda s: round(spot - s * em1, 2)) if down else (lambda s: round(spot + s * em1, 2))
+        pct = lambda p: round((p - spot) / spot * 100, 1)
+        sig = lambda p: round(toward(p) / em1, 1)
+        roll = "down-and-out" if down else "up-and-out"
+        lower = "lower low" if down else "higher high"
+        sr = "support" if down else "resistance"
+        anchor = f"your {short} strike"
+        be = round(short - credit, 2) if down else round(short + credit, 2)
+        strike_sigma = toward(short) / em1
+
+        def snap(target, tol=0.6):
+            c = [(p, l) for p, l in lv if abs(p - target) <= tol * em1]
+            return min(c, key=lambda x: abs(x[0] - target)) if c else None
+
+        if covered:
+            # COVERED CALL — the ADVERSE move is UP toward the short call (exercise = shares called away).
+            # DOWN is GOOD for the trade (the call decays, you keep premium + shares), so there is NO downside
+            # ladder. Being called away is the capped MAX GAIN — a decision, not a loss → terminal rung `cap`.
+            res = [(p, l) for p, l in lv if 0 < toward(p) < toward(short)]   # resistances below the strike
+            w = res[0] if res else (px_at(0.4), "≈0.4σ up — early rally")
+            d = (round(short - 0.5 * em1, 2), "roll zone — just below the strike")
+            if toward(d[0]) <= toward(w[0]):
+                d = (round((w[0] + short) / 2, 2), "mid-way to the strike")
+            emit(side, "watch", w[0], w[1], "Rally underway — the call is starting to be tested.",
+                 f"First resistance / ~{sig(w[0])}σ up. Pushing through it is the first sign the stock is heading for the {short} cap — the call is still OTM, but the shares could get called away.")
+            emit(side, "defend", d[0], d[1], "Approaching the cap — roll the call UP-and-out to keep the shares & more upside.",
+                 f"~{sig(d[0])}σ up, closing on the {short} strike: the call is going at-the-money and assignment turns live. Roll up-and-out here if you'd rather keep the stock and its upside than be capped.")
+            emit(side, "cap", short, "short call strike (the cap)", "At the cap — let the shares be called away (bank the capped gain) or roll up to stay long.",
+                 f"At {short} the call is in-the-money and the shares are called away at the capped MAX gain — not a loss, a decision: take the full profit, or roll up-and-out if still bullish.")
+            return
+
+        if strike_sigma <= 1.5:
+            # NEAR-THE-MONEY — the strike itself is the near-term battleground (intuitive ladder).
+            w = next(((p, l) for p, l in lv if 0 < toward(p) < toward(short)), None) or (px_at(0.4), "≈0.4σ band")
+            emit(side, "watch", w[0], w[1], "Cushion eroding — tighten monitoring; add no new size.",
+                 f"First {sr} between spot and {anchor}; the strike is only {abs(strike_sigma):.1f}σ away, so a break here quickly puts it in play.")
+            emit(side, "defend", short, "short strike",
+                 f"Short strike tested — roll {roll} or close half to cut delta.",
+                 f"At the strike the option goes at-the-money — delta and gamma spike and assignment risk turns real. With the strike just {abs(strike_sigma):.1f}σ out, this is the genuine defend line.")
+            deeper = [(p, l) for p, l in lv if toward(p) > toward(short)]
+            e = deeper[0] if deeper else (be, "credit breakeven")
+            emit(side, "exit", e[0], e[1], "Break beyond breakeven — close to cap the tail.",
+                 f"Past {be} the trade is in real loss and structure has broken; cut before assignment builds.")
+            return
+
+        # FAR-OTM — anchor to STRUCTURE / σ bands, NOT the distant strike.
+        w = snap(px_at(0.8)) or (px_at(0.8), "≈0.8σ measured move")
+        d = snap(px_at(1.6)) or (px_at(1.6), "≈1.6σ measured move")
+        e = snap(px_at(2.5)) or (px_at(2.5), "≈2.5σ measured move")
+        if toward(d[0]) <= toward(w[0]):                 # keep depth strictly increasing
+            d = (px_at(1.6), "≈1.6σ measured move")
+        if toward(e[0]) <= toward(d[0]):
+            e = (px_at(2.5), "≈2.5σ measured move")
+        if toward(e[0]) > toward(be):                     # never place EXIT past breakeven (max-loss zone)
+            e = (be, "credit breakeven")
+
+        strike_txt = f"the strike is still {abs(pct(short)):.0f}% away"
+        emit(side, "watch", w[0], w[1], "Trend wobbling — watch the tape closely; add no new size.",
+             f"Nearest {sr} (~{sig(w[0])}σ). In the current {trend} a probe here is normal, but a decisive break is the FIRST hint a move that could reach {anchor} is starting — {strike_txt}.")
+        emit(side, "defend", d[0], d[1],
+             f"New {'lower' if down else 'higher'} structure forming — act now: roll {roll} or cut size.",
+             f"~{sig(d[0])}σ and through {d[1]}. A close beyond prints a {lower} — a change of character out of the {trend}. {dte}d to expiry leaves room for the move to extend to {anchor}; defend the STRUCTURE break here, not at the far strike.")
+        emit(side, "exit", e[0], e[1], "Structure decisively broken — close before the strike comes into play.",
+             f"~{sig(e[0])}σ with the trend rolled over and momentum now pointing at {anchor}. Exit here — you never ride a broken thesis to assignment.")
+
+    # The ladder tracks the underlying moving TOWARD the short strike (where it's exercised/assigned) — the
+    # adverse direction for a premium seller: DOWN for short puts, UP for short calls. A covered call is a
+    # SHORT CALL → up-side only (a falling stock is GOOD for it), with covered-call framing.
+    put_short = opp.get("put_short") or (opp.get("short_strike")
+                    if struct in ("cash_secured_put", "put_credit_spread") else None)
+    if put_short:
+        build("down", float(put_short))
+
+    call_short = opp.get("call_short") or (opp.get("short_strike")
+                    if struct in ("call_credit_spread", "covered_call") else None)
+    if call_short:
+        build("up", float(call_short), covered=(struct == "covered_call"))
+
+    return trg
+
+
+# ── Live monitor plan — the REAL advanced-TA read at the trade's danger levels ──────────────
+# On-demand (fetched when the user opens "Monitoring & Corrective Action"). It fuses the SAME four
+# institutional reads the strike selection leaned on — microstructure (MTF volume profile, naked POCs,
+# AVWAP), market structure (order blocks, FVGs, liquidity pools, swings), regime (50-day VWAP) and dealer
+# positioning (gamma flip, call/put walls, expected move) — and maps the REAL structures onto the trade's
+# short strikes. No hard-coded σ bands: every rung is a named level that says what the SETUP does if price
+# reaches it, and the corrective action. Goal = manage/avoid the tail.
+_MON_IMPACT = {
+    "gamma_flip": "crossing the gamma flip turns dealers SHORT gamma — their hedging then AMPLIFIES the move (vol expands)",
+    "call_wall":  "the call wall is the dealer-gamma ceiling; a close above pulls the magnet and opens air",
+    "put_wall":   "the put wall is dealer-gamma support; below it that hedging cushion is gone",
+    "pool":       "a liquidity pool — resting stops sit here; a sweep through it accelerates the move",
+    "naked_poc":  "an untested (naked) POC — price is drawn to it and it often gives way once tagged",
+    "ob":         "an order block — the last supply/demand imprint; a close through it cedes control",
+    "swing":      "a market-structure swing — losing it prints a lower low / higher high (change of character)",
+    "avwap":      "an anchored VWAP — a shared cost basis that tends to hold on the first test",
+    "vwap50":     "the 50-day VWAP — the swing mean the tape reverts to",
+    "vp":         "a volume-profile edge — acceptance beyond it signals a value migration",
+    "fvg":        "an unfilled fair-value gap — an imbalance that tends to fill",
+    "expected_move": "the dealer expected-move fence — the market's own 1σ boundary for this tenor",
+}
+_MON_SIG = {"gamma_flip": 3.0, "call_wall": 2.6, "put_wall": 2.6, "naked_poc": 2.2, "ob": 2.2, "pool": 2.0,
+            "swing": 1.8, "avwap": 1.7, "vwap50": 1.7, "expected_move": 1.6, "vp": 1.4, "fvg": 1.2}
+_MON_CTX_CACHE: dict = {}          # ticker → (ts, ctx); in-process TTL cache for the 4 heavy reads
+_MON_TTL = 600
+
+
+def _mon_family(source: str) -> str:
+    for pre in ("vp", "ob", "fvg", "pool", "swing"):
+        if source.startswith(pre + "_"):
+            return pre
+    return source                  # naked_poc / avwap / vwap50 / gamma_flip / call_wall / put_wall / expected_move
+
+
+def _gather_monitor_context(ticker: str) -> dict:
+    """Run the four advanced-TA reads (parallel) → the REAL tagged levels + gamma context — the same
+    fusion the Trade-Setup engine and the strike selection lean on. Best-effort; degrades gracefully."""
+    from concurrent.futures import ThreadPoolExecutor
+    import yfinance as yf
+    from .trade_setup_service import _collect_levels, _atr_from_structure
+    from .microstructure_service import compute_microstructure
+    from .market_structure_service import compute_market_structure
+    from .regime_service import compute_regime
+    from .dealer_positioning_service import compute_dealer_positioning
+    stock = yf.Ticker(_norm_ticker(ticker))
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fm = ex.submit(compute_microstructure, stock); fs = ex.submit(compute_market_structure, stock)
+        fr = ex.submit(compute_regime, stock); fd = ex.submit(compute_dealer_positioning, stock)
+        micro, structure, regime, dealer = fm.result(), fs.result(), fr.result(), fd.result()
+    spot = None
+    for src in (structure, regime, micro, dealer):
+        if src and src.get("price"):
+            spot = float(src["price"]); break
+    walls = (dealer or {}).get("walls") or {}
+    ng = (dealer or {}).get("net_gex") or {}
+    return {
+        "spot": spot, "atr": _atr_from_structure(structure) if structure else None,
+        "levels": _collect_levels(micro, structure, regime, dealer, spot) if spot else [],
+        "gamma_flip": ((dealer or {}).get("gamma_flip") or {}).get("level"),
+        "gamma_sign": ng.get("sign") or ng.get("regime") or ng.get("label"),
+        "call_wall": (walls.get("call_wall") or {}).get("strike"),
+        "put_wall": (walls.get("put_wall") or {}).get("strike"),
+        "regime": (regime or {}).get("overall") or (regime or {}).get("label"),
+    }
+
+
+def _cluster_side(levels: list[dict], spot: float, atr: float, down: bool) -> list[dict]:
+    """Real levels on the danger side of spot, merged into confluence clusters, NEAREST-to-spot first."""
+    picked = [L for L in levels if L.get("price") and ((L["price"] < spot) if down else (L["price"] > spot))]
+    picked.sort(key=lambda L: L["price"], reverse=down)      # nearest to spot first
+    tol = max((atr or 0) * 0.4, spot * 0.004)
+    clusters: list[dict] = []
+    for L in picked:
+        if clusters and abs(L["price"] - clusters[-1]["_mean"]) <= tol:
+            c = clusters[-1]; c["members"].append(L)
+            c["_mean"] = sum(m["price"] for m in c["members"]) / len(c["members"])
+        else:
+            clusters.append({"members": [L], "_mean": L["price"]})
+    out = []
+    for c in clusters:
+        head = max(c["members"], key=lambda m: _MON_SIG.get(_mon_family(m["source"]), 1.0))
+        labels: list[str] = []
+        for m in c["members"]:
+            if m["label"] not in labels:
+                labels.append(m["label"])
+        out.append({"price": round(c["_mean"], 2), "labels": labels, "headline": head["label"],
+                    "family": _mon_family(head["source"]),
+                    "significance": round(max(_MON_SIG.get(_mon_family(m["source"]), 1.0) for m in c["members"]), 1)})
+    return out
+
+
+def build_monitor_plan(structure: str, put_short, call_short, credit: float, spot: float,
+                       dte: int, ctx: dict) -> dict:
+    """Deterministic ladder from the REAL levels — one escalating plan per exposed side, toward the short
+    strike (down for short puts, up for short calls), each rung a named structure + setup impact + action."""
+    levels = ctx.get("levels") or []
+    atr = ctx.get("atr") or (spot * 0.015)
+    triggers: list[dict] = []
+    rationale: list[str] = []
+    au = lambda px: round(abs(spot - px) / atr, 1) if atr else None
+    pc = lambda px: round((px - spot) / spot * 100, 1)
+
+    def side_plan(down: bool, short: float, covered: bool = False):
+        side = "down" if down else "up"
+        toward = (lambda p: spot - p) if down else (lambda p: p - spot)
+        be = round(short - credit, 2) if down else round(short + credit, 2)
+        clusters = _cluster_side(levels, spot, atr, down)
+        between = [c for c in clusters if 0 < toward(c["price"]) < toward(short)]
+        beyond = [c for c in clusters if toward(c["price"]) >= toward(short)]
+
+        cushion = [c for c in beyond if toward(c["price"]) - toward(short) <= 1.5 * atr] or beyond[:1]
+        if cushion:
+            names = "; ".join(c["headline"] for c in cushion[:2])
+            rationale.append(f"{'Put' if down else 'Call'} {short} sits just {'above' if down else 'below'} "
+                             f"{names} — that structure is the cushion the strike was chosen behind.")
+
+        def rung(tier, c, action, lead):
+            if isinstance(c, dict):
+                px, basis = c["price"], c["headline"]
+                extra = f" · confluence with {', '.join(l for l in c['labels'] if l != c['headline'])}" if len(c["labels"]) > 1 else ""
+                why = f"{lead} {_MON_IMPACT.get(c['family'], 'a technical level')}{extra}."
+            else:
+                px, basis, why = c, "credit breakeven", f"{lead} past breakeven the position is in real loss with no structure left to lean on."
+            triggers.append({"side": side, "tier": tier, "price": round(px, 2), "pct_from_spot": pc(px),
+                             "atr_units": au(px), "basis": basis, "action": action, "why": why})
+
+        roll = "down-and-out" if down else "up-and-out"
+        # WATCH — the nearest real structure between spot and the strike.
+        if between:
+            rung("watch", between[0], "Watch closely — first structural line; add no new size.",
+                 f"~{au(between[0]['price'])} ATR away:")
+        # DEFEND — the strongest structure BETWEEN the watch line and the strike; if none, the strike
+        # itself is the line (the option goes ATM there — assignment turns live).
+        after = between[1:]
+        if after:
+            d = max(after, key=lambda c: c["significance"])
+            rung("defend", d, (f"Roll {roll} to keep the shares, or trim." if covered
+                               else f"Roll {roll} or cut size — the setup is breaking."),
+                 f"~{au(d['price'])} ATR — the last structure before the strike:")
+        else:
+            triggers.append({"side": side, "tier": "defend", "price": round(short, 2), "pct_from_spot": pc(short),
+                             "atr_units": au(short), "basis": "short strike",
+                             "action": (f"Roll {roll} to keep the shares, or trim." if covered
+                                        else f"Roll {roll} or cut size — the strike is being tested."),
+                             "why": f"No listed structure between the watch line and the strike — the {short} strike "
+                                    f"itself is the line: the option goes at-the-money here and assignment turns live."})
+        # EXIT / CAP — the first real structure strictly BEYOND the strike (where the tail opens), else the
+        # credit breakeven.
+        past = [c for c in beyond if toward(c["price"]) > toward(short) + 0.01]
+        term = past[0] if past else be
+        if covered:
+            rung("cap", term, "At/through the cap — bank the called-away gain, or roll up to stay long.",
+                 "beyond the strike the shares are called away at the capped MAX gain — a decision, not a loss:")
+        else:
+            rung("exit", term, "Close to cap the tail — the structure behind the strike is giving way.",
+                 f"~{au(term['price']) if isinstance(term, dict) else au(term)} ATR beyond the strike:")
+
+    if put_short:
+        side_plan(True, float(put_short))
+    if call_short:
+        side_plan(False, float(call_short), covered=(structure == "covered_call"))
+
+    gnote = None
+    gflip = ctx.get("gamma_flip")
+    if gflip:
+        gnote = (f"Dealer gamma flip {round(gflip, 2)} ({pc(gflip):+.1f}%): spot is "
+                 f"{'ABOVE it → dealers long gamma, moves are dampened (a tailwind for a premium seller)' if spot >= gflip else 'BELOW it → dealers short gamma, moves are amplified (dangerous for a seller)'}.")
+    return {"triggers": triggers, "strike_rationale": rationale, "gamma_note": gnote,
+            "regime": ctx.get("regime"), "levels_found": len(levels)}
+
+
+async def monitor_trade(ticker: str, trade: dict) -> dict:
+    """On-demand deterministic monitor plan for ONE trade, from the live advanced-TA read (cached per
+    ticker for a few minutes so several trades on the same name reuse the four heavy computes)."""
+    import time
+    ticker = _norm_ticker(ticker)
+    hit = _MON_CTX_CACHE.get(ticker)
+    if hit and (time.time() - hit[0]) < _MON_TTL:
+        ctx = hit[1]
+    else:
+        ctx = await asyncio.to_thread(_gather_monitor_context, ticker)
+        if ctx.get("spot"):
+            _MON_CTX_CACHE[ticker] = (time.time(), ctx)
+    spot = float(trade.get("spot") or ctx.get("spot") or 0)
+    if not spot or not ctx.get("levels"):
+        return {"error": "No live technical levels available for monitoring right now.",
+                "triggers": [], "strike_rationale": [], "gamma_note": None}
+    return build_monitor_plan(trade.get("structure"), trade.get("put_short"), trade.get("call_short"),
+                              float(trade.get("credit") or 0), spot, int(trade.get("dte") or 30), ctx)
+
+
+_MON_ANALYST_SYSTEM = (
+    "You are the trading desk's technical strategist. A premium-selling income trade is LIVE and the trader "
+    "wants a MONITORING plan grounded ONLY in the real technical structure provided — what to watch, when to "
+    "roll, when to cut, to manage the TAIL. Be specific with PRICES and name the exact structure at each rung. "
+    "Never invent a level that isn't in the list; no generic advice."
+)
+_MON_ANALYST_GUIDANCE = (
+    "\n\nWrite it in markdown with these bold labels:\n"
+    "**Why these strikes** — which real structures cushion each short strike (one line).\n"
+    "**Down-side** and/or **Up-side** (only the exposed sides) — the ORDERED sequence of structures price "
+    "must break to reach the short strike, what EACH break means (change of character / gamma flip to short / "
+    "liquidity sweep / value migration), and the action at each (watch · roll · cut). Cite the price every time.\n"
+    "**Tail** — the ONE scenario that blows past the plan, and the hard price stop for it.\n"
+    "Under 200 words. Refine the deterministic ladder; don't just repeat it."
+)
+
+
+async def monitor_analyze(ticker: str, trade: dict, api_key: str, model: str = "gpt-4o") -> dict:
+    """LLM 'deep read' over the SAME live advanced-TA levels — a qualitative monitoring narrative grounded
+    ONLY in the real structures + dealer gamma. Returns {content, plan}."""
+    import time
+    ticker = _norm_ticker(ticker)
+    hit = _MON_CTX_CACHE.get(ticker)
+    if hit and (time.time() - hit[0]) < _MON_TTL:
+        ctx = hit[1]
+    else:
+        ctx = await asyncio.to_thread(_gather_monitor_context, ticker)
+        if ctx.get("spot"):
+            _MON_CTX_CACHE[ticker] = (time.time(), ctx)
+    spot = float(trade.get("spot") or ctx.get("spot") or 0)
+    if not spot or not ctx.get("levels"):
+        return {"error": "No live technical levels available for the deep read right now."}
+    plan = build_monitor_plan(trade.get("structure"), trade.get("put_short"), trade.get("call_short"),
+                              float(trade.get("credit") or 0), spot, int(trade.get("dte") or 30), ctx)
+    lv = sorted((ctx.get("levels") or []), key=lambda L: abs((L.get("price") or spot) - spot))
+    level_lines = [f"  {round(p, 2)} ({(p - spot) / spot * 100:+.1f}%) · {L.get('label')} [{L.get('kind')}]"
+                   for L in lv[:22] if (p := L.get("price"))]
+    deter_lines = [f"  {t['tier'].upper()} {t['price']} ({t['pct_from_spot']:+.1f}%) — {t['basis']}: {t['action']}"
+                   for t in plan["triggers"]]
+    strike_parts = []
+    if trade.get("put_short"):
+        strike_parts.append(f"short put {trade['put_short']}")
+    if trade.get("call_short"):
+        strike_parts.append(f"short call {trade['call_short']}")
+    header = [
+        f"TRADE: {trade.get('structure')} — {', '.join(strike_parts)}, {trade.get('dte')}d, net credit "
+        f"{trade.get('credit')}/sh. Spot {round(spot, 2)}.",
+        "Danger = the underlying moving TOWARD a short strike (exercised/assigned there).", "",
+        "REAL TA LEVELS (nearest first) — price (% from spot) · structure [kind]:", *level_lines, "",
+        f"DEALER GAMMA: flip {ctx.get('gamma_flip')}, call wall {ctx.get('call_wall')}, "
+        f"put wall {ctx.get('put_wall')}. Regime: {ctx.get('regime')}.", "",
+        "DETERMINISTIC LADDER (reference — refine, don't just repeat):", *deter_lines,
+    ]
+    content = await call_llm(api_key=api_key, model=model, max_tokens=900, temperature=0.3,
+                             messages=[{"role": "system", "content": _MON_ANALYST_SYSTEM},
+                                       {"role": "user", "content": "\n".join(header) + _MON_ANALYST_GUIDANCE}])
+    return {"content": content, "plan": plan, "levels_found": len(ctx.get("levels") or [])}
+
+
+# ── Strike de-duplication ───────────────────────────────────────────────
+# A deep option book hands the ranker dozens of $1-apart strikes of the SAME structure that score within
+# a rounding error of each other, so a naive score-sort floods the headline with near-identical clones
+# (15 cash-secured puts at 661/662/663/664 …) and buries genuinely different trades. Collapse each run of
+# adjacent strikes (same structure + expiry, short strike within one moneyness band) down to the
+# best-scoring representative, and hang the rest off it as `nearby_strikes` so nothing is lost.
+_DEDUP_BAND_FLOOR_FRAC = 0.0125   # min band width as a fraction of spot …
+_DEDUP_BAND_EM_FRAC = 0.15        # … or this fraction of the 1σ expected move, whichever is larger
+_DEDUP_PER_STRUCTURE_CAP = 6      # cap distinct representatives per structure so one can't dominate
+
+
+def _expected_move_band(spot: float, iv_pct: Optional[float], dte: Optional[int]) -> float:
+    """Absolute strike-band width for de-dup: max(floor%, a fraction of the 1σ expected move). Vol- and
+    tenor-aware so a quiet name bands tightly and a wild one bands wide, with a hard floor when IV is
+    unavailable (e.g. a chain that returned no implied vol)."""
+    if not spot or spot <= 0:
+        return 1.0
+    floor = spot * _DEDUP_BAND_FLOOR_FRAC
+    if iv_pct and dte:
+        em = spot * (iv_pct / 100.0) * math.sqrt(max(dte, 1) / 365.0)
+        return max(floor, _DEDUP_BAND_EM_FRAC * em)
+    return max(floor, spot * 0.02)
+
+
+def _short_strikes(opp: dict) -> list[float]:
+    """The short strike(s) that define a trade's risk — the axis adjacent-strike clones vary along."""
+    out: list[float] = []
+    for key in ("put_short", "call_short"):
+        v = opp.get(key)
+        if v:
+            out.append(float(v))
+    if not out:
+        v = opp.get("short_strike") or opp.get("strike")
+        if v:
+            out.append(float(v))
+    return out
+
+
+def _dedup_signature(opp: dict, spot: float, band_abs: float) -> tuple:
+    """Structure + expiry + moneyness band(s) — adjacent strikes inside one band share a signature. The
+    blocking flag is included so a vetoed trade never collapses into a healthy one."""
+    bands = tuple(int(abs(spot - s) / band_abs) for s in _short_strikes(opp))
+    return (opp.get("structure"), opp.get("expiration"), bool(opp.get("grade_blocking")), bands)
+
+
+def _collapse_adjacent_strikes(ranked: list[dict], spot: float, band_abs: float,
+                               per_structure_cap: int = _DEDUP_PER_STRUCTURE_CAP) -> list[dict]:
+    """Thin near-identical adjacent strikes. Input MUST be best-first (already score-sorted): the first
+    row seen for a (structure, expiry, band) is the representative; later rows in that band ride along as
+    compact `nearby_strikes`. Caps representatives per structure so one can't flood the headline. Order
+    is preserved (still score order)."""
+    reps: list[dict] = []
+    by_sig: dict[tuple, dict] = {}
+    per_struct: dict[str, int] = {}
+    for r in ranked:
+        sig = _dedup_signature(r, spot, band_abs)
+        rep = by_sig.get(sig)
+        if rep is not None:                                  # a near-adjacent clone → fold into the rep
+            rep.setdefault("nearby_strikes", []).append({
+                "strike": (_short_strikes(r) or [None])[0],
+                "premium_per_share": r.get("premium_per_share"),
+                "premium_annualized_pct": r.get("premium_annualized_pct"),
+                "short_strike_pct": r.get("short_strike_pct"),
+                "desk_score": r.get("desk_score"),
+            })
+            continue
+        struct = r.get("structure") or "?"
+        if per_struct.get(struct, 0) >= per_structure_cap:   # enough distinct strikes already → drop tail
+            continue
+        by_sig[sig] = r
+        per_struct[struct] = per_struct.get(struct, 0) + 1
+        r.setdefault("nearby_strikes", [])
+        reps.append(r)
+    for r in reps:                                           # cheap span summary for the UI chip
+        nb = r.get("nearby_strikes") or []
+        r["nearby_count"] = len(nb)
+        strikes = [x["strike"] for x in nb if x.get("strike") is not None] + _short_strikes(r)
+        if nb and strikes:
+            r["nearby_range"] = [min(strikes), max(strikes)]
+    return reps
 
 
 async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quote_source: str,
                          owns_underlying: bool, user: Optional["User"], db: Optional["AsyncSession"],
-                         target_dte: Optional[int] = None) -> dict:
+                         target_dte: Optional[int] = None, collapse_strikes: bool = False) -> dict:
     """Score a set of candidate opportunities against the ticker's TA / regime / vol context and
     assemble the desk-review payload (chrome passthrough + ranked trades). Shared by ``rank_desk``
-    (the full scan) and ``evaluate_desk_trade`` (one user-supplied trade)."""
+    (the full scan) and ``evaluate_desk_trade`` (one user-supplied trade).
+
+    ``collapse_strikes`` thins near-adjacent same-structure strikes to best-in-band representatives
+    (the full scan wants this; single-trade evaluate does not)."""
     ctx = scan.get("context") or {}
     spot = float(ctx.get("spot") or scan.get("spot") or 0.0)
     sofr_pct = float(ctx.get("sofr_pct") or 5.0)
@@ -1310,7 +1797,9 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
             {"label": "Liquidity",   "points": round(c["liquidity"], 1)},
             {"label": "Beta",        "points": round(c["beta"], 1)},
         ]
+        risk_triggers = _risk_triggers(opp, spot, ta, phys_vol)   # WATCH→DEFEND→EXIT ladder (TA + geometry)
         ranked.append({**opp, "desk_metrics": dm, "desk_score": desk_score, "ta_note": note,
+                       "risk_triggers": risk_triggers,
                        "algo_grade": grade, "approval_odds": approval, "grade_merits": g["merits"],
                        "grade_demerits": g["demerits"], "grade_blocking": g["blocking"],
                        "base_quality": round(base, 1), "grade_adjustments": grade_adjustments,
@@ -1332,6 +1821,13 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         (r["desk_metrics"].get("pm") or {}).get("sortino") or 0,
         r.get("premium_annualized_pct") or 0,
     ), reverse=True)
+
+    # Collapse near-identical adjacent strikes (the full scan only) so the headline shows genuinely
+    # distinct trades, not $1-apart clones of the peak-delta strike. Runs AFTER the sort so each band's
+    # representative is its best-scoring strike; the folded siblings ride along as `nearby_strikes`.
+    if collapse_strikes and spot > 0:
+        band_abs = _expected_move_band(spot, atm_iv_pct, max_dte)
+        ranked = _collapse_adjacent_strikes(ranked, spot, band_abs)
 
     # Term structure: the scan often sees a single expiry (term_structure null) — probe a back
     # month so the Quant always knows contango vs backwardation (the earnings-inversion edge).
@@ -1405,8 +1901,6 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
 async def evaluate_desk_trade(
     ticker: str,
     legs: list[dict],
-    stock_shares: float = 0.0,
-    cost_basis: Optional[float] = None,
     quote_source: str = "yfinance",
     owns_underlying: bool = False,
     user: Optional["User"] = None,
@@ -1439,9 +1933,11 @@ async def evaluate_desk_trade(
             })
         except (KeyError, TypeError, ValueError):
             return {"error": "Each option leg needs action, type, strike and expiration."}
-    has_stock = abs(float(stock_shares or 0.0)) > 0
-    if not norm and not has_stock:
-        return {"error": "Enter at least one option leg or a stock position to evaluate."}
+    # "I already hold the shares" is the sole stock signal: a short call becomes a COVERED call
+    # (scored as an income overlay) rather than a naked call; it also enables the collar.
+    has_stock = bool(owns_underlying)
+    if not norm:
+        return {"error": "Enter at least one option leg to evaluate."}
 
     exps = sorted({l["expiration"] for l in norm})
     today = date.today()
@@ -1498,7 +1994,8 @@ async def evaluate_desk_trade(
                                 "dte": _dte(e), "strikes": strikes_all}
         if not chains_by_exp:
             return {"error": f"No option chain available for {ticker} at the requested expiries."}
-        stock = {"shares": stock_shares, "cost_basis": cost_basis} if has_stock else None
+        # A collar holds the underlying → model 100 sh/contract so the payoff / greeks include the stock.
+        stock = {"shares": 100.0} if structure_id == "collar" else None
         opp = _build_evaluate_opp(norm, stock, chains_by_exp, spot, sofr_pct, hv,
                                   _is_european(ticker), ticker, r_free, structure_id, label, is_custom)
     if opp is None:
@@ -1510,7 +2007,7 @@ async def evaluate_desk_trade(
     desk["note"] = (f"Evaluated a user-supplied {label}."
                     + (" Custom / calendar structure — the desk grade is indicative." if is_custom else ""))
     desk["evaluate"] = {"structure": structure_id, "label": label, "is_custom": is_custom,
-                        "expirations": exps, "stock_shares": stock_shares}
+                        "expirations": exps, "owns_underlying": owns_underlying}
     return desk
 
 
@@ -1620,7 +2117,11 @@ EDGE: <the ONE professional insight that makes this the best pick — structure 
 BEST OUTCOME: <the exact PRICE ZONE for max profit (e.g. "full credit only if spot expires between the short
          put and short call") AND cite institutional.moneyness.prob_max_profit_pct + pm_ratios.expected_value —
          NOT just max_profit, which for a near-ATM short leg is far from certain>
-WATCH: <the one move, level or event that would threaten the thesis>""",
+WATCH: <the one move, level or event that would threaten the thesis>
+MANAGEMENT: <the pre-committed price-level plan to avoid the tail — endorse or REFINE candidates[].management.
+         risk_triggers: give the WATCH / DEFEND / EXIT prices and the corrective action at each (tighten,
+         roll down-and-out, close half, hedge). Anchor each to a technical level (support/value-area/order
+         block) or the credit breakeven, and note its atr_units (how imminent). This is the tail-risk stop-plan.>""",
     "guidance": ("\nWork through the five REASONING steps IN ORDER (vol/regime → events → structure → edge "
                  "vs tail → pre-mortem), then fill the template. Recommend only a candidates[] trade by its "
                  "exact strikes, cite a field for every claim, and never prescribe size. This is a debate — "
@@ -1993,13 +2494,12 @@ async def run_desk_agents(
     Each agent reasons explicitly, sees all prior turns + the full pre-computed JSON, and grounds
     every claim in a GIVEN field. Three modes: ranking (focus=None → pick the best of the top set),
     single-trade (Desk Review v2 — `focus`={structure, expiration, short_strike} → rule
-    EXECUTE/REJECT on THAT scanned trade), and evaluate (`evaluate`={legs, stock_shares, …} → debate
+    EXECUTE/REJECT on THAT scanned trade), and evaluate (`evaluate`={legs, owns_underlying} → debate
     the user's own bring-your-own trade — works for custom/calendar trades the focus selector can't
     rebuild)."""
     if evaluate:
         desk = await evaluate_desk_trade(
-            ticker, legs=evaluate.get("legs") or [], stock_shares=evaluate.get("stock_shares") or 0.0,
-            cost_basis=evaluate.get("cost_basis"), quote_source=quote_source,
+            ticker, legs=evaluate.get("legs") or [], quote_source=quote_source,
             owns_underlying=bool(evaluate.get("owns_underlying")), user=user, db=db)
     else:
         desk = await rank_desk(ticker, target_dte, min_prob, min_income, structures, quote_source,

@@ -445,7 +445,7 @@ def algorithmic_exit(pm: dict, cvar95: Optional[float], capital: float, max_loss
     gamma/pin risk is. Buildup is auditable:
 
         hold_score = base_quality + Σ(lifecycle adjustments)
-        STRONG_HOLD ≥ 70 · HOLD ≥ 45 · CONSIDER_CLOSE ≥ 25 · CLOSE < 25
+        STRONG_HOLD ≥ 68 · HOLD ≥ 45 · CLOSE ≥ 28 · STRONG_CLOSE < 28
         (+ hard overrides: ≥85% captured, near max loss, ≤2 DTE)
     """
     base = algorithmic_quant(pm, cvar95, capital, max_loss, max_profit, kelly, dte_days, sofr_pct)
@@ -467,7 +467,7 @@ def lifecycle_overlay(base_score: float, captured_pct: Optional[float], dte_days
     the exit mapping is identical no matter which base quality drives it.
 
         hold_score = base_score + Σ(adjustments)
-        STRONG_HOLD ≥ 70 · HOLD ≥ 45 · CONSIDER_CLOSE ≥ 25 · CLOSE
+        STRONG_HOLD ≥ 68 · HOLD ≥ 45 · CLOSE ≥ 28 · STRONG_CLOSE < 28
         overrides: ≥85% captured, near max loss, ≤2 DTE
     """
     adjustments: list[dict] = []
@@ -486,25 +486,26 @@ def lifecycle_overlay(base_score: float, captured_pct: Optional[float], dte_days
         adj += td
 
     hold_score = int(max(0, min(100, round(base_score + adj))))
-    signal = ("STRONG_HOLD" if hold_score >= 70 else "HOLD" if hold_score >= 45
-              else "CONSIDER_CLOSE" if hold_score >= 25 else "CLOSE")
+    signal = ("STRONG_HOLD" if hold_score >= 68 else "HOLD" if hold_score >= 45
+              else "CLOSE" if hold_score >= 28 else "STRONG_CLOSE")
 
     overrides: list[str] = []
     if captured_pct is not None and captured_pct >= 85:
-        signal = "CLOSE"
+        signal = "STRONG_CLOSE"
         overrides.append("≥85% of max profit captured — bank it")
     if max_loss is not None and max_loss < 0 and unrealized_pnl is not None and unrealized_pnl <= max_loss * 0.8:
-        signal = "CLOSE"
+        signal = "STRONG_CLOSE"
         overrides.append("near max loss — cut it")
     if dte_days is not None and dte_days <= 2 and signal in ("STRONG_HOLD", "HOLD"):
-        signal = "CONSIDER_CLOSE"
+        signal = "CLOSE"
         overrides.append("≤2 DTE — gamma/pin/assignment risk")
 
     return {"signal": signal, "score": hold_score, "adjustments": adjustments, "overrides": overrides}
 
 
 def _management_factors(*, iv_pct, hv_pct, pop_pct, keep_drift_pct, cushion_pct,
-                        captured_pct, dte_days, is_income: bool) -> list[dict]:
+                        captured_pct, dte_days, is_income: bool,
+                        structure: Optional[str] = None) -> list[dict]:
     """Holder-framed reading of the SAME market factors the entry desk score uses,
     but interpreted for someone ALREADY in the position — where the entry sign is
     often inverted. Display only; the signal comes from the overlay. `favorable`
@@ -553,8 +554,24 @@ def _management_factors(*, iv_pct, hv_pct, pop_pct, keep_drift_pct, cushion_pct,
             f.append({"label": "Cushion", "favorable": True,
                       "note": f"{cushion_pct:.1f}% buffer to your short strike — comfortably out-of-the-money."})
 
+    # Covered vs naked short call — capital is already committed, so the RISK differs.
+    if structure == "covered_call":
+        f.append({"label": "Covered", "favorable": None,
+                  "note": ("You hold the stock — the risk here is being CALLED AWAY above the strike, not a cash "
+                           "loss. If you want to keep the shares, roll the call up/out when it's threatened; "
+                           "otherwise let it decay for the income.")})
+    elif structure == "naked_call":
+        f.append({"label": "Naked call", "favorable": False,
+                  "note": ("No stock behind this call — upside risk is UNBOUNDED. A sharp rally loses far more than "
+                           "the credit; keep it small and defend (roll up / buy a wing / close) if the strike is threatened.")})
+
     if captured_pct is not None:
-        if captured_pct >= 50:
+        if captured_pct < 0:
+            f.append({"label": "Underwater", "favorable": False,
+                      "note": (f"Down {abs(captured_pct):.0f}% of max profit — the short premium has moved AGAINST "
+                               "you (the position is at a loss). Watch the tested strike and your loss discipline, "
+                               "not theta.")})
+        elif captured_pct >= 50:
             f.append({"label": "Take profit", "favorable": None,
                       "note": (f"{captured_pct:.0f}% of max profit banked — most of the juice is gone; the "
                                "remainder isn't worth the gamma/assignment risk of holding on.")})
@@ -574,30 +591,60 @@ def management_exit(*, pop_pct: Optional[float], captured_pct: Optional[float],
                     max_profit=None, max_loss=None, keep_drift_pct: Optional[float] = None,
                     iv_pct: Optional[float] = None, hv_pct: Optional[float] = None,
                     cushion_pct: Optional[float] = None, theta_per_day: float = 0.0,
+                    structure: Optional[str] = None,
                     quality_subscores: Optional[dict] = None,
                     quality_score: Optional[float] = None) -> dict:
     """The MANAGEMENT recommendation for a trade you ALREADY hold — stay in to keep
     the edge decaying, or close to bank it / shed risk.
 
-    Anchored on the position's probability of KEEPING its edge (drift-adjusted keep
-    prob when the scan supplies it, else PoP), then the take-profit + time/gamma
-    overlay + hard overrides. This is deliberately NOT the entry desk score: a
-    short-premium winner rates poorly on entry risk/reward (small reward, fat tail,
-    low Sortino) yet is a clear HOLD — anchoring a HOLD decision on an ENTRY score
-    is the category error this fixes. The entry desk score / 5-lens are still shown
-    as reference (`base_quality` / `subscores`) but no longer drive the signal.
+    A placed trade starts from a NEUTRAL 50 ("no reason either way to keep or close")
+    and the holder-relevant factors push it toward HOLD or CLOSE: the chance of
+    KEEPING the edge, vol decay, cushion and trend — then the take-profit + time/gamma
+    overlay + hard overrides. This is deliberately NOT the entry desk score (which
+    marks every short-premium trade poorly), and NOT the raw keep-prob either:
+    anchoring the score on keep-prob floored every safe trade near 90+ so it read
+    HOLD no matter how thin the remaining edge. A neutral base lets the factors
+    decide. The entry 5-lens is still shown as reference (`base_quality`/`subscores`).
     """
-    base = keep_drift_pct if keep_drift_pct is not None else (pop_pct if pop_pct is not None else 50.0)
-    overlay = lifecycle_overlay(base, captured_pct, dte_days, unrealized_pnl, max_loss)
+    keep = keep_drift_pct if keep_drift_pct is not None else pop_pct
+    hf: list[dict] = []
+    if keep is not None:
+        kp = (12 if keep >= 90 else 8 if keep >= 80 else 4 if keep >= 70
+              else 0 if keep >= 55 else -8 if keep >= 45 else -18)
+        if kp:
+            hf.append({"name": "Keep-prob", "pts": kp,
+                       "note": (f"{keep:.0f}% chance of keeping the edge to expiry — safe to hold" if kp > 0
+                                else f"only {keep:.0f}% chance of keeping the edge — the position is at risk")})
+    if (theta_per_day or 0.0) > 0 and iv_pct is not None and hv_pct is not None:
+        hf.append({"name": "Vol decay", "pts": 5,
+                   "note": "implied ≤ realized — your short premium is decaying cheaply in your favour"}
+                  if iv_pct <= hv_pct else
+                  {"name": "Vol premium", "pts": -3,
+                   "note": "rich implied still in your shorts — a vol spike works against you"})
+    if cushion_pct is not None:
+        cf = 4 if cushion_pct >= 5 else -6 if cushion_pct > 0 else -14
+        hf.append({"name": "Cushion", "pts": cf,
+                   "note": f"{cushion_pct:.1f}% from spot to your short strike"})
+    if keep_drift_pct is not None and pop_pct is not None:
+        d = keep_drift_pct - pop_pct
+        if d <= -5:
+            hf.append({"name": "Trend", "pts": -5, "note": "recent trend is drifting toward your short strike"})
+        elif d >= 5:
+            hf.append({"name": "Trend", "pts": 4, "note": "recent trend is drifting away from your short strike"})
+    if structure == "naked_call":
+        hf.append({"name": "Naked risk", "pts": -6, "note": "unbounded upside — no stock behind the call"})
+
+    hf_sum = sum(f["pts"] for f in hf)
+    overlay = lifecycle_overlay(50 + hf_sum, captured_pct, dte_days, unrealized_pnl, max_loss)
     return {
         "signal": overlay["signal"], "score": overlay["score"],
-        "hold_base": round(float(base), 1),
-        "base_source": "keep_prob_drift" if keep_drift_pct is not None else "pop",
+        "hold_base": int(round(50 + hf_sum)),
+        "base_source": "hold",
         "adjustments": overlay["adjustments"], "overrides": overlay["overrides"],
         "factors": _management_factors(
             iv_pct=iv_pct, hv_pct=hv_pct, pop_pct=pop_pct, keep_drift_pct=keep_drift_pct,
             cushion_pct=cushion_pct, captured_pct=captured_pct, dte_days=dte_days,
-            is_income=(theta_per_day or 0.0) > 0),
+            is_income=(theta_per_day or 0.0) > 0, structure=structure),
         # entry-flavoured 5-lens, reference only (NOT the anchor):
         "subscores": quality_subscores or {},
         "base_quality": quality_score,
@@ -629,18 +676,27 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
                           subscores: Optional[dict], grade_adjustments: Optional[list],
                           ta_factors: Optional[list], captured_pct: Optional[float],
                           dte_days: Optional[int], unrealized_pnl: Optional[float] = None,
-                          max_profit=None, max_loss=None, cushion_pct: Optional[float] = None) -> dict:
+                          max_profit=None, max_loss=None, cushion_pct: Optional[float] = None,
+                          structure: Optional[str] = None) -> dict:
     """The DEEP management read — reuses the SCAN's factor engine (VRP / Moneyness /
     Liquidity / Expectation / Skew / Beta + TA regime/value-area/gamma) but RE-SIGNS
-    and RE-WEIGHTS each factor for someone who ALREADY holds the trade, then anchors
-    on the drift-adjusted probability of KEEPING the edge and layers the take-profit /
-    time-gamma overlay. Same auditable build-up as the scan, but the answer is
-    hold-vs-close (STRONG_HOLD / HOLD / CONSIDER_CLOSE / CLOSE), not enter-vs-skip.
+    and RE-WEIGHTS each factor for someone who ALREADY holds the trade, then layers
+    the take-profit / time-gamma overlay. Same auditable build-up as the scan, but
+    the answer is hold-vs-close (STRONG_HOLD / HOLD / CLOSE / STRONG_CLOSE), not
+    enter-vs-skip.
 
-        score = keep-prob + Σ(re-signed factors) + Σ(take-profit / time overlay)
+    Like the DI scan (desk_score = base_quality + Σ factors), the read starts from a
+    base and the factors move it — but for a PLACED trade the base is a NEUTRAL 50
+    ("no reason either way"), not keep-prob. Anchoring on keep-prob floored every
+    safe income trade near 90+, so a fat stack of holder-negatives (thin remaining
+    edge, rich vol, exit cost, tail) could never overcome it and everything read
+    STRONG_HOLD. From 50, those factors actually decide keep-vs-close. Keep-prob is
+    NOT dropped — it lives in the re-signed Moneyness/cushion + Trend-drift factors
+    and the Q-vs-P boundary shown alongside.
+
+        score = 50 (neutral) + Σ(re-signed factors) + Σ(take-profit / time overlay)
     """
-    anchor = (keep_drift_pct if keep_drift_pct is not None
-              else keep_standard_pct if keep_standard_pct is not None else 50.0)
+    anchor = 50.0
     contribs: list[dict] = []
 
     # TA factors — kept as-is; they already read "does the position hold?".
@@ -679,23 +735,38 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
             contribs.append({"label": "Tail risk", "pts": pts, "favorable": False,
                              "note": "fat left tail — costly if the strike breaks; don't over-hold a winner into it"})
 
+    # Covered vs naked short call — capital is already committed, so the ADVICE differs.
+    advisories: list[str] = []
+    if structure == "naked_call":
+        contribs.append({"label": "Naked risk", "pts": -6, "favorable": False,
+                         "note": "unbounded upside — no stock cap; size small and defend a tested strike"})
+        advisories.append(
+            "Naked call — upside risk is UNBOUNDED. A sharp rally loses far more than the credit; keep it small "
+            "and defend (roll up · add a long-call wing · close) if the strike is threatened.")
+    elif structure == "covered_call":
+        advisories.append(
+            "Covered call — you hold the stock, so the risk is being CALLED AWAY above the strike (opportunity "
+            "cost), not a cash loss. To keep the shares, roll the call up/out when it's threatened; otherwise let "
+            "it decay for the income.")
+
     factors_net = sum(c["pts"] for c in contribs)
     ov = lifecycle_overlay(anchor + factors_net, captured_pct, dte_days, unrealized_pnl, max_loss)
     signal, overrides = ov["signal"], list(ov["overrides"])
 
     # Tested short strike — defend or close regardless of the score.
     if cushion_pct is not None and cushion_pct <= 0 and signal in ("STRONG_HOLD", "HOLD"):
-        signal = "CONSIDER_CLOSE"
+        signal = "CLOSE"
         overrides.append("short strike tested — defend (roll) or close")
 
     return {
         "signal": signal, "score": ov["score"],
-        "anchor": round(float(anchor), 1),
-        "anchor_label": "keep-prob (drift-adj)" if keep_drift_pct is not None else "keep-prob",
+        "anchor": int(round(anchor)),
+        "anchor_label": "neutral baseline",
         "contributions": contribs,          # the re-signed scan factors (holder view)
         "factors_net": round(factors_net, 1),
         "overlay": ov["adjustments"],        # take-profit / time-gamma
         "overrides": overrides,
+        "advisories": advisories,           # covered / naked call structural advice
     }
 
 

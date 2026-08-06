@@ -623,13 +623,19 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
                        atm_iv: Optional[float], iv_hv_ratio: Optional[float],
                        richness: str, european: bool, earnings_before: Optional[str],
                        macro: list[str], min_prob: float, min_income: float,
-                       ticker: str) -> Optional[dict]:
-    """Covered call (right C) or cash-secured put (right P) on a single short strike."""
+                       ticker: str, allow_illiquid: bool = False) -> Optional[dict]:
+    """Covered call (right C) or cash-secured put (right P) on a single short strike.
+
+    ``allow_illiquid`` bypasses the executability / min-income gates — used for the
+    FOCUS path (scoring a trade the user ALREADY holds), where the strike can be
+    illiquid/wide but we must still score the position rather than drop it."""
     right = q.right
-    if not _executable(q)[0]:            # drop un-fillable quotes up front
+    if not allow_illiquid and not _executable(q)[0]:     # drop un-fillable quotes (scan only)
+        return None
+    if not q.mid or q.mid <= 0:                           # no price → can't score either way
         return None
     premium = q.mid * CONTRACT_MULTIPLIER
-    if premium < min_income or q.mid <= 0:
+    if not allow_illiquid and premium < min_income:
         return None
     iv = q.iv if q.iv else atm_iv
     p_keep, method = _prob_keep(rnd, q.strike, right, spot, dte, r, iv)
@@ -1144,10 +1150,26 @@ def _build_focus_opp(focus: dict, calls: dict, puts: dict, common: dict, sofr_pc
     try:
         if structure == "covered_call" and sc:
             q = _q(sc[0]["strike"], calls)
-            return _single_leg_income("covered_call", "Covered Call", q, sofr_pct=sofr_pct, **c0) if q else None
+            return _single_leg_income("covered_call", "Covered Call", q, sofr_pct=sofr_pct, allow_illiquid=True, **c0) if q else None
+        if structure == "naked_call" and sc:
+            q = _q(sc[0]["strike"], calls)
+            if not q:
+                return None
+            # Same short-call option-math as a covered call, but NAKED: profit is just the
+            # credit (no stock upside), the loss is unbounded, and capital is the Reg T
+            # naked-call margin — so the payoff/tail correctly reflect the open risk.
+            opp = _single_leg_income("naked_call", "Naked Call", q, sofr_pct=sofr_pct, allow_illiquid=True, **c0)
+            if opp:
+                spot = common["spot"]
+                otm = max(0.0, q.strike - spot)
+                opp["max_profit"] = round(opp["premium"], 2)
+                opp["max_loss"] = None
+                opp["unbounded_loss"] = True
+                opp["collateral"] = round(max(0.20 * spot - otm, 0.10 * spot) * CONTRACT_MULTIPLIER, 2)
+            return opp
         if structure == "cash_secured_put" and sp:
             q = _q(sp[0]["strike"], puts)
-            return _single_leg_income("cash_secured_put", "Cash-Secured Put", q, sofr_pct=sofr_pct, **c0) if q else None
+            return _single_leg_income("cash_secured_put", "Cash-Secured Put", q, sofr_pct=sofr_pct, allow_illiquid=True, **c0) if q else None
         if structure == "put_credit_spread" and sp and lp:
             sq, lq = _q(sp[0]["strike"], puts), _q(lp[0]["strike"], puts)
             return _credit_spread("put_credit_spread", "Put Credit Spread", sq, lq, **c0) if sq and lq else None
@@ -1185,7 +1207,11 @@ def _build_focus_opp(focus: dict, calls: dict, puts: dict, common: dict, sofr_pc
 
 # Structures the scan's focus mechanism (_build_focus_opp) prices at the user's EXACT strikes;
 # everything else (strangle / condor / jade / collar / calendar / custom) is built generically.
-_EXACT_FOCUS_STRUCTURES = {"cash_secured_put", "covered_call", "put_credit_spread", "call_credit_spread"}
+# Structures the scan's focus mechanism (_build_focus_opp) prices at the user's EXACT strikes.
+# short_strangle is excluded on purpose — its focus builder re-derives strikes, so the Evaluate tab
+# builds it generically (exact) instead. collar / calendar / diagonal / custom → generic builder.
+_EXACT_FOCUS_STRUCTURES = {"cash_secured_put", "covered_call", "naked_call",
+                           "put_credit_spread", "call_credit_spread", "iron_condor", "jade_lizard"}
 
 
 def _classify_structure(legs: list[dict], has_stock: bool) -> tuple[str, str, bool]:
@@ -1204,23 +1230,25 @@ def _classify_structure(legs: list[dict], has_stock: bool) -> tuple[str, str, bo
     counts = (len(sc), len(lc), len(sp), len(lp))
 
     if not multi_exp:
-        if has_stock and counts == (1, 0, 0, 0):
-            return "covered_call", "Covered Call", False
+        # Stock-covered structures — gated by "I hold the underlying" (has_stock). A lone short call is
+        # a COVERED call when held, else a NAKED call (undefined risk); short call + long put = collar.
+        if counts == (1, 0, 0, 0):
+            return ("covered_call", "Covered Call", False) if has_stock else ("naked_call", "Naked Call", False)
         if has_stock and counts == (1, 0, 0, 1):
             return "collar", "Collar", False
-        if not has_stock:
-            if counts == (0, 0, 1, 0):
-                return "cash_secured_put", "Cash-Secured Put", False
-            if counts == (0, 0, 1, 1) and lp[0] < sp[0]:
-                return "put_credit_spread", "Put Credit Spread", False
-            if counts == (1, 1, 0, 0) and lc[0] > sc[0]:
-                return "call_credit_spread", "Call Credit Spread", False
-            if counts == (1, 0, 1, 0):
-                return "short_strangle", "Short Strangle (naked)", False
-            if counts == (1, 1, 1, 1):
-                return "iron_condor", "Iron Condor", False
-            if counts == (1, 1, 1, 0) and lc[0] > sc[0]:
-                return "jade_lizard", "Jade Lizard", False
+        # Pure-option structures — independent of holding stock (the checkbox doesn't apply).
+        if counts == (0, 0, 1, 0):
+            return "cash_secured_put", "Cash-Secured Put", False
+        if counts == (0, 0, 1, 1) and lp[0] < sp[0]:
+            return "put_credit_spread", "Put Credit Spread", False
+        if counts == (1, 1, 0, 0) and lc[0] > sc[0]:
+            return "call_credit_spread", "Call Credit Spread", False
+        if counts == (1, 0, 1, 0):
+            return "short_strangle", "Short Strangle (naked)", False
+        if counts == (1, 1, 1, 1):
+            return "iron_condor", "Iron Condor", False
+        if counts == (1, 1, 1, 0) and lc[0] > sc[0]:
+            return "jade_lizard", "Jade Lizard", False
     if multi_exp and len(legs) == 2:
         rights = {_rt(l["type"]) for l in legs}
         strikes = [float(l["strike"]) for l in legs]

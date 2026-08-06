@@ -3,14 +3,14 @@ import {
   Gauge, Loader2, AlertTriangle, Cpu, Shield, Briefcase, ChevronDown, ChevronUp,
   Trophy, Play, Terminal, Maximize2, X, MessageSquare, Activity, LineChart, Layers, Zap, Sparkles,
 } from 'lucide-react';
-import { runDeskReview, runDeskReviewAgents } from '../api';
+import { runDeskReview, runDeskReviewAgents, runDeskMonitor, runDeskMonitorAnalyze } from '../api';
 import { RatingsHelpButton } from './RatingsHelp';
 import DeskDebateModal from './DeskDebateModal';
 import { OpportunitySummary, LegsTable } from './DerivativeIncome';
 import CollapsibleSection from './trades/CollapsibleSection';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
 import type { DeskReviewParams, DeskEvaluateParams } from '../api';
-import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent } from '../types';
+import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan } from '../types';
 
 const money = (n: number | null | undefined, d = 0) =>
   n == null ? '—' : `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`;
@@ -300,6 +300,145 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false }: {
   );
 }
 
+// The tail-risk management ladder — WATCH → DEFEND → EXIT price levels + corrective action, grounded in
+// the technical read (support/resistance, value area, order blocks) and the trade's credit breakeven.
+function RiskTriggerLadder({ triggers, footer = true }: { triggers: RiskTrigger[]; footer?: boolean }) {
+  const tierTone = (tier: string) =>
+    tier === 'exit' ? 'bg-error/15 text-error' : tier === 'defend' ? 'bg-warning/15 text-warning'
+      : tier === 'cap' ? 'bg-success/15 text-success' : 'bg-info/15 text-info';
+  // Show down-side rungs then up-side, each in escalation order (watch → defend → exit → cap).
+  const order = { watch: 0, defend: 1, exit: 2, cap: 3 } as Record<string, number>;
+  const rows = [...triggers].sort((a, b) => (a.side === b.side ? (order[a.tier] - order[b.tier]) : (a.side === 'down' ? -1 : 1)));
+  return (
+    <div className="space-y-1.5">
+      {rows.map((rt, i) => (
+        <div key={i} className="flex items-start gap-2 text-[11px]">
+          <span className={`shrink-0 mt-0.5 inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ${tierTone(rt.tier)}`}>{rt.tier}</span>
+          <div className="min-w-0">
+            <div className="flex items-baseline gap-1.5 flex-wrap">
+              <span className="font-mono font-semibold text-sm">${rt.price}</span>
+              <span className="text-base-content/45">{rt.pct_from_spot >= 0 ? '+' : ''}{rt.pct_from_spot}%</span>
+              {rt.sigma != null && <span className="text-base-content/35">· {rt.sigma}σ</span>}
+              {rt.atr_units != null && <span className="text-base-content/35">· {rt.atr_units} ATR</span>}
+              <span className="text-base-content/55">· {rt.basis}</span>
+              <span className={`text-[9px] uppercase font-medium ${rt.side === 'down' ? 'text-error/60' : 'text-info/60'}`}>{rt.side === 'down' ? '↓ downside' : '↑ upside'}</span>
+            </div>
+            <div className="text-base-content/70">{rt.action}</div>
+            {rt.why && <div className="text-[10px] text-base-content/45 mt-0.5">{rt.why}</div>}
+          </div>
+        </div>
+      ))}
+      {footer && (
+        <p className="text-[9px] text-base-content/35 pt-1 border-t border-white/[0.06]">
+          Levels track the underlying's STRUCTURE (support/resistance · value area · order blocks), falling back to
+          volatility (σ / measured-move) bands where the chart has none — spaced between spot and the strike, so you
+          defend when a new structure forms, not 30% away at the strike. <span className="font-mono">σ</span> = expected-move units,
+          <span className="font-mono"> ATR</span> = daily-range units (imminence). A pre-committed plan beats reacting in the moment.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Live monitoring plan for ONE recommended trade — fetched from the deterministic advanced-TA engine when
+// this panel opens: real order blocks / POCs / liquidity pools / gamma flip mapped onto the trade's strikes,
+// the SAME fusion the strike selection used. No hard-coded σ bands.
+function mdBold(s: string): string {
+  const esc = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return esc.replace(/\*\*(.+?)\*\*/g, '<strong class="text-base-content">$1</strong>');
+}
+
+function MonitoringSection({ ticker, trade }: { ticker: string; trade: DeskRankedTrade }) {
+  const [plan, setPlan] = useState<MonitorPlan | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [deep, setDeep] = useState<string | null>(null);
+  const [deepLoading, setDeepLoading] = useState(false);
+  const [deepErr, setDeepErr] = useState<string | null>(null);
+  const putStruct = ['cash_secured_put', 'put_credit_spread'].includes(trade.structure);
+  const callStruct = ['call_credit_spread', 'covered_call'].includes(trade.structure);
+  const tradePayload = () => ({
+    structure: trade.structure,
+    put_short: trade.put_short ?? (putStruct ? trade.short_strike ?? null : null),
+    call_short: trade.call_short ?? (callStruct ? trade.short_strike ?? null : null),
+    credit: trade.premium_per_share ?? undefined,
+    dte: trade.dte ?? undefined,
+  });
+  const runDeep = async () => {
+    setDeepLoading(true); setDeepErr(null); setDeep(null);
+    try {
+      const r = await runDeskMonitorAnalyze(ticker, tradePayload());
+      if (r.error) setDeepErr(r.error); else setDeep(r.content || null);
+    } catch (e: any) { setDeepErr(e?.message || 'Deep read failed'); }
+    finally { setDeepLoading(false); }
+  };
+  useEffect(() => {
+    let alive = true;
+    setLoading(true); setErr(null); setPlan(null); setDeep(null); setDeepErr(null);
+    runDeskMonitor(ticker, tradePayload())
+      .then(p => { if (!alive) return; if (p.error) setErr(p.error); else setPlan(p); })
+      .catch(e => { if (alive) setErr(e?.message || 'Failed to read the live technicals'); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ticker, trade.structure, trade.short_strike, trade.expiration]);
+
+  if (loading) return (
+    <div className="text-[11px] text-base-content/50 flex items-center gap-2 py-2">
+      <Loader2 className="w-3.5 h-3.5 animate-spin" /> Reading the live technicals at your strikes…
+    </div>
+  );
+  if (err) return <div className="text-[11px] text-warning py-1">{err}</div>;
+  if (!plan) return null;
+  return (
+    <div className="space-y-2">
+      {plan.gamma_note && (
+        <div className="rounded-md border border-info/25 bg-info/[0.06] px-2 py-1.5 text-[11px] text-base-content/75">
+          <span className="font-semibold text-info">Dealer gamma · </span>{plan.gamma_note}
+        </div>
+      )}
+      {plan.strike_rationale && plan.strike_rationale.length > 0 && (
+        <div className="text-[10.5px] text-base-content/60 leading-relaxed">
+          <span className="text-[9px] uppercase tracking-wider text-base-content/40">Why these strikes · </span>
+          {plan.strike_rationale.join(' ')}
+        </div>
+      )}
+      {plan.triggers.length > 0
+        ? <RiskTriggerLadder triggers={plan.triggers} footer={false} />
+        : <div className="text-[11px] text-base-content/50 py-1">No mapped structure near the strikes right now — they sit clear of the live TA levels.</div>}
+
+      {/* Deep read — on-demand LLM narrative over the SAME live TA (user's OpenAI key). */}
+      <div className="pt-1">
+        {!deep && !deepLoading && (
+          <button onClick={runDeep}
+            className="btn btn-xs btn-outline btn-secondary gap-1">
+            <Cpu className="w-3 h-3" /> Deep TA read
+          </button>
+        )}
+        {deepLoading && (
+          <div className="text-[11px] text-base-content/50 flex items-center gap-2 py-1">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" /> Reading structure, gamma & flow across timeframes…
+          </div>
+        )}
+        {deepErr && <div className="text-[11px] text-warning py-1">{deepErr}</div>}
+        {deep && (
+          <div className="rounded-lg border border-secondary/25 bg-secondary/[0.05] p-2.5 mt-1">
+            <div className="text-[9px] uppercase tracking-wider text-secondary/70 mb-1 flex items-center gap-1">
+              <Cpu className="w-3 h-3" /> Deep technical read
+            </div>
+            <div className="text-[11.5px] text-base-content/80 whitespace-pre-wrap leading-relaxed"
+              dangerouslySetInnerHTML={{ __html: mdBold(deep) }} />
+          </div>
+        )}
+      </div>
+
+      <p className="text-[9px] text-base-content/35 pt-1 border-t border-white/[0.06]">
+        Live read of {plan.levels_found ?? 'the'} advanced-TA structures — MTF volume profile · order blocks/FVG · liquidity pools · swings · 50-day VWAP · dealer gamma — mapped to your strikes, the same fusion the strike selection used. Every rung is a REAL structure (not a fixed band); it says what the setup does if price reaches it and the corrective action. Goal: manage the tail.
+      </p>
+    </div>
+  );
+}
+
 function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams; evaluate?: DeskEvaluateParams }) {
   const dm = t.desk_metrics;
   const q = dm.quant || {};
@@ -337,6 +476,27 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
       {/* Hero summary — identical to the standalone opportunity card */}
       <OpportunitySummary opp={t} />
 
+      {/* Nearby strikes this row stands in for — same structure/expiry, one moneyness band, near-identical
+          score. Folded out of the ranking to keep it distinct; shown here so you can still compare/pick. */}
+      {(t.nearby_strikes && t.nearby_strikes.length > 0) && (
+        <div className="rounded-lg border border-white/[0.06] bg-base-200/30 p-2">
+          <div className="text-[10px] uppercase tracking-wider text-base-content/40 mb-1.5">
+            Nearby strikes · same band, near-identical score
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {t.nearby_strikes.map((n, i) => (
+              <span key={i} className="inline-flex items-baseline gap-1 rounded border border-white/[0.08] bg-base-100/40 px-1.5 py-0.5 text-[11px]">
+                <span className="font-mono font-semibold">{n.strike}</span>
+                {n.short_strike_pct != null && <span className="text-base-content/45">{n.short_strike_pct >= 0 ? '+' : ''}{n.short_strike_pct}%</span>}
+                {n.premium_annualized_pct != null && <span className="text-success/80">{n.premium_annualized_pct}%/yr</span>}
+                {n.desk_score != null && <span className="text-base-content/40">· {n.desk_score}</span>}
+              </span>
+            ))}
+          </div>
+          <p className="text-[9px] text-base-content/35 mt-1.5">This row is the best-scoring of the band; the rest were folded to keep the ranking distinct.</p>
+        </div>
+      )}
+
       {t.legs && t.legs.length > 0 && (
         <CollapsibleSection title="Trade Legs" accent="base-content"
           icon={<Layers className="w-3 h-3" />} subtitle={`${t.legs.length} legs`}>
@@ -352,6 +512,12 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
       <CollapsibleSection title="Capital Risk" accent="warning"
         icon={<Shield className="w-3 h-3" />} subtitle="VaR · CVaR · max loss · sizing">
         <RiskGrid r={dm.risk} />
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Monitoring & Corrective Action" accent="warning"
+        icon={<AlertTriangle className="w-3 h-3" />} subtitle="live TA at your strikes · watch → defend → exit"
+        defaultOpen>
+        <MonitoringSection ticker={ticker} trade={t} />
       </CollapsibleSection>
 
       <CollapsibleSection title="Risk Adjusted Quality" accent="success"
@@ -711,7 +877,15 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                                   {t.algo_grade || '—'}</span>}
                           </td>
                           <td className="whitespace-nowrap">{t.label}</td>
-                          <td className="font-mono text-[11px]">{strikeStr(t)}</td>
+                          <td className="font-mono text-[11px] whitespace-nowrap">
+                            {strikeStr(t)}
+                            {(t.nearby_count ?? 0) > 0 && (
+                              <span className="ml-1 text-[9px] font-sans font-medium text-base-content/40 align-middle cursor-help"
+                                title={`Best of ${(t.nearby_count ?? 0) + 1} adjacent strikes${t.nearby_range ? ` (${t.nearby_range[0]}–${t.nearby_range[1]})` : ''} — near-identical score, collapsed to keep the ranking distinct.`}>
+                                +{t.nearby_count}
+                              </span>
+                            )}
+                          </td>
                           <td className="text-success whitespace-nowrap">{money(t.premium)}</td>
                           <td>{winPct(t.prob_keep_pct)}</td>
                           <td className={confTextTone(t.confidence?.label)}>{t.confidence?.label ?? '—'}</td>

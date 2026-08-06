@@ -749,6 +749,25 @@ async def import_order(
     }
 
 
+@router.get("/book-tail-risk")
+async def book_tail_risk(
+    quote_source: str = "yfinance",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Book-level short-vol / tail-risk desk: aggregate the OPTION-LAYER greeks of
+    every open trade, flag laddered/concentrated shorts as one bet, replay crash
+    scenarios on the aggregate, and size an INDEX (SPX, European) put-spread tail
+    hedge with the Spitznagel cost-vs-drag test. On-demand (fetches quotes)."""
+    from ..services.book_tail_risk import compute_book_tail_risk
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))
+    strategies = list(result.scalars().all())
+    if not strategies:
+        return {"positions": 0, "error": "No active trades to analyze."}
+    return await compute_book_tail_risk(strategies, quote_source, user, db)
+
+
 @router.post("/manual-trade", response_model=SavedStrategyOut, status_code=201)
 async def create_manual_trade(
     body: ManualTradeIn,
@@ -1174,7 +1193,7 @@ _VALID_PURPOSES = {"income", "hedge", "trade", "managed_floor",
 # hold_vs_close signal → the 4-level whole-trade EXIT vocabulary (for the paths
 # that don't warrant the full exit-timing engine — pure stock / futures).
 _EXIT_MAP = {"STRONG_HOLD": "STRONG_HOLD", "HOLD": "HOLD",
-             "CLOSE": "CONSIDER_CLOSE", "STRONG_CLOSE": "CLOSE"}
+             "CLOSE": "CLOSE", "STRONG_CLOSE": "STRONG_CLOSE"}
 
 
 class PurposeUpdateIn(BaseModel):
@@ -3771,8 +3790,8 @@ Your ONE job right now: decide how to MANAGE it from here and issue a single exi
 VERDICT is EXACTLY one of:
   STRONG_HOLD   — edge firmly intact, hold with conviction; nothing to do
   HOLD          — on track; hold and monitor named levels
-  CONSIDER_CLOSE— the risk/reward has tilted; begin taking it off / tighten / roll
-  CLOSE         — exit now (or defend immediately); the reason to hold is gone
+  CLOSE         — the risk/reward has tilted; begin taking it off / tighten / roll
+  STRONG_CLOSE  — exit now (or defend immediately); the reason to hold is gone
 
 # HARD RULES
 - Every number below is PRE-COMPUTED and authoritative. INTERPRET it — do NOT recompute
@@ -3796,7 +3815,7 @@ VERDICT is EXACTLY one of:
 5. CAPITAL EFFICIENCY — is this collateral working, or better redeployed?
 
 # OUTPUT (exactly this shape)
-VERDICT: <STRONG_HOLD | HOLD | CONSIDER_CLOSE | CLOSE>
+VERDICT: <STRONG_HOLD | HOLD | CLOSE | STRONG_CLOSE>
 REASONING:
 1) Edge — ...
 2) Profit vs theta — ...
@@ -3821,7 +3840,7 @@ async def run_lifecycle_manager(
     db: AsyncSession = Depends(get_db),
 ):
     """The institutional quant PM: reasons over the WHOLE live trade and issues a single
-    STRONG_HOLD / HOLD / CONSIDER_CLOSE / CLOSE with a concrete management plan."""
+    STRONG_HOLD / HOLD / CLOSE / STRONG_CLOSE with a concrete management plan."""
     result = await db.execute(
         select(SavedStrategy).where(
             SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id,
@@ -3884,10 +3903,10 @@ Manage this trade now. Follow the output format exactly."""
     # Parse the exit verdict (normalize spaces → the canonical 4-level token).
     raw_verdict, _ = _parse_verdict(response, set())
     v = raw_verdict.upper().replace(" ", "_")
-    signal = next((s for s in ("STRONG_HOLD", "CONSIDER_CLOSE", "CLOSE", "HOLD") if s in v), "HOLD")
+    signal = next((s for s in ("STRONG_HOLD", "STRONG_CLOSE", "HOLD", "CLOSE") if s in v), "HOLD")
     return {
         "role": "manager", "title": "Institutional Desk", "signal": signal,
-        "action_needed": signal in ("CONSIDER_CLOSE", "CLOSE"),
+        "action_needed": signal in ("CLOSE", "STRONG_CLOSE"),
         "content": response, "model": "gpt-4o",
     }
 
@@ -3981,7 +4000,7 @@ async def compute_lifecycle_desk_score(
     # the scan can price at exact legs. For anything else (collar, calendars, ratios,
     # custom multi-leg, plain stock) the always-present Quant Algorithmic card above is
     # the read — say so plainly instead of pricing something we can't stand behind.
-    _SCORABLE = {"covered_call", "cash_secured_put", "put_credit_spread",
+    _SCORABLE = {"covered_call", "naked_call", "cash_secured_put", "put_credit_spread",
                  "call_credit_spread", "short_strangle", "iron_condor", "jade_lizard"}
     if body.structure not in _SCORABLE:
         return {"matched": False,
@@ -4038,7 +4057,7 @@ async def compute_lifecycle_desk_score(
         ta_factors=row.get("ta_factors"), captured_pct=a.get("captured_pct"), dte_days=dte,
         unrealized_pnl=pnl.get("unrealized_pnl"),
         max_profit=pnl.get("max_profit"), max_loss=pnl.get("max_loss"),
-        cushion_pct=row.get("cushion_pct"),
+        cushion_pct=row.get("cushion_pct"), structure=body.structure,
     )
     return {
         "matched": True,
@@ -4069,9 +4088,10 @@ async def compute_lifecycle_desk_score(
             "score": mgmt["score"],
             "signal": mgmt["signal"],
             "overrides": mgmt["overrides"],
+            "advisories": mgmt["advisories"],         # covered / naked call advice
         },
         # keep for back-compat with the light card's buildup line:
         "lifecycle_adjustments": mgmt["overlay"],
         "hold_base": mgmt["anchor"],
-        "base_source": "keep_prob_drift" if qp.get("keep_drift_pct") is not None else "pop",
+        "base_source": "neutral",
     }

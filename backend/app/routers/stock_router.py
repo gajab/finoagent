@@ -37,7 +37,7 @@ from ..services.concentration_service import run_concentration_management
 from ..services.pmcc_service import run_pmcc_pmcp
 from ..services.zebra_service import run_zebra
 from ..services.derivative_income_service import run_derivative_income, run_portfolio_derivative_income
-from ..services.desk_review_service import rank_desk, run_desk_agents, evaluate_desk_trade
+from ..services.desk_review_service import rank_desk, run_desk_agents, evaluate_desk_trade, monitor_trade, monitor_analyze
 from ..services.cppi_service import run_cppi_simulation
 from ..services.tax_loss_harvesting_service import run_portfolio_tax_loss_harvesting
 from ..services.market_impact_service import analyze_market_impact
@@ -269,6 +269,284 @@ async def get_technical_for_timeframe(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Technical analysis failed: {exc}")
+
+
+@router.get("/{ticker}/microstructure")
+async def get_microstructure(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Multi-timeframe Volume-Profile hierarchy (Macro/Swing/Micro POC·VAH·VAL·LVN),
+    naked/virgin POCs, and the Anchored-VWAP matrix (YTD / earnings / 52-wk high·low).
+
+    Heavy (5 history fetches) so it is cached and computed off the event loop. The
+    frontend loads it lazily when the user opens the Microstructure panel.
+    """
+    import asyncio
+    import yfinance as yf
+    from ..services.microstructure_service import compute_microstructure
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"micro:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "microstructure": cached, "cached": True}
+
+    def _build():
+        return compute_microstructure(yf.Ticker(ticker))
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _build)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Microstructure analysis failed: {exc}")
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No microstructure data available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "microstructure": result, "cached": False}
+
+
+@router.get("/{ticker}/market-structure")
+async def get_market_structure(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Multi-timeframe market structure (BOS/CHOCH across Daily/4H/1H via scipy pivots),
+    liquidity pools (unswept BSL/SSL), unmitigated Order Blocks / FVGs, and cross-timeframe
+    mitigation confluence. Cached + computed off the event loop; loaded lazily by the UI."""
+    import asyncio
+    import yfinance as yf
+    from ..services.market_structure_service import compute_market_structure
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"mstruct:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "market_structure": cached, "cached": True}
+
+    def _build():
+        return compute_market_structure(yf.Ticker(ticker))
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _build)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Market-structure analysis failed: {exc}")
+
+    if not result:
+        raise HTTPException(status_code=404, detail="No market-structure data available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "market_structure": result, "cached": False}
+
+
+@router.get("/{ticker}/regime")
+async def get_regime(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Market-regime classifier: Hurst exponent + Kaufman Efficiency Ratio on Daily/4H,
+    and the 50-day VWAP z-score (statistical over-expansion). Cached + executor-run."""
+    import asyncio
+    import yfinance as yf
+    from ..services.regime_service import compute_regime
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"regime:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "regime": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_regime(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Regime analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No regime data available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "regime": result, "cached": False}
+
+
+@router.get("/{ticker}/dealer-positioning")
+async def get_dealer_positioning(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dealer positioning overlay: Net GEX, gamma flip level, gamma walls, and the
+    options-implied expected move (±1σ) for ~30d & ~45d. Cached + executor-run (slow:
+    it pulls several option-chain expiries)."""
+    import asyncio
+    import yfinance as yf
+    from ..services.dealer_positioning_service import compute_dealer_positioning
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"dealergex:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "dealer_positioning": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_dealer_positioning(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Dealer-positioning analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No option-chain data available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "dealer_positioning": result, "cached": False}
+
+
+@router.get("/{ticker}/trade-setups")
+async def get_trade_setups(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The Trade-Setup engine: fuses microstructure + market structure + regime + dealer
+    positioning into ranked, concrete setups (entry / stop / target / R:R, sized to the
+    expected move, filtered by regime). Cached + executor-run (fans out to all four)."""
+    import asyncio
+    import yfinance as yf
+    from ..services.trade_setup_service import compute_trade_setups
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"setups:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "trade_setups": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_trade_setups(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Trade-setup analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No trade-setup data available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "trade_setups": result, "cached": False}
+
+
+class MicroChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class TaAnalyzeIn(BaseModel):
+    selection: dict = Field(default_factory=dict, description="JSON of the user-selected TA indicators")
+    messages: list[MicroChatMessage] = Field(default_factory=list, description="Prior chat turns (client-held)")
+
+
+_TA_ANALYZE_SYSTEM = """You are an elite technical strategist and derivatives desk head. You read \
+markets like an institution — not trendlines, but WHERE volume traded, the AUCTION levels price is \
+drawn back to, the footprints of large orders, and market STRUCTURE across timeframes. You are given \
+ONLY the indicators the user selected, as JSON. They may come from the Volume-Profile / Microstructure \
+map, the Market-Structure map, or both — work with whatever is present.
+
+Concept key (only use what appears in the JSON):
+- POC / VAH / VAL — most-traded price and the 70% Value Area. Above VAH reads "expensive" (rich to \
+sell calls); below VAL reads "cheap" (rich to sell puts); inside = balanced/range.
+- LVN — a thin price between volume shelves; price travels through it fast — a breakout accelerant and \
+a spot for TIGHT stops. Naked/Virgin POC — a prior POC not retested; a magnet / target.
+- AVWAP — volume-weighted price since a catalyst (YTD/earnings/52-wk high-low); above = buyers in \
+control since that event, a trend filter.
+- BOS (Break of Structure) = trend CONTINUATION; CHOCH (Change of Character) = the first counter-trend \
+break, an EARLY-REVERSAL warning. Read them per timeframe and note multi-timeframe alignment.
+- Liquidity Pools — BSL (buy-side, above swing highs) and SSL (sell-side, below swing lows) are resting \
+stops; price is often drawn to SWEEP them before reversing. "Equal highs/lows" = engineered liquidity \
+(stronger draw). Order Blocks / Fair-Value Gaps that are UNMITIGATED are unfinished business price tends \
+to revisit; a confluence of unmitigated zones across timeframes is a high-probability reaction area.
+- Regime — Hurst>0.5 / high Efficiency-Ratio = TRENDING (favor momentum breakouts, trend-following, \
+directional vertical/debit spreads); Hurst<0.5 / low ER = MEAN-REVERTING (favor fading extremes, range \
+trades, iron condors/strangles). The 50-day VWAP z-score flags statistical over-expansion (|z|≥2 = stretched). \
+Pick structures that FIT the regime — don't sell condors in a trend or chase breakouts in a range.
+- Dealer positioning — Net GEX>0 (dealers LONG gamma) = volatility suppressed, price pins/mean-reverts; \
+Net GEX<0 (SHORT gamma) = volatility expansion, moves amplified. The GAMMA FLIP is the spot where this \
+regime changes. Call/Put WALLS (largest +/− GEX strikes) act as resistance/support magnets. The EXPECTED \
+MOVE (±1σ) is the options market's own range forecast — size targets/stops and condor wings around it.
+
+Output plain English, grounded in the ACTUAL NUMBERS in the JSON (quote the price levels). Be specific \
+and concise — short sections with bold headers, no filler, no hedging boilerplate. Cover:
+1. **Read** — where spot sits vs the selected levels/zones; the structural bias (trend vs the BOS/CHOCH \
+and timeframe alignment) and any confluence. State bullish / bearish / balanced and why.
+2. **Swing trade** — a concrete idea: entry zone (a named level/zone), invalidation/STOP (an LVN, a swing, \
+or below a demand zone), and target(s) (a liquidity pool / naked POC / opposite value-area edge). Give ~R:R.
+3. **Directional option trade** — align to the bias (e.g. debit spread), strikes anchored to the levels, \
+expiry suited to the timeframe of the structure.
+4. **Premium-income trade** — sell puts near demand / SSL / VAL, calls near supply / BSL / VAH, or an iron \
+condor bracketing the balance area; name the strikes from the levels.
+5. **Entry timing & risk** — how to time around these levels (e.g. wait for a liquidity sweep + CHOCH), \
+where stops go, which pool/POC is the magnet, and a note on sizing.
+End with one line: "Educational analysis, not financial advice." If a section isn't supported by the \
+selected indicators, say what to add rather than inventing levels."""
+
+
+@router.post("/{ticker}/ta/analyze")
+async def analyze_ta(
+    ticker: str,
+    body: TaAnalyzeIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send the user's SELECTED technical indicators (from any TA panel, as JSON) to the
+    LLM for a plain-English read + concrete trade ideas, with follow-up questions. Stateless:
+    the client holds the transcript and re-posts ``messages`` each turn."""
+    ticker = ticker.upper()
+
+    openai_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not openai_key:
+        raise HTTPException(400, "OpenAI API key not configured. Please add it in Settings.")
+    model = (await get_user_api_key(db, user.id, "openai_model")) or "gpt-4o-mini"
+
+    if not body.selection:
+        raise HTTPException(400, "Select at least one indicator to analyze.")
+
+    selection_json = json.dumps(body.selection, indent=2, default=str)
+    system_prompt = (
+        f"{_TA_ANALYZE_SYSTEM}\n\nTicker: {ticker}\n"
+        f"Selected indicators (JSON):\n```json\n{selection_json}\n```"
+    )
+
+    convo = [
+        {"role": m.role, "content": m.content}
+        for m in body.messages[-20:]
+        if m.role in ("user", "assistant") and m.content.strip()
+    ]
+    if not convo:
+        convo = [{"role": "user",
+                  "content": "Analyze the selected indicators and tell me what trades I could confidently make."}]
+
+    messages = [{"role": "system", "content": system_prompt}, *convo]
+    try:
+        answer = await call_llm(api_key=openai_key, model=model, messages=messages, max_tokens=1600)
+    except Exception as exc:
+        raise HTTPException(502, f"TA analysis failed: {exc}")
+
+    return {"role": "assistant", "content": answer}
 
 
 @router.get("/{ticker}/prediction")
@@ -1880,12 +2158,10 @@ class EvaluateLegIn(BaseModel):
 
 
 class DeskEvaluateIn(BaseModel):
-    """Evaluate a user-entered multi-leg trade (options and/or stock) on the desk pipeline."""
+    """Evaluate a user-entered multi-leg options trade on the desk pipeline."""
     legs: list[EvaluateLegIn] = Field(default_factory=list)
-    stock_shares: float = Field(default=0.0, description="Signed shares (+long / −short); 0 = none")
-    cost_basis: float | None = Field(default=None, description="Stock cost basis / share (optional)")
     quote_source: str = Field(default="yfinance")
-    owns_underlying: bool = Field(default=False, description="Already hold the shares → score covered calls as an income overlay")
+    owns_underlying: bool = Field(default=False, description="Hold the underlying → a short call is a COVERED call (income overlay), not naked; enables the collar")
 
 
 class DeskReviewAgentsIn(DeskReviewIn):
@@ -1937,7 +2213,6 @@ async def compute_desk_evaluate(
     try:
         result = await evaluate_desk_trade(
             ticker, legs=[l.model_dump() for l in body.legs],
-            stock_shares=body.stock_shares, cost_basis=body.cost_basis,
             quote_source=body.quote_source, owns_underlying=body.owns_underlying,
             user=user, db=db,
         )
@@ -1980,6 +2255,64 @@ async def compute_desk_review_agents(
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Desk review agents failed: {exc}")
+
+
+class MonitorTradeIn(BaseModel):
+    """One recommended trade to build a live monitoring plan for."""
+    structure: str
+    put_short: float | None = Field(default=None, description="Short put strike (down-side danger)")
+    call_short: float | None = Field(default=None, description="Short call strike (up-side danger)")
+    credit: float = Field(default=0.0, description="Net credit per share")
+    spot: float | None = Field(default=None, description="Spot at scan time; falls back to the live read")
+    dte: int = Field(default=30, ge=1, le=400)
+
+
+@router.post("/{ticker}/desk-review/monitor")
+async def compute_desk_monitor(
+    ticker: str,
+    body: MonitorTradeIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """On-demand deterministic monitoring plan for ONE recommended trade: reads the LIVE advanced TA
+    (microstructure · market structure · regime · dealer gamma) and maps the real structures onto the
+    trade's short strikes → WATCH / DEFEND / EXIT levels + corrective actions + the strike rationale. No
+    LLM (the deep read is a separate action)."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    try:
+        return await monitor_trade(ticker, body.model_dump())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Monitor plan failed: {exc}")
+
+
+class MonitorAnalyzeIn(MonitorTradeIn):
+    model: str = Field(default="gpt-4o", description="LLM for the deep technical read")
+
+
+@router.post("/{ticker}/desk-review/monitor/analyze")
+async def compute_desk_monitor_analyze(
+    ticker: str,
+    body: MonitorAnalyzeIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """LLM 'deep read' over the SAME live advanced-TA levels — a qualitative monitoring narrative grounded
+    in the real structures + dealer gamma. Needs the user's OpenAI key."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured. Please add it in Settings.")
+    try:
+        result = await monitor_analyze(ticker, body.model_dump(exclude={"model"}), api_key=api_key, model=body.model)
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Monitor deep read failed: {exc}")
 
 
 # =========================================================================

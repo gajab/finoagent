@@ -3,7 +3,7 @@
  *
  * On demand it reasons over the whole placed position (edge, profit banked vs
  * theta left, path/greeks risk, catalysts, capital efficiency) and issues a
- * single lifecycle signal: STRONG HOLD · HOLD · CONSIDER CLOSE · CLOSE, with a
+ * single lifecycle signal: STRONG HOLD · HOLD · CLOSE · STRONG CLOSE, with a
  * concrete management plan and key levels. Sits on top of the deterministic
  * exit engine — it can agree, upgrade, or overrule it.
  */
@@ -15,8 +15,8 @@ import type { LivePnlResponse, SavedStrategyItem, LifecycleManagerResult } from 
 const SIGNAL_STYLE: Record<string, { label: string; cls: string; tone: string }> = {
   STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success',              tone: 'success' },
   HOLD:           { label: 'HOLD',           cls: 'badge-success badge-outline', tone: 'success' },
-  CONSIDER_CLOSE: { label: 'CONSIDER CLOSE', cls: 'badge-warning',              tone: 'warning' },
-  CLOSE:          { label: 'CLOSE',          cls: 'badge-error',                tone: 'error' },
+  CLOSE:          { label: 'CLOSE',          cls: 'badge-warning',              tone: 'warning' },
+  STRONG_CLOSE:   { label: 'STRONG CLOSE',   cls: 'badge-error',                tone: 'error' },
 };
 
 export default function InstitutionalDesk({ trade, pnl }: {

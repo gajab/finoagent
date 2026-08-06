@@ -685,7 +685,7 @@ function PortfolioHoldingRow({ row, params }: { row: DerivativeIncomePortfolioRo
 // as the user builds legs. The backend classification in the result is authoritative.
 function detectStructure(legs: EvaluateLeg[], hasStock: boolean): { label: string; custom: boolean } {
   const valid = legs.filter(l => l.strike > 0 && l.expiration);
-  if (!valid.length) return hasStock ? { label: 'Stock only', custom: true } : { label: '—', custom: false };
+  if (!valid.length) return { label: '—', custom: false };
   const multi = new Set(valid.map(l => l.expiration)).size > 1;
   const sc = valid.filter(l => l.type === 'CALL' && l.action === 'SELL').map(l => l.strike).sort((a, b) => a - b);
   const lc = valid.filter(l => l.type === 'CALL' && l.action === 'BUY').map(l => l.strike).sort((a, b) => a - b);
@@ -693,16 +693,16 @@ function detectStructure(legs: EvaluateLeg[], hasStock: boolean): { label: strin
   const lp = valid.filter(l => l.type === 'PUT' && l.action === 'BUY').map(l => l.strike).sort((a, b) => a - b);
   const k = (a: number, b: number, c: number, d: number) => sc.length === a && lc.length === b && sp.length === c && lp.length === d;
   if (!multi) {
-    if (hasStock && k(1, 0, 0, 0)) return { label: 'Covered Call', custom: false };
+    // A lone short call is a COVERED call when you hold the shares, else a NAKED call.
+    if (k(1, 0, 0, 0)) return hasStock ? { label: 'Covered Call', custom: false } : { label: 'Naked Call', custom: false };
     if (hasStock && k(1, 0, 0, 1)) return { label: 'Collar', custom: false };
-    if (!hasStock) {
-      if (k(0, 0, 1, 0)) return { label: 'Cash-Secured Put', custom: false };
-      if (k(0, 0, 1, 1) && lp[0] < sp[0]) return { label: 'Put Credit Spread', custom: false };
-      if (k(1, 1, 0, 0) && lc[0] > sc[0]) return { label: 'Call Credit Spread', custom: false };
-      if (k(1, 0, 1, 0)) return { label: 'Short Strangle', custom: false };
-      if (k(1, 1, 1, 1)) return { label: 'Iron Condor', custom: false };
-      if (k(1, 1, 1, 0) && lc[0] > sc[0]) return { label: 'Jade Lizard', custom: false };
-    }
+    // Pure-option structures — independent of holding stock.
+    if (k(0, 0, 1, 0)) return { label: 'Cash-Secured Put', custom: false };
+    if (k(0, 0, 1, 1) && lp[0] < sp[0]) return { label: 'Put Credit Spread', custom: false };
+    if (k(1, 1, 0, 0) && lc[0] > sc[0]) return { label: 'Call Credit Spread', custom: false };
+    if (k(1, 0, 1, 0)) return { label: 'Short Strangle', custom: false };
+    if (k(1, 1, 1, 1)) return { label: 'Iron Condor', custom: false };
+    if (k(1, 1, 1, 0) && lc[0] > sc[0]) return { label: 'Jade Lizard', custom: false };
   }
   if (multi && valid.length === 2 && new Set(valid.map(l => l.type)).size === 1) {
     return valid[0].strike === valid[1].strike
@@ -717,9 +717,7 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
   const [expiryLoading, setExpiryLoading] = useState(false);
   const [quoteSource, setQuoteSource] = useState<'yfinance' | 'ibkr'>(defaultQuoteSource);
   const [legs, setLegs] = useState<EvaluateLeg[]>([{ action: 'SELL', type: 'PUT', strike: 0, expiration: '' }]);
-  const [shares, setShares] = useState(0);
-  const [costBasis, setCostBasis] = useState('');
-  const [owns, setOwns] = useState(false);
+  const [owns, setOwns] = useState(false);   // "I hold the underlying" — the sole stock signal
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -757,17 +755,15 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
   const addLeg = () => setLegs(ls => [...ls, { action: 'SELL', type: 'CALL', strike: 0, expiration: ls[0]?.expiration || expiries[0] || '' }]);
   const removeLeg = (i: number) => setLegs(ls => ls.filter((_, idx) => idx !== i));
 
-  const hasStock = shares !== 0;
+  const hasStock = owns;
   const detected = detectStructure(legs, hasStock);
-  const legsReady = legs.every(l => l.strike > 0 && !!l.expiration);
-  const canSubmit = !!ticker.trim() && (legs.length > 0 || hasStock) && legsReady && !loading;
+  const legsReady = legs.length > 0 && legs.every(l => l.strike > 0 && !!l.expiration);
+  const canSubmit = !!ticker.trim() && legsReady && !loading;
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const payload: DeskEvaluateParams = {
       legs: legs.filter(l => l.strike > 0 && l.expiration),
-      stock_shares: shares,
-      cost_basis: costBasis ? Number(costBasis) : null,
       quote_source: quoteSource,
       owns_underlying: owns,
     };
@@ -790,7 +786,7 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
     <div className="space-y-4">
       <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03] text-sm text-base-content/70 flex items-start gap-2">
         <Info className="w-4 h-4 text-secondary mt-0.5 shrink-0" />
-        <span>Built a trade elsewhere? Enter the exact legs (and any stock) and the desk runs the <b>same read as Single Ticker</b> — price, volatility, technicals and the full Desk Review — on <b>your</b> trade. Live quotes; the structure is auto-detected (calendars &amp; custom combos welcome).</span>
+        <span>Built a trade elsewhere? Enter the exact legs and the desk runs the <b>same read as Single Ticker</b> — price, volatility, technicals and the full Desk Review — on <b>your</b> trade. Live quotes; the structure is auto-detected (calendars &amp; custom combos welcome).</span>
       </div>
 
       <form onSubmit={submit} className="space-y-3">
@@ -833,33 +829,18 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
                 {validExpiries.map(([d, dte]) => <option key={d} value={d}>{d} · {dte}d</option>)}
               </select>
               <button type="button" className="btn btn-ghost btn-xs btn-square text-error"
-                onClick={() => removeLeg(i)} disabled={legs.length <= 1 && !hasStock} title="Remove leg">
+                onClick={() => removeLeg(i)} disabled={legs.length <= 1} title="Remove leg">
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
             </div>
           ))}
-          {!legs.length && <p className="text-[11px] text-base-content/40">No option legs — stock-only position.</p>}
         </div>
 
-        {/* stock leg */}
-        <div className="rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 items-end">
-            <div className="form-control">
-              <label className="label py-1"><span className="label-text text-xs font-medium">Stock shares (+ long / − short)</span></label>
-              <input type="number" step="1" className="input input-bordered input-sm" placeholder="0"
-                value={shares || ''} onChange={e => setShares(Number(e.target.value))} />
-            </div>
-            <div className="form-control">
-              <label className="label py-1"><span className="label-text text-xs font-medium">Cost basis / share (optional)</span></label>
-              <input type="number" step="0.01" className="input input-bordered input-sm" placeholder="—"
-                value={costBasis} onChange={e => setCostBasis(e.target.value)} />
-            </div>
-            <label className="flex items-start gap-2 cursor-pointer text-[11px] text-base-content/70 pb-2">
-              <input type="checkbox" className="checkbox checkbox-xs checkbox-secondary mt-0.5" checked={owns} onChange={e => setOwns(e.target.checked)} />
-              <span>I already hold the shares — score covered calls as an <b>income overlay</b> (no fresh-capital / beta penalty).</span>
-            </label>
-          </div>
-        </div>
+        {/* holding toggle — the sole stock signal (100 sh/contract is implied when checked) */}
+        <label className="flex items-start gap-2 cursor-pointer text-[11px] text-base-content/70 rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
+          <input type="checkbox" className="checkbox checkbox-xs checkbox-secondary mt-0.5" checked={owns} onChange={e => setOwns(e.target.checked)} />
+          <span>I already hold the shares — a short call is scored as a <b>covered-call income overlay</b> (no fresh-capital / beta penalty) instead of a naked call, and a long put + short call becomes a <b>collar</b>.</span>
+        </label>
 
         <div className="flex items-center gap-2 justify-end flex-wrap">
           <span className="text-[11px] text-base-content/45 mr-auto">Filters off — the desk scores exactly the trade you enter.</span>
@@ -872,13 +853,7 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
 
       {error && <div className="alert alert-error text-sm"><AlertTriangle className="w-4 h-4 shrink-0" /><span>{error}</span></div>}
       {result && submitted && (
-        <SingleTickerResult
-          desk={result}
-          deskParams={deskParams}
-          evaluate={submitted}
-          shares={hasStock ? Math.abs(shares) : undefined}
-          costBasis={costBasis ? Number(costBasis) : undefined}
-        />
+        <SingleTickerResult desk={result} deskParams={deskParams} evaluate={submitted} />
       )}
     </div>
   );

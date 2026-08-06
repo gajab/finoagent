@@ -5,9 +5,9 @@
  * Moneyness, Liquidity, Expectation, TA regime/value-area/gamma) but every factor is
  * RE-SIGNED and RE-WEIGHTED for a holder (cheap implied vol flips from an entry
  * demerit to "Vol decay" in your favour; liquidity becomes the cost to CLOSE;
- * expectation is downweighted to a remote tail). Anchored on the drift-adjusted
- * probability of KEEPING the edge, then the take-profit / time-gamma overlay →
- * STRONG_HOLD / HOLD / CONSIDER_CLOSE / CLOSE. Mirrors the scan's build-up so it's
+ * expectation is downweighted to a remote tail). Starts from a NEUTRAL 50 baseline
+ * (not keep-prob), then the re-signed factors + take-profit / time-gamma overlay →
+ * STRONG_HOLD / HOLD / CLOSE / STRONG_CLOSE. Mirrors the scan's build-up so it's
  * fully auditable — but answers "should I stay in?", not "should I enter?".
  */
 import { QpBoundary } from '../DeskReview';
@@ -16,8 +16,8 @@ import type { ManagementAnalysis as MA } from '../../api';
 const SIGNAL: Record<string, { label: string; cls: string; tone: string }> = {
   STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success',              tone: 'success' },
   HOLD:           { label: 'HOLD',           cls: 'badge-success badge-outline', tone: 'success' },
-  CONSIDER_CLOSE: { label: 'CONSIDER CLOSE', cls: 'badge-warning',               tone: 'warning' },
-  CLOSE:          { label: 'CLOSE',          cls: 'badge-error',                 tone: 'error' },
+  CLOSE:          { label: 'CLOSE',          cls: 'badge-warning',               tone: 'warning' },
+  STRONG_CLOSE:   { label: 'STRONG CLOSE',   cls: 'badge-error',                 tone: 'error' },
 };
 
 const GROUP = 'text-[9px] uppercase tracking-wider text-base-content/40 mb-1';
@@ -54,12 +54,17 @@ export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
         <span className="text-sm font-bold">{ma.score}<span className="text-[10px] text-base-content/40">/100</span></span>
       </div>
 
+      {/* Structural advice — covered vs naked call (capital already committed) */}
+      {ma.advisories && ma.advisories.length > 0 && ma.advisories.map((a, i) => (
+        <div key={i} className="text-[11px] rounded-lg border border-warning/25 bg-warning/[0.06] px-2 py-1.5 text-warning/90 leading-snug">{a}</div>
+      ))}
+
       {/* The implied-vs-physical boundary — does spot clear both bands vs your strike? */}
       {qp && <QpBoundary qp={qp} />}
 
-      {/* Anchor — the probability of KEEPING the edge (drift-adjusted) */}
+      {/* Baseline — neutral 50; the re-signed factors move it toward hold or close */}
       <div className="flex items-baseline gap-2">
-        <span className={GROUP}>Anchor · {ma.anchor_label}</span>
+        <span className={GROUP}>{ma.anchor_label}</span>
         <span className="text-sm font-bold text-base-content/80 ml-auto">{ma.anchor}</span>
       </div>
 

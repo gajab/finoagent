@@ -67,6 +67,63 @@ export async function fetchTechnicalForTimeframe(
   );
 }
 
+// Microstructure & multi-timeframe volume profile
+export async function fetchMicrostructure(
+  ticker: string,
+): Promise<import('./types').MicrostructureResponse> {
+  return apiFetch<import('./types').MicrostructureResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/microstructure`,
+  );
+}
+
+// Multi-timeframe market structure, liquidity pools & mitigation confluence
+export async function fetchMarketStructure(
+  ticker: string,
+): Promise<import('./types').MarketStructureResponse> {
+  return apiFetch<import('./types').MarketStructureResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/market-structure`,
+  );
+}
+
+// Market regime & statistical extremes
+export async function fetchRegime(
+  ticker: string,
+): Promise<import('./types').RegimeResponse> {
+  return apiFetch<import('./types').RegimeResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/regime`,
+  );
+}
+
+// Dealer positioning (GEX / gamma flip / expected move)
+export async function fetchDealerPositioning(
+  ticker: string,
+): Promise<import('./types').DealerPositioningResponse> {
+  return apiFetch<import('./types').DealerPositioningResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/dealer-positioning`,
+  );
+}
+
+// Trade-setup engine — fused, ranked setups
+export async function fetchTradeSetups(
+  ticker: string,
+): Promise<import('./types').TradeSetupsResponse> {
+  return apiFetch<import('./types').TradeSetupsResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/trade-setups`,
+  );
+}
+
+// Generic "analyze the selected TA indicators" — shared by every TA panel.
+export async function analyzeTa(
+  ticker: string,
+  selection: Record<string, unknown>,
+  messages: import('./types').MicroChatMessage[],
+): Promise<import('./types').MicroChatMessage> {
+  return apiFetch<import('./types').MicroChatMessage>(
+    `/api/stock/${encodeURIComponent(ticker)}/ta/analyze`,
+    { method: 'POST', body: JSON.stringify({ selection, messages }) },
+  );
+}
+
 // ===== Portfolio =====
 
 export async function fetchPortfolioSummary(): Promise<PortfolioSummary> {
@@ -641,6 +698,24 @@ export async function runDerivativeIncome(ticker: string, params: {
   });
 }
 
+export async function runDeskMonitor(ticker: string, trade: {
+  structure: string; put_short?: number | null; call_short?: number | null;
+  credit?: number; spot?: number | null; dte?: number;
+}): Promise<import('./types').MonitorPlan> {
+  return apiFetch<import('./types').MonitorPlan>(
+    `/api/stock/${encodeURIComponent(ticker)}/desk-review/monitor`,
+    { method: 'POST', body: JSON.stringify(trade) },
+  );
+}
+
+export async function runDeskMonitorAnalyze(ticker: string, trade: {
+  structure: string; put_short?: number | null; call_short?: number | null;
+  credit?: number; spot?: number | null; dte?: number; model?: string;
+}): Promise<{ content?: string; error?: string; levels_found?: number }> {
+  return apiFetch(`/api/stock/${encodeURIComponent(ticker)}/desk-review/monitor/analyze`,
+    { method: 'POST', body: JSON.stringify(trade) });
+}
+
 export async function runDerivativeIncomePortfolio(params: {
   offset?: number;
   limit?: number;
@@ -681,8 +756,6 @@ export type DeskFocusTrade = { structure: string; expiration?: string | null; sh
 export type EvaluateLeg = { action: 'BUY' | 'SELL'; type: 'CALL' | 'PUT'; strike: number; expiration: string };
 export type DeskEvaluateParams = {
   legs: EvaluateLeg[];
-  stock_shares?: number;
-  cost_basis?: number | null;
   quote_source?: string;
   owns_underlying?: boolean;
 };
@@ -1238,7 +1311,7 @@ export interface TradeAnalysis {
   hold_vs_close_reasons: string[];
   dte_remaining: number;
   recommendation?: TradeRecommendation;
-  exit_signal?: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  exit_signal?: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   exit_reasons?: string[];
   captured_pct?: number | null;
   quant_exit?: QuantExit | null;
@@ -1254,10 +1327,10 @@ export interface ManagementFactor {
 }
 
 export interface QuantExit {
-  signal: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  signal: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   score: number;              // 0-100 hold conviction
-  hold_base: number;          // the MANAGEMENT anchor (keep-prob / PoP) — drives the buildup
-  base_source: 'keep_prob_drift' | 'pop';
+  hold_base: number;          // neutral-50 baseline shifted by the holder factors — drives the buildup
+  base_source: string;        // 'neutral' (deep) | 'hold' (light)
   base_quality?: number | null; // entry 5-lens score — REFERENCE only, not the anchor
   subscores?: { edge: number; pop: number; sortino: number; tail: number; carry: number };
   adjustments: { name: string; pts: number; note: string }[];
@@ -1334,6 +1407,35 @@ export async function fetchUnderlyingDesk(id: number, quoteSource = 'yfinance'):
   return apiFetch<UnderlyingDeskResult>(`/api/saved-strategies/${id}/underlying-desk?quote_source=${encodeURIComponent(quoteSource)}`);
 }
 
+// Institutional book-level short-vol / tail-risk desk.
+export interface BookHedgeCandidate {
+  label: string; long_put: number; short_put: number | null; contracts: number;
+  cost_per_spread: number; total_cost: number; annual_bleed: number;
+  crash_payoff_20: number; offsets_pct: number | null; cvar_reduction: number;
+  efficiency: number | null; cagr_lift_pct: number; cost_effective: boolean; recommended?: boolean;
+  index?: string; pricing?: string; dte_days?: number; expiry?: string | null;
+}
+export interface BookTailRiskResult {
+  positions: number;
+  error?: string;
+  net_delta?: number; net_gamma?: number; net_vega?: number; net_theta?: number;
+  net_delta_notional?: number; beta_delta_notional?: number; beta_delta_spy?: number | null;
+  book_capital?: number; annual_income?: number;
+  theta_net_liq_pct?: number | null; carry_yield_pct?: number | null; cvar_capital_pct?: number | null;
+  short_vol?: boolean; avg_beta?: number;
+  var_95?: number | null; cvar_95?: number | null; var_99?: number | null; cvar_99?: number | null;
+  horizon?: string;
+  concentration?: { ticker: string; trades: number; short_legs: number; net_gamma: number; net_vega: number; net_delta: number; beta?: number; gamma_share_pct: number; laddered: boolean; flags: string[] }[];
+  crash_scenarios?: { label: string; move_pct: number; pnl: number; pct_of_capital: number | null }[];
+  hedge_menu?: BookHedgeCandidate[];
+  hedge_note?: string | null;
+  verdict?: { level: string; summary: string; actions: string[] };
+  assumptions?: { beta: string; mkt_vol_pct?: number; tail?: string; crash_prob_annual_pct: number; hedge_rolls_per_year: number };
+}
+export async function fetchBookTailRisk(quoteSource = 'yfinance'): Promise<BookTailRiskResult> {
+  return apiFetch<BookTailRiskResult>(`/api/saved-strategies/book-tail-risk?quote_source=${encodeURIComponent(quoteSource)}`);
+}
+
 export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance', marginMode?: string): Promise<LivePnlResponse> {
   const mm = marginMode || (typeof localStorage !== 'undefined' && localStorage.getItem('margin.mode') === 'portfolio' ? 'portfolio' : 'reg_t');
   return apiFetch<LivePnlResponse>(`/api/saved-strategies/${id}/live-pnl?quote_source=${encodeURIComponent(quoteSource)}&margin_mode=${encodeURIComponent(mm)}`);
@@ -1389,10 +1491,10 @@ export interface DeskScoreResult {
   spot?: number;
   lifecycle_adjustments?: { name: string; pts: number; note: string }[];
   lifecycle_score?: number;
-  signal?: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  signal?: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   overrides?: string[];
-  hold_base?: number;                    // MANAGEMENT anchor (drift-adjusted keep-prob)
-  base_source?: string;                  // 'keep_prob_drift' | 'pop'
+  hold_base?: number;                    // neutral-50 baseline (holder factors move it)
+  base_source?: string;                  // 'neutral' (deep) | 'hold' (light)
   management_analysis?: ManagementAnalysis; // deep read: scan factors re-signed for the holder
 }
 
@@ -1405,14 +1507,15 @@ export interface ManagementContribution {
 }
 // The deep management read — scan factors re-signed + take-profit/time overlay → hold/close.
 export interface ManagementAnalysis {
-  anchor: number;                 // keep-prob (drift-adjusted) — the base
+  anchor: number;                 // neutral 50 baseline — the re-signed factors move it
   anchor_label: string;
   contributions: ManagementContribution[]; // re-signed scan factors (VRP/Moneyness/TA/…)
   factors_net: number;
   overlay: { name: string; pts: number; note: string }[]; // take-profit / time-gamma
   score: number;
-  signal: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  signal: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   overrides: string[];
+  advisories?: string[];          // covered / naked call structural advice
 }
 
 export async function runDeskScore(
@@ -1428,7 +1531,7 @@ export async function runDeskScore(
 
 export interface LifecycleManagerResult {
   role: string; title: string;
-  signal: 'STRONG_HOLD' | 'HOLD' | 'CONSIDER_CLOSE' | 'CLOSE';
+  signal: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   action_needed: boolean; content: string; model: string;
 }
 

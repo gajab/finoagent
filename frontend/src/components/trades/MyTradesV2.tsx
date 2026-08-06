@@ -43,6 +43,7 @@ import PayoffChart from './PayoffChart';
 import InstitutionalDesk from './InstitutionalDesk';
 import QuantExitCard from './QuantExitCard';
 import CloseTradeModal from './CloseTradeModal';
+import BookTailRisk from './BookTailRisk';
 import CollapsibleSection from './CollapsibleSection';
 import { DeskDebate } from '../DeskDebate';
 import { TickerChrome } from '../DerivativeIncome';
@@ -74,8 +75,8 @@ function LegActionBadge({ advice }: { advice?: LegAdvice }) {
 const EXIT_STYLE: Record<string, { label: string; cls: string }> = {
   STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success' },
   HOLD:           { label: 'HOLD',           cls: 'badge-success badge-outline' },
-  CONSIDER_CLOSE: { label: 'CONSIDER CLOSE', cls: 'badge-warning' },
-  CLOSE:          { label: 'CLOSE',          cls: 'badge-error' },
+  CLOSE:          { label: 'CLOSE',          cls: 'badge-warning' },
+  STRONG_CLOSE:   { label: 'STRONG CLOSE',   cls: 'badge-error' },
 };
 
 /** Neutral intensity by magnitude — the Action badge carries the good/bad verdict. */
@@ -259,10 +260,15 @@ function deskFocusForTrade(trade: SavedStrategyItem, pnl?: LivePnlResponse | nul
   if (hasStock && sc.length === 1 && lp.length === 0) { structure = 'covered_call'; shortStrike = sc[0].strike; }
   else if (hasStock && sc.length === 1 && lp.length === 1) { structure = 'collar'; shortStrike = sc[0].strike; }
   else if (!hasStock && sp.length === 1 && opts.length === 1) { structure = 'cash_secured_put'; shortStrike = sp[0].strike; }
-  else if (sp.length === 1 && lp.length === 1 && sc.length === 0 && lc.length === 0) { structure = 'put_credit_spread'; shortStrike = sp[0].strike; }
+  // A bare short call — NAKED (no stock). Same short-call option-math as a covered call
+  // (VRP / moneyness / delta / skew / keep-prob), but the deep read carries the true
+  // unbounded-upside risk + naked advice, distinct from a covered call.
+  else if (!hasStock && sc.length === 1 && opts.length === 1) { structure = 'naked_call'; shortStrike = sc[0].strike; }
   else if (sc.length === 1 && lc.length === 1 && sp.length === 0 && lp.length === 0) { structure = 'call_credit_spread'; shortStrike = sc[0].strike; }
+  else if (sp.length === 1 && lp.length === 1 && sc.length === 0 && lc.length === 0) { structure = 'put_credit_spread'; shortStrike = sp[0].strike; }
   else if (sp.length === 1 && lp.length === 1 && sc.length === 1 && lc.length === 1) { structure = 'iron_condor'; shortStrike = sp[0].strike; }
   else if (sp.length === 1 && sc.length === 1 && lc.length === 1 && lp.length === 0) { structure = 'jade_lizard'; shortStrike = sc[0].strike; }
+  else if (sp.length === 1 && sc.length === 1 && lc.length === 0 && lp.length === 0) { structure = 'short_strangle'; shortStrike = sp[0].strike; }
 
   // Unrecognized multi-leg / custom structure — STILL surface the button on every
   // options trade (the user's #1 ask). The backend prices the scan-supported
@@ -1748,7 +1754,7 @@ function TradeCard({
           {/* Quant advisor — overall recommendation folding per-leg + structure */}
           {pnl?.analysis?.recommendation && (() => {
             const exitSig = pnl.analysis.exit_signal || 'HOLD';
-            const tone = exitSig === 'CLOSE' ? 'error' : exitSig === 'CONSIDER_CLOSE' ? 'warning' : 'success';
+            const tone = exitSig === 'STRONG_CLOSE' ? 'error' : exitSig === 'CLOSE' ? 'warning' : 'success';
             return (
             <div className={`rounded-lg p-3 border bg-${tone}/5 border-${tone}/20`}>
               <div className="flex items-center gap-2 mb-1.5 flex-wrap">
@@ -2521,6 +2527,11 @@ export default function MyTradesV2() {
               : 'Closed trades will appear here.'}
           </p>
         </div>
+      )}
+
+      {/* Book-level short-vol / tail-risk desk (active book only) */}
+      {!loading && activeStatus === 'active' && trades.length > 0 && (
+        <BookTailRisk quoteSource={quoteSource} />
       )}
 
       {/* Groups */}

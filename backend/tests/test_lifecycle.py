@@ -15,8 +15,9 @@ from app.services.lifecycle_service import (
 
 
 class TestManagementDeskScore:
-    """The DEEP management read must LEVERAGE the scan's factors — re-signed for a
-    holder — not discard them. Poor ENTRY (desk score 21) but a clear HOLD live."""
+    """The DEEP management read starts from a NEUTRAL 50 baseline and lets the scan's
+    factors — re-signed for a holder — decide keep-vs-close (it does NOT anchor on
+    keep-prob). Same auditable build-up as the scan."""
 
     def _scan_like(self, **over):
         base = dict(
@@ -34,7 +35,7 @@ class TestManagementDeskScore:
     def test_poor_entry_is_a_hold_when_held(self):
         r = self._scan_like()
         assert r["signal"] in ("STRONG_HOLD", "HOLD")
-        assert r["anchor"] == pytest.approx(98.3)
+        assert r["anchor"] == 50   # neutral baseline — keep-prob is no longer the anchor
 
     def test_vrp_flips_to_a_holder_positive(self):
         # Entry VRP demerit (-9 for cheap implied) becomes a holder POSITIVE (vol decay).
@@ -48,32 +49,42 @@ class TestManagementDeskScore:
 
     def test_banked_winner_still_closes(self):
         r = self._scan_like(captured_pct=90.0)
-        assert r["signal"] == "CLOSE"
+        assert r["signal"] == "STRONG_CLOSE"
 
-    def test_tested_strike_forces_at_least_consider_close(self):
+    def test_tested_strike_forces_at_least_close(self):
         r = self._scan_like(cushion_pct=-1.0)
-        assert r["signal"] in ("CONSIDER_CLOSE", "CLOSE")
+        assert r["signal"] in ("CLOSE", "STRONG_CLOSE")
+
+    def test_naked_call_flags_unbounded_risk(self):
+        r = self._scan_like(structure="naked_call")
+        assert any("unbounded" in a.lower() for a in r["advisories"])
+        assert any(c["label"] == "Naked risk" and c["pts"] < 0 for c in r["contributions"])
+
+    def test_covered_call_advises_on_assignment_not_loss(self):
+        r = self._scan_like(structure="covered_call")
+        assert any("called away" in a.lower() for a in r["advisories"])
+        assert not any(c["label"] == "Naked risk" for c in r["contributions"])
 
 
 class TestManagementExit:
-    """The MANAGEMENT recommendation must be anchored on the position's chance of
-    KEEPING its edge — NOT the entry desk score (which marks every short-premium
-    trade poorly). A high-keep-prob winner is a HOLD, never a CLOSE."""
+    """The MANAGEMENT recommendation starts from a NEUTRAL 50 and lets the holder
+    factors (keep-prob, vol decay, cushion, trend) push it toward HOLD or CLOSE —
+    NOT anchored on the entry desk score, NOR floored at the raw keep-prob."""
 
     def test_high_keep_prob_winner_holds_not_closes(self):
-        # The Intel regression: entry desk score was 33/F → CLOSE. Management,
-        # anchored on drift-adjusted keep prob 82.7 with only 30% captured, HOLDS.
+        # The Intel regression: entry desk score was 33/F → CLOSE. Management, with a
+        # safe keep-prob (82.7) and only 30% captured, still HOLDS off the neutral base.
         r = management_exit(pop_pct=96.2, keep_drift_pct=82.7, captured_pct=30.0,
                             dte_days=12, unrealized_pnl=150, max_profit=500, max_loss=-3000,
                             iv_pct=84.8, hv_pct=97.6, cushion_pct=32.6, theta_per_day=5.0)
         assert r["signal"] in ("STRONG_HOLD", "HOLD")
-        assert r["base_source"] == "keep_prob_drift" and r["hold_base"] == pytest.approx(82.7)
+        assert r["base_source"] == "hold" and r["hold_base"] == 62   # 50 + keep/vol/cushion − trend
 
     def test_take_profit_override_still_closes_a_banked_winner(self):
         # 90% of max profit captured → bank it regardless of keep prob.
         r = management_exit(pop_pct=95.0, keep_drift_pct=95.0, captured_pct=90.0,
                             dte_days=20, unrealized_pnl=450, max_profit=500, max_loss=-3000)
-        assert r["signal"] == "CLOSE"
+        assert r["signal"] == "STRONG_CLOSE"
 
     def test_falling_iv_is_favorable_for_the_holder(self):
         # IV below realized is an ENTRY demerit but FAVORABLE for someone short premium.
@@ -82,9 +93,20 @@ class TestManagementExit:
         vol = next(f for f in r["factors"] if f["label"] == "Vol decay")
         assert vol["favorable"] is True
 
-    def test_falls_back_to_pop_when_no_drift(self):
+    def test_uses_pop_for_keep_factor_when_no_drift(self):
+        # No drift → the keep-prob factor is fed by standard PoP; base stays neutral-anchored.
         r = management_exit(pop_pct=88.0, captured_pct=10.0, dte_days=30, theta_per_day=2.0)
-        assert r["base_source"] == "pop" and r["hold_base"] == pytest.approx(88.0)
+        assert r["base_source"] == "hold" and r["hold_base"] == 58   # 50 + keep-prob(+8)
+        assert r["signal"] in ("STRONG_HOLD", "HOLD")
+
+    def test_negative_captured_reads_as_underwater_not_theta_left(self):
+        # A losing short-premium trade (captured < 0) must NOT say "premium still to decay".
+        r = management_exit(pop_pct=40.0, captured_pct=-129.0, dte_days=20,
+                            iv_pct=30.0, hv_pct=40.0, theta_per_day=3.0)
+        labels = [f["label"] for f in r["factors"]]
+        assert "Underwater" in labels and "Theta left" not in labels
+        uw = next(f for f in r["factors"] if f["label"] == "Underwater")
+        assert uw["favorable"] is False and "129%" in uw["note"]
 
 
 class TestHigherOrderGreeks:
@@ -293,19 +315,19 @@ class TestAlgorithmicExit:
 
     def test_85pct_capture_forces_close(self):
         r = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 15, captured_pct=90, unrealized_pnl=90)
-        assert r["signal"] == "CLOSE" and any("captured" in o for o in r["overrides"])
+        assert r["signal"] == "STRONG_CLOSE" and any("captured" in o for o in r["overrides"])
 
     def test_near_max_loss_forces_close(self):
         r = algorithmic_exit(self._GOOD, 400, 20000, -1000, 100, 0.1, 30, captured_pct=5, unrealized_pnl=-850)
-        assert r["signal"] == "CLOSE"
+        assert r["signal"] == "STRONG_CLOSE"
 
     def test_expiry_gamma_override(self):
         r = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 1, captured_pct=20, unrealized_pnl=20)
-        assert r["signal"] in ("CONSIDER_CLOSE", "CLOSE")
+        assert r["signal"] in ("CLOSE", "STRONG_CLOSE")
 
     def test_weak_trade_closes(self):
         r = algorithmic_exit(self._BAD, 5000, 20000, -19000, 100, 0.0, 30, captured_pct=5, unrealized_pnl=5)
-        assert r["signal"] in ("CONSIDER_CLOSE", "CLOSE") and r["score"] < 45
+        assert r["signal"] in ("CLOSE", "STRONG_CLOSE") and r["score"] < 45
 
     def test_buildup_is_auditable(self):
         r = algorithmic_exit(self._GOOD, 400, 20000, -19000, 100, 0.1, 20, 60, 60)
