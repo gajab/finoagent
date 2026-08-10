@@ -367,6 +367,23 @@ def _weighted_var_cvar(pnl_mid: np.ndarray, w: np.ndarray, alpha: float = 0.05) 
     return round(max(var, 0.0), 2), round(max(cvar, 0.0), 2)
 
 
+def _full_tail_var_cvar(life_legs, stock_shares, spot, w_iv, dte_days, r, alphas=(0.05, 0.01)) -> dict:
+    """Deterministic FULL-TAIL VaR/CVaR: integrate the terminal P&L against the lognormal density on a WIDE,
+    FINE price grid (≈1% → 3× spot) so the deep crash tail is NOT truncated — the ±50% scenario grid misses
+    a near-zero collapse, which is exactly where a 99% CVaR on a high-win short lives. This is analytical in
+    spirit (an exact quadrature over the risk-neutral/physical law), not a random Monte-Carlo simulation.
+    Returns {alpha: (var$, cvar$)} — cvar is the mean loss in the worst-α tail (Expected Shortfall)."""
+    curve = terminal_payoff_curve(life_legs, stock_shares, spot, lo=-0.985, hi=2.0, step=0.005)
+    prices = np.array([c["price"] for c in curve], dtype=float)
+    pnls = np.array([c["pnl"] for c in curve], dtype=float)
+    w = _lognormal_weights(prices, spot, w_iv, dte_days, r)
+    if w.sum() <= 0:
+        return {a: (None, None) for a in alphas}
+    pnl_mid = (pnls[:-1] + pnls[1:]) / 2.0
+    wn = w / w.sum()
+    return {a: _weighted_var_cvar(pnl_mid, wn, a) for a in alphas}
+
+
 def _kelly_fraction(rets: np.ndarray, w: np.ndarray) -> Optional[float]:
     """Continuous Kelly on the return distribution: f* = E[r] / E[r²], clamped to
     [0,1] — a distribution-wide analogue of the binary Kelly."""
@@ -902,7 +919,7 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
     w_iv = max([v for v in (implied, realized) if v] or [0]) or 0.30
     pm = {"pop": None, "expected_value": None, "omega": None, "sortino": None,
           "calmar": None, "expected_return_pct": None, "downside_dev_pct": None}
-    var95 = cvar95 = kelly = None
+    var95 = cvar95 = var99 = cvar99 = kelly = None
     if scenarios and len(scenarios) >= 3 and dte_days and dte_days > 0:
         prices = np.array([s["price"] for s in scenarios], dtype=float)
         pnls = np.array([s["pnl"] for s in scenarios], dtype=float)
@@ -910,16 +927,32 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
         pm = payoff_distribution_metrics(prices, pnls, w, capital, max_loss, dte_days)
         pnl_mid = (pnls[:-1] + pnls[1:]) / 2.0
         wn = w / w.sum() if w.sum() > 0 else w
-        var95, cvar95 = _weighted_var_cvar(pnl_mid, wn)
+        # VaR/CVaR at BOTH 95% and 99%. Single-expiry → a full-tail deterministic quadrature (near-0 → 3×
+        # spot) so a 99% CVaR on a high-win short captures the deep crash the ±50% grid truncates.
+        # Multi-expiry (calendars) keep the horizon-scenario grid (a terminal curve would misprice the back leg).
+        multi_exp = len({round(float(l.get("dte_years") or 0.0), 6) for l in (life_legs or [])}) > 1
+        if life_legs and not multi_exp:
+            _tv = _full_tail_var_cvar(life_legs, stock_shares, spot, w_iv, dte_days, r, (0.05, 0.01))
+            var95, cvar95 = _tv[0.05]
+            var99, cvar99 = _tv[0.01]
+        else:
+            var95, cvar95 = _weighted_var_cvar(pnl_mid, wn, 0.05)
+            var99, cvar99 = _weighted_var_cvar(pnl_mid, wn, 0.01)
         if capital and capital > 0:
             kelly = _kelly_fraction(pnl_mid / capital, wn)
 
-    quant = algorithmic_quant(pm, cvar95, capital, max_loss, max_profit, kelly, dte_days, sofr_pct)
+    # A 95% tail is useless for a >95%-win short (the 5th percentile is still profit), so escalate the
+    # HEADLINE tail to 99% there — and score the trade on that honest deep tail, not the benign 5% one.
+    pop_val = pm.get("pop")
+    tail_pctile = 99 if (pop_val is not None and pop_val > 95) else 95
+    tail_cvar = cvar99 if (tail_pctile == 99 and cvar99 is not None) else cvar95
+    quant = algorithmic_quant(pm, tail_cvar, capital, max_loss, max_profit, kelly, dte_days, sofr_pct)
     vrp_ratio = (implied / realized) if (implied and realized) else None   # < 1 = negative VRP
     return {
         "trader": {**trader, "avg_iv_pct": round(avg_iv * 100, 1) if (avg_iv and avg_iv > 0) else None},
         "pm": {**pm, "kelly_fraction": kelly},
-        "risk": {"var_95": var95, "cvar_95": cvar95,
+        "risk": {"var_95": var95, "cvar_95": cvar95, "var_99": var99, "cvar_99": cvar99,
+                 "tail_pctile": tail_pctile,
                  "max_loss": round(max_loss, 2) if max_loss is not None else None,
                  "max_profit": round(max_profit, 2) if max_profit is not None else None,
                  "capital": round(capital, 2) if capital else None},

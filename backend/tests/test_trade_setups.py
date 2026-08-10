@@ -23,7 +23,7 @@ class TestCollectLevels:
                   "expected_move": {"em_30d": {"upper": 105, "lower": 95}}}
         levels = _collect_levels(None, None, None, dealer, spot=100.0)
         by = {l["label"]: l for l in levels}
-        assert by["Call wall"]["kind"] == "resistance" and by["Put wall"]["kind"] == "support"
+        assert by["Call Resistance"]["kind"] == "resistance" and by["Put Support"]["kind"] == "support"
         assert "Gamma flip" in by and by["Gamma flip"]["kind"] == "magnet"
 
     def test_micro_poc_is_magnet(self):

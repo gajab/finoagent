@@ -62,16 +62,24 @@ export function PmGrid({ pm }: { pm: PmMetricsData }) {
 }
 
 export interface RiskMetricsData {
-  var_95?: number | null; cvar_95?: number | null; max_loss?: number | null; max_profit?: number | null; capital?: number | null;
+  var_95?: number | null; cvar_95?: number | null; var_99?: number | null; cvar_99?: number | null;
+  tail_pctile?: number | null;   // 99 for >95%-win shorts (a 95% tail is ~0 there), else 95
+  max_loss?: number | null; max_profit?: number | null; capital?: number | null;
 }
 
 export function RiskGrid({ r, basis, notional }: { r: RiskMetricsData; basis?: string; notional?: number | null }) {
-  const tailPct = r.cvar_95 != null && r.capital ? (r.cvar_95 / r.capital) * 100 : null;
   const isMargin = basis === 'reg_t_margin';
+  // Escalate the displayed tail to 99% for a >95%-win short (a 95% VaR is ~$0 there and hides the real risk).
+  const p = r.tail_pctile === 99 ? 99 : 95;
+  const vaR = p === 99 ? r.var_99 : r.var_95;
+  const cvaR = p === 99 ? r.cvar_99 : r.cvar_95;
+  const tailPct = cvaR != null && r.capital ? (cvaR / r.capital) * 100 : null;
   return (
     <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-      <Metric label="VaR 95%" value={r.var_95 != null ? fmtMoney(r.var_95) : '—'} hint="1-in-20 loss over the horizon (position)" color="text-warning/80" />
-      <Metric label="CVaR 95%" value={r.cvar_95 != null ? fmtMoney(r.cvar_95) : '—'} hint="Expected shortfall — average of the worst 5% outcomes" color="text-error/80" />
+      <Metric label={`VaR ${p}%`} value={vaR != null ? fmtMoney(vaR) : '—'}
+        hint={p === 99 ? '1-in-100 loss over the horizon — escalated to 99% because this is a >95%-win short (its 95% VaR is ~$0 and hides the tail).' : '1-in-20 loss over the horizon (position).'} color="text-warning/80" />
+      <Metric label={`CVaR ${p}%`} value={cvaR != null ? fmtMoney(cvaR) : '—'}
+        hint={`Expected shortfall — the mean loss in the worst ${100 - p}% tail, from an analytical full-tail integration (near-0 → 3× spot), so the deep crash isn't truncated.`} color="text-error/80" />
       <Metric label="Tail / Capital" value={tailPct != null ? `${tailPct.toFixed(0)}%` : '—'} hint="CVaR95 as a fraction of capital committed" color={tailPct != null && tailPct <= 25 ? 'text-success/80' : 'text-warning/80'} />
       <Metric label="Max Profit" value={r.max_profit != null ? fmtMoney(r.max_profit) : '—'} hint="Best-case payoff" color="text-success/80" />
       <Metric label="Max Loss" value={r.max_loss != null ? fmtMoney(r.max_loss) : '—'} hint="Worst-case payoff (deep tail)" color="text-error/80" />

@@ -795,7 +795,8 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
                 iv_rank: Optional[float], beta: Optional[float],
                 hv: Optional[float] = None, gex: Optional[dict] = None,
                 macd: Optional[dict] = None, overwrite: bool = False,
-                next_earnings: Optional[str] = None, today=None) -> dict:
+                next_earnings: Optional[str] = None, today=None,
+                har_rv_pct: Optional[float] = None) -> dict:
     pm = (dm or {}).get("pm") or {}
     merits, demerits, blocking = [], [], []
     # VRP ratio is GAP-AWARE: implied ÷ the physical vol used everywhere (max of HV and ATR), so the
@@ -833,12 +834,26 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
         if iv_hv >= 1.1 and (iv_rank or 0) >= 50:
             merits.append(f"rich VRP (IV/HV {iv_hv}, IV-rank {iv_rank})"); comp["vrp"] += 6
         elif iv_hv < 1.0:
-            pen = min(round((1.0 - iv_hv) * _VRP_PENALTY_K), _VRP_PENALTY_CAP)   # magnitude-scaled by the gap
-            if pen > 0:
-                comp["vrp"] -= pen
-                demerits.append(f"negative VRP — implied {round(iv_hv*100)}% of realized (IV/HV {iv_hv})")
-            if iv_hv < _VRP_BLOCK_RATIO:
-                blocking.append(f"crushed vol — implied only {round(iv_hv*100)}% of realized (negative VRP, no edge)")
+            # VRP vs the FORWARD RV forecast (HAR), not just trailing HV. Trailing realized is often
+            # spike-inflated by a PAST event (an earnings/gap day) and is mean-reverting DOWN — so
+            # "IV < trailing HV" can be a REASONABLE post-event crush, not a no-edge trap. Only hard-VETO
+            # when the vol is crushed vs the FORWARD forecast too; otherwise it's still-elevated premium
+            # normalising, so downgrade softly and keep the opportunity.
+            iv_har = ((atm_iv_pct / 100.0) / (har_rv_pct / 100.0)) if (atm_iv_pct and har_rv_pct and har_rv_pct > 0) else None
+            reasonable_crush = iv_har is not None and iv_har >= _VRP_BLOCK_RATIO   # OK vs the forward RV forecast
+            if reasonable_crush:
+                comp["vrp"] -= 3
+                demerits.append(f"cheap vs trailing HV (IV/HV {iv_hv}) but FAIR vs the forward RV forecast "
+                                f"(IV/HAR {round(iv_har, 2)}) — trailing realized is spike-inflated & reverting down; "
+                                f"premium still sellable (not a no-edge veto)")
+            else:
+                pen = min(round((1.0 - iv_hv) * _VRP_PENALTY_K), _VRP_PENALTY_CAP)   # magnitude-scaled by the gap
+                if pen > 0:
+                    comp["vrp"] -= pen
+                    demerits.append(f"negative VRP — implied {round(iv_hv*100)}% of realized (IV/HV {iv_hv})")
+                if iv_hv < _VRP_BLOCK_RATIO:
+                    _fwd = f" AND {round(iv_har*100)}% of forward RV" if iv_har is not None else ""
+                    blocking.append(f"crushed vol — implied only {round(iv_hv*100)}% of trailing realized{_fwd} (negative VRP, no edge)")
 
     # 3) Moneyness — a near-ATM short leg makes 'income' a DIRECTIONAL bet. Measured against the DUAL
     #    boundary (the WIDER of the implied Q-move and the physical P-move), so a strike that looks
@@ -1908,7 +1923,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
         g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
                         hv=phys_vol, gex=gex, macd=macd_accel, overwrite=overwrite,
-                        next_earnings=(ctx or {}).get("next_earnings"), today=date.today())
+                        next_earnings=(ctx or {}).get("next_earnings"), today=date.today(),
+                        har_rv_pct=vsx.get("har_rv_pct"))
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
         grade, approval = _grade_letter(desk_score, g["blocking"])
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime

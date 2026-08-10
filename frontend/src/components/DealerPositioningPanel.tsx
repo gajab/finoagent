@@ -8,6 +8,7 @@ import { Line } from 'react-chartjs-2';
 import { fetchDealerPositioning, analyzeTa } from '../api';
 import type { DealerPositioningData } from '../types';
 import IndicatorAIConsole from './IndicatorAIConsole';
+import GexChart from './GexChart';
 import { makeLevelPlugin, type OverlayLine, type OverlayBand } from './taOverlay';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip);
@@ -21,29 +22,39 @@ function buildLayers(d: DealerPositioningData): Layer[] {
   const out: Layer[] = [];
   const g = d.net_gex;
   out.push({
-    id: 'net_gex', group: 'Gamma', tone: g.sign === 'long' ? 'text-info' : 'text-warning', color: 'rgb(148,163,184)',
+    id: 'net_gex', group: 'Regime', tone: g.sign === 'long' ? 'text-info' : 'text-warning', color: 'rgb(148,163,184)',
     label: `Net GEX ${g.value_millions ?? '—'}M (${g.sign} gamma)`, sub: g.sign === 'long' ? 'vol suppressed / pin' : 'vol expansion / trend',
     json: { indicator: 'net_gex', value_millions: g.value_millions, sign: g.sign, label: g.label },
   });
+  const gl = d.gamma_levels;
   if (d.gamma_flip?.level != null) {
     const f = d.gamma_flip;
     out.push({
-      id: 'gamma_flip', group: 'Gamma', tone: 'text-amber-400', color: 'rgb(251,191,36)',
-      label: `Gamma flip $${f.level}`, sub: `spot ${f.side} flip (${f.distance_pct}% )`,
-      lines: [{ price: f.level as number, label: `Gamma flip $${f.level}`, color: 'rgb(251,191,36)' }],
+      id: 'gamma_flip', group: 'Key levels', tone: 'text-amber-400', color: 'rgb(251,191,36)',
+      label: `Gamma flip $${f.level}`, sub: `spot ${f.side} flip (${f.distance_pct}%) — vol-regime pivot`,
+      lines: [{ price: f.level as number, label: `γ-flip $${f.level}`, color: 'rgb(251,191,36)', dash: [1, 2] }],
       json: { indicator: 'gamma_flip', level: f.level, side: f.side, distance_pct: f.distance_pct, note: f.note },
     });
   }
-  const w = d.walls;
-  if (w.call_wall?.strike != null || w.put_wall?.strike != null) {
-    const lines: OverlayLine[] = [];
-    if (w.call_wall?.strike != null) lines.push({ price: w.call_wall.strike, label: `Call wall $${w.call_wall.strike}`, color: RED, dash: [5, 3] });
-    if (w.put_wall?.strike != null) lines.push({ price: w.put_wall.strike, label: `Put wall $${w.put_wall.strike}`, color: GREEN, dash: [5, 3] });
+  const addLevel = (id: string, lvl: { strike: number | null; distance_pct: number | null; gex_millions?: number | null } | null | undefined,
+                    name: string, color: string, tone: string, note: string) => {
+    if (!lvl?.strike) return;
     out.push({
-      id: 'walls', group: 'Gamma', tone: 'text-base-content/70', color: 'rgb(148,163,184)',
-      label: 'Gamma walls', sub: `call $${w.call_wall?.strike ?? '—'} · put $${w.put_wall?.strike ?? '—'}`,
-      lines, json: { indicator: 'gamma_walls', call_wall: w.call_wall, put_wall: w.put_wall, by_strike: w.by_strike },
+      id, group: 'Key levels', tone, color,
+      label: `${name} $${lvl.strike}`,
+      sub: `${lvl.distance_pct != null ? `${lvl.distance_pct > 0 ? '+' : ''}${lvl.distance_pct}% vs spot · ` : ''}${note}`,
+      lines: [{ price: lvl.strike, label: `${name} $${lvl.strike}`, color, dash: [5, 3] }],
+      json: { indicator: id, strike: lvl.strike, distance_pct: lvl.distance_pct, gex_millions: lvl.gex_millions ?? null },
     });
+  };
+  if (gl) {
+    addLevel('call_resistance', gl.call_resistance, 'Call Resistance', RED, 'text-error', 'biggest +GEX — caps rallies');
+    addLevel('put_support', gl.put_support, 'Put Support', GREEN, 'text-success', 'biggest −GEX — floors dips');
+    addLevel('hvl', gl.hvl, 'HVL', 'rgb(139,92,246)', 'text-violet-400', 'dominant gamma magnet / pin');
+  } else {
+    const w = d.walls;
+    if (w.call_wall?.strike != null) addLevel('call_resistance', { strike: w.call_wall.strike, distance_pct: null, gex_millions: w.call_wall.gex_millions }, 'Call Resistance', RED, 'text-error', 'call wall');
+    if (w.put_wall?.strike != null) addLevel('put_support', { strike: w.put_wall.strike, distance_pct: null, gex_millions: w.put_wall.gex_millions }, 'Put Support', GREEN, 'text-success', 'put wall');
   }
   const em = d.expected_move;
   const emLayer = (id: string, e: typeof em.em_30d, color: string, tone: string, tag: string) => {
@@ -75,34 +86,6 @@ function Banner({ d }: { d: DealerPositioningData }) {
   );
 }
 
-function GexByStrike({ d }: { d: DealerPositioningData }) {
-  const rows = d.walls.by_strike || [];
-  if (!rows.length) return null;
-  const max = Math.max(...rows.map(r => Math.abs(r.gex_millions ?? 0)), 1);
-  return (
-    <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
-      <span className="text-[10px] font-bold text-base-content/50 uppercase">GEX by strike ($M / 1%)</span>
-      <div className="space-y-[3px] mt-1">
-        {rows.map((r, i) => {
-          const v = r.gex_millions ?? 0;
-          const pos = v >= 0;
-          return (
-            <div key={i} className="flex items-center gap-1.5 text-[10px]">
-              <span className="w-12 text-right tabular-nums text-base-content/50">${r.strike}</span>
-              <div className="flex-1 flex items-center">
-                <div className="w-1/2 flex justify-end">{!pos && <div className="h-2 rounded-sm bg-error/60" style={{ width: `${(Math.abs(v) / max) * 100}%` }} />}</div>
-                <div className="w-px h-3 bg-base-content/20" />
-                <div className="w-1/2">{pos && <div className="h-2 rounded-sm bg-success/60" style={{ width: `${(Math.abs(v) / max) * 100}%` }} />}</div>
-              </div>
-              <span className={`w-10 tabular-nums ${pos ? 'text-success' : 'text-error'}`}>{pos ? '+' : ''}{v}</span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
 export default function DealerPositioningPanel({ ticker }: { ticker: string; price?: number }) {
   const [expanded, setExpanded] = useState(false);
   const [data, setData] = useState<DealerPositioningData | null>(null);
@@ -118,7 +101,9 @@ export default function DealerPositioningPanel({ ticker }: { ticker: string; pri
       setData(dp);
       const def = new Set<string>(['net_gex']);
       if (dp.gamma_flip?.level != null) def.add('gamma_flip');
-      if (dp.walls.call_wall || dp.walls.put_wall) def.add('walls');
+      if (dp.gamma_levels?.call_resistance || dp.walls.call_wall) def.add('call_resistance');
+      if (dp.gamma_levels?.put_support || dp.walls.put_wall) def.add('put_support');
+      if (dp.gamma_levels?.hvl) def.add('hvl');
       if (dp.expected_move.em_30d) def.add('em_30d');
       setSelected(def);
     } catch (e: any) {
@@ -165,8 +150,8 @@ export default function DealerPositioningPanel({ ticker }: { ticker: string; pri
         <div className="flex items-center gap-2 text-left">
           <Boxes className="w-4 h-4 text-secondary" />
           <div>
-            <h4 className="text-sm font-semibold text-base-content/90">Dealer Positioning <span className="text-[10px] text-base-content/40">(Options Mechanics)</span></h4>
-            <p className="text-[10px] text-base-content/50">Net GEX · gamma flip level · call/put walls · options-implied expected move (30d/45d)</p>
+            <h4 className="text-sm font-semibold text-base-content/90">Dealer Positioning <span className="text-[10px] text-base-content/40">(Gamma / GEX)</span></h4>
+            <p className="text-[10px] text-base-content/50">Net GEX regime · gamma flip · Call Resistance / Put Support / HVL · expected move — where dealer hedging gates price</p>
           </div>
         </div>
         {expanded ? <ChevronUp className="w-4 h-4 shrink-0" /> : <ChevronDown className="w-4 h-4 shrink-0" />}
@@ -205,10 +190,13 @@ export default function DealerPositioningPanel({ ticker }: { ticker: string; pri
                       </div>
                     );
                   })}
-                  <GexByStrike d={data} />
                 </div>
 
                 <div className="lg:col-span-3 space-y-3">
+                  {/* GEX-by-strike distribution — the hero chart */}
+                  <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
+                    <GexChart profile={data.gex_profile || []} levels={data.gamma_levels} spot={data.price || 0} netGexMM={data.net_gex.value_millions} />
+                  </div>
                   <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
                     <div className="flex items-center justify-between mb-1 px-1">
                       <span className="text-[11px] font-bold text-base-content/70 flex items-center gap-1"><Boxes className="w-3.5 h-3.5 text-secondary" /> Price · gamma levels · expected move</span>

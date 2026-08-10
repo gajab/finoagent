@@ -104,16 +104,22 @@ def _collect_levels(micro, structure, regime, dealer, spot) -> list[dict]:
         if z and z.get("vwap"):
             add(z["vwap"], "magnet", "vwap50", "50-day VWAP", 2.0)
 
-    # --- dealer: gamma flip, walls, expected-move bounds ---
+    # --- dealer: gamma flip, Call Resistance / Put Support / HVL, expected-move bounds ---
     if dealer:
         gf = dealer.get("gamma_flip")
         if gf and gf.get("level"):
             add(gf["level"], "magnet", "gamma_flip", "Gamma flip", 3.0)
+        gl = dealer.get("gamma_levels") or {}
         walls = dealer.get("walls") or {}
-        if walls.get("call_wall") and walls["call_wall"].get("strike"):
-            add(walls["call_wall"]["strike"], "resistance", "call_wall", "Call wall", 2.5)
-        if walls.get("put_wall") and walls["put_wall"].get("strike"):
-            add(walls["put_wall"]["strike"], "support", "put_wall", "Put wall", 2.5)
+        cr = (gl.get("call_resistance") or {}).get("strike") or (walls.get("call_wall") or {}).get("strike")
+        ps = (gl.get("put_support") or {}).get("strike") or (walls.get("put_wall") or {}).get("strike")
+        hvl = (gl.get("hvl") or {}).get("strike")
+        if cr:
+            add(cr, "resistance", "call_resistance", "Call Resistance", 2.5)
+        if ps:
+            add(ps, "support", "put_support", "Put Support", 2.5)
+        if hvl:
+            add(hvl, "magnet", "hvl", "HVL (gamma magnet)", 2.5)
         em = (dealer.get("expected_move") or {}).get("em_30d")
         if em and em.get("upper"):
             add(em["upper"], "resistance", "expected_move", "Expected-move high (30d)", 1.5)

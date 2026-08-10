@@ -291,11 +291,22 @@ export interface RegimeResponse { ticker: string; regime: RegimeData; cached?: b
 // ── Dealer positioning (option mechanics overlay) ──
 export interface GexWall { strike: number | null; gex_millions: number | null }
 export interface ExpectedMove { dte: number; iv_atm_pct: number | null; move: number | null; move_pct: number | null; upper: number | null; lower: number | null }
+export interface GammaLevel { strike: number | null; gex_millions?: number | null; distance_pct: number | null; kind: string }
+export interface DealerGammaLevels {
+  call_resistance: GammaLevel | null;
+  put_support: GammaLevel | null;
+  hvl: GammaLevel | null;
+  gamma_flip: { level: number | null; distance_pct: number | null; side: string; note: string } | null;
+  regime: string | null;
+}
+export interface GexProfilePoint { strike: number | null; gex_millions: number | null; cum_millions: number | null }
 export interface DealerPositioningData {
   price: number | null;
   as_of: string;
   net_gex: { value: number | null; value_millions: number | null; sign: 'long' | 'short' | string; label: string };
   gamma_flip: { level: number | null; distance_pct: number | null; side: 'above' | 'below' | string; note: string } | null;
+  gamma_levels?: DealerGammaLevels;
+  gex_profile?: GexProfilePoint[];
   walls: { call_wall: GexWall | null; put_wall: GexWall | null; by_strike: { strike: number | null; gex_millions: number | null }[] };
   expected_move: { em_30d: ExpectedMove | null; em_45d: ExpectedMove | null };
   expirations_used: string[];

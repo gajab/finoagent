@@ -141,15 +141,17 @@ def compute_dealer_positioning(stock) -> dict | None:
         if len(contracts) < 10:
             return None
 
-        # net GEX at spot + per-strike aggregation
+        # net GEX at spot + per-strike aggregation (signed) and gamma concentration (unsigned)
         net = 0.0
         by_strike: dict[float, float] = defaultdict(float)
+        abs_by_strike: dict[float, float] = defaultdict(float)
         for c in contracts:
             g = _bs_greeks(spot, c["strike"], c["t"], c["iv"], c["is_call"], DEFAULT_RISK_FREE)["gamma"]
             dg = _dollar_gex(g, c["oi"], spot)
             signed = dg if c["is_call"] else -dg
             net += signed
             by_strike[c["strike"]] += signed
+            abs_by_strike[c["strike"]] += abs(dg)
 
         long_gamma = net >= 0
         net_block = {
@@ -185,11 +187,22 @@ def compute_dealer_positioning(stock) -> dict | None:
                           for k, v in sorted(top, key=lambda kv: kv[0])],
         }
 
+        # MenthorQ-style named levels + the FULL per-strike profile (for the GEX chart)
+        gamma_levels = _gamma_levels(by_strike, abs_by_strike, spot, flip_block, net_block)
+        cum = 0.0
+        gex_profile = []
+        for k, v in strikes_sorted:
+            cum += v
+            gex_profile.append({"strike": _r(k), "gex_millions": _r(v / 1e6, 2),
+                                "cum_millions": _r(cum / 1e6, 2)})
+
         return {
             "price": _r(spot), "as_of": _now_str(),
             "net_gex": net_block,
             "gamma_flip": flip_block,
             "walls": walls,
+            "gamma_levels": gamma_levels,
+            "gex_profile": gex_profile,
             "expected_move": {
                 "em_30d": _expected_move(contracts, spot, 30),
                 "em_45d": _expected_move(contracts, spot, 45),
@@ -201,3 +214,33 @@ def compute_dealer_positioning(stock) -> dict | None:
         }
     except Exception:  # noqa: BLE001
         return None
+
+
+def _gamma_levels(by_strike: dict, abs_by_strike: dict, spot: float, flip_block, net_block) -> dict:
+    """The named dealer levels traders actually watch (MenthorQ conventions):
+      • Call Resistance — the strike with the biggest POSITIVE GEX (dealers sell rallies into
+        it → it caps upside). Prefer above spot.
+      • Put Support — the biggest NEGATIVE GEX (dealers buy dips → it floors downside). Prefer
+        below spot.
+      • HVL (High-Volume Level) — the strike with the largest TOTAL gamma concentration, the
+        dominant magnet/pin around which price gravitates.
+    """
+    def _blk(strike, gex, kind):
+        return {"strike": _r(strike), "gex_millions": _r(gex / 1e6, 1),
+                "distance_pct": _r((strike - spot) / spot * 100) if spot else None, "kind": kind}
+
+    pos = [(k, v) for k, v in by_strike.items() if v > 0]
+    neg = [(k, v) for k, v in by_strike.items() if v < 0]
+    pos_above = [kv for kv in pos if kv[0] >= spot] or pos
+    neg_below = [kv for kv in neg if kv[0] <= spot] or neg
+    cr = max(pos_above, key=lambda kv: kv[1]) if pos_above else None
+    ps = min(neg_below, key=lambda kv: kv[1]) if neg_below else None
+    hvl = max(abs_by_strike.items(), key=lambda kv: kv[1]) if abs_by_strike else None
+    return {
+        "call_resistance": _blk(cr[0], cr[1], "resistance") if cr else None,
+        "put_support": _blk(ps[0], ps[1], "support") if ps else None,
+        "hvl": {"strike": _r(hvl[0]), "distance_pct": _r((hvl[0] - spot) / spot * 100) if spot else None,
+                "kind": "magnet"} if hvl else None,
+        "gamma_flip": flip_block,
+        "regime": net_block.get("sign"),
+    }
