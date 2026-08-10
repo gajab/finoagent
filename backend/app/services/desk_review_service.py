@@ -60,6 +60,11 @@ _VRP_PENALTY_CAP = 25
 # short side past the threshold, the trade is vetoed regardless of the drift level.
 _DRIFT_SCALE = 15                # points per 1.0 of annualized μ (μ 0.30→+4.5, 0.53→cap 8)
 _DRIFT_CAP = 8
+# Annualizing a ~1-month EMA slope can spit out an extreme, un-persistent %/yr. Momentum is
+# a NOISY, mean-reverting predictor, so clamp the drift to a credible band before it feeds the
+# display AND the drift-adjusted keep-prob (μ·T). ±60%/yr leaves genuine trends untouched
+# (a −42%/yr reading is preserved) and only trims the noise-driven tails.
+_DRIFT_MU_CAP = 0.60
 _MACD_ACCEL_VETO = 0.004         # |Δhistogram over ~3 sessions| ÷ spot beyond this = accelerating counter-trend
 
 _STOCK_STRUCTURES = {"covered_call"}               # hold 100 shares/contract
@@ -120,14 +125,15 @@ def _opp_legs(opp: dict) -> list[dict]:
 
 
 def _robust_iv(opp: dict, hv: Optional[float]) -> float:
-    """A sane implied-vol for the payoff distribution. yfinance IVs are garbage when
-    the market is closed (near-zero on OTM strikes), which collapses the lognormal
-    weights (PoP→100%, Omega→∞) — so reject anything outside [5%, 300%] and fall back
-    to the ATM smile IV, then realized vol, then a 30% floor."""
+    """A sane implied-vol for the position's payoff distribution + displayed greeks IV. Prefer the trade's
+    OWN leg IVs — the vol of the STRIKES actually traded — over the ATM smile IV: for a skewed deep-OTM put
+    the strike IV (e.g. 42%) is the real number, and using the ATM (e.g. 21%) understates the tail AND
+    mis-displays the greeks' IV. The ATM is only a FALLBACK for when yfinance leg IVs are garbage (near-zero
+    on OTM strikes with the market closed) — the >3% filter already rejects that case. Then realized, then 30%."""
     atm = (opp.get("atm_iv_pct") or 0) / 100.0
     leg_ivs = [(l.get("iv") or 0) / 100.0 for l in opp.get("legs", []) if (l.get("iv") or 0) > 3.0]
     leg_avg = (sum(leg_ivs) / len(leg_ivs)) if leg_ivs else 0.0
-    for v in (atm, leg_avg, hv):
+    for v in (leg_avg, atm, hv):                          # LEG IV first — the strikes actually traded
         if v and 0.05 <= v <= 3.0:
             return v
     return 0.30
@@ -152,7 +158,10 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
     mp = opp.get("max_profit")
     # On an overwrite the "loss" above the strike is OPPORTUNITY cost, not cash — capital is the held
     # stock notional (the position being overwritten), not a fresh buy-write max loss.
-    capital = float(opp.get("collateral") or 0.0) if overwrite else (abs(ml) if ml is not None else float(opp.get("collateral") or 0.0))
+    # Capital = the trade's EXPLICIT basis (Reg-T BPR for naked shorts, spread width for defined risk, stock
+    # notional for covered / overwrite) — NOT abs(max_loss). So a naked short's small MARGIN (BPR) is the
+    # yield/return denominator, while max_loss & VaR still carry the full notional dollar risk.
+    capital = float(opp.get("collateral") or 0.0) or (abs(ml) if ml is not None else 0.0)
     # Calendars / diagonals: legs expire at different times, so an intrinsic-only terminal curve
     # would misprice a still-alive leg. Use a HORIZON curve at the nearest expiry (BS-marking the
     # longer-dated legs); single-expiry structures keep the exact terminal curve.
@@ -203,7 +212,7 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
             aligned = 0.0
         pts = max(-_DRIFT_CAP, min(_DRIFT_CAP, round(aligned * _DRIFT_SCALE)))
         if pts != 0:
-            add("Trend drift", pts, f"EMA drift {round(mu * 100)}%/yr {'tailwind' if pts > 0 else 'headwind'}")
+            add("Trend drift", pts, f"trend velocity {round(mu * 100)}%/yr (annualized EMA slope, applied over your DTE) — {'tailwind' if pts > 0 else 'headwind'} for this structure")
     if mode == "range" and s in _NEUTRAL_INCOME:
         add("Range fit", 5, "neutral premium suits the range")
     # Short strike protected by a value-area edge / order block on the safe side.
@@ -249,7 +258,13 @@ def _ta_sync(ticker: str) -> dict:
             if len(closes) >= 30:
                 ema = closes.ewm(span=21, adjust=False).mean().values
                 y = np.log(ema[-21:]); x = np.arange(len(y))
-                ta["_drift_mu"] = round(float(np.polyfit(x, y, 1)[0]) * 252, 4)    # annualized log-slope drift
+                # Exponentially-weighted regression: half-life ~7 days so the
+                # current direction dominates and V-shaped reversals don't
+                # report stale declines as today's drift.
+                hl = 7.0
+                w = np.exp(np.log(2) / hl * (x - x[-1]))      # w[-1]=1, decays backward
+                _mu = float(np.polyfit(x, y, 1, w=np.sqrt(w))[0]) * 252    # annualized log-slope drift μ
+                ta["_drift_mu"] = round(max(-_DRIFT_MU_CAP, min(_DRIFT_MU_CAP, _mu)), 4)   # clamp noise-driven extremes
             if len(h6) >= 15:                                # ATR (true range → GAP-AWARE, unlike close-to-close HV)
                 H, L, C = h6["High"].values, h6["Low"].values, h6["Close"].values
                 tr = np.maximum(H[1:] - L[1:], np.maximum(np.abs(H[1:] - C[:-1]), np.abs(L[1:] - C[:-1])))
@@ -698,10 +713,89 @@ def _opp_bps(opp: dict, dm: dict, sofr_pct: float) -> Optional[int]:
 # likely to be APPROVED. Returns a score adjustment + merits/demerits + hard BLOCKING flags.
 # ---------------------------------------------------------------------------
 
+# ── Earnings timing — the vega-ramp / IV-crush nuance a premium desk lives by ────────────────
+_EARN_HOLD_PENALTY = 8.0    # holding a short through the pre-earnings IV RAMP (short vega into rising IV)
+_EARN_CLEAN_BONUS = 3.0     # the window ENDS before earnings → clean theta/VRP harvest, no event gap
+_EARN_CRUSH_BONUS = 4.0     # earnings imminent + short strike OUTSIDE the implied move → a real IV-crush harvest
+
+
+def _earnings_timing_factor(opp: dict, next_earnings: Optional[str], today) -> tuple:
+    """Grade the earnings TIMING of a premium sale — what pure VRP/moneyness miss. Selling well BEFORE the
+    print holds the short through the IV RAMP (short vega into rising implied vol: theta is OFFSET, and the
+    fat premium is EVENT compensation, not free decay) plus the binary gap → penalise. Earnings IMMINENT is
+    the IV-CRUSH play — reward ONLY if the short strike sits outside the implied move. A window that ENDS
+    before earnings is the cleanest harvest → reward. Returns (points, merit|None, demerit|None)."""
+    if not next_earnings:
+        return 0.0, None, None
+    if opp.get("structure") == "calendar":
+        # A calendar is LONG vega — the pre-earnings IV ramp HELPS it, so the short-vol hold-through penalty
+        # is wrong. The IDEAL earnings calendar sells a front that expires BEFORE the print and owns a back
+        # that expires AFTER — harvesting the term-structure collapse. Reward that; otherwise neutral.
+        try:
+            fe = date.fromisoformat(opp.get("expiration"))
+            be = date.fromisoformat(opp.get("back_expiration"))
+            ne = date.fromisoformat(next_earnings)
+        except Exception:  # noqa: BLE001
+            return 0.0, None, None
+        if fe < ne <= be:
+            return _EARN_CRUSH_BONUS, ("earnings calendar — sells the rich pre-earnings front, owns the "
+                    "post-earnings back; harvests the IV term-structure collapse (long vega)"), None
+        return 0.0, None, None
+    try:
+        ed = date.fromisoformat(next_earnings)
+    except Exception:  # noqa: BLE001
+        return 0.0, None, None
+    dte = int(opp.get("dte") or 0)
+    if dte <= 0:
+        return 0.0, None, None
+    expiry = today + timedelta(days=dte)
+    if ed <= today or ed > expiry:                      # earnings outside the trade's life → clean harvest
+        return _EARN_CLEAN_BONUS, "clean window — no earnings before expiry (pure theta/VRP harvest, no event gap)", None
+    days = (ed - today).days
+    imp = _expected_move_pct(opp)                        # 1σ implied move to expiry (%)
+    cush = opp.get("cushion_pct")                        # short-strike distance from spot (%)
+    outside = cush is not None and imp is not None and cush >= imp
+    if days <= 2:                                        # imminent → the IV-crush harvest
+        if outside:
+            return _EARN_CRUSH_BONUS, (f"IV-crush harvest — earnings in {days}d at peak IV and the short strike sits "
+                    f"OUTSIDE the implied move (cushion {cush}% ≥ implied {imp}%): the post-event vol crush works for you"), None
+        return -4.0, None, (f"earnings in {days}d but the short strike is INSIDE the implied move (cushion {cush}% < "
+                    f"implied {imp}%) — the crush only pays if the stock holds the cone; a gap breaches you")
+    pen = _EARN_HOLD_PENALTY if days >= 5 else _EARN_HOLD_PENALTY * 0.6
+    return -round(pen, 1), None, (f"sells ~{days}d before earnings — short VEGA into the IV ramp: theta is offset by "
+            f"rising implied vol until the print, so the fat premium is event compensation (not free decay) and you "
+            f"carry the binary gap. A desk waits until ~1d pre-print (crush) or trades the clean post-event window")
+
+
+def _event_adjusted_yield(opp: dict, vsx: dict, next_earnings: Optional[str], today) -> tuple:
+    """Strip the EVENT premium from the headline annualized yield. When earnings lands inside the window a
+    chunk of the fat premium is compensation for the binary print (jump risk), NOT harvestable time decay —
+    so the headline carry misleads. event share ≈ 1 − baseline_vol/IV (an ATM option's value is ~linear in
+    vol); the adjusted yield is what pure decay would pay. Returns (adjusted_yield_pct, event_share)."""
+    ann = opp.get("premium_annualized_pct")
+    iv = opp.get("atm_iv_pct") or vsx.get("iv_atm_pct")
+    exp = opp.get("expiration")
+    if ann is None or not iv or not exp or not next_earnings:
+        return ann, 0.0
+    try:
+        ne = date.fromisoformat(next_earnings)
+        ed = date.fromisoformat(exp)
+    except Exception:  # noqa: BLE001
+        return ann, 0.0
+    if not (today < ne <= ed):                      # earnings not in the trade's life → the yield is clean
+        return ann, 0.0
+    baseline = max(vsx.get("hv30_pct") or 0.0, vsx.get("har_rv_pct") or 0.0)   # realized / forward-RV floor (%)
+    if baseline <= 0 or iv <= baseline:
+        return ann, 0.0
+    share = min(1.0 - baseline / iv, 0.6)           # cap: never claim >60% of the premium is the event
+    return round(ann * (1.0 - share), 1), round(share, 2)
+
+
 def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: Optional[float],
                 iv_rank: Optional[float], beta: Optional[float],
                 hv: Optional[float] = None, gex: Optional[dict] = None,
-                macd: Optional[dict] = None, overwrite: bool = False) -> dict:
+                macd: Optional[dict] = None, overwrite: bool = False,
+                next_earnings: Optional[str] = None, today=None) -> dict:
     pm = (dm or {}).get("pm") or {}
     merits, demerits, blocking = [], [], []
     # VRP ratio is GAP-AWARE: implied ÷ the physical vol used everywhere (max of HV and ATR), so the
@@ -710,7 +804,10 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     # Itemized signed contributions (points) by factor — so the UI can show each adjustment as a bar
     # and the desk score is auditable: desk_score = base_quality + regime + Σ(these).
     comp: dict[str, float] = {"expectation": 0.0, "vrp": 0.0, "moneyness": 0.0,
-                              "skew": 0.0, "liquidity": 0.0, "beta": 0.0}
+                              "skew": 0.0, "liquidity": 0.0, "beta": 0.0, "event": 0.0}
+    if today is None:
+        today = date.today()
+    is_cal = opp.get("structure") == "calendar"   # LONG-vega, ATM-by-design → the short-vol penalties invert
 
     # 1) Genuinely-bad EV — DEMOTE (never auto-reject). A negative risk-neutral bps is NORMAL for income
     #    selling (fair pricing; the real edge is the VRP), so do NOT block on it. Only flag a trade that
@@ -725,7 +822,14 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     # 2) Volatility Risk Premium — the REAL edge, and the negative-VRP TRAP. Rich implied vs realized
     #    rewards; cheap implied (implied << realized) is penalised IN PROPORTION to the gap and
     #    HARD-BLOCKED past the floor — the crushed-vol case where selling premium has no edge.
-    if iv_hv is not None:
+    if iv_hv is not None and is_cal:
+        # A calendar is LONG vega — CHEAP implied vol is an EDGE (own vol before it reprices up), the exact
+        # opposite of a premium seller. Never block it on "crushed vol".
+        if iv_hv < 0.95:
+            merits.append(f"long-vega calendar in cheap IV (IV/HV {iv_hv}) — own vol before it reprices"); comp["vrp"] += 5
+        elif iv_hv > 1.25:
+            demerits.append(f"paying up for vega (IV/HV {iv_hv}) — a calendar wants CHEAP, not rich, IV"); comp["vrp"] -= 4
+    elif iv_hv is not None:
         if iv_hv >= 1.1 and (iv_rank or 0) >= 50:
             merits.append(f"rich VRP (IV/HV {iv_hv}, IV-rank {iv_rank})"); comp["vrp"] += 6
         elif iv_hv < 1.0:
@@ -741,17 +845,19 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     #    'deep' under crushed IV but is physically exposed can no longer hide.
     dual_em, imp_em, phys_em = _dual_move_pct(opp, hv)
     nss = _nearest_short_sigmas(opp, spot, dual_em)
-    if nss is not None and nss < 0.5:
-        demerits.append(f"near-ATM short leg ({nss}σ dual) — directional, not cushioned"); comp["moneyness"] -= 12
-    elif nss is not None and nss < 1.0:
-        demerits.append(f"thin cushion ({nss}σ dual)"); comp["moneyness"] -= 4
-    elif nss is not None and nss >= 1.5:
-        merits.append(f"deep cushion ({nss}σ dual)"); comp["moneyness"] += 5
     pmp = _prob_max_profit(opp)
-    if pmp is not None and pmp < 50:
-        demerits.append(f"full-credit prob only {pmp}%"); comp["moneyness"] -= 6
-    elif pmp is not None and pmp >= 85:
-        merits.append(f"full-credit prob {pmp}%"); comp["moneyness"] += 3
+    if not is_cal:              # a calendar is ATM BY DESIGN (max profit at the strike) — the near-ATM
+                                # "directional" penalty and the full-credit-prob check don't apply to it
+        if nss is not None and nss < 0.5:
+            demerits.append(f"near-ATM short leg ({nss}σ dual) — directional, not cushioned"); comp["moneyness"] -= 12
+        elif nss is not None and nss < 1.0:
+            demerits.append(f"thin cushion ({nss}σ dual)"); comp["moneyness"] -= 4
+        elif nss is not None and nss >= 1.5:
+            merits.append(f"deep cushion ({nss}σ dual)"); comp["moneyness"] += 5
+        if pmp is not None and pmp < 50:
+            demerits.append(f"full-credit prob only {pmp}%"); comp["moneyness"] -= 6
+        elif pmp is not None and pmp >= 85:
+            merits.append(f"full-credit prob {pmp}%"); comp["moneyness"] += 3
 
     # 4) Skew — extreme = 'pennies in front of a steamroller'.
     sliv = _short_leg_iv(opp)
@@ -801,6 +907,15 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
             blocking.append(f"MACD accelerating down against short puts (Δhist {macd.get('accel')}) — counter-trend timing veto")
         elif struct in _BEARISH_INCOME and an > _MACD_ACCEL_VETO and h > 0:
             blocking.append(f"MACD accelerating up against short calls (Δhist {macd.get('accel')}) — counter-trend timing veto")
+
+    # N) Earnings TIMING — the vega-ramp / IV-crush nuance (avoid selling INTO the ramp; harvest the crush
+    #    or the clean post-event window). What pure VRP/moneyness can't see.
+    et_pts, et_merit, et_demerit = _earnings_timing_factor(opp, next_earnings, today)
+    comp["event"] += et_pts
+    if et_merit:
+        merits.append(et_merit)
+    if et_demerit:
+        demerits.append(et_demerit)
 
     adj = sum(comp.values())
     return {"adj": adj, "merits": merits, "demerits": demerits, "blocking": blocking, "components": comp,
@@ -1246,7 +1361,7 @@ async def rank_desk(
     scan = await run_derivative_income(
         ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
         structures=structures, quote_source=quote_source, user=user, db=db,
-        target_expiration=target_expiration, focus=focus,
+        target_expiration=target_expiration, focus=focus, owns_underlying=owns_underlying,
     )
     if scan.get("error"):
         return {"error": scan["error"]}
@@ -1339,7 +1454,8 @@ def _risk_triggers(opp: dict, spot: Optional[float], ta: dict, phys_vol: Optiona
         if covered:
             # COVERED CALL — the ADVERSE move is UP toward the short call (exercise = shares called away).
             # DOWN is GOOD for the trade (the call decays, you keep premium + shares), so there is NO downside
-            # ladder. Being called away is the capped MAX GAIN — a decision, not a loss → terminal rung `cap`.
+            # ladder. And there's no upside TAIL: being called away is the capped MAX GAIN, and the Defend roll
+            # already carries the only decision — so it stops at Watch → Defend (no redundant rung at the strike).
             res = [(p, l) for p, l in lv if 0 < toward(p) < toward(short)]   # resistances below the strike
             w = res[0] if res else (px_at(0.4), "≈0.4σ up — early rally")
             d = (round(short - 0.5 * em1, 2), "roll zone — just below the strike")
@@ -1348,9 +1464,7 @@ def _risk_triggers(opp: dict, spot: Optional[float], ta: dict, phys_vol: Optiona
             emit(side, "watch", w[0], w[1], "Rally underway — the call is starting to be tested.",
                  f"First resistance / ~{sig(w[0])}σ up. Pushing through it is the first sign the stock is heading for the {short} cap — the call is still OTM, but the shares could get called away.")
             emit(side, "defend", d[0], d[1], "Approaching the cap — roll the call UP-and-out to keep the shares & more upside.",
-                 f"~{sig(d[0])}σ up, closing on the {short} strike: the call is going at-the-money and assignment turns live. Roll up-and-out here if you'd rather keep the stock and its upside than be capped.")
-            emit(side, "cap", short, "short call strike (the cap)", "At the cap — let the shares be called away (bank the capped gain) or roll up to stay long.",
-                 f"At {short} the call is in-the-money and the shares are called away at the capped MAX gain — not a loss, a decision: take the full profit, or roll up-and-out if still bullish.")
+                 f"~{sig(d[0])}σ up, closing on the {short} strike: the call is going at-the-money and assignment turns live. Roll up-and-out here if you'd rather keep the stock and its upside than be capped (being called away is your capped MAX gain — not a loss).")
             return
 
         if strike_sigma <= 1.5:
@@ -1504,6 +1618,10 @@ def build_monitor_plan(structure: str, put_short, call_short, credit: float, spo
     rationale: list[str] = []
     au = lambda px: round(abs(spot - px) / atr, 1) if atr else None
     pc = lambda px: round((px - spot) / spot * 100, 1)
+    # 1σ expected move to expiry (gap-aware ATR) — grades HOW FAR the strike is, i.e. how likely assignment
+    # is by expiry. A strike many σ away is structurally safe: near-spot structures are early warnings, not
+    # "defend the trade" lines. (This is what a −54.8% put needs — nothing at −9.7% threatens it.)
+    em1 = max((atr / 1.4) * math.sqrt(max(dte, 1)), spot * 0.02) if atr else spot * 0.05
 
     def side_plan(down: bool, short: float, covered: bool = False):
         side = "down" if down else "up"
@@ -1512,30 +1630,37 @@ def build_monitor_plan(structure: str, put_short, call_short, credit: float, spo
         clusters = _cluster_side(levels, spot, atr, down)
         between = [c for c in clusters if 0 < toward(c["price"]) < toward(short)]
         beyond = [c for c in clusters if toward(c["price"]) >= toward(short)]
+        strike_sig = round(toward(short) / em1, 1) if em1 else 99.0
+        safe = strike_sig > 1.5           # strike so far it's unlikely to be reached by expiry
+        roll = "down-and-out" if down else "up-and-out"
 
+        # RATIONALE — the cushion behind the strike + HOW FAR / how safe the strike is (the honest headline).
         cushion = [c for c in beyond if toward(c["price"]) - toward(short) <= 1.5 * atr] or beyond[:1]
-        if cushion:
-            names = "; ".join(c["headline"] for c in cushion[:2])
-            rationale.append(f"{'Put' if down else 'Call'} {short} sits just {'above' if down else 'below'} "
-                             f"{names} — that structure is the cushion the strike was chosen behind.")
+        cu = f", tucked behind {cushion[0]['headline']}" if cushion else ""
+        rationale.append(
+            f"{'Put' if down else 'Call'} {short}{cu} — {abs(pc(short)):.0f}% / {strike_sig}σ away." +
+            (" Deep out-of-the-money: reaching it by expiry is unlikely, so the level(s) below are "
+             "EARLY-WARNING thesis checks, not active-defend lines." if safe else ""))
 
         def rung(tier, c, action, lead):
-            if isinstance(c, dict):
-                px, basis = c["price"], c["headline"]
-                extra = f" · confluence with {', '.join(l for l in c['labels'] if l != c['headline'])}" if len(c["labels"]) > 1 else ""
-                why = f"{lead} {_MON_IMPACT.get(c['family'], 'a technical level')}{extra}."
-            else:
-                px, basis, why = c, "credit breakeven", f"{lead} past breakeven the position is in real loss with no structure left to lean on."
-            triggers.append({"side": side, "tier": tier, "price": round(px, 2), "pct_from_spot": pc(px),
-                             "atr_units": au(px), "basis": basis, "action": action, "why": why})
+            extra = f" · confluence with {', '.join(l for l in c['labels'] if l != c['headline'])}" if len(c["labels"]) > 1 else ""
+            triggers.append({"side": side, "tier": tier, "price": round(c["price"], 2), "pct_from_spot": pc(c["price"]),
+                             "atr_units": au(c["price"]), "basis": c["headline"], "action": action,
+                             "why": f"{lead} {_MON_IMPACT.get(c['family'], 'a technical level')}{extra}."})
 
-        roll = "down-and-out" if down else "up-and-out"
-        # WATCH — the nearest real structure between spot and the strike.
+        if safe:
+            # SAFE — the strike is far. Show only the nearest 1-2 structures as EARLY WARNINGS; no defend/exit
+            # (nothing is threatening a strike this far out; the distance note above says so).
+            for c in between[:2]:
+                rung("watch", c,
+                     "Monitor only — an early sign the trend may be turning; the strike is far off, no defend needed yet.",
+                     f"~{au(c['price'])} ATR from spot · still {round((toward(short) - toward(c['price'])) / em1, 1)}σ ABOVE the strike:")
+            return
+
+        # ACTIVE (near-money) — the strike is a genuine near-term risk → the full watch → defend → exit ladder.
         if between:
-            rung("watch", between[0], "Watch closely — first structural line; add no new size.",
+            rung("watch", between[0], "Watch closely — first structural line toward the strike; add no new size.",
                  f"~{au(between[0]['price'])} ATR away:")
-        # DEFEND — the strongest structure BETWEEN the watch line and the strike; if none, the strike
-        # itself is the line (the option goes ATM there — assignment turns live).
         after = between[1:]
         if after:
             d = max(after, key=lambda c: c["significance"])
@@ -1549,16 +1674,16 @@ def build_monitor_plan(structure: str, put_short, call_short, credit: float, spo
                                         else f"Roll {roll} or cut size — the strike is being tested."),
                              "why": f"No listed structure between the watch line and the strike — the {short} strike "
                                     f"itself is the line: the option goes at-the-money here and assignment turns live."})
-        # EXIT / CAP — the first real structure strictly BEYOND the strike (where the tail opens), else the
-        # credit breakeven.
-        past = [c for c in beyond if toward(c["price"]) > toward(short) + 0.01]
-        term = past[0] if past else be
-        if covered:
-            rung("cap", term, "At/through the cap — bank the called-away gain, or roll up to stay long.",
-                 "beyond the strike the shares are called away at the capped MAX gain — a decision, not a loss:")
-        else:
-            rung("exit", term, "Close to cap the tail — the structure behind the strike is giving way.",
-                 f"~{au(term['price']) if isinstance(term, dict) else au(term)} ATR beyond the strike:")
+        if not covered:
+            past = [c for c in beyond if toward(c["price"]) > toward(short) + 0.01]
+            if past:
+                rung("exit", past[0], "Close to cap the tail — the structure behind the strike is giving way.",
+                     f"~{au(past[0]['price'])} ATR beyond the strike:")
+            else:
+                triggers.append({"side": side, "tier": "exit", "price": round(be, 2), "pct_from_spot": pc(be),
+                                 "atr_units": au(be), "basis": "credit breakeven",
+                                 "action": "Close to cap the tail — past breakeven with no structure to lean on.",
+                                 "why": "past breakeven the position is in real loss and structure has broken."})
 
     if put_short:
         side_plan(True, float(put_short))
@@ -1782,7 +1907,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
         g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
-                        hv=phys_vol, gex=gex, macd=macd_accel, overwrite=overwrite)
+                        hv=phys_vol, gex=gex, macd=macd_accel, overwrite=overwrite,
+                        next_earnings=(ctx or {}).get("next_earnings"), today=date.today())
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
         grade, approval = _grade_letter(desk_score, g["blocking"])
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
@@ -1796,10 +1922,13 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
             {"label": "Skew",        "points": round(c["skew"], 1)},
             {"label": "Liquidity",   "points": round(c["liquidity"], 1)},
             {"label": "Beta",        "points": round(c["beta"], 1)},
+            {"label": "Earnings timing", "points": round(c.get("event", 0.0), 1)},
         ]
         risk_triggers = _risk_triggers(opp, spot, ta, phys_vol)   # WATCH→DEFEND→EXIT ladder (TA + geometry)
+        ea_yield, ea_share = _event_adjusted_yield(opp, vsx, (ctx or {}).get("next_earnings"), date.today())
         ranked.append({**opp, "desk_metrics": dm, "desk_score": desk_score, "ta_note": note,
                        "risk_triggers": risk_triggers,
+                       "event_adjusted_yield_pct": ea_yield, "event_premium_share": ea_share,
                        "algo_grade": grade, "approval_odds": approval, "grade_merits": g["merits"],
                        "grade_demerits": g["demerits"], "grade_blocking": g["blocking"],
                        "base_quality": round(base, 1), "grade_adjustments": grade_adjustments,

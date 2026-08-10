@@ -15,9 +15,10 @@ from app.services.lifecycle_service import (
 
 
 class TestManagementDeskScore:
-    """The DEEP management read starts from a NEUTRAL 50 baseline and lets the scan's
-    factors — re-signed for a holder — decide keep-vs-close (it does NOT anchor on
-    keep-prob). Same auditable build-up as the scan."""
+    """The DEEP management read starts from a COMPUTED hold-quality base (remaining
+    reward vs remaining risk from HERE — keep-prob, premium-left×keep, Omega/Sortino,
+    CVaR tail, cushion) — NOT a fixed 50 — then the re-signed scan factors + a
+    dynamic-greek convexity term + a slim time/gamma overlay decide keep-vs-close."""
 
     def _scan_like(self, **over):
         base = dict(
@@ -32,10 +33,35 @@ class TestManagementDeskScore:
         base.update(over)
         return management_desk_score(**base)
 
-    def test_poor_entry_is_a_hold_when_held(self):
+    def test_base_is_computed_from_state_not_a_fixed_50(self):
         r = self._scan_like()
         assert r["signal"] in ("STRONG_HOLD", "HOLD")
-        assert r["anchor"] == 50   # neutral baseline — keep-prob is no longer the anchor
+        assert r["anchor"] > 55                              # computed hold-quality, not the old flat 50
+        assert r["anchor_label"].startswith("hold quality")
+        assert len(r["base_lenses"]) == 5                    # edge / reward / risk-adj / tail / cushion
+        # Every lens carries its weight + weighted contribution, and they RECONCILE to the
+        # base — so the UI can show the exact arithmetic that reaches the number.
+        assert all({"weight", "contribution"} <= set(l) for l in r["base_lenses"])
+        assert sum(l["weight"] for l in r["base_lenses"]) == 100
+        assert abs(sum(l["contribution"] for l in r["base_lenses"]) - r["anchor"]) <= 1.0
+
+    def test_profitable_with_reward_left_and_low_tail_still_holds(self):
+        # 45% captured but strong keep-prob, premium still to decay AND a manageable tail
+        # → optimise risk-vs-reward says HOLD, not a reflexive "you're green, close".
+        r = self._scan_like(captured_pct=45.0, omega=1.6, sortino=1.4,
+                            cvar95=-600, capital=12000)     # CVaR ~5% of capital = small
+        assert r["signal"] in ("STRONG_HOLD", "HOLD")
+
+    def test_fat_tail_scores_lower_than_a_manageable_tail(self):
+        # The CVaR tail feeds the COMPUTED base — a fat left tail lowers hold-quality.
+        safe = self._scan_like(omega=1.4, sortino=1.2, cvar95=-500, capital=12000)
+        fat = self._scan_like(omega=1.4, sortino=1.2, cvar95=-5000, capital=12000)
+        assert fat["anchor"] < safe["anchor"]
+
+    def test_short_gamma_near_expiry_adds_a_convexity_drag(self):
+        # Dynamic greek: short gamma tightening into expiry is a real holding cost.
+        r = self._scan_like(dte_days=10, net_gamma=-0.5)
+        assert any(c["label"].startswith("Convexity") and c["pts"] < 0 for c in r["contributions"])
 
     def test_vrp_flips_to_a_holder_positive(self):
         # Entry VRP demerit (-9 for cheap implied) becomes a holder POSITIVE (vol decay).

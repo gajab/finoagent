@@ -586,6 +586,74 @@ def _management_factors(*, iv_pct, hv_pct, pop_pct, keep_drift_pct, cushion_pct,
     return f
 
 
+def _management_base(*, keep_pct: Optional[float], captured_pct: Optional[float],
+                     cushion_pct: Optional[float], omega: Optional[float],
+                     sortino: Optional[float], cvar95: Optional[float],
+                     capital: Optional[float]) -> dict:
+    """COMPUTED hold-quality (0-100) for a placed trade — the holder analogue of the
+    scan's `algorithmic_quant` base, but measuring REMAINING risk vs REMAINING reward
+    from HERE instead of enter-vs-skip. Replaces the old fixed-50 anchor.
+
+    The five lenses answer "given I'm already in, is what's LEFT worth the risk?":
+      • Edge      — keep-prob: does the short strike survive to expiry?
+      • Reward    — premium still to decay × the chance of actually keeping it (this is
+                    what makes a booked winner score DOWN smoothly, so we no longer need
+                    a punitive profit-captured overlay — but a trade with lots left and a
+                    manageable tail stays HIGH even while green).
+      • Risk-adj  — Omega + Sortino of the remaining payoff (risk-adjusted quality).
+      • Tail      — CVaR95 as a fraction of capital: is the downside MANAGEABLE?
+      • Cushion   — buffer from spot to the short strike.
+    A missing metric scores its lens NEUTRAL (0.5), never a penalty. Returns
+    {base, lenses[]} — the lenses are surfaced so the read is fully auditable."""
+    def clamp(x, lo=0.0, hi=1.0):
+        return max(lo, min(hi, x))
+
+    # 1) Edge — probability the short strike holds to expiry.
+    s_edge = clamp(((keep_pct - 50.0) / 40.0)) if keep_pct is not None else 0.5
+    # 2) Reward left — remaining premium × expected-capture (keep-prob). Little left → low.
+    rem = clamp(1.0 - (captured_pct or 0) / 100.0)
+    kp = (keep_pct if keep_pct is not None else 65.0) / 100.0
+    s_reward = clamp(rem * kp / 0.7)                         # ~70% expected capture = full marks
+    # 3) Risk-adjusted quality of the REMAINING payoff.
+    s_omega = clamp(((omega - 0.8) / 1.2)) if omega is not None else 0.5
+    s_sortino = clamp(sortino / 2.0) if sortino is not None else 0.5
+    s_riskadj = 0.5 * s_omega + 0.5 * s_sortino
+    # 4) Tail — is the downside manageable? CVaR95 (expected shortfall) as % of capital.
+    if capital and capital > 0 and cvar95 is not None:
+        tail_frac = abs(cvar95) / capital
+        s_tail = clamp(1.0 - tail_frac / 0.40)
+    else:
+        tail_frac, s_tail = None, 0.5
+    # 5) Cushion — buffer to the short strike (tested = 0, ≥10% = full).
+    s_cushion = clamp((cushion_pct or 0) / 10.0) if cushion_pct is not None else 0.5
+
+    w = {"edge": 0.28, "reward": 0.20, "riskadj": 0.20, "tail": 0.18, "cushion": 0.14}
+    # Each lens: (label, 0..1 sub-score, weight, note). base = Σ (sub × weight) × 100, and
+    # every lens carries its weight + weighted contribution so the UI can show the FULL
+    # arithmetic (sub × weight% = pts) that reaches the base — nothing is a black box.
+    spec = [
+        ("Edge survives", s_edge, w["edge"],
+         f"{keep_pct:.0f}% keep-prob to expiry — does the short strike survive?" if keep_pct is not None else "keep-prob unavailable"),
+        ("Reward left", s_reward, w["reward"],
+         f"{rem*100:.0f}% of premium still to decay × keep-prob — expected capture from here"),
+        ("Risk-adjusted", s_riskadj, w["riskadj"],
+         (f"Omega {omega:.2f} · Sortino {sortino:.2f} — reward per unit of downside" if (omega is not None and sortino is not None)
+          else "risk-adjusted quality of the remaining payoff (Omega/Sortino unavailable → neutral)")),
+        ("Tail manageable", s_tail, w["tail"],
+         (f"CVaR95 {tail_frac*100:.0f}% of capital — is the expected shortfall containable?" if tail_frac is not None
+          else "downside not yet priced → neutral")),
+        ("Cushion", s_cushion, w["cushion"],
+         f"{cushion_pct:.1f}% from spot to your short strike" if cushion_pct is not None else "cushion unavailable"),
+    ]
+    base = sum(s * wt for _, s, wt, _ in spec) * 100.0
+    lenses = [
+        {"label": lbl, "score": round(s * 100), "weight": round(wt * 100),
+         "contribution": round(s * wt * 100, 1), "note": note}
+        for lbl, s, wt, note in spec
+    ]
+    return {"base": round(base, 1), "lenses": lenses}
+
+
 def management_exit(*, pop_pct: Optional[float], captured_pct: Optional[float],
                     dte_days: Optional[int], unrealized_pnl: Optional[float] = None,
                     max_profit=None, max_loss=None, keep_drift_pct: Optional[float] = None,
@@ -660,8 +728,12 @@ _MGMT_FACTOR_POLICY: dict = {
     "Value area":   (1.0,  "spot's location within the value area"),
     "Gamma regime": (1.0,  "dealer-gamma vol regime (suppressed = your strike holds)"),
     "Moneyness":    (1.0,  "cushion from spot to your short strike"),
-    # ── vol — FLIP: cheap implied is an entry demerit but a holder's friend ─
-    "VRP":          (-0.6, "cheap implied vol is GOOD once you're short (it's decaying / cheap to buy back)"),
+    # ── vol — FLIP, but GENTLY: cheap/falling implied is a clear holder positive
+    # (decaying, cheap to buy back). Rich remaining implied is NOT a pure demerit the
+    # way the entry score treats it — it's also premium still to collect; only the
+    # spike RISK is a negative, so we damp the flip (−0.6 → −0.3) and the base's
+    # Reward/Tail lenses carry the rest. (This is the "penalised for lower vol" fix.)
+    "VRP":          (-0.3, "cheap/falling implied is GOOD once you're short (decaying, cheap to buy back); rich implied is mostly still-collectable premium, only a spike hurts"),
     # ── exit mechanics — reframed, downweighted ────────────────────────────
     "Liquidity":    (0.5,  "bid/ask width is the cost to CLOSE now, not to enter"),
     # ── expected value — a loss at high keep-prob is a remote tail ──────────
@@ -677,26 +749,36 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
                           ta_factors: Optional[list], captured_pct: Optional[float],
                           dte_days: Optional[int], unrealized_pnl: Optional[float] = None,
                           max_profit=None, max_loss=None, cushion_pct: Optional[float] = None,
-                          structure: Optional[str] = None) -> dict:
-    """The DEEP management read — reuses the SCAN's factor engine (VRP / Moneyness /
-    Liquidity / Expectation / Skew / Beta + TA regime/value-area/gamma) but RE-SIGNS
-    and RE-WEIGHTS each factor for someone who ALREADY holds the trade, then layers
-    the take-profit / time-gamma overlay. Same auditable build-up as the scan, but
-    the answer is hold-vs-close (STRONG_HOLD / HOLD / CLOSE / STRONG_CLOSE), not
-    enter-vs-skip.
+                          structure: Optional[str] = None,
+                          omega: Optional[float] = None, sortino: Optional[float] = None,
+                          cvar95: Optional[float] = None, capital: Optional[float] = None,
+                          net_gamma: Optional[float] = None, net_vega: Optional[float] = None,
+                          net_theta: Optional[float] = None) -> dict:
+    """The DEEP management read for a trade you ALREADY hold — "given I'm in, is what's
+    LEFT worth the risk?" Not enter-vs-skip; hold-vs-close (STRONG_HOLD / HOLD / CLOSE /
+    STRONG_CLOSE).
 
-    Like the DI scan (desk_score = base_quality + Σ factors), the read starts from a
-    base and the factors move it — but for a PLACED trade the base is a NEUTRAL 50
-    ("no reason either way"), not keep-prob. Anchoring on keep-prob floored every
-    safe income trade near 90+, so a fat stack of holder-negatives (thin remaining
-    edge, rich vol, exit cost, tail) could never overcome it and everything read
-    STRONG_HOLD. From 50, those factors actually decide keep-vs-close. Keep-prob is
-    NOT dropped — it lives in the re-signed Moneyness/cushion + Trend-drift factors
-    and the Q-vs-P boundary shown alongside.
+    Build-up (auditable, mirrors the scan's `base + Σ factors` shape):
 
-        score = 50 (neutral) + Σ(re-signed factors) + Σ(take-profit / time overlay)
+        score = COMPUTED hold-quality base   ← _management_base: remaining reward vs
+              + Σ(re-signed scan factors)      remaining risk from HERE (keep-prob,
+              + Σ(slim time / gamma overlay)   premium-left×keep, Omega/Sortino, CVaR
+                                               tail, cushion) — NOT a fixed 50.
+
+    Why the base is computed, not anchored at 50: a placed trade's merit is entirely
+    "risk vs reward from here", so we score that directly from the live greeks / risk-
+    adjusted metrics / cushion — the same lenses the entry desk uses, re-pointed at the
+    REMAINING trade. This is what lets a booked winner with lots of premium left and a
+    manageable tail keep reading HOLD, while one with little left and a fat tail reads
+    CLOSE — instead of a blunt "you're green → close". The old punitive profit-captured
+    overlay is GONE (reward-left lives in the base); only a high-capture discipline
+    backstop and the hard risk stops remain.
     """
-    anchor = 50.0
+    keep_pct = keep_drift_pct if keep_drift_pct is not None else keep_standard_pct
+    base_read = _management_base(keep_pct=keep_pct, captured_pct=captured_pct,
+                                 cushion_pct=cushion_pct, omega=omega, sortino=sortino,
+                                 cvar95=cvar95, capital=capital)
+    base = base_read["base"]
     contribs: list[dict] = []
 
     # TA factors — kept as-is; they already read "does the position hold?".
@@ -706,7 +788,9 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
             contribs.append({"label": f.get("label"), "pts": pts, "favorable": pts > 0,
                              "note": "supports your strike holding" if pts > 0 else "pressures your short strike"})
 
-    # Option-math factors — re-signed / re-weighted per the holder policy.
+    # Option-math factors — re-signed / re-weighted per the holder policy. (Tail is NOT
+    # re-added here — the base's CVaR Tail lens already carries downside; adding the
+    # scan's tail sub-score too would double-count it.)
     for a in (grade_adjustments or []):
         label = a.get("label")
         pol = _MGMT_FACTOR_POLICY.get(label)
@@ -718,22 +802,21 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
             continue
         if label == "VRP":
             disp = "Vol decay" if pts > 0 else "Vol premium"
-            note = ("cheap implied vol — your shorts are decaying / cheap to buy back" if pts > 0
-                    else "rich implied vol still in your shorts — a vol spike would hurt")
+            note = ("cheap / falling implied vol — your shorts are decaying and cheap to buy back" if pts > 0
+                    else "rich implied still in your shorts — more premium to collect, but a vol spike would hurt")
         elif label == "Liquidity":
             disp = "Exit cost"
         else:
             disp = label
         contribs.append({"label": disp, "pts": pts, "favorable": pts > 0, "note": note})
 
-    # Downside severity — a fat left tail (low Tail sub-score) is real once you're in:
-    # don't give back a win to a remote-but-costly break.
-    tail = (subscores or {}).get("tail")
-    if tail is not None and tail < 50:
-        pts = -round((50 - tail) * 0.15)   # up to ~-7
-        if pts:
-            contribs.append({"label": "Tail risk", "pts": pts, "favorable": False,
-                             "note": "fat left tail — costly if the strike breaks; don't over-hold a winner into it"})
+    # Dynamic greeks — the CONVEXITY the static score misses. Short gamma tightening into
+    # expiry is the real "holding cost" of a winner: small moves swing P&L hard.
+    if net_gamma is not None and net_gamma < 0 and dte_days is not None and dte_days <= 21:
+        pts = -min(6, round((21 - dte_days) / 21 * 6) + 1)
+        contribs.append({"label": "Convexity (short Γ)", "pts": pts, "favorable": False,
+                         "note": f"short gamma with {dte_days} DTE — delta flips fast near your strike; the "
+                                 "dynamic risk of holding a winner into the gamma zone"})
 
     # Covered vs naked short call — capital is already committed, so the ADVICE differs.
     advisories: list[str] = []
@@ -750,23 +833,53 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
             "it decay for the income.")
 
     factors_net = sum(c["pts"] for c in contribs)
-    ov = lifecycle_overlay(anchor + factors_net, captured_pct, dte_days, unrealized_pnl, max_loss)
-    signal, overrides = ov["signal"], list(ov["overrides"])
 
-    # Tested short strike — defend or close regardless of the score.
+    # SLIM overlay — only the two things that genuinely change once you're in: the expiry
+    # gamma clock, and hard risk/stop overrides. NO graduated profit-captured penalty —
+    # remaining reward is already priced into the base's Reward lens.
+    overlay: list[dict] = []
+    adj = 0.0
+    if dte_days is not None:
+        td = -14 if dte_days <= 2 else -7 if dte_days <= 7 else -2 if dte_days <= 21 else 3
+        overlay.append({"name": "Time / gamma", "pts": td,
+                        "note": (f"{dte_days} DTE — gamma/pin risk elevated" if dte_days <= 7
+                                 else f"{dte_days} DTE — runway to keep collecting" if td > 0
+                                 else f"{dte_days} DTE")})
+        adj += td
+
+    score = int(max(0, min(100, round(base + factors_net + adj))))
+    signal = ("STRONG_HOLD" if score >= 68 else "HOLD" if score >= 45
+              else "CLOSE" if score >= 28 else "STRONG_CLOSE")
+
+    # Hard overrides — risk/discipline stops that beat the score.
+    overrides: list[str] = []
+    if captured_pct is not None and captured_pct >= 90:
+        signal = "STRONG_CLOSE"
+        overrides.append("≥90% of max profit captured — almost nothing left to earn, bank it")
+    elif captured_pct is not None and captured_pct >= 75 and signal == "STRONG_HOLD":
+        signal = "HOLD"
+        overrides.append(f"{captured_pct:.0f}% captured — thin remaining edge, don't over-hold")
+    if max_loss is not None and max_loss < 0 and unrealized_pnl is not None and unrealized_pnl <= max_loss * 0.8:
+        signal = "STRONG_CLOSE"
+        overrides.append("near max loss — cut it")
     if cushion_pct is not None and cushion_pct <= 0 and signal in ("STRONG_HOLD", "HOLD"):
         signal = "CLOSE"
         overrides.append("short strike tested — defend (roll) or close")
+    if dte_days is not None and dte_days <= 2 and signal in ("STRONG_HOLD", "HOLD"):
+        signal = "CLOSE"
+        overrides.append("≤2 DTE — gamma/pin/assignment risk")
 
     return {
-        "signal": signal, "score": ov["score"],
-        "anchor": int(round(anchor)),
-        "anchor_label": "neutral baseline",
-        "contributions": contribs,          # the re-signed scan factors (holder view)
+        "signal": signal, "score": score,
+        "anchor": int(round(base)),
+        "anchor_label": "hold quality · remaining risk vs reward",
+        "base_lenses": base_read["lenses"],   # the 5 computed lenses behind the base
+        "contributions": contribs,            # the re-signed scan + dynamic-greek factors
         "factors_net": round(factors_net, 1),
-        "overlay": ov["adjustments"],        # take-profit / time-gamma
+        "overlay": overlay,                   # slim time / gamma
         "overrides": overrides,
-        "advisories": advisories,           # covered / naked call structural advice
+        "advisories": advisories,             # covered / naked call structural advice
+        "greeks_used": {"net_gamma": net_gamma, "net_vega": net_vega, "net_theta": net_theta},
     }
 
 

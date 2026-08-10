@@ -1438,7 +1438,7 @@ async def get_live_pnl(
     from ..services.stock_service import bs_price, bs_delta, bs_gamma, bs_theta, bs_vega
     from ..services.trade_math import (
         classify_leg_action, summarize_trade_actions, prob_itm_lognormal, dte_from_expiry,
-        structure_payoff_extremes, exit_recommendation,
+        structure_payoff_extremes, structure_breakevens, exit_recommendation,
     )
     from ..services.lifecycle_service import (
         higher_order_greeks, pm_ratios, payoff_distribution_metrics,
@@ -1661,6 +1661,44 @@ async def get_live_pnl(
             elif dte is not None and dte <= 10:
                 hold_signal = "ROLL SOON"
                 hold_reasons.append(f"Contract expiration approaching ({dte} days remaining). Plan rollover.")
+            elif dte is not None and dte <= 21:
+                hold_signal = "MANAGE (21-DTE)"
+                hold_reasons.append(f"21-DTE management window: {dte} days left. Gamma accelerates inside 21 DTE — "
+                                    f"the desk takes profit on winners and rolls tested strikes HERE rather than "
+                                    f"carrying pin / assignment risk into expiration.")
+
+            # 3b. Earnings vs expiry — the vega-event rule: don't hold SHORT premium through the print. If the
+            # next print lands before expiry the fat premium is inflated by the IV ramp and a gap is the tail;
+            # advise closing before it (the crush only pays if you survive the gap outside the implied move).
+            try:
+                _exp = params.get("expiration")
+                _edf = getattr(ticker_obj, "earnings_dates", None)
+                _ne = None
+                if _edf is not None and not _edf.empty:
+                    _td = dt.date.today()
+                    _fut = [ix.date() for ix in _edf.index if hasattr(ix, "date") and ix.date() >= _td]
+                    _ne = min(_fut) if _fut else None
+                if _ne and _exp:
+                    _expd = dt.date.fromisoformat(_exp)
+                    _d2e = (_ne - dt.date.today()).days
+                    _is_short = params.get("action") == "short"
+                    if _ne <= _expd:
+                        if _is_short:
+                            hold_signal = "CLOSE BEFORE EARNINGS"
+                            hold_reasons.insert(0, f"⚠ Earnings {_ne.isoformat()} ({_d2e}d) is BEFORE your {_exp} "
+                                f"expiry — you're holding SHORT premium THROUGH the print. The pre-earnings IV ramp "
+                                f"puffed the premium, but a gap through your strike is the tail. Unless the short "
+                                f"strikes sit OUTSIDE the implied move (an intentional crush harvest), CLOSE before "
+                                f"{_ne.isoformat()} to bank the decay and sidestep the binary.")
+                        else:
+                            hold_reasons.append(f"Earnings {_ne.isoformat()} ({_d2e}d) before your {_exp} expiry — a "
+                                f"vega event: expect a gap and a post-print IV crush. Size / manage exposure into it.")
+                    else:
+                        hold_reasons.append(f"Clean of earnings — the next print {_ne.isoformat()} is AFTER your "
+                            f"{_exp} expiry; no event / gap risk in this trade's life (you keep the elevated premium "
+                            f"without the binary).")
+            except Exception as _ee:
+                logger.debug(f"earnings-vs-expiry check failed: {_ee}")
 
             # 4. Synthesis of P&L + TA + Macro
             if hold_signal == "HOLD":
@@ -2506,8 +2544,11 @@ async def get_live_pnl(
             exp_date = dt.datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
         except Exception:
             exp_date = now + dt.timedelta(days=30)
-        dte_years = max((exp_date - now).days, 0) / 365.0
-        dte_days = max((exp_date - now).days, 0)
+        # CALENDAR-day count (date−date), identical to the greeks_data path above — a
+        # datetime−datetime diff would truncate the intraday hours and read 1 day short,
+        # which is exactly what made the desk theta (_trader) disagree with the leg table.
+        dte_days = max((exp_date.date() - now.date()).days, 0)
+        dte_years = dte_days / 365.0
         opt_type_bs = "call" if lm["right"] == "C" else "put"
         cv = next((v for v in current_values if v.get("leg") == lm["i"] and "mid" in v), None)
         leg_analysis.append({
@@ -2692,6 +2733,7 @@ async def get_live_pnl(
     unbounded_loss = False
     breakevens = []
     exp_pnls = []
+    _pl_legs = []   # option legs for exact extremes/breakevens (empty for box spreads)
 
     # BOX spreads: guaranteed payoff is structural (spread width × contracts), no live price needed.
     # Compute this up-front so it's always available regardless of quote source or IBKR warmup.
@@ -2748,13 +2790,12 @@ async def get_live_pnl(
                 max_profit = round(max(pnl for _, pnl in exp_pnls), 2)
             if max_loss is None and not unbounded_loss:
                 max_loss = round(min(pnl for _, pnl in exp_pnls), 2)
-            for k in range(len(exp_pnls) - 1):
-                p1, pnl1 = exp_pnls[k]
-                p2, pnl2 = exp_pnls[k + 1]
-                if (pnl1 <= 0 and pnl2 > 0) or (pnl1 >= 0 and pnl2 < 0):
-                    if pnl2 != pnl1:
-                        bp = p1 + (0 - pnl1) * (p2 - p1) / (pnl2 - pnl1)
-                        breakevens.append(round(bp, 2))
+
+    # Breakevens — EXACT (piecewise-linear roots at the strike breakpoints), NOT a coarse
+    # grid scan whose interpolation crosses a strike kink and mislocates one breakeven by
+    # up to half a grid step (the asymmetric ~$0.26 error).
+    if _pl_legs:
+        breakevens = structure_breakevens(_pl_legs, entry_cost)
 
     # --- Expiration date for display ---
     min_exp_date = None
@@ -4042,14 +4083,17 @@ async def compute_lifecycle_desk_score(
                          "card above still applies."}
 
     row = ranked[idx]
-    subscores = (((row.get("desk_metrics") or {}).get("quant") or {}).get("subscores")) or {}
+    _dm = row.get("desk_metrics") or {}
+    subscores = ((_dm.get("quant") or {}).get("subscores")) or {}
+    _pm = _dm.get("pm") or {}          # Omega / Sortino / Calmar (risk-adjusted quality)
+    _risk = _dm.get("risk") or {}      # VaR / CVaR / capital (the manageable-tail check)
+    _trader = _dm.get("trader") or {}  # live greeks incl. the dynamic (vanna/charm/volga)
     qp = row.get("qp") or {}
-    # DEEP MANAGEMENT read — reuses the SCAN's whole factor engine (VRP / Moneyness /
-    # Liquidity / Expectation / TA regime/value-area/gamma), but RE-SIGNS + RE-WEIGHTS
-    # every factor for a HOLDER (cheap implied vol flips to a positive, EV downweighted
-    # to a remote tail, liquidity = cost-to-close, …), anchored on the drift-adjusted
-    # keep prob, then the take-profit / time overlay → the hold-vs-close signal. The
-    # raw ENTRY desk_score / grade are still returned for the reference breakdown.
+    # DEEP MANAGEMENT read — "given I'm already in, is what's LEFT worth the risk?". The
+    # base is COMPUTED from the live position state (keep-prob, premium-left×keep,
+    # Omega/Sortino, CVaR tail, cushion) — not a fixed 50 — then the re-signed scan
+    # factors + a dynamic-greek convexity term + a slim time/gamma overlay decide
+    # hold-vs-close. The raw ENTRY desk_score / grade are still returned for reference.
     mgmt = management_desk_score(
         keep_drift_pct=qp.get("keep_drift_pct"),
         keep_standard_pct=qp.get("keep_standard_pct") or row.get("prob_keep_pct"),
@@ -4058,6 +4102,10 @@ async def compute_lifecycle_desk_score(
         unrealized_pnl=pnl.get("unrealized_pnl"),
         max_profit=pnl.get("max_profit"), max_loss=pnl.get("max_loss"),
         cushion_pct=row.get("cushion_pct"), structure=body.structure,
+        omega=_pm.get("omega"), sortino=_pm.get("sortino"),
+        cvar95=_risk.get("cvar_95"), capital=_risk.get("capital"),
+        net_gamma=_trader.get("net_gamma"), net_vega=_trader.get("net_vega"),
+        net_theta=_trader.get("net_theta"),
     )
     return {
         "matched": True,

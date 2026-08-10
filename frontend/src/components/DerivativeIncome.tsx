@@ -42,6 +42,7 @@ const STRUCTURE_OPTIONS = [
   { id: 'credit_spread', label: 'Credit Spreads', icon: <ShieldCheck className="w-3.5 h-3.5" /> },
   { id: 'iron_condor', label: 'Iron Condor', icon: <Layers className="w-3.5 h-3.5" /> },
   { id: 'jade_lizard', label: 'Jade Lizard', icon: <Feather className="w-3.5 h-3.5" /> },
+  { id: 'calendar', label: 'Calendar', icon: <Calendar className="w-3.5 h-3.5" /> },
 ];
 
 const money = (n: number | null | undefined, d = 0) =>
@@ -372,8 +373,13 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
         <MetricTile label="Return / period" value={pct(opp.static_return_pct)} sub={`~${annPct(opp.premium_annualized_pct)} ann.`} />
         <MetricTile label="vs SOFR" tone={opp.beats_sofr ? 'text-success' : 'text-base-content/70'}
           value={opp.beats_sofr ? `+${annPct(opp.sofr_excess_pct)}` : 'below'} sub="excess yield" />
-        <MetricTile label="Capital / risk" value={money(opp.max_loss != null ? opp.max_loss : opp.collateral, 0)}
-          sub={opp.max_loss != null ? 'max loss (defined)' : 'collateral'} />
+        {opp.capital_basis === 'reg_t_margin' ? (
+          <MetricTile label="Margin (BPR)" value={money(opp.collateral, 0)}
+            sub={opp.notional_capital ? `Reg-T · risk ${money(opp.notional_capital, 0)}` : 'Reg-T naked margin'} />
+        ) : (
+          <MetricTile label="Capital / risk" value={money(opp.max_loss != null ? opp.max_loss : opp.collateral, 0)}
+            sub={opp.max_loss != null ? 'max loss (defined)' : 'collateral'} />
+        )}
       </div>
 
       {/* Secondary metrics */}
@@ -870,7 +876,7 @@ export function DerivativeIncome() {
   const [minProb, setMinProb] = useState(90);
   const [minIncome, setMinIncome] = useState(20);
   const [structures, setStructures] = useState<string[]>(
-    ['covered_call', 'cash_secured_put', 'credit_spread', 'iron_condor', 'jade_lizard', 'short_strangle']);
+    ['covered_call', 'cash_secured_put', 'credit_spread', 'iron_condor', 'jade_lizard', 'short_strangle', 'calendar']);
   // Data source is chosen once in Settings (functionality-level), not per-scan. Default Yahoo Finance.
   const [quoteSource] = useState<'yfinance' | 'ibkr'>(
     () => (localStorage.getItem('incomeDesk.quoteSource') === 'ibkr' ? 'ibkr' : 'yfinance'));

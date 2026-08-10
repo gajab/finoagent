@@ -23,6 +23,7 @@ from app.services.trade_math import (
     exit_recommendation,
     expiry_payoff,
     structure_payoff_extremes,
+    structure_breakevens,
     is_crossed,
     is_stale,
     is_wide_spread,
@@ -646,6 +647,37 @@ class TestStructurePayoffExtremes:
         e = structure_payoff_extremes(legs, -100)
         assert e["unbounded_loss"] and e["max_loss"] is None
         assert e["max_profit"] == 900.0 and e["max_profit_price"] == 110.0
+
+
+class TestStructureBreakevens:
+    """EXACT breakevens from the piecewise-linear payoff — no coarse-grid kink error."""
+
+    def test_gld_short_strangle_both_breakevens_exact(self):
+        # short 300 put + short 470 call, $0.80 credit (entry_cost +80). BEs are the
+        # strikes ± the credit — the case where the old grid scan drifted ~$0.26 on one side.
+        legs = [{"strike": 300, "right": "P", "sign": -1, "qty": 1},
+                {"strike": 470, "right": "C", "sign": -1, "qty": 1}]
+        assert structure_breakevens(legs, 80.0) == [299.20, 470.80]
+
+    def test_iron_condor_breakevens(self):
+        legs = [{"strike": 290, "right": "P", "sign": 1, "qty": 1},
+                {"strike": 300, "right": "P", "sign": -1, "qty": 1},
+                {"strike": 470, "right": "C", "sign": -1, "qty": 1},
+                {"strike": 480, "right": "C", "sign": 1, "qty": 1}]
+        assert structure_breakevens(legs, 100.0) == [299.0, 471.0]
+
+    def test_debit_call_spread_single_breakeven(self):
+        # long 100 / short 110 call, $4 debit (entry_cost −400) → one BE at 104.
+        legs = [{"strike": 100, "right": "C", "sign": 1, "qty": 1},
+                {"strike": 110, "right": "C", "sign": -1, "qty": 1}]
+        assert structure_breakevens(legs, -400.0) == [104.0]
+
+    def test_credit_put_matches_strike_minus_credit_exactly(self):
+        # short 90 put, $1.50 credit → BE = 88.50 exactly (a grid scan straddling 90 would drift).
+        assert structure_breakevens([{"strike": 90, "right": "P", "sign": -1, "qty": 1}], 150.0) == [88.50]
+
+    def test_no_legs_no_breakevens(self):
+        assert structure_breakevens([], 100.0) == []
 
 
 class TestExitRecommendation:

@@ -1530,14 +1530,16 @@ function TradeCard({
                                   <td className={`font-mono text-[10px] ${legPnl != null ? (legPnl >= 0 ? 'text-success' : 'text-error') : 'text-base-content/25'}`}>
                                     {legPnl != null ? fmtMoney(legPnl, { signed: true }) : '—'}
                                   </td>
-                                  <td className={`font-mono text-[10px] ${gk?.delta != null ? (leg.action === 'buy' ? 'text-success/80' : 'text-error/80') : 'text-base-content/25'}`}>
+                                  <td className={`font-mono text-[10px] ${gk?.delta != null ? (sign > 0 ? 'text-success/80' : 'text-error/80') : 'text-base-content/25'}`}>
                                     {gk?.delta != null
-                                      ? `${(gk.delta * (leg.action === 'buy' ? 1 : -1)).toFixed(3)}`
+                                      ? `${(gk.delta * sign).toFixed(3)}`
                                       : '—'}
                                   </td>
-                                  <td className={`font-mono text-[10px] ${gk?.theta != null ? 'text-warning/70' : 'text-base-content/25'}`}>
+                                  {/* HOLDER theta: sign×raw×qty×100 — a short leg EARNS decay (positive), so the
+                                      per-leg column sums to the portfolio Net Theta (same convention as Delta). */}
+                                  <td className={`font-mono text-[10px] ${gk?.theta != null ? ((gk.theta * sign) >= 0 ? 'text-success/70' : 'text-error/70') : 'text-base-content/25'}`}>
                                     {gk?.theta != null
-                                      ? `$${(gk.theta * (leg.qty ?? 1) * 100).toFixed(2)}/d`
+                                      ? `$${(gk.theta * sign * (leg.qty ?? 1) * 100).toFixed(2)}/d`
                                       : '—'}
                                   </td>
                                   <td className={`font-mono text-[10px] ${pItmColor(la?.p_itm_pct ?? null)}`}

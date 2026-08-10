@@ -211,9 +211,18 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false }: {
               <span className="text-base-content/70">{winPct(t.qp!.keep_standard_pct)} <span className="opacity-50">risk-neutral</span></span>
               <span className="opacity-40">→</span>
               <span className={`font-semibold ${dd >= 0 ? 'text-success' : 'text-error'}`}>{winPct(t.qp!.keep_drift_pct)} drift-adjusted</span>
-              {mu != null && <span className="text-base-content/50">· EMA drift {mu > 0 ? '+' : ''}{mu}%/yr {dd >= 0 ? 'tailwind' : dd < 0 ? 'headwind' : ''}</span>}
+              {mu != null && (() => {
+                const dte = (t as any).dte ?? (t as any).dte_remaining;
+                const horizon = dte ? (mu * dte / 365) : null;   // μ·T — the drift over YOUR holding period
+                return (
+                  <span className="text-base-content/50 cursor-help"
+                    title={`Trend velocity = annualized slope of the 21-day EMA (the drift μ). It is NOT an EMA-minus-price gap. Over your holding period it works out to μ×DTE${horizon != null ? ` ≈ ${horizon > 0 ? '+' : ''}${horizon.toFixed(1)}% over ${dte}d` : ''} — that horizon drift is what nudges the win %, so −42%/yr does not mean a −42% move.`}>
+                    · trend velocity {mu > 0 ? '+' : ''}{mu}%/yr{horizon != null ? ` (≈${horizon > 0 ? '+' : ''}${horizon.toFixed(1)}% over ${dte}d)` : ''} {dd >= 0 ? 'tailwind' : dd < 0 ? 'headwind' : ''}
+                  </span>
+                );
+              })()}
             </div>
-            <p className="text-[9px] text-base-content/40 mt-0.5">Headline Win% stays standard PoP; this overlay folds in the trend drift (velocity), not the score.</p>
+            <p className="text-[9px] text-base-content/40 mt-0.5">Headline Win% stays standard PoP; this overlay folds in the trend <b>velocity</b> (annualized EMA slope μ, applied over your DTE as μ×T), not the score.</p>
           </div>
         );
       })()}
@@ -511,12 +520,11 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
 
       <CollapsibleSection title="Capital Risk" accent="warning"
         icon={<Shield className="w-3 h-3" />} subtitle="VaR · CVaR · max loss · sizing">
-        <RiskGrid r={dm.risk} />
+        <RiskGrid r={dm.risk} basis={t.capital_basis} notional={t.notional_capital} />
       </CollapsibleSection>
 
       <CollapsibleSection title="Monitoring & Corrective Action" accent="warning"
-        icon={<AlertTriangle className="w-3 h-3" />} subtitle="live TA at your strikes · watch → defend → exit"
-        defaultOpen>
+        icon={<AlertTriangle className="w-3 h-3" />} subtitle="open to read the live TA at your strikes">
         <MonitoringSection ticker={ticker} trade={t} />
       </CollapsibleSection>
 
@@ -889,7 +897,13 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                           <td className="text-success whitespace-nowrap">{money(t.premium)}</td>
                           <td>{winPct(t.prob_keep_pct)}</td>
                           <td className={confTextTone(t.confidence?.label)}>{t.confidence?.label ?? '—'}</td>
-                          <td title="annualized">{annShort(t.premium_annualized_pct)}</td>
+                          <td title="annualized">
+                            {annShort(t.premium_annualized_pct)}
+                            {(t.event_premium_share ?? 0) > 0 && (
+                              <span className="ml-0.5 text-[9px] text-warning cursor-help align-super"
+                                title={`Event-adjusted ${annShort(t.event_adjusted_yield_pct)} — ~${Math.round((t.event_premium_share || 0) * 100)}% of this premium is EARNINGS/event premium (compensation for the binary print), not harvestable time-decay carry.`}>▾</span>
+                            )}
+                          </td>
                           <td className="font-mono">{dm.trader.net_delta ?? '—'}</td>
                           <td className="font-mono">{money(dm.trader.net_theta, 0)}</td>
                         </tr>

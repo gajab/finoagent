@@ -618,13 +618,34 @@ def _term_structure(summaries: list[dict]) -> dict:
             "note": "backwardation (front IV > back) signals event/earnings panic → favor shorter DTE"}
 
 
+def _reg_t_short_put_bpr(spot: float, strike: float, prem_ps: float) -> float:
+    """Reg-T naked short-put Buying Power Reduction per SHARE (Uncovered Margin, NOT cash-secured):
+      max(0.20·underlying − out-of-the-money + premium, 0.10·strike + premium).
+    A put is OTM when spot > strike; deep-OTM puts fall to the 0.10·strike floor (the 0.20·underlying term
+    goes negative). Capital blocked = this × 100. The FULL notional is still the dollar risk on assignment —
+    this only changes the capital the YIELD is measured against, never Max Loss / VaR."""
+    otm = max(spot - strike, 0.0)
+    return max(0.20 * spot - otm + prem_ps, 0.10 * strike + prem_ps)
+
+
+def _reg_t_short_call_bpr(spot: float, strike: float, prem_ps: float) -> float:
+    """Reg-T NAKED short-call Buying Power Reduction per SHARE (uncovered — no stock behind it):
+      max(0.20·underlying − out-of-the-money + premium, 0.10·underlying + premium).
+    A call is OTM when strike > spot; the floor is 10% of the UNDERLYING (not the strike, unlike a put).
+    Upside risk is UNBOUNDED — this only sets the capital blocked, never the (unlimited) max loss."""
+    otm = max(strike - spot, 0.0)
+    return max(0.20 * spot - otm + prem_ps, 0.10 * spot + prem_ps)
+
+
 def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
                        dte: int, exp: str, rnd, r: float, sofr_pct: float,
                        atm_iv: Optional[float], iv_hv_ratio: Optional[float],
                        richness: str, european: bool, earnings_before: Optional[str],
                        macro: list[str], min_prob: float, min_income: float,
-                       ticker: str, allow_illiquid: bool = False) -> Optional[dict]:
-    """Covered call (right C) or cash-secured put (right P) on a single short strike.
+                       ticker: str, allow_illiquid: bool = False, covered: bool = True) -> Optional[dict]:
+    """Short call (right C) or short put (right P) on a single strike. ``covered`` (calls only) = the user
+    HOLDS the shares → the call is stock-secured (covered call); otherwise it is a NAKED call sized by
+    Reg-T margin. Short puts are always Reg-T naked margin (never cash-secured).
 
     ``allow_illiquid`` bypasses the executability / min-income gates — used for the
     FOCUS path (scoring a trade the user ALREADY holds), where the strike can be
@@ -642,7 +663,26 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
     if p_keep is None or p_keep < min_prob:
         return None
 
-    collateral = (spot if right == "C" else q.strike) * CONTRACT_MULTIPLIER
+    # Capital blocked (the YIELD denominator) + the true bounded RISK, by how the short is secured:
+    #   short put             → Reg-T naked margin (BPR);  max loss = strike→0 (bounded notional)
+    #   covered call (owns)   → the held stock (spot·100); max loss = stock→0 (bounded)
+    #   naked call (no stock) → Reg-T naked margin (BPR);  max loss = UNLIMITED (unbounded upside)
+    prem_ps = q.mid
+    if right == "C" and covered:
+        collateral = spot * CONTRACT_MULTIPLIER
+        cap_basis = "covered_stock"
+        max_loss_val = round(-(spot - prem_ps) * CONTRACT_MULTIPLIER, 2)
+        notional_val = round(spot * CONTRACT_MULTIPLIER, 2)
+    elif right == "C":
+        collateral = round(_reg_t_short_call_bpr(spot, q.strike, prem_ps) * CONTRACT_MULTIPLIER, 2)
+        cap_basis = "reg_t_margin"
+        max_loss_val = None                                # naked call — upside risk is unbounded
+        notional_val = round(spot * CONTRACT_MULTIPLIER, 2)
+    else:
+        collateral = round(_reg_t_short_put_bpr(spot, q.strike, prem_ps) * CONTRACT_MULTIPLIER, 2)
+        cap_basis = "reg_t_margin"
+        max_loss_val = round(-(q.strike - prem_ps) * CONTRACT_MULTIPLIER, 2)   # assigned at the strike, stock→0
+        notional_val = round(q.strike * CONTRACT_MULTIPLIER, 2)
     premium_ann = annualized_return_pct(premium, collateral, dte)
     static_ret = premium / collateral * 100 if collateral else 0.0
 
@@ -650,25 +690,32 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
         cushion_pct = (q.strike - spot) / spot * 100
         breakeven = round(spot - q.mid, 2)                 # position breakeven (downside)
         if_assigned = ((q.strike - spot) + q.mid) / spot * 100   # capped gain + premium
-        # CSP earns SOFR on collateral; a covered call's collateral is the stock,
-        # so SOFR-excess is the premium yield itself (alpha on top of holding).
         total_ann = premium_ann
-        sofr_excess = round(premium_ann, 2)
+        # covered = premium alpha on the held stock; naked = AROM excess over the SOFR benchmark
+        sofr_excess = round(premium_ann, 2) if covered else round(premium_ann - sofr_pct, 2)
     else:
         cushion_pct = (spot - q.strike) / spot * 100
         breakeven = round(q.strike - q.mid, 2)             # effective purchase price
         if_assigned = (spot - breakeven) / spot * 100      # discount vs spot if assigned
-        total_ann = sofr_pct + premium_ann                 # MMF base + premium alpha
-        sofr_excess = round(premium_ann, 2)
+        total_ann = premium_ann                            # Reg-T margin: AROM on the BPR (no full-cash SOFR base)
+        sofr_excess = round(premium_ann - sofr_pct, 2)     # carry ALPHA = AROM over the SOFR benchmark
 
     g = _bs_greeks(spot, q.strike, dte, iv or 0.0, right)
     exp_intr = _expected_intrinsic(rnd, q.strike, right)
     expected_pnl = round(premium - exp_intr * CONTRACT_MULTIPLIER, 2) if exp_intr is not None else None
 
     flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
+    if cap_basis == "reg_t_margin":
+        _risk = (f"the full ${notional_val:,.0f} notional is the assignment risk" if right == "P"
+                 else "the upside risk is UNLIMITED (naked call — no stock behind it)")
+        flags.append({"level": "info" if right == "P" else "warn", "text":
+            f"Reg-T naked {'put' if right == 'P' else 'call'} — ${round(collateral):,} BPR blocked (not "
+            f"cash/stock-secured); the yield is a return on MARGIN (AROM). Risk unchanged — {_risk}."})
     return {
         "structure": structure,
-        "label": label,
+        "label": label if (right == "P" or covered) else "Naked Call (Reg-T margin)",
+        "capital_basis": cap_basis,
+        "notional_capital": notional_val,
         "expiration": exp,
         "dte": dte,
         "short_strike": round(q.strike, 2),
@@ -689,8 +736,8 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
         "if_assigned_return_pct": round(if_assigned, 2),
         "breakeven": breakeven,
         "cushion_pct": round(cushion_pct, 2),
-        "max_profit": round(premium, 2) if right == "P" else round(premium + (q.strike - spot) * CONTRACT_MULTIPLIER, 2),
-        "max_loss": None,                       # naked CSP / covered-call downside is open-ended
+        "max_profit": round(premium + (q.strike - spot) * CONTRACT_MULTIPLIER, 2) if (right == "C" and covered) else round(premium, 2),
+        "max_loss": max_loss_val,               # put: strike→0 · covered call: stock→0 · naked call: None (unlimited)
         "expected_pnl": expected_pnl,
         "greeks": {"delta": g["delta"], "gamma": g["gamma"], "theta": g["theta"], "vega": g["vega"]},
         "theta_per_day": round(-g["theta"] * CONTRACT_MULTIPLIER, 2),   # short option → theta accrues to us
@@ -858,6 +905,74 @@ def _short_strangle(calls: dict, puts: dict, spot: float, dte: int, exp: str, rn
     }
 
 
+def _focus_strangle(put_q, call_q, *, spot, dte, exp, rnd, r, atm_iv,
+                    iv_hv_ratio, richness, european, ticker) -> Optional[dict]:
+    """Focus (placed-trade) short strangle priced at the USER'S EXACT short strikes.
+
+    _short_strangle RE-DERIVES near-delta strikes from the RND, so scoring a HELD
+    strangle through it silently scores a DIFFERENT, near-ATM strangle (the bug that
+    made a far-OTM GLD 300/470 read STRONG_CLOSE at 0/100 — the desk saw a ~ATM band).
+    This prices the exact put+call the user holds, gates OFF (the trade is already on).
+    P(keep)=P(finish in band) from the RND when available, else a lognormal-BS estimate."""
+    if put_q is None or call_q is None:
+        return None
+    kp_s, kc_s = float(put_q.strike), float(call_q.strike)
+    net_credit = (put_q.mid or 0.0) + (call_q.mid or 0.0)
+    premium = net_credit * CONTRACT_MULTIPLIER
+    p_keep = None
+    if rnd is not None:
+        try:
+            p_keep = max(0.0, min(1.0, rnd.prob_below(kc_s) - rnd.prob_below(kp_s)))
+        except Exception:  # noqa: BLE001
+            p_keep = None
+    if p_keep is None:                                   # RND unavailable → lognormal BS band prob
+        iv = atm_iv or getattr(put_q, "iv", None) or getattr(call_q, "iv", None) or 0.30
+        T = max(dte, 1) / 365.0
+        p_keep = max(0.0, min(1.0, bs_prob_otm(spot, kc_s, T, r, iv, "call")
+                                   + bs_prob_otm(spot, kp_s, T, r, iv, "put") - 1.0))
+    # Reg-T naked margin (approx): greater single-leg requirement + credit kept.
+    put_m = max(0.20 * spot - (spot - kp_s), 0.10 * kp_s) * CONTRACT_MULTIPLIER
+    call_m = max(0.20 * spot - (kc_s - spot), 0.10 * kc_s) * CONTRACT_MULTIPLIER
+    capital = round(max(put_m, call_m) + premium, 2)
+    premium_ann = annualized_return_pct(premium, capital, dte) if (premium > 0 and capital > 0) else 0.0
+    gp = _bs_greeks(spot, kp_s, dte, (getattr(put_q, "iv", None) or atm_iv or 0.0), "P")
+    gc = _bs_greeks(spot, kc_s, dte, (getattr(call_q, "iv", None) or atm_iv or 0.0), "C")
+    flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
+    flags.append({"level": "warn", "text": "Undefined risk — naked both wings; sized by margin, not cash."})
+    flags.append({"level": "info", "text": f"Profit if it stays in ${round(kp_s, 2)}–${round(kc_s, 2)}"})
+    return {
+        "structure": "short_strangle", "label": "Short Strangle (naked put + call)",
+        "expiration": exp, "dte": dte,
+        "short_strike": round(kp_s, 2), "short_strike_pct": round((kp_s - spot) / spot * 100, 1),
+        "put_short": round(kp_s, 2), "call_short": round(kc_s, 2),
+        "band_low": round(kp_s, 2), "band_high": round(kc_s, 2),
+        "short_delta": gp["delta"],
+        "prob_keep_pct": round(p_keep * 100, 1), "prob_assign_pct": round((1 - p_keep) * 100, 1),
+        "prob_in_band_pct": round(p_keep * 100, 1), "prob_method": "RND" if rnd is not None else "BS",
+        "premium": round(premium, 2), "premium_per_share": round(net_credit, 2),
+        "collateral": capital,
+        "premium_annualized_pct": round(premium_ann, 2), "total_annualized_pct": round(premium_ann, 2),
+        "sofr_excess_pct": round(premium_ann, 2), "beats_sofr": premium_ann > 0,
+        "static_return_pct": round(premium / capital * 100, 2) if capital else 0.0,
+        "breakeven": round(kp_s - net_credit, 2),
+        "cushion_pct": round(min(spot - kp_s, kc_s - spot) / spot * 100, 2),   # nearest breach, both OTM ≥ 0
+        "max_profit": round(premium, 2), "max_loss": None,          # undefined (naked)
+        "expected_pnl": None,
+        "greeks": {"delta": round(gp["delta"] + gc["delta"], 3), "gamma": round(gp["gamma"] + gc["gamma"], 4),
+                   "theta": round(gp["theta"] + gc["theta"], 4), "vega": round(gp["vega"] + gc["vega"], 4)},
+        "theta_per_day": round(-(gp["theta"] + gc["theta"]) * CONTRACT_MULTIPLIER, 2),
+        "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
+        "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
+        "liquidity": {"oi": min(getattr(put_q, "oi", 0) or 0, getattr(call_q, "oi", 0) or 0),
+                      "volume": min(getattr(put_q, "volume", 0) or 0, getattr(call_q, "volume", 0) or 0),
+                      "spread_pct": max(_spread_pct(put_q) or 0, _spread_pct(call_q) or 0)},
+        "exercise_style": "European (cash-settled)" if european else "American",
+        "flags": flags,
+        "legs": [_leg(put_q, "SELL", exp, spot, dte, atm_iv, rnd),
+                 _leg(call_q, "SELL", exp, spot, dte, atm_iv, rnd)],
+    }
+
+
 def _pick_wing(qmap: dict, short_strike: float, side: str) -> Optional[float]:
     """Nearest *executable* strike further OTM than the short. side: 'below' | 'above'."""
     cands = [k for k in qmap if (k < short_strike if side == "below" else k > short_strike)]
@@ -1009,6 +1124,144 @@ def _jade_lizard(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
 
 
 # ---------------------------------------------------------------------------
+# Calendar / horizontal spread — the ONLY long-vega income structure (spans two expiries)
+# ---------------------------------------------------------------------------
+
+def _calendar(front_q: OptionQuote, back_q: OptionQuote, spot: float, front_dte: int, back_dte: int,
+              front_exp: str, back_exp: str, right: str, front_atm_iv: Optional[float],
+              back_atm_iv: Optional[float], r: float, min_income: float, richness: str,
+              iv_hv_ratio: Optional[float]) -> Optional[dict]:
+    """Neutral, defined-risk, LONG-VEGA income: SELL the near-dated option, BUY the far-dated at the SAME
+    strike (a horizontal calendar). Harvests the theta differential (the front decays faster) and is long
+    vega (gains if IV rises / a backwardated front-vs-back term structure normalises) — the counterpart to
+    the short-vol strangle / condor. Max loss = the net debit; max profit ≈ at the strike on the FRONT
+    expiry. Payoff is a HORIZON curve (the back leg is still alive at front expiry)."""
+    from .lifecycle_service import horizon_payoff_curve
+    if front_q is None or back_q is None or back_dte <= front_dte:
+        return None
+    K = float(front_q.strike)
+    if abs(float(back_q.strike) - K) > 1e-6:
+        return None
+    if not _executable(front_q)[0] or not _executable(back_q)[0]:
+        return None
+    fmid, bmid = float(front_q.mid or 0.0), float(back_q.mid or 0.0)
+    net_debit = round(bmid - fmid, 4)
+    if net_debit <= 0.02:                                # must be a real debit (back richer than front)
+        return None
+    cost = round(net_debit * CONTRACT_MULTIPLIER, 2)     # capital at risk = the debit = max loss
+    otype = "call" if right == "C" else "put"
+    fiv = float(front_q.iv or front_atm_iv or 0.30)      # OptionQuote.iv is already a decimal
+    biv = float(back_q.iv or back_atm_iv or 0.30)
+    T = max(front_dte, 1) / 365.0
+    t_rem = max(back_dte - front_dte, 1) / 365.0
+    max_profit = round((bs_price(K, K, t_rem, r, biv, otype) - net_debit) * CONTRACT_MULTIPLIER, 2)
+    if max_profit < max(min_income, 1.0):
+        return None
+    legs_life = [
+        {"strike": K, "right": right, "sign": -1, "qty": 1, "price": fmid, "iv": fiv, "dte_years": front_dte / 365.0},
+        {"strike": K, "right": right, "sign": 1, "qty": 1, "price": bmid, "iv": biv, "dte_years": back_dte / 365.0},
+    ]
+    curve = horizon_payoff_curve(legs_life, 0.0, spot, T, r=r)
+    bes = []
+    for a, b in zip(curve, curve[1:]):
+        if (a["pnl"] < 0 <= b["pnl"]) or (a["pnl"] >= 0 > b["pnl"]):
+            denom = (b["pnl"] - a["pnl"]) or 1e-9
+            bes.append(round(a["price"] + (b["price"] - a["price"]) * (0 - a["pnl"]) / denom, 2))
+    be_low = min(bes) if bes else None
+    be_high = max(bes) if bes else None
+
+    def _cdf_below(x):                                   # lognormal P(S_T < x) at the FRONT horizon
+        if not x or x <= 0 or fiv <= 0:
+            return None
+        d = (math.log(x / spot) - (r - 0.5 * fiv * fiv) * T) / (fiv * math.sqrt(T))
+        return 0.5 * (1 + math.erf(d / math.sqrt(2)))
+    cl, ch = _cdf_below(be_low), _cdf_below(be_high)
+    p_profit = max(0.0, min(1.0, ch - cl)) if (cl is not None and ch is not None) else None
+
+    gf = _bs_greeks(spot, K, front_dte, fiv, right)
+    gb = _bs_greeks(spot, K, back_dte, biv, right)
+    net = {k: (gb[k] - gf[k]) for k in ("delta", "gamma", "theta", "vega")}   # LONG back − SHORT front
+    # A calendar's max profit is a LARGE fraction of a SMALL debit over a short front — COMPOUND-annualizing
+    # it explodes (billions of %). Use a LINEAR, probability-weighted annualization capped at a sane ceiling;
+    # the risk-adjusted desk score (not this headline) does the real ranking.
+    _pf = p_profit if p_profit is not None else 0.5
+    premium_ann = round(min((max_profit / cost) * _pf * (365.0 / max(front_dte, 1)), 3.0) * 100.0, 1)
+
+    flags = _opp_flags(richness, front_atm_iv, iv_hv_ratio)
+    flags.append({"level": "info",
+                  "text": f"Debit calendar — SELL {front_exp} / BUY {back_exp} @ {round(K, 2)}. Max loss = debit "
+                          f"${cost}; max profit ~${max_profit} at ${round(K, 2)} on the {front_exp} expiry. LONG "
+                          f"vega — gains if IV rises (best in contango / when the front is rich to the back)."})
+    if be_low and be_high:
+        flags.append({"level": "info", "text": f"Profit tent ${be_low}–${be_high} at front expiry"})
+    return {
+        "structure": "calendar",
+        "label": f"{'Call' if right == 'C' else 'Put'} Calendar ({front_exp} → {back_exp})",
+        "expiration": front_exp, "dte": front_dte, "back_expiration": back_exp, "back_dte": back_dte,
+        "short_strike": round(K, 2), "short_strike_pct": round((K - spot) / spot * 100, 1),
+        "put_short": round(be_low, 2) if be_low else None,     # danger edge DOWN (tent collapses beyond it)
+        "call_short": round(be_high, 2) if be_high else None,  # danger edge UP
+        "band_low": be_low, "band_high": be_high,
+        "prob_keep_pct": round(p_profit * 100, 1) if p_profit is not None else None,
+        "prob_in_band_pct": round(p_profit * 100, 1) if p_profit is not None else None,
+        "prob_method": "lognormal(front)",
+        "net_debit": net_debit,
+        "premium": max_profit, "premium_per_share": round(max_profit / CONTRACT_MULTIPLIER, 2),
+        "collateral": cost,
+        "premium_annualized_pct": round(premium_ann, 2), "total_annualized_pct": round(premium_ann, 2),
+        "sofr_excess_pct": round(premium_ann, 2), "beats_sofr": True,
+        "static_return_pct": round(max_profit / cost * 100, 2) if cost else 0.0,
+        "breakeven": be_low,
+        "cushion_pct": (round(min(spot - be_low, be_high - spot) / spot * 100, 2)
+                        if (be_low and be_high) else None),
+        "max_profit": max_profit, "max_loss": round(-cost, 2), "expected_pnl": None,
+        "greeks": {"delta": round(net["delta"], 3), "gamma": round(net["gamma"], 4),
+                   "theta": round(net["theta"], 4), "vega": round(net["vega"], 4)},
+        "theta_per_day": round(net["theta"] * CONTRACT_MULTIPLIER, 2),    # + = net decay collected
+        "vega_exposure": round(net["vega"] * CONTRACT_MULTIPLIER, 2),     # + = LONG vega
+        "atm_iv_pct": round(front_atm_iv * 100, 1) if front_atm_iv else None,
+        "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
+        "liquidity": {"oi": min(front_q.oi or 0, back_q.oi or 0),
+                      "volume": min(front_q.volume or 0, back_q.volume or 0),
+                      "spread_pct": max(_spread_pct(front_q) or 0, _spread_pct(back_q) or 0)},
+        "exercise_style": "American",
+        "flags": flags,
+        "legs": [_leg(front_q, "SELL", front_exp, spot, front_dte, front_atm_iv),
+                 _leg(back_q, "BUY", back_exp, spot, back_dte, back_atm_iv)],
+    }
+
+
+def _scan_calendars(chains: list, spot: float, r: float, min_income: float,
+                    hv: Optional[float]) -> list[dict]:
+    """Build calendar(s) from the cached per-expiry chains: pair the nearest expiry (front, ≥7 DTE) with a
+    later one (≥20 days out) and write an ATM calendar. `chains` = [(dte, exp, calls, puts)] sorted by dte."""
+    usable = sorted([c for c in chains if c[0] and c[0] >= 7], key=lambda c: c[0])
+    if len(usable) < 2:
+        return []
+    fdte, fexp, fcalls, fputs = usable[0]
+    back = next((c for c in reversed(usable) if c[0] - fdte >= 20), None)
+    if not back:
+        return []
+    bdte, bexp, bcalls, bputs = back
+    f_atm = _atm_iv(None, fcalls, fputs, spot)
+    b_atm = _atm_iv(None, bcalls, bputs, spot)
+    iv_hv_ratio, richness = _richness(f_atm, hv)
+    out: list[dict] = []
+    for right, fbook, bbook in (("C", fcalls, bcalls), ("P", fputs, bputs)):
+        common = sorted(set(fbook) & set(bbook), key=lambda k: abs(k - spot))
+        if not common:
+            continue
+        K = common[0]                                    # ATM common strike
+        o = _calendar(fbook[K], bbook[K], spot, fdte, bdte, fexp, bexp, right,
+                      f_atm, b_atm, r, min_income, richness, iv_hv_ratio)
+        if o:
+            out.append(o)
+    # keep the single best ATM calendar (call/put are ~equivalent at ATM; pick the higher keep-prob)
+    out.sort(key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0), reverse=True)
+    return out[:1]
+
+
+# ---------------------------------------------------------------------------
 # Per-expiry scan
 # ---------------------------------------------------------------------------
 
@@ -1150,22 +1403,18 @@ def _build_focus_opp(focus: dict, calls: dict, puts: dict, common: dict, sofr_pc
     try:
         if structure == "covered_call" and sc:
             q = _q(sc[0]["strike"], calls)
-            return _single_leg_income("covered_call", "Covered Call", q, sofr_pct=sofr_pct, allow_illiquid=True, **c0) if q else None
+            return _single_leg_income("covered_call", "Covered Call", q, sofr_pct=sofr_pct,
+                                      allow_illiquid=True, covered=True, **c0) if q else None
         if structure == "naked_call" and sc:
             q = _q(sc[0]["strike"], calls)
             if not q:
                 return None
-            # Same short-call option-math as a covered call, but NAKED: profit is just the
-            # credit (no stock upside), the loss is unbounded, and capital is the Reg T
-            # naked-call margin — so the payoff/tail correctly reflect the open risk.
-            opp = _single_leg_income("naked_call", "Naked Call", q, sofr_pct=sofr_pct, allow_illiquid=True, **c0)
+            # NAKED short call — _single_leg_income(covered=False) already sets the Reg-T naked-call BPR
+            # (premium included), max_profit = the credit, and max_loss = None (unbounded upside).
+            opp = _single_leg_income("naked_call", "Naked Call", q, sofr_pct=sofr_pct,
+                                     allow_illiquid=True, covered=False, **c0)
             if opp:
-                spot = common["spot"]
-                otm = max(0.0, q.strike - spot)
-                opp["max_profit"] = round(opp["premium"], 2)
-                opp["max_loss"] = None
                 opp["unbounded_loss"] = True
-                opp["collateral"] = round(max(0.20 * spot - otm, 0.10 * spot) * CONTRACT_MULTIPLIER, 2)
             return opp
         if structure == "cash_secured_put" and sp:
             q = _q(sp[0]["strike"], puts)
@@ -1177,8 +1426,13 @@ def _build_focus_opp(focus: dict, calls: dict, puts: dict, common: dict, sofr_pc
             sq, lq = _q(sc[0]["strike"], calls), _q(lc[0]["strike"], calls)
             return _credit_spread("call_credit_spread", "Call Credit Spread", sq, lq, **c0) if sq and lq else None
         if structure == "short_strangle" and sp and sc:
-            return _short_strangle(calls, puts, **{k: v for k, v in c0.items()
-                                                   if k not in ("earnings_before", "macro")})
+            # Price the USER'S EXACT short put + call (NOT _short_strangle, which re-derives
+            # near-ATM strikes and would score a different band).
+            sq, cq = _q(sp[0]["strike"], puts), _q(sc[0]["strike"], calls)
+            return _focus_strangle(sq, cq, spot=common["spot"], dte=common["dte"], exp=common["exp"],
+                                   rnd=common["rnd"], r=common["r"], atm_iv=common["atm_iv"],
+                                   iv_hv_ratio=common["iv_hv_ratio"], richness=common["richness"],
+                                   european=common["european"], ticker=common["ticker"]) if sq and cq else None
         if structure == "iron_condor" and sp and lp and sc and lc:
             sq, lpq = _q(sp[0]["strike"], puts), _q(lp[0]["strike"], puts)
             scq, lcq = _q(sc[0]["strike"], calls), _q(lc[0]["strike"], calls)
@@ -1410,10 +1664,18 @@ def _build_evaluate_opp(legs: list[dict], stock: Optional[dict], chains_by_exp: 
     # Only annualize genuine income (net credit); a net debit reads as its period return, not a yield.
     premium_ann = annualized_return_pct(premium, capital, near_dte) if (premium > 0 and capital > 0) else round(static_ret, 2)
 
+    # Cushion = distance to the NEAREST short strike that could be breached, SIDE-AWARE:
+    # a short call is breached from ABOVE (K−spot), a short put from BELOW (spot−K). The
+    # book cushion is the thinner of the two (min), positive while both wings are OTM. A
+    # single (nearest−spot) formula wrongly flips the sign on a below-spot short put.
     short_strike = None
-    if shorts_put or shorts_call:
-        short_strike = min(shorts_put + shorts_call, key=lambda k: abs(k - spot))
-    cushion_pct = round(((short_strike if short_strike else breakeven) - spot) / spot * 100, 2)
+    leg_cush = ([((k - spot) / spot, k) for k in shorts_call]
+                + [((spot - k) / spot, k) for k in shorts_put])
+    if leg_cush:
+        cushion_frac, short_strike = min(leg_cush, key=lambda t: t[0])
+    else:
+        cushion_frac = (breakeven - spot) / spot if breakeven else 0.0
+    cushion_pct = round(cushion_frac * 100, 2)
 
     ois = [d.get("oi") or 0 for d in leg_dicts]; vols = [d.get("vol") or 0 for d in leg_dicts]
     sprs = [d.get("bid_ask_spread_pct") for d in leg_dicts if d.get("bid_ask_spread_pct") is not None]
@@ -1466,8 +1728,10 @@ def _build_evaluate_opp(legs: list[dict], stock: Optional[dict], chains_by_exp: 
 def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: date,
                  r: float, sofr_pct: float, hv: Optional[float], structures: list[str],
                  european: bool, next_earnings: Optional[str], min_prob: float,
-                 min_income: float, ticker: str, focus: Optional[dict] = None) -> tuple[list[dict], dict]:
-    """All qualifying opportunities for one expiration + an expiry summary."""
+                 min_income: float, ticker: str, focus: Optional[dict] = None,
+                 owns_underlying: bool = False) -> tuple[list[dict], dict]:
+    """All qualifying opportunities for one expiration + an expiry summary. ``owns_underlying`` = the user
+    holds the shares → short calls are COVERED; otherwise they are NAKED (Reg-T margin)."""
     calls, puts = _split_chain(chain)
     strikes_all = sorted(set(calls) | set(puts))
     rnd = _build_rnd(calls, puts, strikes_all, spot, dte)
@@ -1489,11 +1753,12 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     call_strikes = sorted(k for k in calls if k > spot * 1.001)
     put_strikes = sorted((k for k in puts if k < spot * 0.999), reverse=True)
 
-    # ---- Covered calls (OTM calls) ----
+    # ---- Short calls (OTM) — COVERED if the user holds the shares, else NAKED (Reg-T margin) ----
     if "covered_call" in structures:
+        _cc_label = "Covered Call" if owns_underlying else "Naked Call (Reg-T margin)"
         cc = [o for k in call_strikes
-              if (o := _single_leg_income("covered_call", "Covered Call", calls[k],
-                                          sofr_pct=sofr_pct, **common))]
+              if (o := _single_leg_income("covered_call", _cc_label, calls[k],
+                                          sofr_pct=sofr_pct, covered=owns_underlying, **common))]
         # Prioritize SAFER strikes (higher keep-prob) — surface the ladder above min_prob, not just the
         # nearest-money / highest-yield strikes; yield breaks ties.
         opps += sorted(cc, key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0),
@@ -1622,6 +1887,7 @@ async def run_derivative_income(
     db: Optional["AsyncSession"] = None,
     target_expiration: Optional[str] = None,
     focus: Optional[dict] = None,
+    owns_underlying: bool = False,
 ) -> dict:
     """Deep-scan one underlying for income opportunities (≥``min_prob`` no-assignment,
     ≥``min_income`` premium), ranked by annualized yield vs SOFR.
@@ -1630,13 +1896,14 @@ async def run_derivative_income(
     caller's EXACT placed trade as a candidate (filters off) — for lifecycle scoring."""
     ticker = _norm_ticker(ticker)
     structures = structures or ["covered_call", "cash_secured_put", "short_strangle",
-                                "credit_spread", "iron_condor", "jade_lizard"]
+                                "credit_spread", "iron_condor", "jade_lizard", "calendar"]
     min_prob = min(max(min_prob, 0.5), 0.99)
     today = date.today()
 
     exp_key = target_expiration or (target_dte if target_dte else "monthly")
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
-                 f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:v1")
+                 f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
+                 f"{'own' if owns_underlying else 'naked'}:v2")   # owns → covered call · else naked-call BPR
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:
         cached = await get_cached(db, cache_key)
@@ -1672,6 +1939,7 @@ async def run_derivative_income(
 
     opportunities: list[dict] = []
     expiry_summaries: list[dict] = []
+    chains_cache: list = []       # (dte, exp, calls, puts) — kept so the CALENDAR builder can pair two expiries
     for exp, dte in chosen:
         try:
             chain = await provider.get_option_chain(ticker, exp)
@@ -1687,10 +1955,22 @@ async def run_derivative_income(
         opps, summary = _scan_expiry(
             chain, spot, dte, exp, today, sofr_frac, sofr_pct, hv, structures,
             european, ctx.get("next_earnings"), min_prob, min_income, ticker,
-            focus=focus,
+            focus=focus, owns_underlying=owns_underlying,
         )
         opportunities.extend(opps)
         expiry_summaries.append(summary)
+        try:
+            _cc, _pp = _split_chain(chain)
+            chains_cache.append((dte, exp, _cc, _pp))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Calendars span TWO expiries → built here (not in _scan_expiry, which sees one chain) from the cache.
+    if "calendar" in structures:
+        try:
+            opportunities.extend(_scan_calendars(chains_cache, spot, sofr_frac, min_income, hv))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("calendar scan failed for %s: %s", ticker, exc)
 
     opportunities.sort(key=lambda o: o.get("premium_annualized_pct", 0), reverse=True)
     best_by_structure: dict[str, dict] = {}

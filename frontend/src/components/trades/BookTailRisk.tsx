@@ -126,12 +126,12 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                 </div>
               )}
 
-              {/* Hedge menu — ranked alternatives */}
+              {/* Hedge menu — ranked alternatives: SPX puts (linear) + VIX calls (convex black-swan) */}
               {(data.hedge_menu?.length ?? 0) > 0 && (
                 <div className="rounded-xl border border-info/20 bg-info/[0.03] p-2.5 space-y-2">
                   <div className="text-[10px] uppercase tracking-wider text-info/80 font-semibold flex items-center gap-1">
-                    <Umbrella className="w-3.5 h-3.5" /> Tail-hedge menu · index (SPX) convexity
-                    <span className="ml-auto normal-case text-[9px] text-base-content/40">{data.hedge_menu![0].pricing}{data.hedge_menu![0].expiry ? ` · exp ${data.hedge_menu![0].expiry}` : ''} · ~{data.hedge_menu![0].dte_days}d</span>
+                    <Umbrella className="w-3.5 h-3.5" /> Tail-hedge menu · SPX puts + VIX black-swan
+                    <span className="ml-auto normal-case text-[9px] text-base-content/40">~{data.hedge_menu![0].dte_days}d</span>
                   </div>
                   <div className="overflow-x-auto">
                     <table className="table table-xs w-full text-[11px]">
@@ -139,23 +139,36 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                         <th>Hedge</th><th>Strikes</th><th>×</th><th>Cost/yr</th><th>Offsets −20%</th><th title="Book CVaR-95 reduction">CVaR cut</th><th title="Spitznagel: compound-growth lift">CAGR</th>
                       </tr></thead>
                       <tbody>
-                        {data.hedge_menu!.map((c, i) => (
+                        {data.hedge_menu!.map((c, i) => {
+                          const lo = c.long_strike ?? c.long_put;
+                          const sh = c.short_strike ?? c.short_put;
+                          const badge = c.instrument === 'VIX' ? 'badge-secondary'
+                            : c.instrument === 'VIXY' ? 'badge-accent' : 'badge-info';
+                          const isVixy = c.instrument === 'VIXY';
+                          return (
                           <tr key={i} className={c.recommended ? 'bg-success/[0.06]' : ''}>
-                            <td className="whitespace-nowrap">{c.recommended && <CheckCircle2 className="w-3 h-3 text-success inline mr-1" />}{c.label}</td>
-                            <td className="font-mono">{c.long_put}{c.short_put ? `/${c.short_put}` : ''}</td>
-                            <td>{c.contracts}</td>
-                            <td className="text-warning/90">{money(c.annual_bleed)}</td>
+                            <td className="whitespace-nowrap" title={isVixy ? c.signal : undefined}>
+                              {c.recommended && <CheckCircle2 className="w-3 h-3 text-success inline mr-1" />}
+                              <span className={`badge badge-xs mr-1 ${badge} badge-outline`}>{c.instrument ?? 'SPX'}</span>
+                              {c.label}
+                            </td>
+                            <td className="font-mono">{isVixy ? `${money(c.sleeve_capital)} cash` : (lo != null ? `${lo}${sh ? `/${sh}` : ''}` : '—')}</td>
+                            <td>{c.contracts ?? (isVixy ? 'sig' : '—')}</td>
+                            <td className={isVixy ? 'text-success/90' : 'text-warning/90'}>{money(c.annual_bleed)}{isVixy ? '*' : ''}</td>
                             <td>{c.offsets_pct != null ? `${c.offsets_pct}%` : '—'}</td>
                             <td className="text-success/90">{money(c.cvar_reduction)}</td>
                             <td className={c.cagr_lift_pct >= 0 ? 'text-success font-semibold' : 'text-error'}>{c.cagr_lift_pct >= 0 ? '+' : ''}{c.cagr_lift_pct}%</td>
                           </tr>
-                        ))}
+                        ); })}
                       </tbody>
                     </table>
                   </div>
                   <p className="text-[9px] text-base-content/40 leading-snug">
-                    Ranked by CVaR reduced per $/yr spent, then Spitznagel cost-vs-drag. A <b>positive CAGR</b> means capping the
-                    crash lifts your compound growth (worth it even while bleeding premium); negative = pure insurance.
+                    Ranked by CVaR reduced per $/yr spent, then Spitznagel cost-vs-drag. <b className="text-info/80">SPX puts</b> = linear crash protection.
+                    {' '}<b className="text-secondary/80">VIX call spreads</b> = cheap convexity that only pays when vol EXPLODES (a −20% month implies VIX ≈ {data.hedge_menu!.find(c => c.instrument === 'VIX')?.vix_at_minus20 ?? '—'}).
+                    {' '}<b className="text-accent/80">Dynamic VIXY</b> = a cash sleeve deployed into VIXY ONLY when the VIX term structure inverts (backwardation),
+                    so it avoids permanent roll-decay — <b>*near-zero cost</b>, but it ties up cash and its payoff is haircut ~35% for signal/gap lag.
+                    A <b>positive CAGR</b> means capping the crash lifts compound growth; negative = pure insurance.
                   </p>
                 </div>
               )}

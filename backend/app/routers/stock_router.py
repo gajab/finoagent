@@ -140,7 +140,7 @@ async def get_box_market_timing(user: User = Depends(get_current_user)):
 # =========================================================================
 
 _DI_DEFAULT_STRUCTURES = ["covered_call", "cash_secured_put", "collar", "credit_spread",
-                          "iron_condor", "jade_lizard"]
+                          "iron_condor", "jade_lizard", "calendar"]
 
 
 class DerivativeIncomePortfolioIn(BaseModel):

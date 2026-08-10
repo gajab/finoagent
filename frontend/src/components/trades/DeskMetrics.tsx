@@ -65,8 +65,9 @@ export interface RiskMetricsData {
   var_95?: number | null; cvar_95?: number | null; max_loss?: number | null; max_profit?: number | null; capital?: number | null;
 }
 
-export function RiskGrid({ r }: { r: RiskMetricsData }) {
+export function RiskGrid({ r, basis, notional }: { r: RiskMetricsData; basis?: string; notional?: number | null }) {
   const tailPct = r.cvar_95 != null && r.capital ? (r.cvar_95 / r.capital) * 100 : null;
+  const isMargin = basis === 'reg_t_margin';
   return (
     <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
       <Metric label="VaR 95%" value={r.var_95 != null ? fmtMoney(r.var_95) : '—'} hint="1-in-20 loss over the horizon (position)" color="text-warning/80" />
@@ -74,7 +75,10 @@ export function RiskGrid({ r }: { r: RiskMetricsData }) {
       <Metric label="Tail / Capital" value={tailPct != null ? `${tailPct.toFixed(0)}%` : '—'} hint="CVaR95 as a fraction of capital committed" color={tailPct != null && tailPct <= 25 ? 'text-success/80' : 'text-warning/80'} />
       <Metric label="Max Profit" value={r.max_profit != null ? fmtMoney(r.max_profit) : '—'} hint="Best-case payoff" color="text-success/80" />
       <Metric label="Max Loss" value={r.max_loss != null ? fmtMoney(r.max_loss) : '—'} hint="Worst-case payoff (deep tail)" color="text-error/80" />
-      <Metric label="Capital" value={r.capital != null ? fmtMoney(r.capital) : '—'} hint="Total capital committed" />
+      <Metric label={isMargin ? 'Margin (BPR)' : 'Capital'} value={r.capital != null ? fmtMoney(r.capital) : '—'}
+        hint={isMargin
+          ? `Reg-T naked-margin buying-power reduction blocked — the YIELD denominator. The full notional${notional != null ? ` (${fmtMoney(notional)})` : ''} is still the assignment risk (see Max Loss), not this.`
+          : 'Total capital committed'} />
     </div>
   );
 }

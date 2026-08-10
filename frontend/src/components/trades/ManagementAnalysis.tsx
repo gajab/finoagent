@@ -1,17 +1,38 @@
 /**
  * ManagementAnalysis — the DEEP hold-vs-close read for a trade you already hold.
  *
- * It leverages the SAME quant engine the Derivative Income scan runs (VRP boundary,
- * Moneyness, Liquidity, Expectation, TA regime/value-area/gamma) but every factor is
- * RE-SIGNED and RE-WEIGHTED for a holder (cheap implied vol flips from an entry
- * demerit to "Vol decay" in your favour; liquidity becomes the cost to CLOSE;
- * expectation is downweighted to a remote tail). Starts from a NEUTRAL 50 baseline
- * (not keep-prob), then the re-signed factors + take-profit / time-gamma overlay →
- * STRONG_HOLD / HOLD / CLOSE / STRONG_CLOSE. Mirrors the scan's build-up so it's
- * fully auditable — but answers "should I stay in?", not "should I enter?".
+ * "Given I'm already in, is what's LEFT worth the risk?" The base is COMPUTED from the
+ * live position state — remaining reward vs remaining risk from HERE (keep-prob,
+ * premium-left × keep, Omega/Sortino, CVaR tail, cushion), the holder analogue of the
+ * scan's entry base — NOT a fixed 50. Then the SAME scan factors, re-signed for a
+ * holder (cheap/falling vol → "Vol decay"; liquidity → cost to CLOSE; expectation →
+ * remote tail), a dynamic-greek convexity term, and a slim time/gamma overlay decide
+ * STRONG_HOLD / HOLD / CLOSE / STRONG_CLOSE. A booked winner with premium left and a
+ * manageable tail keeps reading HOLD — no reflexive "you're green, close".
  */
 import { QpBoundary } from '../DeskReview';
-import type { ManagementAnalysis as MA } from '../../api';
+import type { ManagementAnalysis as MA, ManagementLens } from '../../api';
+
+// One computed base lens — shows the FULL arithmetic: sub-score bar × weight = points
+// toward the base, so the base is never a black-box number.
+function LensRow({ lens }: { lens: ManagementLens }) {
+  const s = Math.max(0, Math.min(100, lens.score));
+  const tone = s >= 66 ? 'bg-success' : s >= 40 ? 'bg-warning' : 'bg-error';
+  return (
+    <div title={lens.note} className="grid grid-cols-[7.5rem_1fr_5.5rem] items-center gap-2">
+      <span className="text-[10px] text-base-content/70 truncate">{lens.label}</span>
+      <div className="flex items-center gap-1.5">
+        <div className="h-1.5 flex-1 rounded-full bg-base-300/40 overflow-hidden">
+          <div className={`h-full ${tone} rounded-full`} style={{ width: `${s}%` }} />
+        </div>
+        <span className="font-mono text-[10px] text-base-content/50 w-5 text-right">{s}</span>
+      </div>
+      <span className="font-mono text-[9px] text-base-content/45 text-right whitespace-nowrap">
+        ×{lens.weight}% = <span className="text-base-content/70 font-semibold">{lens.contribution}</span>
+      </span>
+    </div>
+  );
+}
 
 const SIGNAL: Record<string, { label: string; cls: string; tone: string }> = {
   STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success',              tone: 'success' },
@@ -62,16 +83,28 @@ export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
       {/* The implied-vs-physical boundary — does spot clear both bands vs your strike? */}
       {qp && <QpBoundary qp={qp} />}
 
-      {/* Baseline — neutral 50; the re-signed factors move it toward hold or close */}
-      <div className="flex items-baseline gap-2">
-        <span className={GROUP}>{ma.anchor_label}</span>
-        <span className="text-sm font-bold text-base-content/80 ml-auto">{ma.anchor}</span>
+      {/* Computed base — the 5 lenses and the EXACT weighted arithmetic that reaches it,
+          so "base quality" is auditable (mirrors the scan's base-quality build-up). */}
+      <div className="rounded-lg border border-white/[0.06] bg-base-300/20 p-2">
+        <div className="flex items-baseline gap-2 mb-1.5">
+          <span className={GROUP}>{ma.anchor_label}</span>
+          <span className="text-[8px] text-base-content/35 ml-auto">score × weight = pts</span>
+        </div>
+        {ma.base_lenses && ma.base_lenses.length > 0 && (
+          <div className="space-y-1.5">
+            {ma.base_lenses.map((l, i) => <LensRow key={i} lens={l} />)}
+          </div>
+        )}
+        <div className="flex items-baseline gap-2 mt-2 pt-1.5 border-t border-white/[0.06]">
+          <span className="text-[10px] text-base-content/60">Σ weighted lenses</span>
+          <span className="ml-auto text-sm font-bold text-base-content/85">{ma.anchor}<span className="text-[10px] text-base-content/40">/100 base</span></span>
+        </div>
       </div>
 
-      {/* Re-signed scan factors — the holder interpretation */}
+      {/* Re-signed scan + dynamic-greek factors — the holder interpretation */}
       {ma.contributions.length > 0 && (
         <div>
-          <div className={GROUP}>Factors · re-signed for your position (± on keep-prob)</div>
+          <div className={GROUP}>Factors · re-signed for your position (adjust the base)</div>
           <div className="grid sm:grid-cols-2 gap-x-4 gap-y-1.5">
             {ma.contributions.map((c, i) => <FactorRow key={i} {...c} />)}
           </div>
@@ -81,7 +114,7 @@ export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
         </div>
       )}
 
-      {/* Take-profit / time overlay */}
+      {/* Slim time / gamma overlay */}
       {ma.overlay.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
           {ma.overlay.map((o, i) => (
@@ -92,9 +125,9 @@ export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
         </div>
       )}
 
-      {/* Auditable build-up */}
+      {/* Auditable build-up: computed base + factors + overlay = score */}
       <div className="text-[10px] text-base-content/50 font-mono pt-1.5 border-t border-white/[0.06]">
-        {ma.anchor} {ma.anchor_label} {sgn(ma.factors_net)} factors {sgn(overlayNet)} overlay = {ma.score}
+        base {ma.anchor} {sgn(ma.factors_net)} factors {sgn(overlayNet)} overlay = {ma.score}
         {' '}→ <span className={`text-${s.tone} font-semibold`}>{s.label}</span>
       </div>
 

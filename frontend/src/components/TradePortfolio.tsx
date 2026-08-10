@@ -737,9 +737,13 @@ export function TradePortfolio() {
                             <div className="text-[10px] uppercase opacity-70">Unrealized P&L</div>
                             <div className="font-bold text-sm">{pnl.unrealized_pnl >= 0 ? '+' : ''}${pnl.unrealized_pnl.toFixed(2)} ({pnl.pnl_pct >= 0 ? '+' : ''}{pnl.pnl_pct}%)</div>
                           </div>
-                          <div className="bg-base-300/30 rounded-lg p-2 text-center">
+                          <div className={`rounded-lg p-2 text-center ${dteRemaining != null && dteRemaining >= 0 && dteRemaining <= 21 ? 'bg-warning/15 ring-1 ring-warning/40' : 'bg-base-300/30'}`}
+                            title={dteRemaining != null && dteRemaining <= 21 ? '21-DTE management window — gamma accelerates; take profit on winners / roll tested strikes rather than carrying into expiration.' : undefined}>
                             <div className="text-[10px] text-base-content/50 uppercase">Days Held</div>
                             <div className="font-bold text-sm">{pnl.days_held}{dteRemaining != null ? ` / ${dteRemaining} DTE` : ''}</div>
+                            {dteRemaining != null && dteRemaining >= 0 && dteRemaining <= 21 && (
+                              <div className="text-[8px] font-semibold text-warning uppercase tracking-wide">21-DTE · manage</div>
+                            )}
                           </div>
                         </div>
 

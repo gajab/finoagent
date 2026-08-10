@@ -3501,6 +3501,8 @@ export interface DerivativeIncomeOpportunity {
   premium: number;
   premium_per_share: number;
   collateral: number;
+  capital_basis?: 'reg_t_margin' | 'covered_stock' | string;   // short put = Reg-T naked margin (BPR)
+  notional_capital?: number | null;                            // full cash-secured notional (the dollar RISK)
   premium_annualized_pct: number;
   total_annualized_pct: number;
   sofr_pct?: number;
@@ -3690,7 +3692,7 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
     physical_wider?: boolean; exposed_physical?: boolean;
     keep_standard_pct?: number | null;               // headline Win% — standard risk-neutral PoP
     keep_drift_pct?: number | null;                  // drift-adjusted Win% (P-measure overlay; display only)
-    drift_mu_pct?: number | null;                    // EMA-slope annualized drift (%/yr)
+    drift_mu_pct?: number | null;                    // trend velocity: annualized 21-day EMA slope μ (%/yr), applied over DTE as μ×T
     atr_vol_pct?: number | null;                     // ATR-implied (gap-aware) annualized vol
     gap_aware?: boolean;                             // true when ATR-vol > close-to-close HV (gaps present)
   };
@@ -3702,6 +3704,8 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   nearby_count?: number;                             // how many adjacent strikes this row stands in for
   nearby_range?: [number, number];                   // [min, max] strike span it represents
   risk_triggers?: RiskTrigger[];                     // WATCH→DEFEND→EXIT price ladder (TA + geometry)
+  event_adjusted_yield_pct?: number | null;          // annualized yield with the earnings/event premium stripped
+  event_premium_share?: number | null;               // fraction of the premium that is event (not harvestable) premium
 }
 
 // One rung of the tail-risk management plan — a price level + the corrective action to take there.

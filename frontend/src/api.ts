@@ -1409,11 +1409,15 @@ export async function fetchUnderlyingDesk(id: number, quoteSource = 'yfinance'):
 
 // Institutional book-level short-vol / tail-risk desk.
 export interface BookHedgeCandidate {
-  label: string; long_put: number; short_put: number | null; contracts: number;
+  label: string; long_put: number | null; short_put: number | null; contracts: number | null;
+  instrument?: 'SPX' | 'VIX' | 'VIXY'; kind?: string;     // SPX put · VIX call · VIXY signal-based
+  long_strike?: number | null; short_strike?: number | null;
   cost_per_spread: number; total_cost: number; annual_bleed: number;
   crash_payoff_20: number; offsets_pct: number | null; cvar_reduction: number;
   efficiency: number | null; cagr_lift_pct: number; cost_effective: boolean; recommended?: boolean;
-  index?: string; pricing?: string; dte_days?: number; expiry?: string | null;
+  index?: string; pricing?: string; dte_days?: number | null; expiry?: string | null;
+  vix_at_minus20?: number;                                // VIX future level a −20% month implies
+  sleeve_capital?: number; signal?: string; capture_pct?: number;   // VIXY dynamic sleeve
 }
 export interface BookTailRiskResult {
   positions: number;
@@ -1506,16 +1510,25 @@ export interface ManagementContribution {
   note: string;
 }
 // The deep management read — scan factors re-signed + take-profit/time overlay → hold/close.
+export interface ManagementLens {
+  label: string; score: number;   // the 0-100 lens sub-score
+  weight?: number;                 // its weight in the base (percent)
+  contribution?: number;           // score × weight → points toward the base
+  note: string;
+}
+
 export interface ManagementAnalysis {
-  anchor: number;                 // neutral 50 baseline — the re-signed factors move it
+  anchor: number;                 // COMPUTED hold-quality base (remaining risk vs reward), not a fixed 50
   anchor_label: string;
-  contributions: ManagementContribution[]; // re-signed scan factors (VRP/Moneyness/TA/…)
+  base_lenses?: ManagementLens[]; // the 5 lenses behind the base (edge/reward/risk-adj/tail/cushion)
+  contributions: ManagementContribution[]; // re-signed scan + dynamic-greek factors
   factors_net: number;
-  overlay: { name: string; pts: number; note: string }[]; // take-profit / time-gamma
+  overlay: { name: string; pts: number; note: string }[]; // slim time / gamma
   score: number;
   signal: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   overrides: string[];
   advisories?: string[];          // covered / naked call structural advice
+  greeks_used?: { net_gamma?: number | null; net_vega?: number | null; net_theta?: number | null };
 }
 
 export async function runDeskScore(

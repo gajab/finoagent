@@ -493,6 +493,38 @@ def structure_payoff_extremes(legs: list[dict], entry_cost: float,
     }
 
 
+def structure_breakevens(legs: list[dict], entry_cost: float,
+                         stock: Optional[dict] = None) -> list:
+    """EXACT breakevens (underlying prices where the expiry P&L crosses 0).
+
+    The expiry payoff is piecewise-linear with kinks ONLY at the strikes, so we evaluate
+    at the breakpoints (0, each strike, a far-high probe) and solve each linear SEGMENT
+    for its zero analytically. This is exact — unlike scanning a coarse price grid, whose
+    linear interpolation runs ACROSS a strike kink and mislocates a breakeven by up to
+    half a grid step (the source of the asymmetric ~$0.26 breakeven error). Same leg
+    format as `structure_payoff_extremes`.
+    """
+    strikes = sorted({float(lg["strike"]) for lg in legs if lg.get("strike")})
+    if not strikes and not stock:
+        return []
+    hi = (strikes[-1] * 2.0 + 10.0) if strikes else (float((stock or {}).get("avg_cost") or 100.0) * 2.0 + 10.0)
+    xs = [0.0] + strikes + [hi]
+    pts = [(x, expiry_payoff(legs, x, entry_cost, stock)) for x in xs]
+    bes: list[float] = []
+    for (x1, v1), (x2, v2) in zip(pts, pts[1:]):
+        if v1 == 0.0:                                   # breakeven sits exactly on a breakpoint
+            bes.append(x1)
+        elif (v1 < 0.0 < v2) or (v1 > 0.0 > v2):        # sign change → exact root of a LINEAR segment
+            bes.append(x1 + (0.0 - v1) * (x2 - x1) / (v2 - v1))
+    if pts[-1][1] == 0.0:
+        bes.append(pts[-1][0])
+    out: list = []
+    for b in sorted(bes):
+        if b > 0 and (not out or abs(b - out[-1]) > 1e-6):   # dedupe shared endpoints, keep positive
+            out.append(round(b, 2))
+    return out
+
+
 # Rank of urgency so the overall verdict can pick the most pressing leg action.
 _ACTION_URGENCY = {"ROLL": 3, "CLOSE": 2, "LET_EXPIRE": 1, "HOLD": 0}
 

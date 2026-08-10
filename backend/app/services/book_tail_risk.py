@@ -47,6 +47,16 @@ _MKT_VOL_FALLBACK = 0.16         # annualized S&P vol if VIX is unavailable
 _TDF = 4                         # Student-t d.o.f. — fat market tails
 _SKEW_K = 0.75                   # vol-points (decimal) added per unit adverse move
 
+_VIX_IDX = "^VIX"                # spot VIX (30-day implied vol)
+_VIX_3M = "^VIX3M"               # 3-month VIX → forward-vol proxy for a ~90d hedge
+_VIX_MULT = 100.0                # VIX options: $100 per index point, European, cash-settled
+# SPX 21-day return → VIX FRONT-FUTURE bump over the forward. VIX options settle on the VIX
+# FUTURE (not spot VIX), which mean-reverts — so the future peaks BELOW spot VIX in a crash
+# (COVID: spot VIX 82, ~1-mo future ~60). Anchors: historical monthly SPX drawdowns → front
+# future levels, dampened for that mean reversion so the hedge payoff is NOT overstated.
+_VIX_CURVE_X = [-0.50, -0.34, -0.20, -0.10, -0.05, 0.0, 0.05]   # SPX log-return (ascending)
+_VIX_CURVE_Y = [55.0, 48.0, 33.0, 17.0, 8.0, 0.0, -3.0]         # +VIX future points over forward
+
 
 # ── vectorized Black-Scholes (for the MC reval) ──────────────────────────────
 
@@ -369,7 +379,9 @@ def _hedge_candidates(idx, iv, T, r, puts, book_pnl, idx_sim, cvar0,
                                         hedge_payoff=n * payoff20, crash_prob_annual=crash_prob,
                                         book_capital=book_capital, annual_income=annual_income)
         out.append({
-            "label": label, "long_put": long_k, "short_put": short_k if so else None,
+            "label": label, "instrument": "SPX", "kind": "put spread" if so else "put",
+            "long_strike": long_k, "short_strike": short_k if so else None,
+            "long_put": long_k, "short_put": short_k if so else None,   # back-compat aliases
             "contracts": n, "cost_per_spread": round(cost_per, 0), "total_cost": round(total_cost, 0),
             "annual_bleed": round(annual_bleed, 0), "crash_payoff_20": round(n * payoff20, 0),
             "offsets_pct": round(n * payoff20 / book_loss20 * 100, 0) if book_loss20 else None,
@@ -377,11 +389,185 @@ def _hedge_candidates(idx, iv, T, r, puts, book_pnl, idx_sim, cvar0,
             "efficiency": round(cvar_red / annual_bleed, 2) if annual_bleed > 0 else None,   # $ CVaR cut per $/yr spent
             "cagr_lift_pct": spitz["cagr_lift_pct"], "cost_effective": spitz["cost_effective"],
         })
-    # rank: cost-effective first, then most CVaR reduced per dollar.
-    out.sort(key=lambda c: (c["cost_effective"], c["efficiency"] or -1), reverse=True)
+    return out
+
+
+def _rank_hedges(out: list[dict]) -> list[dict]:
+    """Rank a MIXED hedge menu (SPX puts + VIX calls) together: cost-effective first, then
+    most book-CVaR reduced per $/yr spent. Flags the single best as recommended."""
+    out.sort(key=lambda c: (c.get("cost_effective", False), c.get("efficiency") or -1), reverse=True)
     for i, c in enumerate(out):
         c["recommended"] = (i == 0)
     return out
+
+
+# ── VIX black-swan overlay — call spreads that only pay in a genuine vol spike ─────
+
+def _vix_future(mkt_ret, base_fwd: float, cap: float = 80.0):
+    """Terminal VIX FUTURE level for a horizon SPX log-return, from the empirical crash
+    curve. Vectorized (scalar or array). Dampened vs SPOT-VIX peaks (the future mean-
+    reverts) so the VIX-hedge payoff isn't overstated. Floors near the current forward."""
+    bump = np.interp(mkt_ret, _VIX_CURVE_X, _VIX_CURVE_Y)   # np.interp clamps outside the range
+    floor = max(9.0, base_fwd - 5.0)
+    return np.clip(base_fwd + bump, floor, cap)
+
+
+def _vix_levels() -> tuple:
+    """(spot_vix, forward_vix) from ^VIX and ^VIX3M. Forward ≈ 3-month vol — the right base
+    for a ~90d hedge (the term structure is usually in contango, so 3M > spot)."""
+    try:
+        import yfinance as yf
+        d = yf.download([_VIX_IDX, _VIX_3M], period="5d", progress=False, auto_adjust=True)["Close"]
+        spot = float(d[_VIX_IDX].dropna().iloc[-1]) if _VIX_IDX in d else None
+        fwd = float(d[_VIX_3M].dropna().iloc[-1]) if _VIX_3M in d and not d[_VIX_3M].dropna().empty else spot
+        return spot, (fwd or spot)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("VIX levels fetch failed: %s", exc)
+        return None, None
+
+
+async def _vix_calls(provider, dte_days: int, today: date):
+    """Live ^VIX CALL chain {strike: quote} nearest ~dte_days, + meta. VIX options are
+    European and cash-settled on the VIX future, so we take REAL chain mids for cost and
+    value the payoff on the future — never a naive BS on spot VIX."""
+    from .hedging_service import _split_chain
+    try:
+        exps = await provider.get_option_expirations(_VIX_IDX)
+    except Exception:  # noqa: BLE001
+        exps = None
+    if not exps:
+        return None, None
+
+    def _dist(e):
+        try:
+            return abs((date.fromisoformat(str(e)[:10]) - today).days - dte_days)
+        except (ValueError, TypeError):
+            return 10 ** 6
+    exp = min(exps, key=_dist)
+    try:
+        calls, _ = _split_chain(await provider.get_option_chain(_VIX_IDX, exp))
+    except Exception:  # noqa: BLE001
+        return None, None
+    if not calls:
+        return None, None
+    try:
+        adte = max(1, (date.fromisoformat(str(exp)[:10]) - today).days)
+    except (ValueError, TypeError):
+        adte = dte_days
+    return calls, {"exp": str(exp)[:10], "dte": adte}
+
+
+def _vix_hedge_candidates(vix_calls, fwd_vix, idx, idx_sim, book_pnl, cvar0, book_loss20,
+                          hedge_target, crash_prob, book_capital, annual_income, rolls):
+    """VIX CALL-SPREAD black-swan hedges (multi-leg → cost-capped). VIX explodes in a crash,
+    so deep-OTM call spreads are cheap convexity that ONLY pay in a genuine vol event and do
+    nothing in an ordinary drawdown (which diversification already handles). Cost from the
+    REAL ^VIX chain; payoff valued at intrinsic on the VIX future implied by each MC SPX path
+    (idx_sim → SPX return → VIX future) — the SAME scenarios as the SPX hedges, so CVaR
+    reduction is apples-to-apples. Intrinsic (no residual time value) is deliberately
+    CONSERVATIVE — it understates the hedge, never flatters it."""
+    if not vix_calls or not fwd_vix:
+        return []
+    # Onset strikes span moderate → deep black-swan. VIX ~15 now, so a 30 onset only
+    # triggers on a real vol event (SPX ≈ −7%); 40 is a genuine crash (SPX ≈ −12%).
+    designs = [("VIX 25/50 call spread", 25.0, 50.0),   # cost-reduced, earlier onset
+               ("VIX 30/60 call spread", 30.0, 60.0),   # black-swan
+               ("VIX 40/80 call spread", 40.0, 80.0)]   # deep black-swan, cheapest convexity
+    mkt_ret = np.log(np.maximum(idx_sim / idx, 1e-6))            # per-path SPX log-return over the horizon
+    vix_term = _vix_future(mkt_ret, fwd_vix)                     # terminal VIX future per path
+    vix20 = float(_vix_future(math.log(1 + _HEDGE_SCEN[0]), fwd_vix))   # VIX future at a −20% month
+
+    def _pick(target):
+        ks = [s for s in vix_calls if s >= target - 1e-9]
+        if not ks:
+            return None, None
+        k = min(ks, key=lambda s: abs(s - target))
+        q = vix_calls.get(k)
+        mid = getattr(q, "mid", None) if q is not None else None
+        return (float(k), float(mid)) if (mid and mid > 0) else (float(k), None)
+
+    out = []
+    for label, lo, so in designs:
+        lk, lmid = _pick(lo)
+        sk, smid = _pick(so)
+        if lk is None or sk is None or lmid is None or smid is None or sk <= lk:
+            continue
+        width = sk - lk
+        cost_per = max(0.0, lmid - smid) * _VIX_MULT
+        payoff20 = min(max(0.0, vix20 - lk), width) * _VIX_MULT
+        if cost_per <= 0 or payoff20 <= 0:
+            continue
+        n = max(1, round(hedge_target / payoff20))
+        total_cost = n * cost_per
+        annual_bleed = total_cost * rolls
+        v1 = np.minimum(np.maximum(vix_term - lk, 0.0), width) * _VIX_MULT   # spread value at horizon (intrinsic)
+        hedge_pnl = n * (v1 - cost_per)                                      # paid cost_per → worth v1
+        cvar_red = cvar0 - _cvar95_of(book_pnl + hedge_pnl)
+        spitz = spitznagel_cost_vs_drag(annual_bleed=annual_bleed, crash_loss=book_loss20,
+                                        hedge_payoff=n * payoff20, crash_prob_annual=crash_prob,
+                                        book_capital=book_capital, annual_income=annual_income)
+        out.append({
+            "label": label, "instrument": "VIX", "kind": "call spread",
+            "long_strike": lk, "short_strike": sk,
+            "long_put": lk, "short_put": sk,                    # aliases so the table renders uniformly
+            "contracts": n, "cost_per_spread": round(cost_per, 0), "total_cost": round(total_cost, 0),
+            "annual_bleed": round(annual_bleed, 0), "crash_payoff_20": round(n * payoff20, 0),
+            "offsets_pct": round(n * payoff20 / book_loss20 * 100, 0) if book_loss20 else None,
+            "cvar_reduction": round(cvar_red, 0),
+            "efficiency": round(cvar_red / annual_bleed, 2) if annual_bleed > 0 else None,
+            "cagr_lift_pct": spitz["cagr_lift_pct"], "cost_effective": spitz["cost_effective"],
+            "vix_at_minus20": round(vix20, 1),
+        })
+    return out
+
+
+def _vixy_dynamic_candidate(spot_vix, fwd_vix, idx, idx_sim, book_pnl, cvar0, book_loss20,
+                            hedge_target, crash_prob, book_capital, annual_income):
+    """DYNAMIC VIXY sleeve — the (near) zero-COST hedge. Hold a cash sleeve and deploy it
+    into a short-term VIX-futures ETF (VIXY) ONLY when the term structure INVERTS (spot VIX
+    > 3-month VIX = backwardation = stress onset). This dodges the constant contango roll-
+    decay of holding VIXY permanently — you pay almost nothing in calm markets and only
+    carry the position while a cascade is actually building.
+
+    Honest modelling of the trade-offs:
+      • cost ≈ a small whipsaw/friction only (the sleeve otherwise sits in cash earning the
+        risk-free rate) — NOT an options premium bleed. That's the whole point.
+      • BUT a signal-based deploy LAGS a gap-down crash, so we haircut the payoff by a
+        capture factor; and it ties up cash. Both are surfaced, not hidden."""
+    ref = (spot_vix or fwd_vix)
+    if not ref or ref <= 0:
+        return []
+    front = ref * 1.03                 # VIXY tracks the ~1-mo future — mild contango over spot
+    invert_thresh = -0.05              # SPX horizon return that flips the curve into backwardation
+    capture = 0.65                     # deploy lags a gap → partial capture (conservative)
+    whipsaw = 0.015                    # ~1.5%/yr friction from entries/exits & false signals
+    ret20 = float(_vix_future(math.log(1 + _HEDGE_SCEN[0]), front) / front - 1.0)   # VIXY % at −20%
+    if ret20 <= 0:
+        return []
+    sleeve = hedge_target / (ret20 * capture)          # cash sized so its −20% gain hits the target
+    annual_bleed = max(1.0, sleeve * whipsaw)
+    mkt_ret = np.log(np.maximum(idx_sim / idx, 1e-6))
+    vixy_ret = _vix_future(mkt_ret, front) / front - 1.0
+    deployed = mkt_ret < invert_thresh                 # only long VIXY when the curve inverts
+    payoff = sleeve * capture * np.where(deployed, np.maximum(vixy_ret, 0.0), 0.0)
+    hedge_pnl = payoff - annual_bleed / 12.0           # ~monthly friction over the horizon
+    cvar_red = cvar0 - _cvar95_of(book_pnl + hedge_pnl)
+    payoff20 = sleeve * capture * ret20
+    spitz = spitznagel_cost_vs_drag(annual_bleed=annual_bleed, crash_loss=book_loss20,
+                                    hedge_payoff=payoff20, crash_prob_annual=crash_prob,
+                                    book_capital=book_capital, annual_income=annual_income)
+    return [{
+        "label": "Dynamic VIXY sleeve", "instrument": "VIXY", "kind": "signal-based",
+        "long_strike": None, "short_strike": None, "long_put": None, "short_put": None,
+        "contracts": None, "sleeve_capital": round(sleeve, 0),
+        "cost_per_spread": 0, "total_cost": round(sleeve, 0),
+        "annual_bleed": round(annual_bleed, 0), "crash_payoff_20": round(payoff20, 0),
+        "offsets_pct": round(payoff20 / book_loss20 * 100, 0) if book_loss20 else None,
+        "cvar_reduction": round(cvar_red, 0),
+        "efficiency": round(cvar_red / annual_bleed, 2) if annual_bleed > 0 else None,
+        "cagr_lift_pct": spitz["cagr_lift_pct"], "cost_effective": spitz["cost_effective"],
+        "signal": "deploy when spot VIX > VIX3M (backwardation)", "capture_pct": round(capture * 100),
+    }]
 
 
 def _verdict_and_actions(*, crash20_pct, short_vol, concentration, hedge_menu, cvar_pct, beta_delta_spy):
@@ -502,18 +688,51 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
         concentration.append({**{k: round(v, 4) if isinstance(v, float) else v for k, v in b.items()},
                               "gamma_share_pct": round(share * 100, 1), "laddered": b["short_legs"] > 1, "flags": flags})
 
-    # #4 — hedge MENU (ranked), repriced on the MC scenarios for true CVaR reduction.
+    # #4 — hedge MENU (ranked), repriced on the MC scenarios for true CVaR reduction. Two
+    # families ranked TOGETHER: SPX put spreads (linear crash protection) and VIX call
+    # spreads (convex black-swan protection — VIX explodes in a vol spike, cheap, pays
+    # nothing in an ordinary drawdown that diversification already handles).
     hedge_menu, hedge_note = [], None
     if idx > 0 and book_loss20 > 0 and mc.get("pnl") is not None:
+        target = hedge_target_pct * book_loss20
         puts, meta = await _index_puts(provider, hedge_dte_days, today)
         hdte = meta["dte"] if meta else hedge_dte_days
-        pricing = "live SPX chain" if puts else "model (BS + VIX)"
-        hedge_menu = _hedge_candidates(idx, mkt_vol, hdte / 365.0, r, puts, mc["pnl"], mc["idx_sim"],
-                                       mc["cvar_95"] or 0.0, book_loss20, hedge_target_pct * book_loss20,
-                                       crash_prob_annual, book_capital, annual_income, 365.0 / max(hdte, 1),
-                                       horizon_years=mc.get("horizon_years", 0.0))
-        for c in hedge_menu:
-            c["index"], c["pricing"], c["dte_days"], c["expiry"] = "SPX (European)", pricing, hdte, (meta or {}).get("exp")
+        spx = _hedge_candidates(idx, mkt_vol, hdte / 365.0, r, puts, mc["pnl"], mc["idx_sim"],
+                                mc["cvar_95"] or 0.0, book_loss20, target,
+                                crash_prob_annual, book_capital, annual_income, 365.0 / max(hdte, 1),
+                                horizon_years=mc.get("horizon_years", 0.0))
+        for c in spx:
+            c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
+                "SPX (European)", ("live SPX chain" if puts else "model (BS + VIX)"), hdte, (meta or {}).get("exp")
+
+        # VIX call-spread overlay — real ^VIX chain + a forward-vol base.
+        vcalls, vmeta = await _vix_calls(provider, hedge_dte_days, today)
+        spot_vix, fwd_vix = await asyncio.to_thread(_vix_levels)
+        spot_vix = spot_vix or (vix if vix > 5 else None)
+        fwd_vix = fwd_vix or spot_vix
+        vix_cands = []
+        if vcalls and fwd_vix:
+            vdte = vmeta["dte"] if vmeta else hedge_dte_days
+            vix_cands = _vix_hedge_candidates(vcalls, fwd_vix, idx, mc["idx_sim"], mc["pnl"],
+                                              mc["cvar_95"] or 0.0, book_loss20, target,
+                                              crash_prob_annual, book_capital, annual_income,
+                                              365.0 / max(vdte, 1))
+            for c in vix_cands:
+                c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
+                    "VIX (European)", "live ^VIX chain", vdte, (vmeta or {}).get("exp")
+
+        # Dynamic VIXY sleeve — the near-zero-COST, signal-based hedge (only deploys on
+        # term-structure inversion, so no permanent roll decay).
+        vixy_cands = _vixy_dynamic_candidate(spot_vix, fwd_vix, idx, mc["idx_sim"], mc["pnl"],
+                                             mc["cvar_95"] or 0.0, book_loss20, target,
+                                             crash_prob_annual, book_capital, annual_income)
+        for c in vixy_cands:
+            c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
+                "VIXY (ETF)", "signal-based · VIX term structure", None, None
+
+        hedge_menu = _rank_hedges(spx + vix_cands + vixy_cands)
+        if not vix_cands:
+            hedge_note = "VIX black-swan overlay unavailable (no live ^VIX chain) — showing SPX put hedges only."
     elif book_loss20 <= 0:
         hedge_note = "The book isn't net short the tail at −20% — no index hedge needed."
 
@@ -546,5 +765,11 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
         "assumptions": {"beta": "per-name β vs S&P 500" if beta_weighted else "β≈1 (beta data unavailable)",
                         "mkt_vol_pct": round(mkt_vol * 100, 1), "tail": f"Student-t (df={_TDF}) market factor + skew",
                         "crash_prob_annual_pct": round(crash_prob_annual * 100, 1),
-                        "hedge_rolls_per_year": round(365 / hedge_dte_days, 1)},
+                        "hedge_rolls_per_year": round(365 / hedge_dte_days, 1),
+                        "vix": ("VIX call spreads priced off the live ^VIX chain; payoff valued at intrinsic on a "
+                                "VIX FUTURE (not spot VIX) mapped from each MC path's SPX move, dampened for mean "
+                                "reversion — conservative, so the black-swan hedge is never overstated."),
+                        "vixy": ("Dynamic VIXY sleeve is near-zero COST (cash until the VIX term structure inverts) "
+                                 "but its payoff is haircut ~35% for signal/gap lag and it ties up the sleeve in cash — "
+                                 "shown as 'capital', not premium.")},
     })
