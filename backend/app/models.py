@@ -36,6 +36,7 @@ class User(Base):
     broker_orders: Mapped[list["BrokerOrder"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     saved_strategies: Mapped[list["SavedStrategy"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     tracked_companies: Mapped[list["TrackedCompany"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    tracked_trades: Mapped[list["TrackedTrade"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     highlight_dismissals: Mapped[list["PortfolioHighlightDismissal"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
@@ -529,6 +530,75 @@ class TrackedCompany(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="tracked_companies")
+
+
+class TrackedTrade(Base):
+    """A trade setup the user has chosen to actively track through its lifecycle.
+
+    Lifecycle:
+      • ``watching``     — waiting at/near entry; each Refresh re-checks the secondary
+                           entry confirmations (LTF CHOCH, VWAP σ-bands, rejection wick,
+                           1H RSI, CVD, level integrity …) → verdict EXECUTE / WAIT / INVALID.
+      • ``in_progress``  — the user executed; Refresh now checks exit conditions
+                           (target, stop, CHOCH-against, VWAP reclaim, gamma flip, trail)
+                           → verdict HOLD / SCALE-OUT / EXIT / TIGHTEN.
+      • ``closed``       — exited; realized P&L booked.
+      • ``invalidated``  — the setup died before entry (conditions changed).
+
+    The whole setup is snapshotted as JSON at track-time so the plan stays stable even as
+    live TA drifts; each Refresh caches its verdict + full payload in ``last_eval``.
+    """
+    __tablename__ = "tracked_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ticker: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)   # long | short | neutral
+    instrument: Mapped[str] = mapped_column(String(12), nullable=False, default="equity")  # equity | options | futures
+    setup_type: Mapped[str | None] = mapped_column(String(40), nullable=True)  # trend_continuation | mean_reversion_fade | ...
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="watching", index=True)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    # Plan levels — denormalized from the snapshot for fast list rendering + eval math.
+    entry_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_levels: Mapped[str | None] = mapped_column(Text, nullable=True)   # JSON list[float]
+
+    # Snapshots (JSON blobs) captured when the trade was first tracked.
+    setup_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default="{}")   # the whole setup object
+    context_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)         # compact bias/regime/dealer/EM
+
+    # Execution (set when the user presses Execute → moves to in_progress).
+    executed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    executed_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    execution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Exit (set when the user presses Close).
+    closed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Last refresh evaluation (cached so the list can show the verdict without recomputing).
+    last_eval: Mapped[str | None] = mapped_column(Text, nullable=True)          # JSON — full eval payload
+    last_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True) # execute|wait|invalid|hold|scale_out|exit|tighten
+    last_eval_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship(back_populates="tracked_trades")
 
 
 class DataCache(Base):

@@ -28,6 +28,9 @@ psycopg2-binary>=2.9.0
 statsmodels>=0.14.0
 scikit-learn>=1.3.0
 fastdtw>=0.3.4
+# Chart-pattern PNG export (annotated candlesticks). Detection itself is scipy/numpy.
+matplotlib>=3.8.0
+mplfinance>=0.12.10b0
 # Institutional vol modeling — Heston calibration & Vanna-Volga greeks (SVI/RND are scipy)
 QuantLib>=1.34
 # Portfolio optimization — min-vol / HRP / DiscreteAllocation (pulls in cvxpy + solvers)

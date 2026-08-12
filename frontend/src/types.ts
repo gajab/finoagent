@@ -376,6 +376,9 @@ export interface TradeSetup {
     options?: { pop_pct: number | null; ev: number | null; basis: string };
   };
   event_risk?: { type: string; date: string; in_days: number; warning: string } | null;
+  entry_style?: { type: string; label: string; note: string; distance_pct: number };
+  horizon?: { label: string; style?: string; est_days?: number; atrs_to_t1?: number; note: string };
+  from_current?: { to_entry_pct: number | null; to_t1_pct: number | null };
   thesis: string;
   evidence: string[];
 }
@@ -398,6 +401,105 @@ export interface TradeSetupsData {
   meta: { sources_ok: Record<string, boolean> };
 }
 export interface TradeSetupsResponse { ticker: string; trade_setups: TradeSetupsData; cached?: boolean }
+
+// ===== Chart patterns =====
+export interface PatternPoint { idx: number; date: string; price: number; label: string }
+export interface PatternLineEnd { idx: number; date: string; price: number }
+export interface PatternLine { from: PatternLineEnd; to: PatternLineEnd; label: string; kind: string }
+export interface PatternEducation { what: string; where: string; how_to_spot: string; confirms: string; invalidates: string }
+export interface ChartPattern {
+  type: string; name: string; category: 'reversal' | 'continuation' | string;
+  direction: 'bullish' | 'bearish' | 'neutral' | string;
+  status: 'forming' | 'broken_out' | string;
+  confidence: number;
+  points: PatternPoint[]; lines: PatternLine[];
+  breakout: { level: number; side: 'up' | 'down' | string } | null;
+  target: { price: number; method: string; pct: number | null } | null;
+  stop: number | null; as_of_idx: number; education: PatternEducation;
+}
+export interface FibLevel { ratio: number; price: number }
+export interface FibonacciData {
+  direction: 'up' | 'down' | string;
+  swing: { from: PatternPoint; to: PatternPoint };
+  levels: FibLevel[]; in_zone: { low: FibLevel; high: FibLevel } | null; education: PatternEducation;
+}
+export interface PatternSeries {
+  timestamps: string[]; open: (number | null)[]; high: (number | null)[];
+  low: (number | null)[]; close: (number | null)[]; volume: (number | null)[]; offset: number;
+}
+export interface ChartPatternsData {
+  price: number; as_of: string; atr: number; series: PatternSeries;
+  patterns: ChartPattern[]; fibonacci: FibonacciData | null; meta: { n_pivots: number; n_bars: number };
+}
+export interface ChartPatternsResponse { ticker: string; chart_patterns: ChartPatternsData; cached?: boolean }
+
+// ===== Trade Tracking & Management =====
+export type TrackVerdict = 'execute' | 'wait' | 'invalid' | 'hold' | 'scale_out' | 'tighten' | 'exit' | string;
+export type TrackStatus = 'watching' | 'in_progress' | 'closed' | 'invalidated' | string;
+export interface TrackCheck {
+  key: string; label: string;
+  status: 'pass' | 'fail' | 'warn' | 'na' | string;
+  detail: string; value?: unknown; weight?: number;
+  role?: 'gate' | 'critical' | 'confirm' | 'trigger' | 'caution' | 'favorable' | string;
+}
+export interface TrackChochEvent { type?: string; direction?: string; level?: number | null; index?: number }
+export interface TrackChoch { trend?: string; last_event?: TrackChochEvent | null; recent_swing_high?: number | null; recent_swing_low?: number | null }
+export interface TrackVwap {
+  vwap: number | null; sigma: number | null; z: number | null; session_bars?: number;
+  upper_1: number | null; upper_2: number | null; upper_3: number | null;
+  lower_1: number | null; lower_2: number | null; lower_3: number | null;
+}
+export interface TrackMarket {
+  as_of: string; spot: number | null;
+  vwap: TrackVwap | null; rsi_1h: number | null;
+  choch_5m?: TrackChoch | null; choch_15m?: TrackChoch | null; choch_1h?: TrackChoch | null; trend_daily?: TrackChoch | null;
+  cvd?: { last: number | null; slope_10: number | null; divergence: string | null } | null;
+  volume?: { ratio: number | null; last: number | null; avg: number | null } | null;
+  atr_15m?: number | null; atr_daily?: number | null;
+  gamma?: Record<string, unknown> | null;
+}
+export interface TrackPosition {
+  spot: number | null; entry: number | null; stop: number | null; targets: (number | null)[]; ref?: number | null;
+  dist_to_entry_pct?: number | null; open_pnl_pct?: number | null; open_pnl?: number | null;
+  r_multiple?: number | null; dist_to_t1_pct?: number | null;
+}
+export interface TrackEval {
+  ok: boolean; error?: string; detail?: string;
+  as_of: string; mode?: 'entry' | 'exit' | string; spot?: number | null;
+  verdict?: TrackVerdict; verdict_label?: string; headline?: string;
+  confidence_pct?: number | null; reasons?: string[]; need?: string[];
+  checks?: TrackCheck[]; position?: TrackPosition; market?: TrackMarket;
+  payload?: Record<string, unknown>;
+}
+export interface TrackedTrade {
+  id: number; ticker: string; direction: string; instrument: string;
+  setup_type?: string | null; status: TrackStatus; title?: string | null;
+  entry_low: number | null; entry_high: number | null; entry_level: number | null; stop_level: number | null;
+  target_levels: number[];
+  setup_snapshot?: Record<string, unknown>; context_snapshot?: Record<string, unknown> | null;
+  executed_at?: string | null; executed_price?: number | null; executed_qty?: number | null; execution_note?: string | null;
+  closed_at?: string | null; exit_price?: number | null; exit_note?: string | null; realized_pnl?: number | null;
+  last_eval?: TrackEval | null; last_verdict?: string | null; last_eval_at?: string | null;
+  user_notes?: string | null; created_at: string; updated_at: string;
+}
+export interface TrackedTradesResponse {
+  groups: { watching: TrackedTrade[]; in_progress: TrackedTrade[]; closed: TrackedTrade[]; invalidated: TrackedTrade[] };
+  counts: Record<string, number>; total: number;
+}
+export interface TrackRefreshResponse { trade: TrackedTrade; evaluation: TrackEval }
+export interface TrackAdvice {
+  advice: {
+    agree_with_verdict?: boolean; assessment?: string; recommended_action?: string;
+    key_risks?: string[]; what_to_watch?: string[]; confidence?: string; raw?: string;
+  };
+  verdict_reviewed?: string;
+}
+export interface TrackInput {
+  ticker: string; direction: string; instrument?: string; setup_type?: string | null; title?: string | null;
+  entry_low?: number | null; entry_high?: number | null; entry_level?: number | null; stop_level?: number | null;
+  target_levels?: number[]; setup_snapshot?: Record<string, unknown>; context_snapshot?: Record<string, unknown> | null;
+  evaluate_now?: boolean;
+}
 
 export interface QuarterlyEarningsHistory {
   quarter: string;

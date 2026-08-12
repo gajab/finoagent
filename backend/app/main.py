@@ -18,6 +18,7 @@ from .database import init_db
 from .middleware import SessionMiddleware
 from .routers import auth_router, portfolio_router, settings_router, stock_router, proxy_router, agent_router, stock_notes_router, channel_router, tlh_portfolio_router, broker_router, saved_strategy_router, metrics_router, market_router
 from .routers import tracking_router
+from .routers import trade_tracking_router
 from .routers import pick_shovel_v2_router
 from .routers import debt_entry_router
 from .services.scheduler_service import scheduler_loop
@@ -132,6 +133,7 @@ app.include_router(saved_strategy_router.router)
 app.include_router(metrics_router.router)
 app.include_router(market_router.router)
 app.include_router(tracking_router.router)
+app.include_router(trade_tracking_router.router)
 app.include_router(pick_shovel_v2_router.router)
 app.include_router(debt_entry_router.router)
 
@@ -261,7 +263,7 @@ _frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "d
 _SPA_ROUTES = {
     "", "login", "market", "dashboard", "portfolio", "agents", "strategies",
     "debt", "settings", "ai-research", "impact", "channels", "metrics",
-    "tracking", "my-trades", "calculators", "financial-calculators",
+    "tracking", "trade-tracking", "my-trades", "calculators", "financial-calculators",
     "roth-ira-conversion", "college-529",
 }
 

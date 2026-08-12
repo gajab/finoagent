@@ -125,6 +125,19 @@ export async function verifySetup(
   );
 }
 
+// Classical chart-pattern recognition (geometry + education + measured-move targets).
+export async function fetchChartPatterns(
+  ticker: string,
+): Promise<import('./types').ChartPatternsResponse> {
+  return apiFetch<import('./types').ChartPatternsResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/chart-patterns`,
+  );
+}
+// Direct URL to the annotated PNG for one pattern (same-origin cookie auth) — for <img>/download.
+export function chartPatternImageUrl(ticker: string, pattern: string): string {
+  return `${API_BASE}/api/stock/${encodeURIComponent(ticker)}/chart-patterns/image?pattern=${encodeURIComponent(pattern)}`;
+}
+
 // Generic "analyze the selected TA indicators" — shared by every TA panel.
 export async function analyzeTa(
   ticker: string,
@@ -135,6 +148,53 @@ export async function analyzeTa(
     `/api/stock/${encodeURIComponent(ticker)}/ta/analyze`,
     { method: 'POST', body: JSON.stringify({ selection, messages }) },
   );
+}
+
+// ===== Trade Tracking & Management =====
+export async function trackTrade(
+  input: import('./types').TrackInput,
+): Promise<import('./types').TrackedTrade> {
+  return apiFetch<import('./types').TrackedTrade>('/api/tracked-trades', {
+    method: 'POST', body: JSON.stringify(input),
+  });
+}
+export async function listTrackedTrades(): Promise<import('./types').TrackedTradesResponse> {
+  return apiFetch<import('./types').TrackedTradesResponse>('/api/tracked-trades');
+}
+export async function refreshTrackedTrade(id: number): Promise<import('./types').TrackRefreshResponse> {
+  return apiFetch<import('./types').TrackRefreshResponse>(`/api/tracked-trades/${id}/refresh`, { method: 'POST' });
+}
+export async function executeTrackedTrade(
+  id: number, body: { price?: number | null; qty?: number | null; note?: string | null },
+): Promise<import('./types').TrackedTrade> {
+  return apiFetch<import('./types').TrackedTrade>(`/api/tracked-trades/${id}/execute`, {
+    method: 'POST', body: JSON.stringify(body),
+  });
+}
+export async function closeTradeLifecycle(
+  id: number, body: { price?: number | null; note?: string | null },
+): Promise<import('./types').TrackedTrade> {
+  return apiFetch<import('./types').TrackedTrade>(`/api/tracked-trades/${id}/close`, {
+    method: 'POST', body: JSON.stringify(body),
+  });
+}
+export async function invalidateTrackedTrade(id: number): Promise<import('./types').TrackedTrade> {
+  return apiFetch<import('./types').TrackedTrade>(`/api/tracked-trades/${id}/invalidate`, { method: 'POST' });
+}
+export async function updateTrackedTradeNotes(id: number, user_notes: string | null): Promise<import('./types').TrackedTrade> {
+  return apiFetch<import('./types').TrackedTrade>(`/api/tracked-trades/${id}/notes`, {
+    method: 'PATCH', body: JSON.stringify({ user_notes }),
+  });
+}
+export async function deleteTrackedTrade(id: number): Promise<void> {
+  return apiFetch<void>(`/api/tracked-trades/${id}`, { method: 'DELETE' });
+}
+export async function askTrackedTradeLLM(
+  id: number, body: { question?: string; refresh?: boolean },
+): Promise<import('./types').TrackAdvice> {
+  return apiFetch<import('./types').TrackAdvice>(`/api/tracked-trades/${id}/ask-llm`, {
+    method: 'POST', body: JSON.stringify(body),
+  });
 }
 
 // ===== Portfolio =====

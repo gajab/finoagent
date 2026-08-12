@@ -451,6 +451,79 @@ async def get_trade_setups(
     return {"ticker": ticker, "trade_setups": result, "cached": False}
 
 
+@router.get("/{ticker}/chart-patterns")
+async def get_chart_patterns(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Classical chart-pattern recognition (double top/bottom, H&S, triangles, flags, cup &
+    handle, VCP, wedges + Fibonacci) with drawable geometry, measured-move targets and an
+    education block per pattern. Cached + executor-run."""
+    import asyncio
+    import yfinance as yf
+    from ..services.chart_pattern_service import compute_chart_patterns
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"patterns:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "chart_patterns": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_chart_patterns(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Chart-pattern analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No chart-pattern data available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "chart_patterns": result, "cached": False}
+
+
+@router.get("/{ticker}/chart-patterns/image")
+async def get_chart_pattern_image(
+    ticker: str,
+    pattern: str = Query(..., description="Pattern type slug (e.g. 'cup_handle', 'double_top')"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Render one detected pattern as an annotated candlestick PNG (mplfinance) for download/share."""
+    import asyncio
+    import yfinance as yf
+    from fastapi.responses import Response
+    from ..services.chart_pattern_service import compute_chart_patterns, render_pattern_png
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"patterns:{ticker}:v1"
+    data = await get_cached(db, cache_key)
+    if data is None:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: compute_chart_patterns(yf.Ticker(ticker)))
+        if data:
+            await set_cached(db, cache_key, data, ttl_seconds=900)
+    if not data:
+        raise HTTPException(status_code=404, detail="No chart-pattern data available.")
+
+    match = next((p for p in (data.get("patterns") or []) if p.get("type") == pattern), None)
+    if not match:
+        raise HTTPException(status_code=404, detail=f"Pattern '{pattern}' not found for {ticker}.")
+
+    loop = asyncio.get_event_loop()
+    png = await loop.run_in_executor(None, lambda: render_pattern_png(data.get("series") or {}, match, ticker))
+    if not png:
+        raise HTTPException(status_code=500, detail="Could not render the pattern image.")
+    return Response(content=png, media_type="image/png",
+                    headers={"Content-Disposition": f'inline; filename="{ticker}_{pattern}.png"'})
+
+
 class MicroChatMessage(BaseModel):
     role: str
     content: str

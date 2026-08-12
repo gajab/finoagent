@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowDown, ArrowUp, Minus, TrendingUp, TrendingDown, Loader2, Crosshair, Layers } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Minus, TrendingUp, TrendingDown, Loader2, Crosshair, Layers, Shapes } from 'lucide-react';
 import { fetchTechnicalForTimeframe, fetchTradeSetups } from '../api';
 import {
   Chart as ChartJS,
@@ -25,6 +25,7 @@ import RegimePanel from './RegimePanel';
 import DealerPositioningPanel from './DealerPositioningPanel';
 import MarketContextHero from './MarketContextHero';
 import TradeSetupCards from './TradeSetupCards';
+import ChartPatternsPanel from './ChartPatternsPanel';
 import { SectionIntro } from './taUi';
 import type { TradeSetupsData } from '../types';
 
@@ -66,6 +67,11 @@ const TIMEFRAME_GROUPS: { label: string; keys: string[] }[] = [
 
 const DEFAULT_TIMEFRAME = 'medium_term';
 
+// Null-safe number formatters — indicator fields are null for limited-history names
+// (recent IPOs, or medium-term SMA200 before enough bars exist). Never call .toFixed on null.
+const nfx = (n: number | null | undefined, d = 2): string => (n == null || Number.isNaN(n)) ? '—' : n.toFixed(d);
+const mfx = (n: number | null | undefined, d = 2): string => (n == null || Number.isNaN(n)) ? '—' : `$${n.toFixed(d)}`;
+
 function formatVolume(val: number): string {
   if (val >= 1e9) return `${(val / 1e9).toFixed(1)}B`;
   if (val >= 1e6) return `${(val / 1e6).toFixed(1)}M`;
@@ -98,7 +104,7 @@ function PhaseIndicator({ phase }: { phase: string }) {
 }
 
 function RsiGauge({ rsi }: { rsi: number | null }) {
-  if (rsi === null) return <span className="text-base-content/50">N/A</span>;
+  if (rsi == null || Number.isNaN(rsi)) return <span className="text-base-content/50">N/A</span>;
   let color = 'text-warning';
   if (rsi > 70) color = 'text-error';
   else if (rsi > 60) color = 'text-success';
@@ -154,7 +160,7 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
   const [activeChartTab, setActiveChartTab] = useState<'MACD' | 'RSI' | 'Price' | 'Volume'>('MACD');
 
   // Setups-first sub-navigation
-  const [activeSection, setActiveSection] = useState<'setups' | 'indicators' | 'advanced'>('setups');
+  const [activeSection, setActiveSection] = useState<'setups' | 'patterns' | 'indicators' | 'advanced'>('setups');
   const [setups, setSetups] = useState<TradeSetupsData | null>(null);
   const [setupsLoading, setSetupsLoading] = useState(false);
   const [setupsError, setSetupsError] = useState<string | null>(null);
@@ -181,6 +187,7 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
 
   const SECTIONS = [
     { key: 'setups' as const, label: 'Setups', Icon: Crosshair },
+    { key: 'patterns' as const, label: 'Patterns', Icon: Shapes },
     { key: 'indicators' as const, label: 'Indicators', Icon: Activity },
     { key: 'advanced' as const, label: 'Advanced', Icon: Layers },
   ];
@@ -551,6 +558,12 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
           </div>
         )}
 
+        {activeSection === 'patterns' && (
+          <div className="animate-fade-in">
+            <ChartPatternsPanel ticker={ticker} />
+          </div>
+        )}
+
         {activeSection === 'indicators' && (
         <>
         <div className="flex items-start justify-between flex-wrap gap-2 mb-3">
@@ -647,13 +660,13 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
           <div className="bg-base-200/40 rounded-xl py-1.5 px-2 border border-white/[0.03] text-center flex flex-col justify-center">
             <div className="text-[11px] text-base-content/50 leading-none mb-1">Support</div>
             <div className="text-base font-bold text-success tabular-nums leading-none">
-              ${technical.supportLevel.toFixed(2)}
+              {mfx(technical.supportLevel, 2)}
             </div>
           </div>
           <div className="bg-base-200/40 rounded-xl py-1.5 px-2 border border-white/[0.03] text-center flex flex-col justify-center">
             <div className="text-[11px] text-base-content/50 leading-none mb-1">Resistance</div>
             <div className="text-base font-bold text-error tabular-nums leading-none">
-              ${technical.resistanceLevel.toFixed(2)}
+              {mfx(technical.resistanceLevel, 2)}
             </div>
           </div>
           <div className="bg-base-200/40 rounded-xl py-1.5 px-2 border border-white/[0.03] text-center flex flex-col justify-center">
@@ -665,7 +678,7 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
         </div>
 
         {/* Momentum Indicators Row */}
-        {(macd || bb || ma || ema) && (
+        {(macd?.histogram != null || bb?.lower != null || ma?.sma50 != null || ma?.sma200 != null || ema?.ema12 != null) && (
           <>
             <h4 className="text-sm font-bold text-base-content/70 mb-1.5 flex items-center gap-2">
               <TrendingUp size={16} className="text-primary" />
@@ -674,58 +687,60 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
             </h4>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
               {/* MACD */}
-              {macd && (
+              {macd?.histogram != null && (
                 <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
                   <div className="text-xs text-base-content/50 mb-0.5">MACD (12,26,9)</div>
                   <div className={`text-base font-bold tabular-nums ${macd.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
-                    {macd.histogram > 0 ? '+' : ''}{macd.histogram.toFixed(2)}
+                    {macd.histogram > 0 ? '+' : ''}{nfx(macd.histogram, 2)}
                   </div>
                   <div className="flex items-center gap-1 mt-0.5">
-                    <SignalBadge signal={macd.signal} />
-                    {macd.crossover !== 'none' && (
+                    {macd.signal && <SignalBadge signal={macd.signal} />}
+                    {macd.crossover && macd.crossover !== 'none' && (
                       <SignalBadge signal={macd.crossover} label={macd.crossover.replace('_', ' ')} />
                     )}
                   </div>
                   <div className="text-[10px] text-base-content/40 mt-1 tabular-nums">
-                    MACD: {macd.macdLine.toFixed(2)} | Sig: {macd.signalLine.toFixed(2)}
+                    MACD: {nfx(macd.macdLine, 2)} | Sig: {nfx(macd.signalLine, 2)}
                   </div>
                 </div>
               )}
 
               {/* Bollinger Bands */}
-              {bb && (
+              {bb?.lower != null && (
                 <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
                   <div className="text-xs text-base-content/50 mb-0.5">Bollinger Bands</div>
                   <div className={`text-base font-bold tabular-nums ${bb.position === 'overbought' ? 'text-error' : bb.position === 'oversold' ? 'text-success' : 'text-info'}`}>
-                    {(bb.percentB * 100).toFixed(0)}%B
+                    {bb.percentB != null ? (bb.percentB * 100).toFixed(0) : '—'}%B
                   </div>
-                  <div className="flex items-center gap-1 mt-0.5">
-                    <SignalBadge signal={bb.position} label={bb.position.replace('_', ' ')} />
-                  </div>
+                  {bb.position && (
+                    <div className="flex items-center gap-1 mt-0.5">
+                      <SignalBadge signal={bb.position} label={bb.position.replace('_', ' ')} />
+                    </div>
+                  )}
                   <div className="text-[10px] text-base-content/40 mt-1 tabular-nums">
-                    ${bb.lower.toFixed(0)} — ${bb.middle.toFixed(0)} — ${bb.upper.toFixed(0)}
+                    {mfx(bb.lower, 0)} — {mfx(bb.middle, 0)} — {mfx(bb.upper, 0)}
                   </div>
                   <div className="text-[10px] text-base-content/40 tabular-nums">
-                    Width: {bb.bandwidthPct.toFixed(1)}%
+                    Width: {nfx(bb.bandwidthPct, 1)}%
                   </div>
                 </div>
               )}
 
               {/* Moving Averages */}
-              {ma && (
+              {(ma?.sma50 != null || ma?.sma200 != null || ma?.goldenDeathCross) && (
                 <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
                   <div className="text-xs text-base-content/50 mb-0.5">Moving Averages</div>
-                  {ma.sma50 && (
+                  {ma.sma50 != null && (
                     <div className="flex items-center justify-between text-xs mb-0.5">
                       <span className="text-base-content/60">SMA 50:</span>
-                      <span className="font-bold tabular-nums">${ma.sma50.toFixed(0)}</span>
+                      <span className="font-bold tabular-nums">{mfx(ma.sma50, 0)}</span>
                       {ma.priceVsSma50 && <SignalBadge signal={ma.priceVsSma50} />}
                     </div>
                   )}
-                  {ma.sma200 && (
+                  {ma.sma200 != null && (
                     <div className="flex items-center justify-between text-xs mb-0.5">
                       <span className="text-base-content/60">SMA 200:</span>
-                      <span className="font-bold tabular-nums">${ma.sma200.toFixed(0)}</span>
+                      <span className="font-bold tabular-nums">{mfx(ma.sma200, 0)}</span>
                       {ma.priceVsSma200 && <SignalBadge signal={ma.priceVsSma200} />}
                     </div>
                   )}
@@ -738,18 +753,18 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
               )}
 
               {/* EMA Crossover */}
-              {ema && (
+              {ema?.ema12 != null && (
                 <div className="bg-base-200/40 rounded-xl p-2.5 border border-white/[0.03]">
                   <div className="text-xs text-base-content/50 mb-0.5">EMA Crossover</div>
                   <div className={`text-base font-bold ${ema.signal === 'bullish' ? 'text-success' : 'text-error'}`}>
                     {ema.signal === 'bullish' ? <TrendingUp size={16} className="inline mr-1" /> : <TrendingDown size={16} className="inline mr-1" />}
-                    {ema.signal.charAt(0).toUpperCase() + ema.signal.slice(1)}
+                    {ema.signal ? ema.signal.charAt(0).toUpperCase() + ema.signal.slice(1) : '—'}
                   </div>
                   <div className="text-[10px] text-base-content/40 mt-1">
-                    EMA 12: ${ema.ema12.toFixed(2)}
+                    EMA 12: {mfx(ema.ema12, 2)}
                   </div>
                   <div className="text-[10px] text-base-content/40">
-                    EMA 26: ${ema.ema26.toFixed(2)}
+                    EMA 26: {mfx(ema.ema26, 2)}
                   </div>
                 </div>
               )}
@@ -866,28 +881,28 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
             <p>
               <strong>RSI Signal:</strong> {technical.rsiSignal}
             </p>
-            {macd && (
+            {macd?.histogram != null && (
               <p>
                 <strong>MACD:</strong>{' '}
                 <span className={macd.signal === 'bullish' ? 'text-success' : 'text-error'}>
-                  {macd.signal.charAt(0).toUpperCase() + macd.signal.slice(1)}
+                  {macd.signal ? macd.signal.charAt(0).toUpperCase() + macd.signal.slice(1) : '—'}
                 </span>
-                {macd.crossover !== 'none' && (
+                {macd.crossover && macd.crossover !== 'none' && (
                   <span className={macd.crossover.includes('bullish') ? 'text-success' : 'text-error'}>
                     {' '}({macd.crossover.replace('_', ' ')})
                   </span>
                 )}
-                {' — '}Histogram: {macd.histogram > 0 ? '+' : ''}{macd.histogram.toFixed(4)}
+                {' — '}Histogram: {macd.histogram > 0 ? '+' : ''}{nfx(macd.histogram, 4)}
               </p>
             )}
-            {bb && (
+            {bb?.lower != null && (
               <p>
                 <strong>Bollinger Bands:</strong>{' '}
                 Price is{' '}
                 <span className={bb.position === 'overbought' ? 'text-error' : bb.position === 'oversold' ? 'text-success' : 'text-info'}>
-                  {bb.position.replace('_', ' ')}
+                  {bb.position ? bb.position.replace('_', ' ') : '—'}
                 </span>
-                {' '}at {(bb.percentB * 100).toFixed(1)}%B (Range: ${bb.lower.toFixed(2)} — ${bb.upper.toFixed(2)})
+                {' '}at {bb.percentB != null ? (bb.percentB * 100).toFixed(1) : '—'}%B (Range: {mfx(bb.lower, 2)} — {mfx(bb.upper, 2)})
               </p>
             )}
             {ma && ma.goldenDeathCross && (

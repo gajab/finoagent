@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Target, Shield, Crosshair, Sparkles, ChevronDown, ChevronUp, Layers3, CalendarClock,
-  LineChart, TrendingUp, ShieldCheck, Loader2, Code2, Eye, FlaskConical,
+  LineChart, TrendingUp, ShieldCheck, Loader2, Code2, Eye, FlaskConical, Clock, LogIn,
 } from 'lucide-react';
 import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg } from '../types';
 
@@ -19,9 +19,10 @@ function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: strin
 import { DirectionBadge, ConfidencePill, InfoTip } from './taUi';
 import IndicatorAIConsole from './IndicatorAIConsole';
 import PayoffDiagram from './PayoffDiagram';
-import { analyzeTa, verifySetup } from '../api';
+import { analyzeTa, verifySetup, trackTrade } from '../api';
 
 const money = (n?: number | null) => (n == null ? '—' : `$${n.toFixed(2)}`);
+const pctFrom = (n?: number | null) => (n == null ? '—' : `${n > 0 ? '+' : ''}${n}%`);
 const d0 = (n?: number | null) => (n == null ? '—' : `${n < 0 ? '-$' : '$'}${Math.abs(Math.round(n)).toLocaleString()}`);
 
 const TYPE_LABEL: Record<string, string> = {
@@ -224,6 +225,7 @@ function VerdictView({ v }: { v: SetupVerification }) {
 }
 
 function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker: string; spot: number | null; dossier: Record<string, unknown> }) {
+  const navigate = useNavigate();
   const [showWhy, setShowWhy] = useState(false);
   const [showAI, setShowAI] = useState(false);
   const [showVerify, setShowVerify] = useState(false);
@@ -232,6 +234,30 @@ function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker
   const [verifying, setVerifying] = useState(false);
   const [verifyRes, setVerifyRes] = useState<SetupVerification | null>(null);
   const [verifyErr, setVerifyErr] = useState<string | null>(null);
+  const [tracking, setTracking] = useState(false);
+  const [tracked, setTracked] = useState(false);
+
+  const doTrack = async () => {
+    setTracking(true);
+    try {
+      await trackTrade({
+        ticker,
+        direction: setup.direction,
+        instrument: planView === 'options' ? 'options' : 'equity',
+        setup_type: setup.type,
+        title: `${setup.type.replace(/_/g, ' ')} ${setup.direction}`,
+        entry_low: setup.entry.low,
+        entry_high: setup.entry.high,
+        entry_level: setup.entry.level,
+        stop_level: setup.stop.level,
+        target_levels: (setup.targets || []).map(t => t.level).filter((n): n is number => n != null),
+        setup_snapshot: setup as unknown as Record<string, unknown>,
+        evaluate_now: true,
+      });
+      setTracked(true);
+    } catch { /* ignore — button reverts */ }
+    finally { setTracking(false); }
+  };
 
   const rr = setup.risk_reward;
   const rrTone = rr == null ? 'text-base-content/50' : rr >= 2 ? 'text-success' : rr >= 1 ? 'text-warning' : 'text-error';
@@ -254,6 +280,11 @@ function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker
           <DirectionBadge direction={setup.direction} />
           <span className="text-sm font-bold text-base-content/85">{TYPE_LABEL[setup.type] || setup.type}</span>
           <ConfidencePill level={setup.confidence} />
+          {setup.horizon && (
+            <span className="badge badge-xs bg-info/15 text-info border-info/30 gap-1" title={setup.horizon.note}>
+              <Clock className="w-3 h-3" /> {setup.horizon.label}{setup.horizon.est_days ? ` · ~${setup.horizon.est_days}d` : ''}
+            </span>
+          )}
           {fitWarn && <span className="badge badge-xs badge-warning gap-1">counter-trend</span>}
         </div>
         <div className="text-right">
@@ -263,6 +294,18 @@ function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker
       </div>
 
       <p className="text-sm text-base-content/75 leading-snug mt-2.5">{setup.thesis}</p>
+
+      {setup.entry_style && (
+        <div className="mt-2 rounded-lg border border-primary/20 bg-primary/5 px-2.5 py-1.5 text-[11px]">
+          <div className="flex items-center gap-1.5 font-semibold text-primary flex-wrap">
+            <LogIn className="w-3.5 h-3.5 shrink-0" /> {setup.entry_style.label}
+            {setup.from_current && (setup.from_current.to_entry_pct != null || setup.from_current.to_t1_pct != null) && (
+              <span className="font-normal text-base-content/50">· from now: entry {pctFrom(setup.from_current.to_entry_pct)}, T1 {pctFrom(setup.from_current.to_t1_pct)}</span>
+            )}
+          </div>
+          <p className="text-base-content/60 mt-0.5 leading-snug">{setup.entry_style.note}</p>
+        </div>
+      )}
 
       {setup.event_risk && (
         <div className="mt-2 rounded-lg border border-warning/30 bg-warning/10 text-warning px-2.5 py-1.5 text-[11px] flex items-start gap-1.5">
@@ -295,6 +338,16 @@ function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker
         </button>
         <button className={`btn btn-xs gap-1 ${showVerify ? 'btn-secondary' : 'btn-outline btn-secondary'}`} onClick={() => setShowVerify(s => !s)}><ShieldCheck className="w-3.5 h-3.5" /> Verify with AI</button>
         <button className="btn btn-ghost btn-xs gap-1" onClick={() => setShowAI(s => !s)}><Sparkles className="w-3.5 h-3.5" /> Ask AI</button>
+        {tracked ? (
+          <button className="btn btn-xs gap-1 btn-success btn-outline" onClick={() => navigate('/trade-tracking')}>
+            <Crosshair className="w-3.5 h-3.5" /> Tracking ✓ — open
+          </button>
+        ) : (
+          <button className="btn btn-xs gap-1 btn-primary" onClick={doTrack} disabled={tracking}
+            title="Add this setup to the Trade Tracker to confirm entry and manage the exit">
+            {tracking ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Crosshair className="w-3.5 h-3.5" />} Track this trade
+          </button>
+        )}
       </div>
 
       {showWhy && (

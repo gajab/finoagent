@@ -16,6 +16,7 @@ import { AnalystRatings } from '../components/AnalystRatings';
 import { FinancialCharts } from '../components/FinancialCharts';
 import { EarningsSummary } from '../components/EarningsSummary';
 import { TechnicalAnalysis } from '../components/TechnicalAnalysis';
+import ErrorBoundary from '../components/ErrorBoundary';
 import { OptionsVolatility } from '../components/OptionsVolatility';
 import { TradingOpportunities } from '../components/TradingOpportunities';
 import { IndustryWatch } from '../components/IndustryWatch';
@@ -557,8 +558,10 @@ export default function DashboardPage() {
 
             {activeTab === 'technical' && (
               <div className="space-y-5">
-                <TechnicalAnalysis technical={stockData.technical} ticker={stockData.ticker} />
-                <PricePrediction ticker={stockData.ticker} />
+                <ErrorBoundary label="Technical analysis">
+                  <TechnicalAnalysis technical={stockData.technical} ticker={stockData.ticker} />
+                  <PricePrediction ticker={stockData.ticker} />
+                </ErrorBoundary>
               </div>
             )}
 

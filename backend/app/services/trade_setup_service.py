@@ -29,6 +29,7 @@ from .microstructure_service import _r, _now_str, compute_microstructure
 from .market_structure_service import compute_market_structure
 from .regime_service import compute_regime
 from .dealer_positioning_service import compute_dealer_positioning
+from .chart_pattern_service import compute_chart_patterns
 from .stock_service import safe_float
 from .zebra_service import _bs_price, _norm_cdf, DEFAULT_RISK_FREE
 
@@ -87,6 +88,7 @@ def _edge(setup, spot, atm_iv, dte) -> dict:
     return out
 
 _RISK_BUDGET = 250.0        # $ risked per trade = 1% of a nominal $25k book (share-sizing basis)
+_MIN_RR = 1.0               # never surface a directional trade you can't make at least 1:1 on
 
 
 def _indicators(stock) -> dict:
@@ -124,7 +126,7 @@ def _dir_kind(price: float, spot: float) -> str:
     return "resistance" if price >= spot else "support"
 
 
-def _collect_levels(micro, structure, regime, dealer, spot, indicators=None) -> list[dict]:
+def _collect_levels(micro, structure, regime, dealer, spot, indicators=None, patterns=None) -> list[dict]:
     """Every tradeable price from all five reads → tagged, weighted levels."""
     out: list[dict] = []
     add = lambda *a: (lambda L: out.append(L) if L else None)(_lvl(*a))
@@ -210,6 +212,14 @@ def _collect_levels(micro, structure, regime, dealer, spot, indicators=None) -> 
     add(ma.get("sma200"), "magnet", "sma200", "SMA-200", 2.0)
     add(ind.get("supportLevel"), "support", "ta_sr", "Support (swing)", 1.6)
     add(ind.get("resistanceLevel"), "resistance", "ta_sr", "Resistance (swing)", 1.6)
+
+    # --- classical chart patterns: the breakout trigger and the measured-move target ---
+    for p in (patterns or []):
+        conf = float(p.get("confidence") or 0.5)
+        bk = (p.get("breakout") or {}).get("level")
+        add(bk, _dir_kind(bk, spot) if bk else "magnet", f"pattern_{p.get('type')}", f"{p.get('name')} trigger", 1.6 * conf)
+        tg = (p.get("target") or {}).get("price")
+        add(tg, _dir_kind(tg, spot) if tg else "magnet", f"pattern_{p.get('type')}", f"{p.get('name')} target", 1.1 * conf)
     return out
 
 
@@ -288,7 +298,7 @@ def _mean_zone(zones, mean_price, spot):
 # 3. directional bias
 # ---------------------------------------------------------------------------
 
-def _derive_bias(structure, regime, dealer, indicators=None) -> dict:
+def _derive_bias(structure, regime, dealer, indicators=None, patterns=None) -> dict:
     votes = 0.0
     reasons = []
     confirms = []                                    # every signal that voted, for the evidence trail
@@ -350,6 +360,14 @@ def _derive_bias(structure, regime, dealer, indicators=None) -> dict:
         vote(0.15, "upper half of the Bollinger band", "bollinger")
     elif (bb.get("percentB") or 0.5) < 0.45:
         vote(-0.15, "lower half of the Bollinger band", "bollinger")
+
+    # --- classical chart patterns (a confirmed breakout votes full weight, forming half) ---
+    for p in (patterns or []):
+        if p.get("direction") not in ("bullish", "bearish"):
+            continue
+        w = min(1.0, float(p.get("confidence") or 0.5)) * (1.0 if p.get("status") == "broken_out" else 0.5)
+        vote((1 if p["direction"] == "bullish" else -1) * w,
+             f"{p.get('name')} ({p.get('status','')})", "chart_pattern")
 
     direction = "bullish" if votes >= 1 else "bearish" if votes <= -1 else "neutral"
     strength = "strong" if abs(votes) >= 2.5 else "moderate" if abs(votes) >= 1 else "weak"
@@ -590,14 +608,21 @@ def _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, st
                          f"support {sup['sources'][0]['label']} ${sup['center']}", f"resistance {res['sources'][0]['label']} ${res['center']}"],
         })
 
-    # D) breakout (trending + price pressing a strong resistance/support edge)
+    # D) breakout (trending + price pressing a strong resistance/support edge). The entry is a
+    # small TRIGGER just above the level (not a full-ATR overshoot — that used to place the buy
+    # above the very target it aimed at), the stop sits just back inside the level, and the target
+    # must be the next resistance ABOVE the trigger with real room, else the breakout is skipped.
     if reg == "trending" and trend_up and res and res["score"] >= 5 and res["distance_pct"] is not None and res["distance_pct"] <= 3:
-        beyond = _nearest([z for z in zones if z["center"] > res["center"]], "resistance", spot, above=True)
-        tgt_level = beyond["center"] if beyond else res["center"] + max(2 * atr, res["center"] * 0.03)
-        mk("breakout", "long", res, res["high"] + buf, res["center"] - buf,
-           [{"level": _r(tgt_level), "label": beyond["sources"][0]["label"] if beyond else "measured move", "rr": _rr(res["high"] + buf, res["center"] - buf, tgt_level)}],
-           3.5, f"Coiling under strong resistance ${res['center']} in an uptrend — buy the breakout, target ${round(tgt_level,2)}.",
-           ["regime: trending", f"resistance confluence score {res['score']}"], "with_regime")
+        trig = max(0.06 * atr, 0.0015 * spot) if atr else 0.0015 * spot
+        brk_entry = res["high"] + trig
+        brk_stop = res["center"] - max(0.35 * atr, 0.003 * spot) if atr else res["center"] * 0.997
+        beyond = _nearest([z for z in zones if z["center"] > brk_entry], "resistance", spot, above=True)
+        tgt_level = beyond["center"] if beyond else brk_entry + max(2 * atr, brk_entry * 0.03)
+        if tgt_level > brk_entry:          # only a breakout with room to run is worth showing
+            mk("breakout", "long", res, brk_entry, brk_stop,
+               [{"level": _r(tgt_level), "label": beyond["sources"][0]["label"] if beyond else "measured move", "rr": _rr(brk_entry, brk_stop, tgt_level)}],
+               3.5, f"Coiling under strong resistance ${res['center']} in an uptrend — buy the breakout over ${_r(res['high'])}, target ${round(tgt_level,2)}.",
+               ["regime: trending", f"resistance confluence score {res['score']}"], "with_regime")
 
     # Fallback — nothing fired but we have a bracket: rotate the range.
     if not setups and sup and res:
@@ -912,6 +937,56 @@ def _what_to_watch(s, dealer) -> list[str]:
     return out
 
 
+def _entry_style(direction, entry, spot, atr) -> dict:
+    """How you actually get in. A long's entry BELOW spot is a *buy-the-pullback* limit (it only
+    fills if price dips to support first — it is NOT 'buy now'); an entry ABOVE spot is a
+    *breakout* stop; an entry AT spot is a market entry. This is why a long can show entry<spot<target."""
+    if not entry or not spot:
+        return {}
+    band = max(0.0015 * spot, 0.1 * (atr or 0))
+    dist = round((entry - spot) / spot * 100, 2)
+    if abs(entry - spot) <= band:
+        return {"type": "market", "label": "Enter near current price",
+                "note": f"Price is already at the entry (${_r(entry)}) — enter around here.", "distance_pct": dist}
+    if direction == "long":
+        if entry < spot:
+            return {"type": "pullback", "label": "Buy the pullback · limit order",
+                    "note": (f"Rests as a LIMIT buy at ${_r(entry)} — it only fills if price first dips ~{abs(dist)}% "
+                             f"back to support. If it never pulls back, the trade simply doesn't trigger (don't chase)."),
+                    "distance_pct": dist}
+        return {"type": "breakout", "label": "Buy the breakout · stop order",
+                "note": (f"Rests as a STOP buy at ${_r(entry)} — it only fills if price rises ~{abs(dist)}% and breaks "
+                         f"out. You wait for strength, you don't buy here."), "distance_pct": dist}
+    if entry > spot:
+        return {"type": "pullback", "label": "Sell the bounce · limit order",
+                "note": (f"Rests as a LIMIT short at ${_r(entry)} — it only fills if price first rallies ~{abs(dist)}% "
+                         f"into resistance. If it never bounces, the trade doesn't trigger."), "distance_pct": dist}
+    return {"type": "breakout", "label": "Short the breakdown · stop order",
+            "note": (f"Rests as a STOP short at ${_r(entry)} — it only fills if price drops ~{abs(dist)}% and breaks "
+                     f"down."), "distance_pct": dist}
+
+
+def _trade_horizon(entry, t1, atr) -> dict:
+    """Rough holding period. These setups are built from DAILY / 4H / 1H structure and 3-month /
+    15-day / 5-day volume profiles — i.e. **swing trades held days-to-weeks, not intraday scalps**
+    (the 5m/15m checks live only in the Trade Tracker's entry confirmation). Time-to-target is
+    estimated from how many daily ATRs away T1 is (price nets ~0.4 ATR/session in its favor)."""
+    base = "Swing trade — normally held a few days to a couple of weeks, not an intraday day-trade."
+    if not (entry and t1 and atr and atr > 0):
+        return {"label": "Swing", "style": "swing", "note": base}
+    atrs = abs(t1 - entry) / atr
+    est = max(1, round(atrs / 0.4))
+    if atrs < 0.6:
+        return {"label": "Quick swing", "style": "quick", "est_days": est, "atrs_to_t1": round(atrs, 1),
+                "note": (f"Short target — only ~{round(atrs,1)}× the daily range to T1 (~{est} session(s)). Still a "
+                         f"swing off daily structure, not an intraday scalp; the move is just small on this name.")}
+    if est <= 10:
+        return {"label": "Swing", "style": "swing", "est_days": est, "atrs_to_t1": round(atrs, 1),
+                "note": f"T1 is ~{round(atrs,1)}× the daily range away — roughly {est} trading sessions. {base}"}
+    return {"label": "Position", "style": "position", "est_days": est, "atrs_to_t1": round(atrs, 1),
+            "note": f"Longer hold — T1 is ~{round(atrs,1)}× the daily range (~{est}+ sessions)."}
+
+
 def _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, next_earnings, strikes) -> None:
     direction = s.get("direction")
     entry = (s.get("entry") or {}).get("level")
@@ -940,6 +1015,19 @@ def _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, n
             s["risk_reward"] = _rr(entry, stop, nt1)
             s["targets"][0]["rr"] = s["risk_reward"]
 
+    # correctness guard: a target must be on the PROFIT side of entry (long → above, short →
+    # below). Capping or a mis-placed level can otherwise leave a "long" whose target sits below
+    # entry (a guaranteed loss to "hit target"). Drop wrong-sided targets and re-price R:R.
+    if direction in ("long", "short") and entry is not None:
+        good = [t for t in s.get("targets", [])
+                if t.get("level") is not None
+                and ((t["level"] > entry) if direction == "long" else (t["level"] < entry))]
+        for t in good:
+            if stop is not None:
+                t["rr"] = _rr(entry, stop, t["level"])
+        s["targets"] = good
+        s["risk_reward"] = good[0]["rr"] if good else None
+
     t1c = s["targets"][0].get("level") if s.get("targets") else None
     # EV-ranked candidate structures (debit vs credit spread) — primary + alternatives
     if direction in ("long", "short"):
@@ -964,6 +1052,13 @@ def _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, n
         s["equity_plan"] = _equity_plan(direction, entry, stop, s["targets"], spot, risk_pct)
     s["event_risk"] = _event_risk(next_earnings, expiry)
     s["what_to_watch"] = _what_to_watch(s, dealer)
+    # make the trade self-explain: how you get in (pullback/market/breakout) + holding horizon,
+    # plus the distance from the CURRENT price to entry and to T1 so proximity is never a mystery.
+    if direction in ("long", "short"):
+        s["entry_style"] = _entry_style(direction, entry, spot, atr)
+        s["horizon"] = _trade_horizon(entry, t1c, atr)
+        s["from_current"] = {"to_entry_pct": round((entry - spot) / spot * 100, 2) if (entry and spot) else None,
+                             "to_t1_pct": round((t1c - spot) / spot * 100, 2) if (t1c and spot) else None}
 
 
 def _leg_quotes(stock, expiry_date) -> dict:
@@ -989,7 +1084,7 @@ def _leg_quotes(stock, expiry_date) -> dict:
     return out
 
 
-def _dossier(spot, bias, structure, regime, dealer, micro, indicators, zones, setups) -> dict:
+def _dossier(spot, bias, structure, regime, dealer, micro, indicators, zones, setups, patterns=None) -> dict:
     """One consolidated JSON of every indicator + advanced metric + the quant trades — the
     exact payload handed to the LLM for verification."""
     ind = indicators or {}
@@ -1010,22 +1105,40 @@ def _dossier(spot, bias, structure, regime, dealer, micro, indicators, zones, se
         "indicators": {k: ind.get(k) for k in ("currentRSI", "rsiSignal", "supportLevel", "resistanceLevel",
                                                "macd", "bollingerBands", "movingAverages", "emaCrossover", "volumeAnalysis")},
         "confluence_zones": zones[:8],
+        "chart_patterns": [{k: p.get(k) for k in ("type", "name", "category", "direction", "status",
+                                                  "confidence", "breakout", "target")} for p in (patterns or [])],
         "setups": setups,
     }
+
+
+def _passes_quality(s) -> bool:
+    """A directional setup is only worth showing if it has a valid, correctly-sided target and
+    its BEST achievable reward-to-risk clears ``_MIN_RR``. Neutral/range plays are exempt (their
+    edge is theta/pinning, not a directional R:R)."""
+    if s.get("direction") not in ("long", "short"):
+        return True
+    tgts = [t for t in (s.get("targets") or []) if t.get("level") is not None]
+    if not tgts:
+        return False
+    rrs = [t["rr"] for t in tgts if t.get("rr") is not None]
+    best = max(rrs) if rrs else s.get("risk_reward")
+    return best is not None and best >= _MIN_RR
 
 
 def compute_trade_setups(stock) -> dict | None:
     """Fuse all five TA reads into ranked setups (equity + priced-options plans) plus a
     consolidated dossier. Runs sub-computes concurrently; degrades gracefully."""
     try:
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=6) as ex:
             f_micro = ex.submit(compute_microstructure, stock)
             f_struct = ex.submit(compute_market_structure, stock)
             f_regime = ex.submit(compute_regime, stock)
             f_dealer = ex.submit(compute_dealer_positioning, stock)
             f_ind = ex.submit(_indicators, stock)
-            micro, structure, regime, dealer, indicators = (
-                f.result() for f in (f_micro, f_struct, f_regime, f_dealer, f_ind))
+            f_pat = ex.submit(compute_chart_patterns, stock)
+            micro, structure, regime, dealer, indicators, patterns_data = (
+                f.result() for f in (f_micro, f_struct, f_regime, f_dealer, f_ind, f_pat))
+        patterns = (patterns_data or {}).get("patterns") or []
 
         spot = None
         for src in (structure, regime, micro, dealer):
@@ -1037,8 +1150,8 @@ def compute_trade_setups(stock) -> dict | None:
             return None
 
         atr = _atr_from_structure(structure) or _atr_from_indicators(indicators, spot)
-        bias = _derive_bias(structure, regime, dealer, indicators)
-        levels = _collect_levels(micro, structure, regime, dealer, spot, indicators)
+        bias = _derive_bias(structure, regime, dealer, indicators, patterns)
+        levels = _collect_levels(micro, structure, regime, dealer, spot, indicators, patterns)
         zones = _cluster_zones(levels, atr, spot)
         em_pct = (((dealer or {}).get("expected_move") or {}).get("em_30d") or {}).get("move_pct")
         mean_price = ((regime or {}).get("zscore") or {}).get("vwap")
@@ -1057,16 +1170,24 @@ def compute_trade_setups(stock) -> dict | None:
         for s in setups:
             _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, next_earn, strikes)
 
+        # quality gate — drop directional trades with no correctly-sided target or sub-1:1 R:R
+        # (better to show "no clean setup" than a trade that risks more than it can make), re-rank.
+        setups = [s for s in setups if _passes_quality(s)]
+        for i, s in enumerate(setups):
+            s["rank"] = i + 1
+
         return {
             "price": _r(spot),
             "as_of": _now_str(),
             "context": _context(bias, structure, regime, dealer),
             "confluence_zones": zones[:8],
             "setups": setups,
-            "dossier": _dossier(spot, bias, structure, regime, dealer, micro, indicators, zones, setups),
+            "chart_patterns": patterns,
+            "dossier": _dossier(spot, bias, structure, regime, dealer, micro, indicators, zones, setups, patterns),
             "price_series": (structure or micro or regime or {}).get("price_series"),
             "meta": {"sources_ok": {"micro": bool(micro), "structure": bool(structure),
-                                    "regime": bool(regime), "dealer": bool(dealer), "indicators": bool(indicators)}},
+                                    "regime": bool(regime), "dealer": bool(dealer), "indicators": bool(indicators),
+                                    "patterns": bool(patterns)}},
         }
     except Exception:  # noqa: BLE001
         return None

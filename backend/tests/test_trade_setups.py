@@ -5,6 +5,7 @@ from app.services.trade_setup_service import (
     _collect_levels, _cluster_zones, _make_zone, _rr, _derive_bias, _build_setups,
     _snap, _option_play, compute_trade_setups,
     _equity_plan, _options_plan, _second_target, _edge, _event_risk, _candidate_plans,
+    _passes_quality, _enrich_setup, _MIN_RR,
 )
 
 # a realistic (whole + half dollar) strike board near spot 100
@@ -228,3 +229,35 @@ class _NullStock:
 class TestComputeTradeSetups:
     def test_no_data_returns_none(self):
         assert compute_trade_setups(_NullStock()) is None
+
+
+class TestQualityGate:
+    """A directional trade must have a correctly-sided target and clear the min R:R —
+    the QQQM regression: a 'long' whose target sat BELOW entry at 0.18R must be dropped."""
+
+    def test_drops_sub_1r_long(self):
+        s = {"direction": "long", "risk_reward": 0.18, "targets": [{"level": 302, "rr": 0.18}]}
+        assert _passes_quality(s) is False
+
+    def test_keeps_when_best_target_clears_floor(self):
+        s = {"direction": "long", "risk_reward": 0.76,
+             "targets": [{"level": 299.58, "rr": 0.76}, {"level": 302, "rr": 1.31}]}
+        assert _passes_quality(s) is True and _MIN_RR == 1.0
+
+    def test_neutral_is_exempt(self):
+        assert _passes_quality({"direction": "neutral", "targets": [{"level": 300, "rr": None}]}) is True
+
+    def test_no_targets_fails(self):
+        assert _passes_quality({"direction": "long", "targets": []}) is False
+
+    def test_enrich_drops_wrong_sided_target(self):
+        # a long whose only target ($302) is BELOW entry ($303.17) — the exact QQQM defect
+        s = {"direction": "long", "type": "breakout",
+             "entry": {"level": 303.17, "low": 298.22, "high": 300.24, "label": "x"},
+             "stop": {"level": 296.65, "label": "y"},
+             "targets": [{"level": 302.0, "label": "z", "rr": 0.18}],
+             "options": {"structure": "", "detail": "", "bias": "bullish"}}
+        _enrich_setup(s, spot=298.12, atr=2.9, em_pct=6.6, zones=[], quotes={}, expiry=None,
+                      dealer=None, atm_iv=None, next_earnings=None, strikes=None)
+        assert all(t.get("level") is None or t["level"] > 303.17 for t in s.get("targets", []))
+        assert _passes_quality(s) is False           # nothing correctly-sided survives → dropped

@@ -3,6 +3,7 @@ import { Routes, Route, useLocation, Navigate } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import Navbar from './components/Navbar';
+import ErrorBoundary from './components/ErrorBoundary';
 import { useAuth } from './contexts/AuthContext';
 
 // Landing + login stay EAGER — they're the first paint for anonymous visitors.
@@ -20,6 +21,7 @@ const StrategiesPage = lazy(() => import('./pages/StrategiesPage'));
 const AIResearchPage = lazy(() => import('./pages/AIResearchPage'));
 const ChannelsPage = lazy(() => import('./pages/ChannelsPage'));
 const TrackingPage = lazy(() => import('./pages/TrackingPage'));
+const TradeTrackingPage = lazy(() => import('./pages/TradeTrackingPage'));
 const MyTradesPage = lazy(() => import('./pages/MyTradesPage'));
 const CalculatorsPage = lazy(() => import('./pages/CalculatorsPage'));
 const MetricsDashboard = lazy(() => import('./components/MetricsDashboard').then(m => ({ default: m.MetricsDashboard })));
@@ -50,6 +52,7 @@ export default function App() {
   return (
     <AuthProvider>
       <AppLayout>
+        <ErrorBoundary label="the app">
         <Suspense fallback={<RouteFallback />}>
         <Routes>
           <Route path="/" element={<LandingPage />} />
@@ -146,6 +149,14 @@ export default function App() {
             }
           />
           <Route
+            path="/trade-tracking"
+            element={
+              <ProtectedRoute>
+                <TradeTrackingPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
             path="/my-trades"
             element={
               <ProtectedRoute>
@@ -164,6 +175,7 @@ export default function App() {
           <Route path="/finclaw" element={<Navigate to="/" replace />} />
         </Routes>
         </Suspense>
+        </ErrorBoundary>
       </AppLayout>
     </AuthProvider>
   );

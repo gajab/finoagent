@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { apiBase } from '../api';
 import {
   Settings, LogOut, LayoutDashboard, Briefcase, Bot, Layers, Zap, Share2,
-  Menu, X, Crown, Lock, Globe, Bookmark, AlignJustify, ClipboardList, Sparkles, Landmark, Calculator,
+  Menu, X, Crown, Lock, Globe, Bookmark, AlignJustify, ClipboardList, Sparkles, Landmark, Calculator, Crosshair,
 } from 'lucide-react';
 import { TickerInput } from './TickerInput';
 
@@ -16,6 +16,7 @@ const PRIMARY_NAV = [
   { path: '/market',      icon: Globe,            label: 'Markets',     premiumOnly: false },
   { path: '/portfolio',   icon: Briefcase,        label: 'Portfolio',   premiumOnly: false },
   { path: '/tracking',    icon: Bookmark,         label: 'Tracking',    premiumOnly: false },
+  { path: '/trade-tracking', icon: Crosshair,     label: 'Trade Tracker', premiumOnly: false },
   { path: '/my-trades',   icon: ClipboardList,    label: 'Derivative Trades',      premiumOnly: false },
   { path: '/ai-research', icon: Sparkles,         label: 'AI Research', premiumOnly: false },
   { path: '/agents',      icon: Bot,              label: 'Agents',      premiumOnly: true  },
@@ -28,6 +29,7 @@ const EVERYTHING_NAV = [
   { path: '/tracking',    icon: Bookmark,         label: 'Tracking',    premiumOnly: false, desc: 'Pick & shovel watchlist' },
   { path: '/ai-research', icon: Sparkles,         label: 'AI Research', premiumOnly: false, desc: 'What-if, event impact & pick-and-shovel', accent: true },
   { path: '/my-trades',   icon: ClipboardList,    label: 'My Trades',   premiumOnly: false, desc: 'Trade journal with live P&L' },
+  { path: '/trade-tracking', icon: Crosshair,     label: 'Trade Tracker', premiumOnly: false, desc: 'Track setups to entry, manage to exit', accent: true },
   { path: '/calculators', icon: Calculator,       label: 'Calculators', premiumOnly: false, desc: 'Financial planning calculators' },
   { path: '/strategies',  icon: Layers,           label: 'Strategies',  premiumOnly: true,  desc: 'Long/short & options strategies' },
   { path: '/debt',        icon: Landmark,         label: 'Debt Radar',  premiumOnly: true,  desc: 'Bond/CLO entry-timing tracker' },

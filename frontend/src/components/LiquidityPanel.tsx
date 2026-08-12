@@ -701,9 +701,12 @@ export default function LiquidityPanel({ view }: { view?: 'liquidity' | 'regime'
               )}
               {pillar.id === 'funding' && data.spy.series_obv.length > 0 && (
                 <MultiLineChart
-                  title="SPY On-Balance Volume (1Y) — diverging from price = conviction signal"
+                  title="SPY Price vs On-Balance Volume (1Y) — price at new highs while OBV lags = weak conviction"
+                  dualAxis
                   datasets={[
-                    { label: 'OBV', pts: data.spy.series_obv, color: 'rgba(56,189,248,1)', fill: true },
+                    // Price (2Y series) sliced to OBV's window so both align by trading day.
+                    { label: 'SPY ($)', pts: data.spy.series_price.slice(-data.spy.series_obv.length), color: 'rgba(99,102,241,1)', axis: 'y' },
+                    { label: 'OBV', pts: data.spy.series_obv, color: 'rgba(56,189,248,1)', axis: 'y1', fill: true },
                   ]}
                 />
               )}

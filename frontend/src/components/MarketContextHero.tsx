@@ -23,10 +23,11 @@ function readout(dir: string, regime: string | null | undefined, ticker: string)
 }
 
 export default function MarketContextHero({ context, spot, ticker }: { context: SetupContext; spot: number | null; ticker: string }) {
-  const bias = context.bias;
-  const em = context.expected_move;
-  const dealer = context.dealer;
-  const ta = context.trend_alignment;
+  const bias = context?.bias ?? { direction: 'neutral', strength: 'weak', score: 0, rationale: '', confirmations: [], regime: '' };
+  const regime = context?.regime ?? { label: null, confidence: null, hurst: null, note: null, favored: [] };
+  const em = context?.expected_move;
+  const dealer = context?.dealer;
+  const ta = context?.trend_alignment;
   const long = dealer?.gamma === 'long';
 
   // expected-move meter geometry (lower — spot — upper)
@@ -44,7 +45,7 @@ export default function MarketContextHero({ context, spot, ticker }: { context: 
             <div className="text-[11px] uppercase tracking-wider text-base-content/45 flex items-center gap-1">
               <Compass className="w-3 h-3" /> Market context
             </div>
-            <div className="text-sm font-semibold text-base-content/80">{regimeText(context.regime.label)} · {bias.strength} bias</div>
+            <div className="text-sm font-semibold text-base-content/80">{regimeText(regime.label)} · {bias.strength} bias</div>
           </div>
         </div>
         <div className="text-[10px] text-base-content/40 text-right">
@@ -53,14 +54,14 @@ export default function MarketContextHero({ context, spot, ticker }: { context: 
         </div>
       </div>
 
-      <p className="text-sm text-base-content/70 leading-snug mt-3">{readout(bias.direction, context.regime.label, ticker)}</p>
+      <p className="text-sm text-base-content/70 leading-snug mt-3">{readout(bias.direction, regime.label, ticker)}</p>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mt-3">
         <StatTile
           label="Regime" tip="How the stock is moving: a Trend keeps going one way (trade with it); Mean-Reverting bounces around a middle (fade the edges)."
-          value={regimeText(context.regime.label)}
-          tone={context.regime.label === 'trending' ? 'success' : context.regime.label === 'mean_reverting' ? 'warning' : undefined}
-          sub={context.regime.hurst != null ? `Hurst ${context.regime.hurst} · ${context.regime.confidence ?? ''}` : context.regime.confidence ?? undefined}
+          value={regimeText(regime.label)}
+          tone={regime.label === 'trending' ? 'success' : regime.label === 'mean_reverting' ? 'warning' : undefined}
+          sub={regime.hurst != null ? `Hurst ${regime.hurst} · ${regime.confidence ?? ''}` : regime.confidence ?? undefined}
         />
         <StatTile
           label="Expected move" tip="How far the options market expects the stock to move over the next ~30 days (±1 standard deviation). Good for sizing targets and stops."

@@ -51,9 +51,13 @@ function signalBadge(signal: string): string {
   }
 }
 
-function formatSignal(s: string): string {
-  return s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+function formatSignal(s: string | null | undefined): string {
+  return s ? s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) : '—';
 }
+
+// Null-safe number formatters — prediction fields can be null for thin/limited-history names.
+const nf = (n: number | null | undefined, d = 2): string => (n == null || Number.isNaN(n)) ? '—' : n.toFixed(d);
+const mf = (n: number | null | undefined, d = 2): string => (n == null || Number.isNaN(n)) ? '—' : `$${n.toFixed(d)}`;
 
 export function PricePrediction({ ticker }: PricePredictionProps) {
   const [data, setData] = useState<PricePredictionData | null>(null);
@@ -369,9 +373,9 @@ export function PricePrediction({ ticker }: PricePredictionProps) {
                 )}
               </div>
               <div className="flex justify-between text-xs text-base-content/40 mt-2 px-1">
-                <span>Current: ${data.current_price.toFixed(2)}</span>
-                <span>Projected: ${data.linear_trend.projected_price.toFixed(2)} ({data.linear_trend.projected_change_pct >= 0 ? '+' : ''}{data.linear_trend.projected_change_pct.toFixed(1)}%)</span>
-                <span>95% Range: ${data.volatility.projected_95_range.low.toFixed(0)} — ${data.volatility.projected_95_range.high.toFixed(0)}</span>
+                <span>Current: {mf(data.current_price, 2)}</span>
+                <span>Projected: {mf(data.linear_trend?.projected_price, 2)} ({(data.linear_trend?.projected_change_pct ?? 0) >= 0 ? '+' : ''}{nf(data.linear_trend?.projected_change_pct, 1)}%)</span>
+                <span>95% Range: {mf(data.volatility?.projected_95_range?.low, 0)} — {mf(data.volatility?.projected_95_range?.high, 0)}</span>
               </div>
             </div>
 
@@ -395,12 +399,12 @@ export function PricePrediction({ ticker }: PricePredictionProps) {
                   <BarChart3 className="w-3 h-3" />
                   Projected Price
                 </div>
-                <div className="text-lg font-bold">${data.linear_trend.projected_price.toFixed(2)}</div>
-                <div className={`text-sm font-medium ${data.linear_trend.projected_change_pct >= 0 ? 'text-success' : 'text-error'}`}>
-                  {data.linear_trend.projected_change_pct >= 0 ? '+' : ''}{data.linear_trend.projected_change_pct.toFixed(2)}%
+                <div className="text-lg font-bold">{mf(data.linear_trend?.projected_price, 2)}</div>
+                <div className={`text-sm font-medium ${(data.linear_trend?.projected_change_pct ?? 0) >= 0 ? 'text-success' : 'text-error'}`}>
+                  {(data.linear_trend?.projected_change_pct ?? 0) >= 0 ? '+' : ''}{nf(data.linear_trend?.projected_change_pct, 2)}%
                 </div>
                 <div className="text-xs text-base-content/40 mt-0.5">
-                  {formatSignal(data.linear_trend.trend_direction)} ({data.linear_trend.trend_strength})
+                  {formatSignal(data.linear_trend?.trend_direction)} ({data.linear_trend?.trend_strength ?? '—'})
                 </div>
               </div>
 
@@ -410,12 +414,12 @@ export function PricePrediction({ ticker }: PricePredictionProps) {
                   <Activity className="w-3 h-3" />
                   Mean Reversion
                 </div>
-                <div className="text-lg font-bold">{data.mean_reversion.z_score.toFixed(2)}</div>
-                <div className={`text-sm font-medium ${signalColor(data.mean_reversion.signal)}`}>
-                  {formatSignal(data.mean_reversion.signal)}
+                <div className="text-lg font-bold">{nf(data.mean_reversion?.z_score, 2)}</div>
+                <div className={`text-sm font-medium ${signalColor(data.mean_reversion?.signal)}`}>
+                  {formatSignal(data.mean_reversion?.signal)}
                 </div>
                 <div className="text-xs text-base-content/40 mt-0.5">
-                  SMA50: ${data.mean_reversion.sma50.toFixed(2)} ({data.mean_reversion.deviation_pct >= 0 ? '+' : ''}{data.mean_reversion.deviation_pct.toFixed(1)}%)
+                  SMA50: {mf(data.mean_reversion?.sma50, 2)} ({(data.mean_reversion?.deviation_pct ?? 0) >= 0 ? '+' : ''}{nf(data.mean_reversion?.deviation_pct, 1)}%)
                 </div>
               </div>
 
@@ -425,14 +429,14 @@ export function PricePrediction({ ticker }: PricePredictionProps) {
                   <TrendingUp className="w-3 h-3" />
                   Momentum
                 </div>
-                <div className={`text-lg font-bold ${data.momentum.roc_14d_pct >= 0 ? 'text-success' : 'text-error'}`}>
-                  {data.momentum.roc_14d_pct >= 0 ? '+' : ''}{data.momentum.roc_14d_pct.toFixed(2)}%
+                <div className={`text-lg font-bold ${(data.momentum?.roc_14d_pct ?? 0) >= 0 ? 'text-success' : 'text-error'}`}>
+                  {(data.momentum?.roc_14d_pct ?? 0) >= 0 ? '+' : ''}{nf(data.momentum?.roc_14d_pct, 2)}%
                 </div>
-                <div className={`text-sm font-medium ${signalColor(data.momentum.signal)}`}>
-                  {formatSignal(data.momentum.signal)}
+                <div className={`text-sm font-medium ${signalColor(data.momentum?.signal)}`}>
+                  {formatSignal(data.momentum?.signal)}
                 </div>
                 <div className="text-xs text-base-content/40 mt-0.5">
-                  ROC-14d{data.momentum.roc_30d_pct !== null ? ` | 30d: ${data.momentum.roc_30d_pct.toFixed(1)}%` : ''}
+                  ROC-14d{data.momentum?.roc_30d_pct != null ? ` | 30d: ${nf(data.momentum.roc_30d_pct, 1)}%` : ''}
                 </div>
               </div>
 
@@ -442,10 +446,10 @@ export function PricePrediction({ ticker }: PricePredictionProps) {
                   <Gauge className="w-3 h-3" />
                   Volatility
                 </div>
-                <div className="text-lg font-bold">{data.volatility.annualized_volatility_pct.toFixed(1)}%</div>
+                <div className="text-lg font-bold">{nf(data.volatility?.annualized_volatility_pct, 1)}%</div>
                 <div className="text-sm text-base-content/60">Annual</div>
                 <div className="text-xs text-base-content/40 mt-0.5">
-                  95% Range: ${data.volatility.projected_95_range.low.toFixed(0)} - ${data.volatility.projected_95_range.high.toFixed(0)}
+                  95% Range: {mf(data.volatility?.projected_95_range?.low, 0)} - {mf(data.volatility?.projected_95_range?.high, 0)}
                 </div>
               </div>
             </div>
@@ -455,17 +459,17 @@ export function PricePrediction({ ticker }: PricePredictionProps) {
               <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03]">
                 <h4 className="font-semibold text-base-content/70 mb-2">Linear Trend</h4>
                 <div className="space-y-1 text-base-content/60">
-                  <div>R-squared: <span className="font-mono text-base-content">{data.linear_trend.r_squared.toFixed(4)}</span></div>
-                  <div>Daily slope: <span className="font-mono text-base-content">${data.linear_trend.slope_per_day.toFixed(4)}</span></div>
-                  <div>Daily change: <span className="font-mono text-base-content">{data.linear_trend.daily_change_pct.toFixed(4)}%</span></div>
+                  <div>R-squared: <span className="font-mono text-base-content">{nf(data.linear_trend?.r_squared, 4)}</span></div>
+                  <div>Daily slope: <span className="font-mono text-base-content">{mf(data.linear_trend?.slope_per_day, 4)}</span></div>
+                  <div>Daily change: <span className="font-mono text-base-content">{nf(data.linear_trend?.daily_change_pct, 4)}%</span></div>
                 </div>
               </div>
               <div className="bg-base-200/40 rounded-xl p-3 border border-white/[0.03]">
                 <h4 className="font-semibold text-base-content/70 mb-2">Volatility Detail</h4>
                 <div className="space-y-1 text-base-content/60">
-                  <div>Daily vol: <span className="font-mono text-base-content">{data.volatility.daily_volatility_pct.toFixed(4)}%</span></div>
-                  <div>Annual vol: <span className="font-mono text-base-content">{data.volatility.annualized_volatility_pct.toFixed(2)}%</span></div>
-                  <div>{horizon}d range: <span className="font-mono text-base-content">${data.volatility.projected_95_range.low.toFixed(2)} — ${data.volatility.projected_95_range.high.toFixed(2)}</span></div>
+                  <div>Daily vol: <span className="font-mono text-base-content">{nf(data.volatility?.daily_volatility_pct, 4)}%</span></div>
+                  <div>Annual vol: <span className="font-mono text-base-content">{nf(data.volatility?.annualized_volatility_pct, 2)}%</span></div>
+                  <div>{horizon}d range: <span className="font-mono text-base-content">{mf(data.volatility?.projected_95_range?.low, 2)} — {mf(data.volatility?.projected_95_range?.high, 2)}</span></div>
                 </div>
               </div>
             </div>
