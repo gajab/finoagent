@@ -29,9 +29,11 @@ function buildLayers(d: DealerPositioningData): Layer[] {
   const gl = d.gamma_levels;
   if (d.gamma_flip?.level != null) {
     const f = d.gamma_flip;
+    const spotAbove = d.price != null ? d.price >= (f.level as number) : f.side === 'below';
     out.push({
       id: 'gamma_flip', group: 'Key levels', tone: 'text-amber-400', color: 'rgb(251,191,36)',
-      label: `Gamma flip $${f.level}`, sub: `spot ${f.side} flip (${f.distance_pct}%) — vol-regime pivot`,
+      label: `Gamma flip $${f.level}`,
+      sub: `spot ${spotAbove ? 'above' : 'below'} flip · ${Math.abs(f.distance_pct ?? 0)}% away — dealers ${spotAbove ? 'LONG' : 'SHORT'} γ`,
       lines: [{ price: f.level as number, label: `γ-flip $${f.level}`, color: 'rgb(251,191,36)', dash: [1, 2] }],
       json: { indicator: 'gamma_flip', level: f.level, side: f.side, distance_pct: f.distance_pct, note: f.note },
     });

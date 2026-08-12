@@ -112,6 +112,19 @@ export async function fetchTradeSetups(
   );
 }
 
+// LLM pre-trade review of a quant setup (+ optional sentiment/fundamental/analyst)
+export async function verifySetup(
+  ticker: string,
+  setup: Record<string, unknown>,
+  dossier: Record<string, unknown>,
+  enrichments: { sentiment?: boolean; fundamental?: boolean; analyst?: boolean },
+): Promise<import('./types').VerifyResponse> {
+  return apiFetch<import('./types').VerifyResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/verify-setup`,
+    { method: 'POST', body: JSON.stringify({ setup, dossier, enrichments }) },
+  );
+}
+
 // Generic "analyze the selected TA indicators" — shared by every TA panel.
 export async function analyzeTa(
   ticker: string,
@@ -1424,13 +1437,15 @@ export interface BookTailRiskResult {
   error?: string;
   net_delta?: number; net_gamma?: number; net_vega?: number; net_theta?: number;
   net_delta_notional?: number; beta_delta_notional?: number; beta_delta_spy?: number | null;
-  book_capital?: number; annual_income?: number;
+  book_capital?: number; annual_income?: number; capital_basis?: string;
   theta_net_liq_pct?: number | null; carry_yield_pct?: number | null; cvar_capital_pct?: number | null;
   short_vol?: boolean; avg_beta?: number;
   var_95?: number | null; cvar_95?: number | null; var_99?: number | null; cvar_99?: number | null;
   horizon?: string;
   concentration?: { ticker: string; trades: number; short_legs: number; net_gamma: number; net_vega: number; net_delta: number; beta?: number; gamma_share_pct: number; laddered: boolean; flags: string[] }[];
   crash_scenarios?: { label: string; move_pct: number; pnl: number; pct_of_capital: number | null }[];
+  assignment_ladder?: { move_pct: number; pnl: number; put_assignment_capital: number; call_cover_cost: number; puts_itm: number; calls_itm: number }[];
+  naked_assignment?: { put_capital: number; call_capital: number; total: number; n_naked_puts: number; n_naked_calls: number };
   hedge_menu?: BookHedgeCandidate[];
   hedge_note?: string | null;
   verdict?: { level: string; summary: string; actions: string[] };

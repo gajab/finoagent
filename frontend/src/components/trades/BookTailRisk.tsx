@@ -27,6 +27,7 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<BookTailRiskResult | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [assignOpen, setAssignOpen] = useState(false);   // scenario lab — collapsed by default
 
   const run = async () => {
     setOpen(true); setLoading(true); setErr(null);
@@ -47,7 +48,7 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
         <div className="w-7 h-7 rounded-lg bg-warning/15 flex items-center justify-center text-warning shrink-0"><ShieldAlert className="w-4 h-4" /></div>
         <div className="flex-1 min-w-0">
           <div className="font-semibold text-sm text-warning">Book Tail Risk · short-vol desk</div>
-          <div className="text-[10px] text-base-content/40">Beta-weighted greeks · full-reprice crash · 1-mo CVaR · ranked index hedges</div>
+          <div className="text-[10px] text-base-content/40">Beta-weighted greeks · two-sided stress · 1-mo CVaR · assignment lab · ranked hedges</div>
         </div>
         {loading ? <Loader2 className="w-4 h-4 animate-spin text-warning" />
           : data ? (open ? <ChevronUp className="w-4 h-4 text-base-content/30" /> : <ChevronDown className="w-4 h-4 text-base-content/30" />)
@@ -83,6 +84,15 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                   sub={data.cvar_capital_pct != null ? `${data.cvar_capital_pct}% of cap · 1mo` : (data.horizon || 'expected shortfall')} />
               </div>
 
+              {/* Book capital — spell out the "% of cap" denominator so it isn't a mystery */}
+              {data.book_capital != null && (
+                <div className="text-[10px] text-base-content/50 -mt-1 flex flex-wrap items-baseline gap-x-1.5" title={data.capital_basis}>
+                  <span className="text-base-content/40 uppercase tracking-wider text-[9px]">Book capital</span>
+                  <b className="text-base-content/75">{money(data.book_capital)}</b>
+                  <span className="cursor-help text-base-content/40">— the “% of cap” base: Σ committed capital (short-put strikes ×100 + short-call/other strike notional), the capital put to work. <b>Not</b> your whole account net-liq. Hover for detail.</span>
+                </div>
+              )}
+
               {/* Income-vs-tail reality check — how many days of carry one 1-month tail erases */}
               {data.carry_yield_pct != null && (data.cvar_95 ?? 0) > 0 && (data.net_theta ?? 0) > 0 && (
                 <div className="text-[10px] text-base-content/50 -mt-1">
@@ -92,19 +102,79 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                 </div>
               )}
 
-              {/* Crash scenarios (full reprice) */}
+              {/* Stress scenarios (full reprice) — TWO-SIDED: short gamma loses either way */}
               <div>
-                <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><TrendingDown className="w-3 h-3" /> Crash scenarios · full reprice (β-weighted{data.avg_beta ? ` · book β ${data.avg_beta}` : ''})</div>
+                <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><TrendingDown className="w-3 h-3" /> Stress scenarios · downside &amp; melt-up · full reprice (β-weighted{data.avg_beta ? ` · book β ${data.avg_beta}` : ''})</div>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {data.crash_scenarios?.map(c => (
-                    <div key={c.label} className="rounded-lg border border-error/15 bg-error/[0.04] p-2 text-center">
+                  {data.crash_scenarios?.map(c => {
+                    const up = c.move_pct > 0;
+                    return (
+                    <div key={c.label} className={`rounded-lg border p-2 text-center ${up ? 'border-warning/25 bg-warning/[0.05]' : 'border-error/15 bg-error/[0.04]'}`}>
                       <div className="text-[9px] uppercase text-base-content/40">{c.label}</div>
-                      <div className="text-sm font-bold text-error mt-0.5">{money(c.pnl)}</div>
+                      <div className={`text-sm font-bold mt-0.5 ${up ? 'text-warning' : 'text-error'}`}>{money(c.pnl)}</div>
                       {c.pct_of_capital != null && <div className="text-[9px] text-base-content/40">{c.pct_of_capital}% of capital</div>}
                     </div>
-                  ))}
+                  ); })}
                 </div>
+                <p className="text-[9px] text-base-content/40 mt-1">Short gamma loses on a big move in <b>either</b> direction — the amber melt-up rows are the upside risk a downside-only crash table hides. Full reprice (not a delta-gamma approximation).</p>
               </div>
+
+              {/* Assignment / scenario lab — COLLAPSIBLE, collapsed by default */}
+              {(data.assignment_ladder?.length ?? 0) > 0 && (
+                <div className="rounded-lg border border-white/10">
+                  <button onClick={() => setAssignOpen(o => !o)}
+                    className="w-full flex items-center gap-1.5 px-2 py-1.5 text-left hover:bg-white/[0.03] transition-colors">
+                    <Compass className="w-3 h-3 text-base-content/40 shrink-0" />
+                    <span className="text-[9px] uppercase tracking-wider text-base-content/40">Assignment / scenario lab · capital if assigned</span>
+                    {data.naked_assignment && data.naked_assignment.total > 0 && (
+                      <span className="ml-auto text-[10px] text-base-content/55 whitespace-nowrap"
+                        title={`Worst case if EVERY naked short is assigned at once. Puts ${money(data.naked_assignment.put_capital)} (cash to buy) + naked calls ${money(data.naked_assignment.call_capital)} (delivery notional). Covered calls & spread-protected legs excluded.`}>
+                        all-naked-assigned <b className="text-warning">{money(data.naked_assignment.total)}</b>
+                      </span>
+                    )}
+                    {assignOpen ? <ChevronUp className="w-3.5 h-3.5 text-base-content/30 shrink-0" /> : <ChevronDown className="w-3.5 h-3.5 text-base-content/30 shrink-0" />}
+                  </button>
+                  {assignOpen && (
+                    <div className="px-2 pb-2">
+                      {/* Headline — worst case if every naked short is assigned (covered excluded) */}
+                      {data.naked_assignment && (data.naked_assignment.total > 0) && (
+                        <div className="rounded-lg border border-warning/20 bg-warning/[0.04] p-2 mb-2 text-[10px] leading-snug">
+                          <div className="flex flex-wrap items-baseline gap-x-2">
+                            <span className="uppercase tracking-wider text-[9px] text-warning/80 font-semibold">If every naked short is assigned</span>
+                            <b className="text-warning text-sm">{money(data.naked_assignment.total)}</b>
+                          </div>
+                          <div className="text-base-content/50 mt-0.5">
+                            = {money(data.naked_assignment.put_capital)} to buy the {data.naked_assignment.n_naked_puts} naked short put{data.naked_assignment.n_naked_puts !== 1 ? 's' : ''} (strike ×100)
+                            {data.naked_assignment.call_capital > 0 && <> + {money(data.naked_assignment.call_capital)} delivery notional on {data.naked_assignment.n_naked_calls} naked short call{data.naked_assignment.n_naked_calls !== 1 ? 's' : ''}</>}.
+                            {' '}<span className="text-base-content/40">Covered calls &amp; spread-protected legs excluded. A naked call's true buy-to-cover can exceed its strike notional if the stock has already run (upside is unbounded).</span>
+                          </div>
+                        </div>
+                      )}
+                      <div className="overflow-x-auto">
+                        <table className="table table-xs w-full text-[11px]">
+                          <thead><tr className="text-[8px] uppercase text-base-content/30">
+                            <th>Market</th><th>Book P&amp;L</th><th title="Cash to take delivery on ITM short puts (strike ×100)">Put assignment $</th><th title="Intrinsic to deliver / buy back ITM short calls">Call cover $</th><th>ITM</th>
+                          </tr></thead>
+                          <tbody>
+                            {data.assignment_ladder!.map((r, i) => {
+                              const up = r.move_pct > 0;
+                              return (
+                              <tr key={i} className={Math.abs(r.move_pct) <= 5 ? 'bg-base-300/20' : ''}>
+                                <td className={`font-mono ${up ? 'text-warning/80' : 'text-error/80'}`}>{r.move_pct > 0 ? '+' : ''}{r.move_pct}%</td>
+                                <td className={`font-mono ${r.pnl >= 0 ? 'text-success/90' : 'text-error/90'}`}>{money(r.pnl)}</td>
+                                <td className="font-mono text-warning/90">{r.put_assignment_capital > 0 ? money(r.put_assignment_capital) : '—'}</td>
+                                <td className="font-mono text-warning/90">{r.call_cover_cost > 0 ? money(r.call_cover_cost) : '—'}</td>
+                                <td className="text-base-content/50">{[r.puts_itm > 0 ? `${r.puts_itm}P` : '', r.calls_itm > 0 ? `${r.calls_itm}C` : ''].filter(Boolean).join(' ') || '—'}</td>
+                              </tr>
+                            ); })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="text-[9px] text-base-content/40 mt-1"><b>Put assignment</b> = cash to buy the shares you're put (strike ×100); <b>Call cover</b> = intrinsic to deliver/buy-back at that move. Only the binding wing is ITM at a given move — a strangle never demands both at once. Shaded row ≈ spot today.</p>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Concentration */}
               {(data.concentration?.length ?? 0) > 0 && (

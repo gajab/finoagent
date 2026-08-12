@@ -315,7 +315,7 @@ export interface DealerPositioningData {
 export interface DealerPositioningResponse { ticker: string; dealer_positioning: DealerPositioningData; cached?: boolean }
 
 // ── Trade-setup engine (fusion of all four TA families) ──
-export interface SetupBias { direction: string; strength: string; score: number; rationale: string; regime: string }
+export interface SetupBias { direction: string; strength: string; score: number; rationale: string; regime: string; confirmations?: { signal: string; reads: string; detail: string }[] }
 export interface SetupContext {
   bias: SetupBias;
   regime: { label: string | null; confidence: string | null; hurst: number | null; note: string | null; favored: string[] | null };
@@ -330,6 +330,30 @@ export interface ConfluenceZone {
   distance_pct: number | null;
 }
 export interface SetupTarget { level: number | null; label: string; rr: number | null }
+export interface EquityPlan {
+  side: string; entry: number | null; stop: number | null;
+  targets: { level: number | null; gain_per_share: number | null }[];
+  risk_per_share: number | null; reward_per_share_t1: number | null; risk_reward: number | null;
+  suggested_shares: number | null; risk_budget: number | null; sizing_basis?: string;
+  dollar_risk: number | null; dollar_reward_t1: number | null; note: string;
+}
+export interface OptionLeg { action: string; right: string; strike: number; price: number | null }
+export interface OptionsPlan {
+  available: boolean; structure: string; kind?: string; note?: string;
+  expiry?: { date: string; dte: number | null } | null;
+  priced_from?: string;
+  legs?: OptionLeg[];
+  net_cost?: number | null; net_cost_label?: string;
+  max_profit?: number | null; max_loss?: number | null;
+  breakevens?: number[];
+  payoff?: { price: number; pnl: number }[];
+  pop_pct?: number | null; ev?: number | null; why?: string; preferred?: boolean;
+}
+export interface OptionsAlt {
+  structure: string; kind?: string; net_cost?: number | null; net_cost_label?: string;
+  max_profit?: number | null; max_loss?: number | null; breakevens?: number[];
+  pop_pct?: number | null; ev?: number | null; legs?: OptionLeg[];
+}
 export interface TradeSetup {
   rank?: number;
   type: string;
@@ -343,15 +367,33 @@ export interface TradeSetup {
   risk_reward: number | null;
   sizing: { risk_per_share: number | null; target_move_pct: number | null; within_expected_move: boolean; note: string | null };
   options: { structure: string; detail: string; bias: string; strikes?: Record<string, number | null>; expiry?: { date: string; dte: number | null } | null };
+  equity_plan?: EquityPlan | null;
+  options_plan?: OptionsPlan | null;
+  options_alternatives?: OptionsAlt[];
+  what_to_watch?: string[];
+  edge?: {
+    equity?: { pop_pct: number | null; ev_per_share: number | null; payoff_ratio: number | null; kelly_pct: number | null; half_kelly_risk_pct: number | null };
+    options?: { pop_pct: number | null; ev: number | null; basis: string };
+  };
+  event_risk?: { type: string; date: string; in_days: number; warning: string } | null;
   thesis: string;
   evidence: string[];
 }
+export interface SetupVerification {
+  verdict?: string | null; confidence?: string; summary?: string;
+  verification?: string[]; pnl_check?: string; adjustments?: string[];
+  alternate?: { name?: string; kind?: string; direction?: string; entry?: string; stop?: string; target?: string; structure?: string; why?: string };
+  risks?: string[]; enrichment_read?: { sentiment?: string; fundamental?: string; analyst?: string };
+  raw?: string;
+}
+export interface VerifyResponse { verification: SetupVerification; enrichments_used: string[] }
 export interface TradeSetupsData {
   price: number | null;
   as_of: string;
   context: SetupContext;
   confluence_zones: ConfluenceZone[];
   setups: TradeSetup[];
+  dossier?: Record<string, unknown>;
   price_series: { timestamps: string[]; closes: number[] } | null;
   meta: { sources_ok: Record<string, boolean> };
 }

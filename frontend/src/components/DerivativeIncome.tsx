@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
@@ -725,6 +726,17 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
   const [legs, setLegs] = useState<EvaluateLeg[]>([{ action: 'SELL', type: 'PUT', strike: 0, expiration: '' }]);
   const [owns, setOwns] = useState(false);   // "I hold the underlying" — the sole stock signal
 
+  useEffect(() => {   // one-shot prefill handed off from a TA setup card ("Research in Evaluate")
+    try {
+      const raw = sessionStorage.getItem('evaluatePrefill');
+      if (!raw) return;
+      sessionStorage.removeItem('evaluatePrefill');
+      const p = JSON.parse(raw) as { ticker?: string; legs?: EvaluateLeg[] };
+      if (p.ticker) setTicker(p.ticker.toUpperCase());
+      if (p.legs?.length) setLegs(p.legs);
+    } catch { /* ignore */ }
+  }, []);
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DeskReviewResult | null>(null);
@@ -870,6 +882,11 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
 export function DerivativeIncome() {
   const [mode, setMode] = useState<Mode>('single');
   const [ticker, setTicker] = useState('AAPL');
+  const [searchParams] = useSearchParams();
+  useEffect(() => {                                   // deep-link: ?mode=evaluate (from a TA setup card)
+    const m = searchParams.get('mode');
+    if (m === 'single' || m === 'portfolio' || m === 'evaluate') setMode(m);
+  }, [searchParams]);
   const [selectedExpiry, setSelectedExpiry] = useState('');   // '' = auto (monthlies ≤45d)
   const [expiries, setExpiries] = useState<string[]>([]);
   const [expiryLoading, setExpiryLoading] = useState(false);

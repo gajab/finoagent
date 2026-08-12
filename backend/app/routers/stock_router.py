@@ -549,6 +549,130 @@ async def analyze_ta(
     return {"role": "assistant", "content": answer}
 
 
+class VerifySetupIn(BaseModel):
+    setup: dict = Field(..., description="The quant-generated setup (entry/stop/targets/equity_plan/options_plan)")
+    dossier: dict = Field(default_factory=dict, description="The full TA dossier (all indicators + advanced metrics)")
+    enrichments: dict = Field(default_factory=dict, description="Toggle flags {sentiment, fundamental, analyst}: bool")
+
+
+def _gather_verify_enrichments(ticker: str, want: set) -> dict:
+    """Cheap raw enrichment data (headlines / key fundamentals / analyst ratings) for the
+    dimensions the user toggled — the verify-LLM reasons over these, no sub-LLM calls."""
+    import yfinance as yf
+    out: dict = {}
+    try:
+        stock = yf.Ticker(ticker)
+    except Exception:  # noqa: BLE001
+        return out
+    if "sentiment" in want:
+        try:
+            news = stock.news or []
+            heads = []
+            for n in news[:10]:
+                c = n.get("content") if isinstance(n.get("content"), dict) else None
+                title = n.get("title") or (c or {}).get("title")
+                pub = n.get("publisher") or ((c or {}).get("provider") or {}).get("displayName")
+                if title:
+                    heads.append({"title": title, "publisher": pub})
+            if heads:
+                out["sentiment"] = {"recent_headlines": heads}
+        except Exception:  # noqa: BLE001
+            pass
+    info = {}
+    if want & {"fundamental", "analyst"}:
+        try:
+            info = stock.info or {}
+        except Exception:  # noqa: BLE001
+            info = {}
+    if "fundamental" in want and info:
+        keys = ["trailingPE", "forwardPE", "priceToBook", "profitMargins", "grossMargins", "revenueGrowth",
+                "earningsGrowth", "debtToEquity", "returnOnEquity", "freeCashflow", "marketCap", "beta"]
+        fund = {k: info.get(k) for k in keys if info.get(k) is not None}
+        if fund:
+            out["fundamental"] = fund
+    if "analyst" in want and info:
+        an = {k: info.get(k) for k in ("recommendationKey", "recommendationMean", "targetMeanPrice",
+                                       "targetHighPrice", "targetLowPrice", "numberOfAnalystOpinions") if info.get(k) is not None}
+        try:
+            rec = stock.recommendations
+            if rec is not None and not rec.empty:
+                an["recent"] = [{"firm": r.get("Firm"), "grade": r.get("To Grade"), "action": r.get("Action")}
+                                for _, r in rec.tail(6).iterrows()]
+        except Exception:  # noqa: BLE001
+            pass
+        if an:
+            out["analyst"] = an
+    return out
+
+
+_VERIFY_SYSTEM = """You are the CHIEF RISK OFFICER and head of trade execution on an elite desk. A quant \
+engine has produced a candidate trade from a full technical dossier (multi-timeframe volume profile, market \
+structure/liquidity, regime, dealer gamma, and the classic indicators). Your job is a rigorous, sceptical \
+PRE-TRADE REVIEW — protect capital first, then improve the trade.
+
+Work ONLY from the JSON provided (quote the actual numbers). Be specific and decisive; no filler. Do:
+1. VERIFY — does the thesis hold up across ALL the evidence, or do signals conflict? Decide take / adjust / pass.
+2. P&L SANITY — check the stated risk:reward, the options payoff (net cost, max profit/loss, breakevens) and the \
+share sizing for internal consistency and reasonableness; flag anything wrong or unattractive (e.g. a debit \
+spread risking more than it can make).
+3. ALTERNATE — propose ONE better or complementary trade (equity OR options) with concrete entry/stop/target or \
+strikes+expiry, and why it's better.
+4. RISKS — the top 3 risks / what invalidates the trade.
+5. ENRICHMENTS — if a sentiment / fundamental / analyst block is present, factor it explicitly; if absent, ignore \
+that dimension (do NOT invent it).
+
+Return ONLY valid JSON, no prose outside it:
+{"verdict":"take|adjust|pass","confidence":"high|medium|low","summary":"one or two sentences",
+ "verification":["evidence-grounded points, cite numbers"],
+ "pnl_check":"assessment of the risk:reward / payoff / sizing",
+ "adjustments":["concrete changes if verdict=adjust, else []"],
+ "alternate":{"name":"","kind":"equity|options","direction":"long|short|neutral","entry":"","stop":"","target":"","structure":"","why":""},
+ "risks":["..."],
+ "enrichment_read":{"sentiment":"","fundamental":"","analyst":""}}"""
+
+
+@router.post("/{ticker}/verify-setup")
+async def verify_setup(
+    ticker: str,
+    body: VerifySetupIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a quant setup + the full TA dossier (+ optional sentiment/fundamental/analyst
+    blocks the user toggled) to the LLM for a rigorous pre-trade review: verify the trade,
+    sanity-check the P&L, propose an alternate, and list the risks. Returns structured JSON."""
+    ticker = ticker.upper()
+    openai_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not openai_key:
+        raise HTTPException(400, "OpenAI API key not configured. Please add it in Settings.")
+    model = (await get_user_api_key(db, user.id, "openai_model")) or "gpt-4o-mini"
+
+    # gather only the enrichment dimensions the user toggled on (cheap yfinance fetches, off-loop)
+    want = {k for k in ("sentiment", "fundamental", "analyst") if (body.enrichments or {}).get(k)}
+    enrich = {}
+    if want:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        enrich = await loop.run_in_executor(None, lambda: _gather_verify_enrichments(ticker, want))
+    payload = {"ticker": ticker, "setup": body.setup, "dossier": body.dossier,
+               "enrichments": enrich, "enrichments_selected": sorted(want)}
+    user_msg = ("Review this quant trade and return the JSON verdict.\n```json\n"
+                + json.dumps(payload, default=str)[:60000] + "\n```")
+
+    try:
+        answer = await call_llm(api_key=openai_key, model=model,
+                                messages=[{"role": "system", "content": _VERIFY_SYSTEM},
+                                          {"role": "user", "content": user_msg}],
+                                max_tokens=2000, expect_json=True)
+    except Exception as exc:
+        raise HTTPException(502, f"Trade verification failed: {exc}")
+
+    try:
+        return {"verification": json.loads(answer), "enrichments_used": list(enrich.keys())}
+    except Exception:
+        return {"verification": {"raw": answer, "verdict": None}, "enrichments_used": list(enrich.keys())}
+
+
 @router.get("/{ticker}/prediction")
 async def get_price_prediction(
     ticker: str,

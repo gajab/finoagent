@@ -21,12 +21,87 @@ any one is unavailable. Best-effort throughout — never raises.
 
 from __future__ import annotations
 
+import datetime as _dt
+import math
 from concurrent.futures import ThreadPoolExecutor
 
 from .microstructure_service import _r, _now_str, compute_microstructure
 from .market_structure_service import compute_market_structure
 from .regime_service import compute_regime
 from .dealer_positioning_service import compute_dealer_positioning
+from .stock_service import safe_float
+from .zebra_service import _bs_price, _norm_cdf, DEFAULT_RISK_FREE
+
+
+# ---------------------------------------------------------------------------
+# probability & edge — market-implied (risk-neutral lognormal), consistent with the
+# income desk's BS-prob fallback (stock_service.bs_prob_otm / hedging RND use the same basis)
+# ---------------------------------------------------------------------------
+
+def _p_above(spot, level, t, iv, r=DEFAULT_RISK_FREE):
+    """Risk-neutral P(S_T ≥ level) = N(d2)."""
+    if not (spot and level and t and iv) or spot <= 0 or level <= 0 or t <= 0 or iv <= 0:
+        return None
+    d2 = (math.log(spot / level) + (r - 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
+    return _norm_cdf(d2)
+
+
+def _p_below(spot, level, t, iv, r=DEFAULT_RISK_FREE):
+    p = _p_above(spot, level, t, iv, r)
+    return (1.0 - p) if p is not None else None
+
+
+def _edge(setup, spot, atm_iv, dte) -> dict:
+    """PoP + expected value + Kelly for the equity and options expressions of the trade."""
+    t = max(dte or 30, 1) / 365.0
+    iv = atm_iv if (atm_iv and atm_iv > 0) else 0.30
+    out: dict = {}
+    direction = setup.get("direction")
+    entry = (setup.get("entry") or {}).get("level")
+    stop = (setup.get("stop") or {}).get("level")
+    t1 = (setup.get("targets") or [{}])[0].get("level")
+
+    if direction in ("long", "short") and entry and stop and t1:
+        if direction == "long":
+            p_win, p_lose = _p_above(spot, t1, t, iv), _p_below(spot, stop, t, iv)
+        else:
+            p_win, p_lose = _p_below(spot, t1, t, iv), _p_above(spot, stop, t, iv)
+        risk, reward = abs(entry - stop), abs(t1 - entry)
+        b = reward / risk if risk > 0 else 0.0
+        if p_win is not None and p_lose is not None:
+            ev = p_win * reward - p_lose * risk
+            kelly = (p_win - (1 - p_win) / b) if b > 0 else 0.0
+            out["equity"] = {"pop_pct": _r(p_win * 100, 1), "ev_per_share": _r(ev, 2),
+                             "payoff_ratio": _r(b, 2), "kelly_pct": _r(max(0.0, kelly) * 100, 1),
+                             "half_kelly_risk_pct": _r(min(2.0, max(0.0, kelly) / 2 * 100), 2)}
+
+    op = setup.get("options_plan") or {}
+    if op.get("available") and op.get("breakevens") and op.get("max_profit") is not None:
+        be = op["breakevens"][0]
+        legs = op.get("legs") or []
+        bull = ("Call" in (op.get("structure") or "")) or (legs and legs[0].get("right") == "Call" and legs[0].get("action") == "Buy")
+        pop = _p_above(spot, be, t, iv) if bull else _p_below(spot, be, t, iv)
+        if pop is not None:
+            ev = pop * op["max_profit"] + (1 - pop) * op["max_loss"]
+            out["options"] = {"pop_pct": _r(pop * 100, 1), "ev": _r(ev, 0), "basis": "BS-implied (ATM IV)"}
+    return out
+
+_RISK_BUDGET = 250.0        # $ risked per trade = 1% of a nominal $25k book (share-sizing basis)
+
+
+def _indicators(stock) -> dict:
+    """Classic Indicators-tab read (RSI/MACD/Bollinger/SMA/EMA/S-R/volume) on the
+    medium-term swing timeframe — same pattern desk_review uses. Best-effort."""
+    try:
+        from .stock_service import compute_technical_block, compute_momentum_indicators
+        block = compute_technical_block(stock, "medium_term") or {}
+        try:
+            block.update(compute_momentum_indicators(stock))
+        except Exception:  # noqa: BLE001
+            pass
+        return block
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +124,8 @@ def _dir_kind(price: float, spot: float) -> str:
     return "resistance" if price >= spot else "support"
 
 
-def _collect_levels(micro, structure, regime, dealer, spot) -> list[dict]:
-    """Every tradeable price from the four reads → tagged, weighted levels."""
+def _collect_levels(micro, structure, regime, dealer, spot, indicators=None) -> list[dict]:
+    """Every tradeable price from all five reads → tagged, weighted levels."""
     out: list[dict] = []
     add = lambda *a: (lambda L: out.append(L) if L else None)(_lvl(*a))
 
@@ -124,6 +199,17 @@ def _collect_levels(micro, structure, regime, dealer, spot) -> list[dict]:
         if em and em.get("upper"):
             add(em["upper"], "resistance", "expected_move", "Expected-move high (30d)", 1.5)
             add(em["lower"], "support", "expected_move", "Expected-move low (30d)", 1.5)
+
+    # --- classic indicators: Bollinger bands, moving averages, base support/resistance ---
+    ind = indicators or {}
+    bb = ind.get("bollingerBands") or {}
+    add(bb.get("upper"), "resistance", "bollinger", "Bollinger upper", 1.2)
+    add(bb.get("lower"), "support", "bollinger", "Bollinger lower", 1.2)
+    ma = ind.get("movingAverages") or {}
+    add(ma.get("sma50"), "magnet", "sma50", "SMA-50", 1.6)
+    add(ma.get("sma200"), "magnet", "sma200", "SMA-200", 2.0)
+    add(ind.get("supportLevel"), "support", "ta_sr", "Support (swing)", 1.6)
+    add(ind.get("resistanceLevel"), "resistance", "ta_sr", "Resistance (swing)", 1.6)
     return out
 
 
@@ -202,36 +288,78 @@ def _mean_zone(zones, mean_price, spot):
 # 3. directional bias
 # ---------------------------------------------------------------------------
 
-def _derive_bias(structure, regime, dealer) -> dict:
-    votes = 0
+def _derive_bias(structure, regime, dealer, indicators=None) -> dict:
+    votes = 0.0
     reasons = []
+    confirms = []                                    # every signal that voted, for the evidence trail
+    def vote(w, msg, tag=None):
+        nonlocal votes
+        votes += w
+        if tag:
+            confirms.append({"signal": tag, "reads": ("bullish" if w > 0 else "bearish"), "detail": msg})
+        if abs(w) >= 0.5:
+            reasons.append(msg)
+
     s_bias = ((structure or {}).get("bias") or {}).get("overall")
     if s_bias == "bullish":
-        votes += 1; reasons.append("market structure is bullish")
+        vote(1, "market structure is bullish", "market_structure")
     elif s_bias == "bearish":
-        votes -= 1; reasons.append("market structure is bearish")
+        vote(-1, "market structure is bearish", "market_structure")
 
     daily = ((structure or {}).get("timeframes") or {}).get("daily") or {}
     if daily.get("trend") == "up":
-        votes += 1
+        vote(1, "daily trend is up", "daily_trend")
     elif daily.get("trend") == "down":
-        votes -= 1
+        vote(-1, "daily trend is down", "daily_trend")
 
     if dealer:
         gf = dealer.get("gamma_flip") or {}
-        if gf.get("side") == "below":            # spot above flip → long gamma / supportive
-            votes += 0.5; reasons.append("spot is above the gamma flip")
+        if gf.get("side") == "below":                # flip below spot → spot above flip → long gamma / supportive
+            vote(0.5, "spot is above the gamma flip", "gamma")
         elif gf.get("side") == "above":
-            votes -= 0.5; reasons.append("spot is below the gamma flip")
+            vote(-0.5, "spot is below the gamma flip", "gamma")
+
+    # --- classic Indicators-tab confirmations ---
+    ind = indicators or {}
+    rsi = ind.get("currentRSI")
+    if rsi is not None:
+        if rsi >= 55:
+            vote(0.5, f"RSI {rsi:.0f} — bullish momentum", "rsi")
+        elif rsi <= 45:
+            vote(-0.5, f"RSI {rsi:.0f} — bearish momentum", "rsi")
+    macd = ind.get("macd") or {}
+    if macd.get("crossover") == "bullish_crossover":
+        vote(0.75, "MACD bullish crossover", "macd")
+    elif macd.get("crossover") == "bearish_crossover":
+        vote(-0.75, "MACD bearish crossover", "macd")
+    elif macd.get("signal") == "bullish":
+        vote(0.35, "MACD above signal", "macd")
+    elif macd.get("signal") == "bearish":
+        vote(-0.35, "MACD below signal", "macd")
+    ma = ind.get("movingAverages") or {}
+    if ma.get("priceVsSma50") == "above":
+        vote(0.3, "price above the 50-day MA", "sma50")
+    elif ma.get("priceVsSma50") == "below":
+        vote(-0.3, "price below the 50-day MA", "sma50")
+    if ma.get("goldenDeathCross") == "golden_cross":
+        vote(0.5, "golden cross (SMA50 > SMA200)", "sma_cross")
+    elif ma.get("goldenDeathCross") == "death_cross":
+        vote(-0.5, "death cross (SMA50 < SMA200)", "sma_cross")
+    bb = ind.get("bollingerBands") or {}
+    if (bb.get("percentB") or 0.5) > 0.55:
+        vote(0.15, "upper half of the Bollinger band", "bollinger")
+    elif (bb.get("percentB") or 0.5) < 0.45:
+        vote(-0.15, "lower half of the Bollinger band", "bollinger")
 
     direction = "bullish" if votes >= 1 else "bearish" if votes <= -1 else "neutral"
-    strength = "strong" if abs(votes) >= 2 else "moderate" if abs(votes) >= 1 else "weak"
+    strength = "strong" if abs(votes) >= 2.5 else "moderate" if abs(votes) >= 1 else "weak"
     reg = (regime or {}).get("regime") or {}
     return {
         "direction": direction,
         "strength": strength,
-        "score": round(votes, 1),
-        "rationale": ("; ".join(reasons[:3]) or "no dominant directional signal").capitalize() + ".",
+        "score": round(votes, 2),
+        "rationale": ("; ".join(reasons[:4]) or "no dominant directional signal").capitalize() + ".",
+        "confirmations": confirms,
         "regime": reg.get("overall", "transitional"),
     }
 
@@ -425,8 +553,11 @@ def _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, st
            [f"regime: {reg}", bias["rationale"]], cont_fit)
 
     # B) mean-reversion fade (mean-reverting regime, or a stretched z-score) — target the mean
-    stretched_hi = zval.get("z", 0) >= 1.5
-    stretched_lo = zval.get("z", 0) <= -1.5
+    # A stretched z-score only justifies a FADE when we're NOT trending — in a trend (esp. a
+    # short-gamma tape) stretched = momentum and support/resistance is made to break, not bought.
+    allow_stretch = reg != "trending"
+    stretched_hi = zval.get("z", 0) >= 1.5 and allow_stretch
+    stretched_lo = zval.get("z", 0) <= -1.5 and allow_stretch
     if (reg == "mean_reverting" or stretched_hi) and res and mean_z and mean_z["center"] < res["center"]:
         fit = "with_regime" if reg == "mean_reverting" else "neutral"
         mk("mean_reversion_fade", "short", res, res["center"], res["high"] + buf,
@@ -522,27 +653,392 @@ def _context(bias, structure, regime, dealer) -> dict:
     }
 
 
-def compute_trade_setups(stock) -> dict | None:
-    """Fuse all four TA reads into ranked setups. Runs sub-computes concurrently; degrades
-    gracefully. ``None`` only if nothing usable could be computed."""
+def _atr_from_indicators(indicators, spot) -> float:
+    bb = (indicators or {}).get("bollingerBands") or {}
+    bw = bb.get("bandwidthPct")
+    if bw and spot:
+        return spot * (bw / 100.0) / 4.0        # band width ≈ 4 ATR — a rough fallback
+    return spot * 0.015 if spot else 0.0
+
+
+# ---------------------------------------------------------------------------
+# per-setup enrichment: T2 · equity plan · priced options payoff · management
+# ---------------------------------------------------------------------------
+
+def _second_target(zones, spot, direction, t1) -> float | None:
+    if direction == "long":
+        cands = [z["center"] for z in zones if z["kind"] == "resistance" and z["center"] > t1]
+        return min(cands) if cands else round(t1 + (t1 - spot), 2)          # measured move
+    cands = [z["center"] for z in zones if z["kind"] == "support" and z["center"] < t1]
+    return max(cands) if cands else round(t1 - (spot - t1), 2)
+
+
+def _equity_plan(direction, entry, stop, targets, spot, risk_pct=None) -> dict | None:
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    # edge-based budget (half-Kelly %, capped 0.2–2% of a $25k book); default flat 1%
+    budget, basis = _RISK_BUDGET, "1% flat"
+    if risk_pct and risk_pct > 0:
+        budget = max(50.0, min(500.0, risk_pct / 100.0 * 25000.0))
+        basis = f"half-Kelly ({risk_pct}% of book)"
+    shares = max(1, int(budget / risk))
+    tgs = [t for t in targets if t.get("level") is not None]
+    t1 = tgs[0]["level"] if tgs else entry
+    reward = abs(t1 - entry)
+    rr = round(reward / risk, 2)
+    return {
+        "side": "Buy (long)" if direction == "long" else "Short (sell)",
+        "entry": _r(entry), "stop": _r(stop),
+        "targets": [{"level": t["level"], "gain_per_share": _r(abs(t["level"] - entry))} for t in tgs],
+        "risk_per_share": _r(risk), "reward_per_share_t1": _r(reward), "risk_reward": rr,
+        "suggested_shares": shares, "risk_budget": _r(budget, 0), "sizing_basis": basis,
+        "dollar_risk": _r(shares * risk, 0), "dollar_reward_t1": _r(shares * reward, 0),
+        "note": (f"Risking ~${round(budget)} ({basis}) ⇒ {shares} shares. "
+                 f"Max loss ≈ ${round(shares * risk)}, T1 gain ≈ ${round(shares * reward)} (R:R {rr})."),
+    }
+
+
+def _next_earnings(stock) -> str | None:
     try:
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        cal = stock.calendar
+        ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
+        if isinstance(ed, (list, tuple)):
+            ed = ed[0] if ed else None
+        return ed.isoformat() if hasattr(ed, "isoformat") else (str(ed) if ed else None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _event_risk(next_earnings, expiry) -> dict | None:
+    exp = (expiry or {}).get("date")
+    if not next_earnings or not exp:
+        return None
+    try:
+        ed = _dt.date.fromisoformat(str(next_earnings)[:10])
+        xd = _dt.date.fromisoformat(str(exp)[:10])
+    except Exception:  # noqa: BLE001
+        return None
+    today = _dt.date.today()
+    if today <= ed <= xd:
+        return {"type": "earnings", "date": ed.isoformat(), "in_days": (ed - today).days,
+                "warning": (f"Earnings on {ed.isoformat()} ({(ed - today).days}d) falls INSIDE the option's expiry — "
+                            f"expect an IV crush after the report and gap risk. Prefer the stock trade, or close the "
+                            f"option before the print.")}
+    return None
+
+
+def _build_legs(st, quotes) -> list[dict]:
+    def q(strike, right):
+        return (quotes.get(round(float(strike), 2)) or {}).get(right) or {}
+    legs: list[dict] = []
+    if st.get("long_call") and st.get("short_call"):
+        for k, sign in ((st["long_call"], 1), (st["short_call"], -1)):
+            d = q(k, "C"); legs.append({"strike": float(k), "right": "C", "sign": sign, "qty": 1, "mid": d.get("mid"), "iv": d.get("iv")})
+    elif st.get("long_put") and st.get("short_put"):
+        for k, sign in ((st["long_put"], 1), (st["short_put"], -1)):
+            d = q(k, "P"); legs.append({"strike": float(k), "right": "P", "sign": sign, "qty": 1, "mid": d.get("mid"), "iv": d.get("iv")})
+    elif st.get("short_put") and st.get("short_call"):
+        pw, cw = float(st["short_put"]), float(st["short_call"])
+        lpw, lcw = round(pw * 0.975), round(cw * 1.025)                     # modelled condor wings
+        for k, right, sign in ((lpw, "P", 1), (pw, "P", -1), (cw, "C", -1), (lcw, "C", 1)):
+            d = q(k, right); legs.append({"strike": float(k), "right": right, "sign": sign, "qty": 1, "mid": d.get("mid"), "iv": d.get("iv")})
+    return legs
+
+
+def _payoff_curve(legs, net_debit, spot, lo=0.7, hi=1.3, n=60) -> list[dict]:
+    out = []
+    for i in range(n + 1):
+        P = spot * (lo + (hi - lo) * i / n)
+        val = 0.0
+        for lg in legs:
+            intr = max(0.0, P - lg["strike"]) if lg["right"] == "C" else max(0.0, lg["strike"] - P)
+            val += lg["sign"] * lg.get("qty", 1) * intr
+        out.append({"price": round(P, 2), "pnl": round((val - net_debit) * 100.0, 2)})
+    return out
+
+
+def _breakevens_from_curve(curve) -> list[float]:
+    bes = []
+    for a, b in zip(curve, curve[1:]):
+        if a["pnl"] == 0:
+            bes.append(a["price"])
+        elif (a["pnl"] < 0 < b["pnl"]) or (a["pnl"] > 0 > b["pnl"]):
+            bes.append(round(a["price"] + (0 - a["pnl"]) * (b["price"] - a["price"]) / (b["pnl"] - a["pnl"]), 2))
+    return bes
+
+
+def _options_plan(op, expiry, quotes, spot, dealer) -> dict:
+    st = (op or {}).get("strikes") or {}
+    structure = (op or {}).get("structure") or "Options structure"
+    dte = (expiry or {}).get("dte")
+    t_years = (dte / 365.0) if dte else 0.08
+    legs = _build_legs(st, quotes)
+    if not legs or not spot:
+        return {"available": False, "structure": structure,
+                "note": "Couldn't price a defined-risk structure from the chain — see the option idea in the plan text."}
+    net_debit, priced, any_real = 0.0, [], False
+    for lg in legs:
+        mid = lg.get("mid")
+        if mid and mid > 0:
+            any_real = True
+        else:
+            iv = lg.get("iv") or 0.30
+            iv = iv / 100.0 if iv > 3 else iv
+            mid = _bs_price(spot, lg["strike"], t_years, iv, lg["right"] == "C")
+        net_debit += lg["sign"] * lg["qty"] * float(mid)
+        priced.append({**lg, "price": round(float(mid), 2)})
+    curve = _payoff_curve(priced, net_debit, spot)
+    pnls = [c["pnl"] for c in curve]
+    return {
+        "available": True,
+        "structure": structure.split(" / ")[0],
+        "expiry": expiry,
+        "priced_from": "live chain" if any_real else "model (thin quotes)",
+        "legs": [{"action": "Buy" if lg["sign"] > 0 else "Sell", "right": "Call" if lg["right"] == "C" else "Put",
+                  "strike": lg["strike"], "price": lg["price"]} for lg in priced],
+        "net_cost": round(net_debit * 100.0, 2),
+        "net_cost_label": "debit" if net_debit >= 0 else "credit",
+        "max_profit": round(max(pnls), 2),
+        "max_loss": round(min(pnls), 2),
+        "breakevens": _breakevens_from_curve(curve),
+        "payoff": curve,
+    }
+
+
+def _plan_from_legs(name, kind, legs, quotes, spot, expiry, direction, atm_iv) -> dict | None:
+    """Price an explicit leg set (real chain mid, BS fallback) → payoff + PoP + EV. Used to
+    compare candidate structures (debit vs credit) and pick the best by expected value."""
+    if not legs or not spot:
+        return None
+    dte = (expiry or {}).get("dte")
+    t = (dte / 365.0) if dte else 0.08
+    iv0 = atm_iv if (atm_iv and atm_iv > 0) else 0.30
+    net, priced, any_real = 0.0, [], False
+    for lg in legs:
+        d = (quotes.get(round(float(lg["strike"]), 2)) or {}).get(lg["right"]) or {}
+        mid = d.get("mid")
+        if mid and mid > 0:
+            any_real = True
+        else:
+            liv = d.get("iv") or iv0
+            liv = liv / 100.0 if liv > 3 else liv
+            mid = _bs_price(spot, lg["strike"], t, liv, lg["right"] == "C")
+        net += lg["sign"] * float(mid)
+        priced.append({**lg, "price": round(float(mid), 2)})
+    curve = _payoff_curve(priced, net, spot)
+    pnls = [c["pnl"] for c in curve]
+    bes = _breakevens_from_curve(curve)
+    mp, ml = round(max(pnls), 2), round(min(pnls), 2)
+    pop = ev = None
+    if bes:
+        pop = _p_above(spot, bes[0], t, iv0) if direction == "long" else _p_below(spot, bes[0], t, iv0)
+        if pop is not None:
+            ev = round(pop * mp + (1 - pop) * ml, 0)
+    return {
+        "available": True, "structure": name, "kind": kind, "expiry": expiry,
+        "priced_from": "live chain" if any_real else "model (thin quotes)",
+        "legs": [{"action": "Buy" if l["sign"] > 0 else "Sell", "right": "Call" if l["right"] == "C" else "Put",
+                  "strike": l["strike"], "price": l["price"]} for l in priced],
+        "net_cost": round(net * 100.0, 2), "net_cost_label": "debit" if net >= 0 else "credit",
+        "max_profit": mp, "max_loss": ml, "breakevens": bes, "payoff": curve,
+        "pop_pct": _r(pop * 100, 1) if pop is not None else None, "ev": ev,
+    }
+
+
+def _candidate_plans(direction, setup_type, spot, entry, target, ssup, sres, dealer, strikes, quotes, expiry, atm_iv) -> list[dict]:
+    """Both a DEBIT spread (directional/convex) and a CREDIT spread (sell premium AT the level
+    you're trading into) with sane strikes. The PRIMARY is chosen STRUCTURALLY, not by EV:
+    a pullback / fade entry INTO a level = premium selling → credit spread (positive theta, wider
+    margin, no 'OTM debit on a bounce'); only a BREAKOUT (entering ON a break) favors the debit
+    spread's convexity. EV/PoP are still computed for transparency and to break ties."""
+    walls = (dealer or {}).get("walls") or {}
+    cw = (walls.get("call_wall") or {}).get("strike")
+    pw = (walls.get("put_wall") or {}).get("strike")
+    width = max(1.0, round(spot * 0.03))
+    specs = []
+    if direction == "long":
+        lc = _snap(spot, strikes, "below"); sc = _snap(_first(target, sres, cw), strikes, "near")
+        if lc and sc and sc <= lc:
+            sc = _next_strike(lc, strikes, True)
+        if lc and sc:
+            specs.append(("Bull Call Spread", "debit", [{"strike": lc, "right": "C", "sign": 1}, {"strike": sc, "right": "C", "sign": -1}]))
+        sp = _snap(_first(entry, ssup, pw), strikes, "below"); lp = _snap((sp or spot) - width, strikes, "below")
+        if sp and lp and lp >= sp:
+            lp = _next_strike(sp, strikes, False)
+        if sp and lp and lp < sp:
+            specs.append(("Put Credit Spread", "credit", [{"strike": sp, "right": "P", "sign": -1}, {"strike": lp, "right": "P", "sign": 1}]))
+    elif direction == "short":
+        lp = _snap(spot, strikes, "above"); sp = _snap(_first(target, ssup, pw), strikes, "near")
+        if lp and sp and sp >= lp:
+            sp = _next_strike(lp, strikes, False)
+        if lp and sp:
+            specs.append(("Bear Put Spread", "debit", [{"strike": lp, "right": "P", "sign": 1}, {"strike": sp, "right": "P", "sign": -1}]))
+        sc = _snap(_first(entry, sres, cw), strikes, "above"); lc = _snap((sc or spot) + width, strikes, "above")
+        if sc and lc and lc <= sc:
+            lc = _next_strike(sc, strikes, True)
+        if sc and lc and lc > sc:
+            specs.append(("Call Credit Spread", "credit", [{"strike": sc, "right": "C", "sign": -1}, {"strike": lc, "right": "C", "sign": 1}]))
+    else:
+        return []
+    # Premium-selling setups (pullback/fade INTO a level) prefer the credit spread; only a
+    # breakout (entering ON a break) prefers the debit spread's convexity.
+    prefer_credit = setup_type != "breakout"
+    built = [p for p in (_plan_from_legs(n, k, legs, quotes, spot, expiry, direction, atm_iv) for n, k, legs in specs) if p]
+    for p in built:
+        p["preferred"] = (p["kind"] == "credit") if prefer_credit else (p["kind"] == "debit")
+        p["why"] = ("Sells premium AT the level you're trading into — positive theta and a wider margin of "
+                    "safety than a debit spread bought on the bounce (which goes OTM and fights theta)."
+                    if p["kind"] == "credit" else
+                    "Directional debit spread — defined risk with convexity if the move runs; best when you "
+                    "enter ON a break, not on a fade into a level.")
+    # primary = structurally preferred first, then higher EV as the tiebreak
+    built.sort(key=lambda p: (1 if p.get("preferred") else 0, p.get("ev") if p.get("ev") is not None else -1e9), reverse=True)
+    return built
+
+
+def _what_to_watch(s, dealer) -> list[str]:
+    d, out = s.get("direction"), []
+    stop = (s.get("stop") or {}).get("level")
+    if stop is not None:
+        out.append(f"Invalidation — a daily close {'below' if d == 'long' else 'above'} ${stop} kills the thesis; exit.")
+    out.append("Take partial profit at T1 and trail the stop to breakeven; let the rest run to T2.")
+    gf = (dealer or {}).get("gamma_flip") or {}
+    if gf.get("level") is not None:
+        out.append(f"Gamma flip ${gf['level']} — losing it flips dealers short-gamma → expect bigger, faster moves.")
+    if s.get("regime_fit") == "counter_regime":
+        out.append("Counter-trend trade — keep size small and be quick to cut.")
+    out.append("A change-of-character (CHOCH) against you on the 1H/4H is your early warning to tighten or exit.")
+    return out
+
+
+def _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, next_earnings, strikes) -> None:
+    direction = s.get("direction")
+    entry = (s.get("entry") or {}).get("level")
+    stop = (s.get("stop") or {}).get("level")
+    tgts = s.get("targets") or []
+    t1 = tgts[0].get("level") if tgts else None
+    if direction in ("long", "short") and t1 is not None and entry is not None:
+        t2 = _second_target(zones, spot, direction, t1)
+        if t2 is not None and abs(t2 - entry) > abs(t1 - entry) * 1.05:
+            s["targets"] = tgts + [{"level": _r(t2), "label": "extended (T2)",
+                                    "rr": _rr(entry, stop, t2) if stop is not None else None}]
+
+    # cap targets to a REALISTIC distance (≤1.5× the 30-day expected move) — no fantasy 43% targets
+    if em_pct and direction in ("long", "short"):
+        max_dist = spot * (em_pct / 100.0) * 1.5
+        for t in s.get("targets", []):
+            lvl = t.get("level")
+            if lvl is None:
+                continue
+            if direction == "long" and lvl > spot + max_dist:
+                t["level"], t["capped"] = _r(spot + max_dist), True
+            elif direction == "short" and lvl < spot - max_dist:
+                t["level"], t["capped"] = _r(spot - max_dist), True
+        nt1 = s["targets"][0].get("level") if s.get("targets") else None
+        if nt1 is not None and entry is not None and stop is not None:
+            s["risk_reward"] = _rr(entry, stop, nt1)
+            s["targets"][0]["rr"] = s["risk_reward"]
+
+    t1c = s["targets"][0].get("level") if s.get("targets") else None
+    # EV-ranked candidate structures (debit vs credit spread) — primary + alternatives
+    if direction in ("long", "short"):
+        sups = [z for z in zones if z["kind"] == "support"]
+        ress = [z for z in zones if z["kind"] == "resistance"]
+        ssup = max(sups, key=lambda z: z["score"])["center"] if sups else None
+        sres = max(ress, key=lambda z: z["score"])["center"] if ress else None
+        cands = _candidate_plans(direction, s.get("type"), spot, entry, t1c, ssup, sres, dealer, strikes, quotes, expiry, atm_iv)
+        if cands:
+            s["options_plan"] = cands[0]
+            s["options_alternatives"] = [{k: c.get(k) for k in ("structure", "kind", "net_cost", "net_cost_label",
+                                                                 "max_profit", "max_loss", "breakevens", "pop_pct", "ev", "legs")}
+                                         for c in cands[1:]]
+        else:
+            s["options_plan"] = _options_plan(s.get("options"), expiry, quotes, spot, dealer)
+    else:
+        s["options_plan"] = _options_plan(s.get("options"), expiry, quotes, spot, dealer)
+
+    s["edge"] = _edge(s, spot, atm_iv, (expiry or {}).get("dte"))
+    if direction in ("long", "short") and entry is not None and stop is not None:
+        risk_pct = ((s["edge"].get("equity") or {}).get("half_kelly_risk_pct"))
+        s["equity_plan"] = _equity_plan(direction, entry, stop, s["targets"], spot, risk_pct)
+    s["event_risk"] = _event_risk(next_earnings, expiry)
+    s["what_to_watch"] = _what_to_watch(s, dealer)
+
+
+def _leg_quotes(stock, expiry_date) -> dict:
+    """Real per-strike option mids for one expiry: {strike: {'C': {mid,iv}, 'P': {mid,iv}}}."""
+    if not expiry_date:
+        return {}
+    try:
+        oc = stock.option_chain(expiry_date)
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict = {}
+    for df, right in ((getattr(oc, "calls", None), "C"), (getattr(oc, "puts", None), "P")):
+        if df is None or getattr(df, "empty", True):
+            continue
+        for _, row in df.iterrows():
+            k = safe_float(row.get("strike"))
+            if not k:
+                continue
+            bid, ask = safe_float(row.get("bid")), safe_float(row.get("ask"))
+            last, iv = safe_float(row.get("lastPrice")), safe_float(row.get("impliedVolatility"))
+            mid = (bid + ask) / 2 if (bid and ask and ask >= bid) else (last or bid or ask or 0.0)
+            out.setdefault(round(k, 2), {})[right] = {"mid": round(mid, 2), "iv": iv}
+    return out
+
+
+def _dossier(spot, bias, structure, regime, dealer, micro, indicators, zones, setups) -> dict:
+    """One consolidated JSON of every indicator + advanced metric + the quant trades — the
+    exact payload handed to the LLM for verification."""
+    ind = indicators or {}
+    tf = (structure or {}).get("timeframes") or {}
+    return {
+        "spot": _r(spot),
+        "bias": bias,
+        "regime": (regime or {}).get("regime"),
+        "vwap_zscore": (regime or {}).get("zscore"),
+        "market_structure": {"bias": (structure or {}).get("bias"),
+                             "trend_alignment": {k: (tf.get(k) or {}).get("trend") for k in ("daily", "h4", "h1")},
+                             "confluence": (structure or {}).get("confluence")},
+        "dealer_gamma": {"net_gex": (dealer or {}).get("net_gex"), "gamma_flip": (dealer or {}).get("gamma_flip"),
+                         "gamma_levels": (dealer or {}).get("gamma_levels"), "expected_move": (dealer or {}).get("expected_move")},
+        "volume_profile": (micro or {}).get("timeframe_profiles"),
+        "naked_pocs": (micro or {}).get("naked_pocs"),
+        "avwap": (micro or {}).get("avwap"),
+        "indicators": {k: ind.get(k) for k in ("currentRSI", "rsiSignal", "supportLevel", "resistanceLevel",
+                                               "macd", "bollingerBands", "movingAverages", "emaCrossover", "volumeAnalysis")},
+        "confluence_zones": zones[:8],
+        "setups": setups,
+    }
+
+
+def compute_trade_setups(stock) -> dict | None:
+    """Fuse all five TA reads into ranked setups (equity + priced-options plans) plus a
+    consolidated dossier. Runs sub-computes concurrently; degrades gracefully."""
+    try:
+        with ThreadPoolExecutor(max_workers=5) as ex:
             f_micro = ex.submit(compute_microstructure, stock)
             f_struct = ex.submit(compute_market_structure, stock)
             f_regime = ex.submit(compute_regime, stock)
             f_dealer = ex.submit(compute_dealer_positioning, stock)
-            micro, structure, regime, dealer = (f.result() for f in (f_micro, f_struct, f_regime, f_dealer))
+            f_ind = ex.submit(_indicators, stock)
+            micro, structure, regime, dealer, indicators = (
+                f.result() for f in (f_micro, f_struct, f_regime, f_dealer, f_ind))
 
         spot = None
         for src in (structure, regime, micro, dealer):
             if src and src.get("price"):
                 spot = float(src["price"]); break
+        if spot is None and indicators and indicators.get("prices"):
+            spot = float(indicators["prices"][-1])
         if spot is None:
             return None
 
-        atr = _atr_from_structure(structure)
-        bias = _derive_bias(structure, regime, dealer)
-        levels = _collect_levels(micro, structure, regime, dealer, spot)
+        atr = _atr_from_structure(structure) or _atr_from_indicators(indicators, spot)
+        bias = _derive_bias(structure, regime, dealer, indicators)
+        levels = _collect_levels(micro, structure, regime, dealer, spot, indicators)
         zones = _cluster_zones(levels, atr, spot)
         em_pct = (((dealer or {}).get("expected_move") or {}).get("em_30d") or {}).get("move_pct")
         mean_price = ((regime or {}).get("zscore") or {}).get("vwap")
@@ -551,15 +1047,26 @@ def compute_trade_setups(stock) -> dict | None:
         strikes = (dealer or {}).get("strikes") or None
         setups = _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, strikes)
 
+        # enrich each setup with an equity plan, T1/T2, a management plan, and a priced
+        # options plan (real leg quotes + payoff). Fetch the one expiry chain we need.
+        expiry = _pick_expiry(dealer)
+        quotes = _leg_quotes(stock, expiry.get("date")) if expiry else {}
+        atm_iv_pct = (((dealer or {}).get("expected_move") or {}).get("em_30d") or {}).get("iv_atm_pct")
+        atm_iv = (atm_iv_pct / 100.0) if atm_iv_pct else None
+        next_earn = _next_earnings(stock)
+        for s in setups:
+            _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, next_earn, strikes)
+
         return {
             "price": _r(spot),
             "as_of": _now_str(),
             "context": _context(bias, structure, regime, dealer),
             "confluence_zones": zones[:8],
             "setups": setups,
+            "dossier": _dossier(spot, bias, structure, regime, dealer, micro, indicators, zones, setups),
             "price_series": (structure or micro or regime or {}).get("price_series"),
             "meta": {"sources_ok": {"micro": bool(micro), "structure": bool(structure),
-                                    "regime": bool(regime), "dealer": bool(dealer)}},
+                                    "regime": bool(regime), "dealer": bool(dealer), "indicators": bool(indicators)}},
         }
     except Exception:  # noqa: BLE001
         return None

@@ -38,9 +38,14 @@ _BENCH = "^GSPC"          # S&P 500 index — beta benchmark + hedge underlier
 _SPX_OPT = "^SPX"         # CBOE SPX options (European · cash-settled), $100/point
 _SPY_DIV = 10.0           # SPY ≈ SPX / 10
 
-# (label, index move, vol-points shock). Vol spikes as spot drops (skew).
-_CRASH = [("−10%", -0.10, 8.0), ("−20%", -0.20, 15.0),
-          ("COVID −34%", -0.34, 30.0), ("GFC −50%", -0.50, 45.0)]
+# (label, index move, vol-points shock). Vol SPIKES as spot drops (skew) and CRUSHES on a
+# melt-up. A short-GAMMA book loses on a big move in EITHER direction — so the stress set is
+# two-sided: the deep downside crashes AND the upside melt-ups the net-short-delta / short-
+# call side is exposed to (the risk a downside-only crash table hides).
+_CRASH = [("GFC −50%", -0.50, 45.0), ("COVID −34%", -0.34, 30.0),
+          ("−20%", -0.20, 15.0), ("−10%", -0.10, 8.0),
+          ("Melt-up +10%", 0.10, -4.0), ("Melt-up +20%", 0.20, -6.0),
+          ("Squeeze +35%", 0.35, 8.0)]   # a violent gap-up can BID call skew (vol up, not crush)
 _HEDGE_SCEN = (-0.20, 15.0)      # size hedges to the −20% book loss
 _HORIZON_TD = 21                 # VaR/CVaR horizon: ~1 trading month
 _MKT_VOL_FALLBACK = 0.16         # annualized S&P vol if VIX is unavailable
@@ -289,8 +294,14 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
     g = higher_order_greeks(life_legs, spot, r=r, stock_shares=0.0)   # OPTION LAYER ONLY
     avg_iv = sum(x["iv"] for x in life_legs) / len(life_legs)
     capital = sum(sk * _MULT for sk in short_strikes) or abs(g["net_delta"]) * spot
+    # structure + stock presence → so a short CALL can be flagged COVERED (excluded from the
+    # naked-assignment total) vs naked. Any non-option long-share leg also counts as cover.
+    structure = getattr(strategy, "strategy_type", None) or getattr(strategy, "structure", None)
+    has_stock = any(("stock" in str(l.get("type", "")).lower() or "share" in str(l.get("type", "")).lower())
+                    and float(l.get("shares") or l.get("qty") or 0) > 0 for l in legs)
     return {"ticker": ticker, "name": strategy.name, "spot": spot, "iv": avg_iv,
-            "n_short": n_short, "capital": round(capital, 0), "legs": life_legs, **g}
+            "n_short": n_short, "capital": round(capital, 0), "legs": life_legs,
+            "structure": structure, "has_stock": bool(has_stock), **g}
 
 
 async def _index_puts(provider, dte_days: int, today: date):
@@ -600,6 +611,86 @@ def _verdict_and_actions(*, crash20_pct, short_vol, concentration, hedge_menu, c
     return {"level": level, "summary": msg, "actions": actions}
 
 
+def _vol_shock_for(mv: float) -> float:
+    """Vol-point shock for a market move: vol SPIKES on the downside (skew), CRUSHES mildly
+    on a melt-up. Consistent with the crash table's skew constant."""
+    return -_SKEW_K * 100.0 * mv if mv < 0 else -0.30 * 100.0 * mv
+
+
+def _assignment_ladder(positions: list[dict], r: float, moves=None) -> list[dict]:
+    """What-if ASSIGNMENT / capital lab — 'what happens in various market scenarios'.
+
+    For each market move, full-reprice the book AND tally the capital an assignment would
+    demand at that spot:
+      • a short PUT finishing ITM → cash-secured you must PRODUCE to take delivery
+        (strike × 100 × qty — the 'forced to purchase' capital);
+      • a short CALL finishing ITM → stock called away / bought-to-cover
+        (intrinsic (spot − strike) × 100 × qty).
+    Long legs never demand assignment capital. On a strangle only ONE wing is ITM at a given
+    spot, so the binding side is picked automatically — no double count, matching "if it's a
+    straddle take the highest capital required"."""
+    moves = moves or [-0.35, -0.25, -0.20, -0.15, -0.10, -0.05,
+                      0.05, 0.10, 0.15, 0.20, 0.25, 0.35]
+    out = []
+    for mv in moves:
+        put_cap = call_cost = 0.0
+        puts_itm = calls_itm = 0
+        for p in positions:
+            s = p["spot"] * (1 + mv * p.get("beta", 1.0))     # β-adjusted per name
+            for lg in p["legs"]:
+                if lg["sign"] >= 0:                            # only SHORT legs get assigned
+                    continue
+                K, qty = lg["strike"], lg["qty"]
+                if lg["right"] == "P" and s < K:
+                    put_cap += K * _MULT * qty                 # cash to buy the assigned shares
+                    puts_itm += 1
+                elif lg["right"] == "C" and s > K:
+                    call_cost += (s - K) * _MULT * qty         # intrinsic to deliver / cover
+                    calls_itm += 1
+        pnl = reprice_scenario(positions, mv, _vol_shock_for(mv), r)
+        out.append({
+            "move_pct": round(mv * 100, 0),
+            "pnl": round(pnl, 0),
+            "put_assignment_capital": round(put_cap, 0),
+            "call_cover_cost": round(call_cost, 0),
+            "puts_itm": puts_itm, "calls_itm": calls_itm,
+        })
+    return out
+
+
+def _naked_assignment(positions: list[dict]) -> dict:
+    """Worst-case capital if EVERY NAKED short is assigned at once — the aggregate obligation
+    a scenario-by-scenario ladder never sums (a put is assigned low, a call high). COVERED
+    calls (stock behind them, or a covered_call structure) and spread-protected legs (an
+    offsetting long option on the same side) are EXCLUDED — only the genuinely naked shorts.
+
+      • naked short PUT  → cash to buy the shares put to you   = strike × 100 × qty
+      • naked short CALL → notional you must deliver / source  = strike × 100 × qty
+        (true buy-to-cover can exceed this if the stock has already run — upside is unbounded)."""
+    put_cap = call_cap = 0.0
+    n_puts = n_calls = 0
+    for p in positions:
+        legs = p.get("legs", [])
+        covered = (p.get("structure") == "covered_call") or p.get("has_stock")
+        has_long_put = any(lg["right"] == "P" and lg["sign"] > 0 for lg in legs)
+        has_long_call = any(lg["right"] == "C" and lg["sign"] > 0 for lg in legs)
+        for lg in legs:
+            if lg["sign"] >= 0:
+                continue
+            notional = lg["strike"] * _MULT * lg["qty"]
+            if lg["right"] == "P" and not has_long_put:        # naked/cash-secured short put
+                put_cap += notional
+                n_puts += 1
+            elif lg["right"] == "C" and not covered and not has_long_call:   # naked short call
+                call_cap += notional
+                n_calls += 1
+    return {
+        "put_capital": round(put_cap, 0), "call_capital": round(call_cap, 0),
+        "total": round(put_cap + call_cap, 0),
+        "n_naked_puts": n_puts, "n_naked_calls": n_calls,
+    }
+
+
 async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
                                  *, hedge_target_pct: float = 0.6, crash_prob_annual: float = 0.05,
                                  hedge_dte_days: int = 90) -> dict:
@@ -748,6 +839,10 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
         "net_delta_notional": round(sum(p["net_delta"] * p["spot"] for p in positions), 0),
         "beta_delta_notional": round(bw_delta_notional, 0), "beta_delta_spy": beta_delta_spy,
         "book_capital": round(book_capital, 0), "annual_income": round(annual_income, 0),
+        # What the "% of capital" denominator IS — surfaced so the user can see it, not guess.
+        "capital_basis": ("Σ committed capital across positions = short-put strikes × 100 (the cash "
+                          "each CSP secures) + short-call/other strike notional. It is the capital PUT TO "
+                          "WORK, the % of cap denominator — NOT your whole account net-liq."),
         # θ/Net-Liq — daily decay income as a % of capital at work (how hard the book earns);
         # carry_yield = that annualized. tastytrade rule-of-thumb: ~0.1%/day (~25%/yr) is healthy.
         "theta_net_liq_pct": round(net_theta / book_capital * 100, 3) if book_capital else None,
@@ -760,6 +855,10 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
         "horizon": "1 month (21 trading days)",
         "concentration": concentration,
         "crash_scenarios": scenarios,
+        # Assignment / scenario lab — capital demanded and P&L across a two-sided move ladder,
+        # plus the worst-case if EVERY naked short is assigned (covered calls excluded).
+        "assignment_ladder": _assignment_ladder(positions, r),
+        "naked_assignment": _naked_assignment(positions),
         "hedge_menu": hedge_menu, "hedge_note": hedge_note,
         "verdict": verdict,
         "assumptions": {"beta": "per-name β vs S&P 500" if beta_weighted else "β≈1 (beta data unavailable)",

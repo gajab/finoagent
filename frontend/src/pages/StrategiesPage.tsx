@@ -1,4 +1,5 @@
-import React, { useState, lazy, Suspense } from 'react';
+import React, { useState, useEffect, lazy, Suspense } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Layers, Box, ArrowLeftRight, Building, Shield, Target, ArrowDownRight, Crown, Lock, Briefcase, ClipboardList, ShieldCheck, Coins
 } from 'lucide-react';
@@ -93,6 +94,11 @@ const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; descript
 export default function StrategiesPage() {
   const { isPremium } = useAuth();
   const [activeStrategy, setActiveStrategy] = useState<Strategy>('derivative_income');
+  const [searchParams] = useSearchParams();
+  useEffect(() => {                                   // deep-link: /strategies?strategy=derivative_income
+    const s = searchParams.get('strategy');
+    if (s) setActiveStrategy(s as Strategy);
+  }, [searchParams]);
 
   if (!isPremium) {
     return (

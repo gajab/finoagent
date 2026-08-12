@@ -334,71 +334,38 @@ def _portfolio_fit_sync(ticker: str) -> dict:
 
 
 def _gex_sync(ticker: str) -> dict:
-    """Dealer Gamma-Exposure (GEX) proxy from the front option chain — a POSITIONING read plain
-    price/vol TA can't see. Convention: dealers are long call gamma (+) and short put gamma (−), so
-    GEX = Σ(γ·OI, calls) − Σ(γ·OI, puts), scaled to $ per 1% move.
-      • GEX > 0 → dealers LONG gamma → they fade moves (sell rallies / buy dips) → vol SUPPRESSED,
-        mean-reverting → a GOOD backdrop for selling premium.
-      • GEX < 0 → dealers SHORT gamma → they chase moves → vol EXPANSION, trending → DANGEROUS,
-        especially for delta-neutral structures (iron condors).
-    Retail-data proxy (open interest + a modelled γ), NOT classified dealer flow — labelled as such."""
+    """Dealer Gamma-Exposure read for the stock-level chip. Reuses the CANONICAL
+    ``dealer_positioning_service.compute_dealer_positioning`` so the gamma flip / regime /
+    Call-Resistance / Put-Support match the Technical → Dealer Positioning panel EXACTLY
+    (one source of truth — no more two different flip values across the app).
+
+    Still an open-interest × modelled-γ proxy for dealer POSITIONING, not classified dealer
+    flow — labelled ``proxy: True``. Convention: +GEX → dealers LONG gamma → fade moves →
+    vol SUPPRESSED / mean-reverting (good for selling premium); −GEX → SHORT gamma → chase
+    moves → vol EXPANSION / trending (dangerous, esp. for delta-neutral structures)."""
     try:
         import yfinance as yf
-        from datetime import datetime as _dt
-        from .hedging_service import _bs_greeks
-        stock = yf.Ticker(_norm_ticker(ticker))
-        spot = None
-        try:
-            spot = _fin((stock.fast_info or {}).get("last_price")) or None
-        except Exception:  # noqa: BLE001
-            spot = None
-        if not spot:
-            h = stock.history(period="1d")
-            spot = _fin(h["Close"].iloc[-1]) if len(h) else None
-        exps = list(stock.options or [])
-        if not spot or not exps:
+        from .dealer_positioning_service import compute_dealer_positioning
+        dp = compute_dealer_positioning(yf.Ticker(_norm_ticker(ticker)))
+        if not dp:
             return {}
-        today = _dt.utcnow().date()
-        rows: list[tuple] = []                       # (strike, dte, iv, right, oi)
-        for exp in exps[:2]:                         # front expiries dominate dealer gamma
-            try:
-                dte = (_dt.strptime(exp, "%Y-%m-%d").date() - today).days
-            except Exception:  # noqa: BLE001
-                continue
-            if dte <= 0 or dte > 60:
-                continue
-            oc = stock.option_chain(exp)
-            for df, right in ((oc.calls, "C"), (oc.puts, "P")):
-                for k, iv, oi in zip(df["strike"], df["impliedVolatility"], df["openInterest"]):
-                    k, iv, oi = _fin(k) or 0.0, _fin(iv) or 0.0, _fin(oi) or 0.0
-                    if k <= 0 or oi <= 0 or not (0.02 < iv < 3.0) or abs(k / spot - 1) > 0.25:
-                        continue
-                    rows.append((k, dte, iv, right, oi))
-        if len(rows) < 6:                            # too thin to be a reliable positioning read
-            return {}
-
-        def gex_at(S: float) -> float:
-            tot = 0.0
-            for k, dte, iv, right, oi in rows:
-                gamma = _fin(_bs_greeks(S, k, dte, iv, right).get("gamma")) or 0.0
-                tot += (1.0 if right == "C" else -1.0) * gamma * oi * 100 * S * S * 0.01
-            return tot
-
-        gex = _fin(gex_at(spot))
-        if gex is None:
-            return {}
-        flip, prev_s, prev_v = None, None, None       # zero-gamma flip — sweep spot ±12%
-        for i in range(25):
-            S = spot * (0.88 + 0.24 * i / 24.0)
-            v = gex_at(S)
-            if prev_v is not None and (prev_v < 0 <= v or prev_v > 0 >= v):
-                flip = round((prev_s + S) / 2.0, 2); break
-            prev_s, prev_v = S, v
-
-        return {"gex_bn": round(gex / 1e9, 2), "regime": "long" if gex >= 0 else "short",
-                "flip_level": flip, "spot": round(spot, 2), "n_strikes": len(rows), "proxy": True}
+        ng = dp.get("net_gex") or {}
+        gf = dp.get("gamma_flip") or {}
+        gl = dp.get("gamma_levels") or {}
+        val = ng.get("value")
+        return {
+            "gex_bn": round(val / 1e9, 2) if val is not None else None,
+            "regime": ng.get("sign"),
+            "flip_level": gf.get("level"),
+            "spot": dp.get("price"),
+            "call_resistance": (gl.get("call_resistance") or {}).get("strike"),
+            "put_support": (gl.get("put_support") or {}).get("strike"),
+            "hvl": (gl.get("hvl") or {}).get("strike"),
+            "n_strikes": len(dp.get("strikes") or []),
+            "proxy": True,
+        }
     except Exception as exc:  # noqa: BLE001
-        logger.debug("GEX proxy failed for %s: %s", ticker, exc)
+        logger.debug("GEX read failed for %s: %s", ticker, exc)
         return {}
 
 
