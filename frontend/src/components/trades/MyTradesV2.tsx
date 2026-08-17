@@ -27,12 +27,12 @@ import {
   TrendingUp, TrendingDown, Clock, BarChart3, Activity,
   Brain, Send, Bot, History, PlusCircle, X, Target,
   DollarSign, Percent, Calendar, Shield, Zap, List, ExternalLink, Trash2, Pencil, Check,
-  Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp,
+  Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp, Cpu,
 } from 'lucide-react';
 import {
   fetchActiveTrades, fetchTradeLivePnl, fetchTradeAdvisor,
   appendTradeTransaction, fetchTradeTransactions, createAgent,
-  deleteTrade, updateSavedStrategy,
+  deleteTrade, updateSavedStrategy, saveTradePnlSnapshot,
 } from '../../api';
 import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind } from '../../api';
 import { fmtMoney, fmtPct, fmtAnnualized, fmtDTE, fmtDate, fmtQty, pnlSummary } from '../../lib/tradeFormat';
@@ -41,7 +41,7 @@ import TransactionHistoryPanel from './TransactionHistoryPanel';
 import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
 import InstitutionalDesk from './InstitutionalDesk';
-import QuantExitCard from './QuantExitCard';
+import { QuantAnalysisLoader } from './QuantExitCard';
 import CloseTradeModal from './CloseTradeModal';
 import BookTailRisk from './BookTailRisk';
 import CollapsibleSection from './CollapsibleSection';
@@ -330,11 +330,37 @@ function dteFrom(expiry: string | null): number | null {
   return Math.max(0, d);
 }
 
+// Trimmed P&L snapshot persisted server-side so collapsed rows show last-known numbers on
+// landing (a full live refresh runs on expand / Refresh all). `_cached` marks a seeded-from-DB
+// entry so the expand effect knows to fetch the full detail.
+function trimPnl(p: LivePnlResponse): Record<string, any> {
+  const a: any = (p as any).analysis || {};
+  return {
+    unrealized_pnl: p.unrealized_pnl, pnl_pct: (p as any).pnl_pct, underlying_price: (p as any).underlying_price,
+    current_value: (p as any).current_value, cost_basis: (p as any).cost_basis, margin_required: (p as any).margin_required,
+    expiration_date: (p as any).expiration_date, max_profit: (p as any).max_profit, max_loss: (p as any).max_loss,
+    analysis: {
+      exit_signal: a.exit_signal, exit_reasons: (a.exit_reasons || []).slice(0, 1),
+      annualized_return_to_expiry: a.annualized_return_to_expiry, dte_remaining: a.dte_remaining, captured_pct: a.captured_pct,
+    },
+  };
+}
+
+// "5m ago" style relative time for the last-refreshed indicator.
+function timeAgo(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
 // ── Metric chip ──────────────────────────────────────────────────────────────
 
-function Chip({ label, value, color = '' }: { label: string; value: string; color?: string }) {
+function Chip({ label, value, color = '', hint }: { label: string; value: string; color?: string; hint?: string }) {
   return (
-    <div className="flex flex-col items-center px-3 py-1.5 rounded-lg bg-base-300/30 min-w-[72px]">
+    <div className={`flex flex-col items-center px-3 py-1.5 rounded-lg bg-base-300/30 min-w-[72px] ${hint ? 'cursor-help' : ''}`} title={hint}>
       <span className="text-[9px] uppercase tracking-wider text-base-content/40">{label}</span>
       <span className={`text-xs font-semibold mt-0.5 ${color}`}>{value}</span>
     </div>
@@ -343,69 +369,67 @@ function Chip({ label, value, color = '' }: { label: string; value: string; colo
 
 // ── Group summary bar ────────────────────────────────────────────────────────
 
-function GroupSummary({ trades, pnlMap }: {
-  trades: SavedStrategyItem[];
+// Deployed CAPITAL for a trade (NOT the premium): stock/covered-call notional, else the
+// defined-risk collateral (≈ CSP strike×100 via |max_loss|), else stored collateral, else the
+// debit. This is what the money is actually tied up in — summing premiums badly understated it.
+// Deployed = the purchasing power PUT ON HOLD (Reg-T / portfolio margin), NOT the premium.
+// The authoritative number is the backend's `margin_required` (`_calc_margin`, which does the
+// Reg-T naked formula max(20%·U − OTM, 10%·base)·100 for naked shorts and spread widths for
+// verticals, honoring the account's margin mode). A naked call's max_loss is UNBOUNDED, so the
+// old |max_loss| path fell through to the PREMIUM — the "$2,178 for 21 naked calls" bug.
+function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): number {
+  const shares = Number(t.parameters?.shares) || 0;
+  const avgCost = Number(t.parameters?.avg_cost ?? t.entry_prices?.[0]?.price) || 0;
+  if (t.strategy_type === 'futures') {
+    const margin = t.parameters?.margin_req ? parseFloat(t.parameters.margin_req) : 0;
+    return margin || Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));
+  }
+  if (shares > 0 && avgCost > 0) return shares * avgCost;                 // stock / covered call — stock is the collateral
+  const margin = Number((p as any)?.margin_required) || 0;
+  if (margin > 0) return margin;                                         // Reg-T / portfolio margin on hold
+  const ml = (p as any)?.max_loss;
+  if (ml != null && ml < 0) return Math.abs(ml);                          // fallback: defined-risk collateral (width)
+  const coll = Number(t.parameters?.collateral) || 0;
+  if (coll > 0) return coll;
+  return Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));     // last resort (understates naked shorts)
+}
+
+function GroupSummary({ trades, pnlMap, isIncome = false }: {
+  trades: SavedStrategyItem[];              // the FILTERED/visible trades — so the summary tracks filters
   pnlMap: Record<number, LivePnlResponse>;
+  isIncome?: boolean;
 }) {
   const anyFutures = trades.some(t => t.strategy_type === 'futures');
-  const totalCapital = trades.reduce((s, t) => {
-    const p = pnlMap[t.id];
-    if (t.strategy_type === 'futures') {
-      const margin = t.parameters?.margin_req ? parseFloat(t.parameters.margin_req) : 0;
-      return s + (margin || Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0)));
-    }
-    return s + Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));
-  }, 0);
+  const totalCapital = trades.reduce((s, t) => s + deployedCapital(t, pnlMap[t.id]), 0);
+  const totalPnl = trades.reduce((s, t) => s + (pnlMap[t.id]?.unrealized_pnl ?? 0), 0);
+  const anyPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
 
-  const totalNotional = anyFutures ? trades.reduce((s, t) => {
-    const p = pnlMap[t.id];
-    const contracts = t.parameters?.contracts ?? t.parameters?.shares ?? 1;
-    const multiplier = t.parameters?.multiplier ?? 1.0;
-    const price = p?.underlying_price ?? t.entry_prices?.[0]?.price ?? 0;
-    return s + (price * contracts * multiplier);
-  }, 0) : 0;
+  // Capital-WEIGHTED annualized yield — an arithmetic mean over-weights a tiny high-yield CSP
+  // (the misleading "avg 206% ann."). Weight each trade's yield by the capital behind it.
+  let wnum = 0, wden = 0;
+  for (const t of trades) {
+    const ann = pnlMap[t.id]?.analysis?.annualized_return_to_expiry;
+    const c = deployedCapital(t, pnlMap[t.id]);
+    if (ann != null && c > 0) { wnum += ann * c; wden += c; }
+  }
+  const avgAnn = wden > 0 ? wnum / wden : null;
 
-  const totalPnl = trades.reduce((s, t) => {
-    const p = pnlMap[t.id];
-    return s + (p?.unrealized_pnl ?? 0);
-  }, 0);
-
-  const annReturns = trades
-    .map(t => pnlMap[t.id]?.analysis?.annualized_return_to_expiry)
-    .filter((v): v is number => v != null);
-  const avgAnn = annReturns.length
-    ? annReturns.reduce((a, b) => a + b, 0) / annReturns.length
-    : null;
+  // Income: the max possible gain (all premium kept) and how much is LEFT to capture from here.
+  const maxGain = isIncome
+    ? trades.reduce((s, t) => { const mp = Number((pnlMap[t.id] as any)?.max_profit); return s + (mp > 0 ? mp : 0); }, 0)
+    : 0;
+  const leftToCapture = isIncome && maxGain > 0 ? Math.max(0, maxGain - totalPnl) : null;
+  const money = (n: number) => `${n < 0 ? '−' : ''}${fmtMoney(Math.abs(n))}`;
 
   return (
-    <div className="flex items-center gap-2 flex-wrap text-xs text-base-content/50 px-4 pb-3">
-      <span>{trades.length} position{trades.length !== 1 ? 's' : ''}</span>
-      <span className="opacity-30">·</span>
-      <span>
-        {fmtMoney(totalCapital)} {anyFutures ? 'margin deployed' : 'deployed'}
-      </span>
-      {anyFutures && totalNotional > 0 && (
-        <>
-          <span className="opacity-30">·</span>
-          <span>{fmtMoney(totalNotional)} notional exposure</span>
-        </>
-      )}
-      {totalPnl !== 0 && (
-        <>
-          <span className="opacity-30">·</span>
-          <span className={totalPnl >= 0 ? 'text-success' : 'text-error'}>
-            {totalPnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalPnl))} unrealized
-          </span>
-        </>
-      )}
-      {avgAnn != null && (
-        <>
-          <span className="opacity-30">·</span>
-          <span className={`${avgAnn >= 0 ? 'text-success' : 'text-error'} font-medium`}>
-            avg {fmtAnnualized(avgAnn)}
-          </span>
-        </>
-      )}
+    <div className="flex items-stretch gap-2 flex-wrap px-4 py-2.5">
+      <Chip label="Positions" value={`${trades.length}`} />
+      <Chip label={anyFutures ? 'Margin' : 'Deployed'} value={fmtMoney(totalCapital)}
+        hint="Buying power on hold — Reg-T / portfolio margin (naked shorts ≈ 20% of notional, spreads = width, stock = notional). Not the premium collected." />
+      {anyPnl && <Chip label="Unrealized" value={`${totalPnl >= 0 ? '+' : ''}${money(totalPnl)}`} color={totalPnl >= 0 ? 'text-success' : 'text-error'} />}
+      {avgAnn != null && <Chip label="Avg yield" value={fmtAnnualized(avgAnn)} color={avgAnn >= 0 ? 'text-success' : 'text-error'} />}
+      {isIncome && maxGain > 0 && <Chip label="Max gain" value={fmtMoney(maxGain)} color="text-success/70" />}
+      {leftToCapture != null && <Chip label="Left to capture" value={fmtMoney(leftToCapture)} color="text-warning/80" />}
     </div>
   );
 }
@@ -509,6 +533,7 @@ function TradeCard({
   const expiry = expiryFrom(trade, pnl);
   const dte = dteFrom(expiry);
   const held = daysHeld(trade.entry_date);
+  const struct = tradeStructure(trade);   // proper structure label (Cash-Secured Put, Covered Call, …)
   const isIncome = group === 'income_options';
   const isStock = group === 'long_stocks' || group === 'short_stocks';
   const isFutures = group === 'futures';
@@ -722,33 +747,29 @@ function TradeCard({
         className="px-4 py-3 flex items-center gap-3 cursor-pointer"
         onClick={onToggle}
       >
-        {/* Left: ticker + strategy */}
+        {/* Left: ticker · structure · expiry · Quant recommendation */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-bold text-sm">{trade.ticker}</span>
-            <span className="badge badge-xs badge-ghost opacity-70">
-              {trade.strategy_type?.replace(/_/g, ' ')}
-            </span>
+            <span className="badge badge-xs badge-ghost opacity-70">{struct.label}</span>
+            {expiry && (
+              <span className="text-[10px] text-base-content/50">
+                exp {fmtDate(expiry)}{dte != null ? ` (${fmtDTE(dte)})` : ''}
+              </span>
+            )}
             {dte != null && dte <= 7 && (
               <span className="badge badge-xs badge-warning">⚠ {dte}d left</span>
             )}
-            {/* Whole-trade exit call (Strong Hold / Hold / Consider Close / Close) */}
+            {/* Quant recommendation — Strong Hold / Hold / Close / Strong Close */}
             {pnl?.analysis?.exit_signal && trade.strategy_type !== 'box_spread' && (
-              <span className={`badge badge-xs font-semibold ${EXIT_STYLE[pnl.analysis.exit_signal]?.cls || 'badge-ghost'}`}
+              <span className={`badge badge-xs font-semibold ml-auto ${EXIT_STYLE[pnl.analysis.exit_signal]?.cls || 'badge-ghost'}`}
                 title={pnl.analysis.exit_reasons?.[0]}>
                 {EXIT_STYLE[pnl.analysis.exit_signal]?.label || pnl.analysis.exit_signal}
               </span>
             )}
           </div>
           <div className="flex items-center gap-3 mt-0.5 text-[10px] text-base-content/40 flex-wrap">
-            {trade.entry_date && (
-              <span className="flex items-center gap-1">
-                <Calendar className="w-2.5 h-2.5" />
-                {fmtDate(trade.entry_date)}
-              </span>
-            )}
             {held > 0 && <span className="flex items-center gap-1"><Clock className="w-2.5 h-2.5" />{held}d held</span>}
-            {expiry && <span>exp {expiry}{dte != null ? ` (${fmtDTE(dte)})` : ''}</span>}
             {shares && (isStock || isComboLike) && (
               <span>
                 {fmtQty(shares)} sh @{' '}
@@ -775,25 +796,19 @@ function TradeCard({
               </div>
               <div className="text-[9px] uppercase tracking-wider text-base-content/40">realized</div>
             </>
-          ) : isIncome && annReturn != null ? (
-            <>
-              <div className={`font-bold text-sm ${annReturn >= 0 ? 'text-success' : 'text-error'}`}>
-                {fmtAnnualized(annReturn)}
-              </div>
-              {pnlAmt != null && (
-                <div className="text-[10px] text-base-content/40">
-                  {pnlAmt >= 0 ? '+' : ''}{fmtMoney(Math.abs(pnlAmt))}
-                </div>
-              )}
-            </>
           ) : pnlAmt != null ? (
+            /* $ P&L is the headline for EVERY structure (income included), % + annualized secondary */
             <>
               <div className={`font-bold text-sm ${statusColor}`}>
                 {pnlAmt >= 0 ? '+' : ''}{fmtMoney(Math.abs(pnlAmt))}
               </div>
-              {pnlPct != null && (
-                <div className={`text-[10px] ${statusColor} opacity-70`}>
-                  {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
+              <div className={`text-[10px] ${statusColor} opacity-70`}>
+                {pnlPct != null && <>{pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</>}
+              </div>
+              {/* Income: max possible gain → shows how much premium is left to capture */}
+              {isIncome && (pnl as any)?.max_profit > 0 && (
+                <div className="text-[9px] text-base-content/40" title="Maximum possible gain (all premium kept) — the gap to your current P&L is what's left to capture">
+                  of {fmtMoney((pnl as any).max_profit)} max
                 </div>
               )}
             </>
@@ -1804,20 +1819,13 @@ function TradeCard({
             );
           })()}
 
-          {/* Tier 2 — QUANT ALGORITHMIC exit (scored, deterministic, auditable) */}
-          {pnl?.analysis?.quant_exit && (
-            <QuantExitCard q={pnl.analysis.quant_exit} trade={trade} pnl={pnl} deskFocus={deskFocusForTrade(trade, pnl)} />
-          )}
-
-          {/* Tier 3 — Institutional Desk (LLM quant PM manages the trade) */}
-          {pnl?.analysis && (
-            <InstitutionalDesk trade={trade} pnl={pnl} />
-          )}
-
-          {/* Desk sections — the SAME layout as the Income desk single-ticker view:
-              Dynamic Greeks · Capital Risk · Risk-Adjusted Quality */}
+          {/* Collapsed desk panels — SAME experience & sequence as the Derivative Income desk:
+              Dynamic Greeks · Capital Risk · Risk-Adjusted Quality · Quant Analysis (each opens
+              on demand; nothing auto-runs). The old always-on "Management read" card is gone —
+              its deep read now lives inside the Quant Analysis panel. */}
           {pnl?.lifecycle && hasOptionLegsNow && (() => {
             const lc = pnl.lifecycle!;
+            const deskFocus = deskFocusForTrade(trade, pnl);
             return (
               <div className="space-y-2">
                 {lc.trader && (
@@ -1843,6 +1851,12 @@ function TradeCard({
                     }} />
                   </CollapsibleSection>
                 )}
+                {deskFocus && (
+                  <CollapsibleSection title="Quant Analysis" accent="secondary"
+                    icon={<Cpu className="w-3 h-3" />} subtitle="base + factor + TA → desk score">
+                    <QuantAnalysisLoader trade={trade} pnl={pnl} deskFocus={deskFocus} />
+                  </CollapsibleSection>
+                )}
               </div>
             );
           })()}
@@ -1853,6 +1867,11 @@ function TradeCard({
               icon={<BarChart3 className="w-3 h-3" />} subtitle="P&L across underlying moves">
               <PayoffChart pnl={pnl} />
             </CollapsibleSection>
+          )}
+
+          {/* Institutional Desk · lifecycle manager (LLM quant PM) — then Continuous Lifecycle below */}
+          {pnl?.analysis && (
+            <InstitutionalDesk trade={trade} pnl={pnl} />
           )}
 
           {/* Continuous Lifecycle Management — Desk Debate (Explorer) */}
@@ -2206,7 +2225,8 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
 
       {!collapsed && (
         <div className={`border-x border-b border-${meta.color}/10 rounded-b-2xl overflow-hidden`}>
-          <GroupSummary trades={trades} pnlMap={pnlMap} />
+          {/* Summary reflects the ACTIVE filter (shown), not the whole group */}
+          <GroupSummary trades={shown} pnlMap={pnlMap} isIncome={purpose === 'income'} />
 
           {/* Filter by structure + sort — shown when the group holds a mix of types */}
           {showFilters && (
@@ -2288,6 +2308,8 @@ export default function MyTradesV2() {
   const [pnlLoadingMap, setPnlLoadingMap] = useState<Record<number, boolean>>({});
   const [quoteSource, setQuoteSource] = useState('yfinance');
   const [advisorMap, setAdvisorMap] = useState<Record<number, AdvisorState>>({});
+  const [refreshingAll, setRefreshingAll] = useState(false);
+  const [lastRefreshAt, setLastRefreshAt] = useState<string | null>(null);   // most recent snapshot time
 
   // Modals
   const [updateTrade, setUpdateTrade] = useState<SavedStrategyItem | null>(null);
@@ -2299,6 +2321,18 @@ export default function MyTradesV2() {
     try {
       const data = await fetchActiveTrades(activeStatus);
       setTrades(data);
+      // Seed the P&L map from each trade's LAST persisted snapshot → collapsed rows show
+      // last-known numbers immediately; a full live refresh happens on expand / Refresh all.
+      const seeded: Record<number, LivePnlResponse> = {};
+      let latest: string | null = null;
+      for (const t of data) {
+        const lp = (t.parameters as any)?.last_pnl;
+        if (lp) seeded[t.id] = { ...lp, _cached: true } as LivePnlResponse;
+        const at = (t.parameters as any)?.last_pnl_at;
+        if (at && (!latest || at > latest)) latest = at;
+      }
+      setPnlMap(seeded);
+      setLastRefreshAt(latest);
     } catch (e: any) {
       setErr(e?.message || 'Failed to load trades');
     } finally {
@@ -2314,7 +2348,8 @@ export default function MyTradesV2() {
   const expandedKey = Array.from(expandedIds).sort().join(',');
   useEffect(() => {
     expandedIds.forEach(id => {
-      if (!pnlMap[id] && !pnlLoadingMap[id]) {
+      // Fetch full live detail on expand when there's no data OR only a cached (trimmed) snapshot.
+      if ((!pnlMap[id] || (pnlMap[id] as any)?._cached) && !pnlLoadingMap[id]) {
         handleRefreshPnl(id);
       }
     });
@@ -2340,10 +2375,28 @@ export default function MyTradesV2() {
     try {
       const data = await fetchTradeLivePnl(id, quoteSource);
       setPnlMap(prev => ({ ...prev, [id]: data }));
+      // Persist the last-known snapshot so it's shown on the next page landing (fire-and-forget).
+      saveTradePnlSnapshot(id, trimPnl(data)).catch(() => {});
+      setLastRefreshAt(new Date().toISOString());
     } catch (e: any) {
       setErr(`P&L refresh failed for trade ${id}: ${e.message}`);
     } finally {
       setPnlLoadingMap(prev => ({ ...prev, [id]: false }));
+    }
+  };
+
+  // Refresh EVERY visible trade (bounded concurrency so we don't hammer the quote provider).
+  const refreshAll = async () => {
+    if (refreshingAll) return;
+    setRefreshingAll(true);
+    try {
+      const ids = trades.map(t => t.id);
+      const BATCH = 4;
+      for (let i = 0; i < ids.length; i += BATCH) {
+        await Promise.all(ids.slice(i, i + BATCH).map(id => handleRefreshPnl(id)));
+      }
+    } finally {
+      setRefreshingAll(false);
     }
   };
 
@@ -2419,16 +2472,10 @@ export default function MyTradesV2() {
   };
   trades.forEach(t => { groups[tradePurpose(t)].push(t); });
 
-  const totalCapital = trades.reduce((s, t) => {
-    const p = pnlMap[t.id];
-    if (t.strategy_type === 'futures') {
-      const margin = t.parameters?.margin_req ? parseFloat(t.parameters.margin_req) : 0;
-      return s + (margin || Math.abs(p?.entry_cost ?? t.entry_net_debit ?? 0));
-    }
-    return s + Math.abs(p?.entry_cost ?? t.entry_net_debit ?? 0);
-  }, 0);
-  const totalPnl = Object.values(pnlMap).reduce((s, p) => s + p.unrealized_pnl, 0);
-  const hasPnl = Object.keys(pnlMap).length > 0;
+  const totalCapital = trades.reduce((s, t) => s + deployedCapital(t, pnlMap[t.id]), 0);
+  // Only sum P&L for trades still in view (pnlMap can hold stale/closed entries).
+  const totalPnl = trades.reduce((s, t) => s + (pnlMap[t.id]?.unrealized_pnl ?? 0), 0);
+  const hasPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
 
   const groupOrder: TradePurpose[] = PURPOSE_ORDER;
 
@@ -2484,7 +2531,7 @@ export default function MyTradesV2() {
           </button>
         </div>
 
-        {/* Portfolio summary strip */}
+        {/* Portfolio summary strip + Refresh all */}
         {trades.length > 0 && (
           <div className="flex items-center gap-3 text-xs text-base-content/50 flex-wrap">
             <span>{trades.length} position{trades.length !== 1 ? 's' : ''}</span>
@@ -2496,6 +2543,19 @@ export default function MyTradesV2() {
                 <span className={totalPnl >= 0 ? 'text-success' : 'text-error'}>
                   {totalPnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalPnl))} unrealized
                 </span>
+              </>
+            )}
+            {activeStatus === 'active' && (
+              <>
+                <span className="opacity-30">·</span>
+                <button className="btn btn-ghost btn-xs gap-1 h-6 min-h-0" onClick={refreshAll} disabled={refreshingAll}
+                  title="Refresh live P&L for every position (and save the snapshot)">
+                  {refreshingAll ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                  {refreshingAll ? 'Refreshing…' : 'Refresh all'}
+                </button>
+                {lastRefreshAt && !refreshingAll && (
+                  <span className="text-[10px] text-base-content/35">updated {timeAgo(lastRefreshAt)}</span>
+                )}
               </>
             )}
           </div>

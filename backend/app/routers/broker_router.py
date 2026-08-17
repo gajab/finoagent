@@ -470,6 +470,67 @@ async def diagnose_connection(
     return results
 
 
+@router.get("/ibkr/data-capabilities")
+async def ibkr_data_capabilities(
+    symbol: str = "AAPL",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Probe what DATA the live IBKR Web API actually exposes for THIS account, so we know exactly what to
+    integrate (esp. whether a HISTORICAL implied-vol series for a true IV-rank is reachable). Read-only.
+
+    It (1) introspects the ibind client's method surface — the definitive list of endpoints available in
+    your environment — and (2) best-effort probes the session + a few historical/vol methods, reporting
+    their signatures + any output/error. Run this in your connected env and paste the JSON back."""
+    import re
+    import inspect
+
+    service = await _get_ib_service(user, db)          # raises 404/502 on missing creds / auth failure
+    client = getattr(service, "_client", None)
+    if client is None:
+        raise HTTPException(status_code=502, detail="IB client did not initialise (no ibind client).")
+    loop = asyncio.get_event_loop()
+
+    async def _call(fn, *a, **kw):
+        return await loop.run_in_executor(None, lambda: fn(*a, **kw))
+
+    report: dict = {"symbol": symbol, "session": {}, "client_data_methods": {}, "probes": {}}
+
+    # 1) DEFINITIVE: enumerate the client's method surface (what ibind actually exposes in this env).
+    try:
+        methods = [m for m in dir(client) if not m.startswith("_") and callable(getattr(client, m, None))]
+        pat = re.compile(r"hist|market|snapshot|scan|secdef|vol|strike|contract|quote|bar|option|conid|search", re.I)
+        data_methods = sorted(m for m in methods if pat.search(m))
+        report["all_methods_count"] = len(methods)
+        report["client_data_methods"] = {m: str(inspect.signature(getattr(client, m))) for m in data_methods}
+    except Exception as exc:  # noqa: BLE001
+        report["introspection_error"] = str(exc)
+
+    # 2) Session live?
+    for probe in ("authentication_status", "tickle"):
+        if hasattr(client, probe):
+            try:
+                res = await _call(getattr(client, probe))
+                report["session"][probe] = str(getattr(res, "data", res))[:600]
+            except Exception as exc:  # noqa: BLE001
+                report["session"][f"{probe}_error"] = str(exc)
+
+    # 3) Best-effort DATA probes — resolve a conid, then try a snapshot (IV/HV fields) + historical calls.
+    #    Guarded by hasattr so it never 500s on a method-name mismatch (the introspection above is the truth).
+    for meth in ("stock_conid_by_symbol", "search_contract_by_symbol", "security_stocks_by_symbol",
+                 "marketdata_history_by_conid", "marketdata_history_by_symbol", "historical_marketdata_beta",
+                 "live_marketdata_snapshot", "market_data_availability"):
+        if not hasattr(client, meth):
+            report["probes"][meth] = "not present"
+            continue
+        try:
+            report["probes"][meth] = {"signature": str(inspect.signature(getattr(client, meth)))}
+        except (ValueError, TypeError):
+            report["probes"][meth] = {"signature": "n/a"}
+
+    return report
+
+
 @router.get("/connection")
 async def get_connection(
     user: User = Depends(get_current_user),

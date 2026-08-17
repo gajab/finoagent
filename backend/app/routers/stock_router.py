@@ -37,7 +37,7 @@ from ..services.concentration_service import run_concentration_management
 from ..services.pmcc_service import run_pmcc_pmcp
 from ..services.zebra_service import run_zebra
 from ..services.derivative_income_service import run_derivative_income, run_portfolio_derivative_income
-from ..services.desk_review_service import rank_desk, run_desk_agents, evaluate_desk_trade, monitor_trade, monitor_analyze
+from ..services.desk_review_service import rank_desk, run_desk_agents, evaluate_desk_trade, monitor_trade, monitor_analyze, blind_read
 from ..services.cppi_service import run_cppi_simulation
 from ..services.tax_loss_harvesting_service import run_portfolio_tax_loss_harvesting
 from ..services.market_impact_service import analyze_market_impact
@@ -2510,6 +2510,37 @@ async def compute_desk_monitor_analyze(
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Monitor deep read failed: {exc}")
+
+
+@router.post("/{ticker}/desk-review/blind")
+async def compute_desk_blind(
+    ticker: str,
+    body: DeskReviewAgentsIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """INDEPENDENT LLM second opinion on ONE trade, BLIND to our desk score/grade (it never sees them) —
+    an un-anchored read: a DECISION + cited factor calls (no fuzzy rating), plus the divergence vs the rule
+    grade. Needs the user's OpenAI key."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured. Please add it in Settings.")
+    try:
+        result = await blind_read(
+            ticker, api_key=api_key, target_dte=body.target_dte, min_prob=body.min_prob,
+            min_income=body.min_income, structures=body.structures, quote_source=body.quote_source,
+            model=body.model, focus=body.focus.model_dump() if body.focus else None,
+            user=user, db=db, target_expiration=body.target_expiration,
+        )
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Blind read failed: {exc}")
 
 
 # =========================================================================

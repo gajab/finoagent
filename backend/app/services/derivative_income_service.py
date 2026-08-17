@@ -836,7 +836,8 @@ def _best_credit_spread(structure: str, label: str, short_q: OptionQuote,
 
 def _short_strangle(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
                     atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
-                    min_prob: float, min_income: float, european: bool, ticker: str) -> Optional[dict]:
+                    min_prob: float, min_income: float, european: bool, ticker: str,
+                    ta_levels: Optional[list[float]] = None) -> Optional[dict]:
     """Neutral, UNDEFINED-RISK income: short OTM put + short OTM call (naked both wings). Income while
     the underlying stays between the shorts. Collects more premium than the iron condor in exchange for
     an open tail; sized by naked margin, not cash. P(keep) = P(in band). The iron condor is its
@@ -848,8 +849,9 @@ def _short_strangle(calls: dict, puts: dict, spot: float, dte: int, exp: str, rn
     if not put_strikes or not call_strikes:
         return None
     tail = (1 - min_prob) / 2.0                       # split the breach budget both sides
-    kp_s = _nearest_strike(put_strikes, rnd.strike_for_prob_below(tail), "below")
-    kc_s = _nearest_strike(call_strikes, rnd.strike_for_prob_below(1 - tail), "above")
+    # TA-aware: bias each short toward the nearest support (put) / resistance (call) on the safe side.
+    kp_s = _snap_short_to_levels(put_strikes, rnd.strike_for_prob_below(tail), spot, "below", ta_levels)
+    kc_s = _snap_short_to_levels(call_strikes, rnd.strike_for_prob_below(1 - tail), spot, "above", ta_levels)
     if not kp_s or not kc_s or kp_s not in puts or kc_s not in calls:
         return None
     if not all(_executable(q)[0] for q in (puts[kp_s], calls[kc_s])):
@@ -985,7 +987,8 @@ def _pick_wing(qmap: dict, short_strike: float, side: str) -> Optional[float]:
 
 def _iron_condor(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
                  atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
-                 min_prob: float, min_income: float, european: bool, ticker: str) -> Optional[dict]:
+                 min_prob: float, min_income: float, european: bool, ticker: str,
+                 ta_levels: Optional[list[float]] = None) -> Optional[dict]:
     """Neutral, defined-risk both sides: short put spread + short call spread. Income if
     the underlying stays between the short strikes. P(keep) = P(in band)."""
     if rnd is None:
@@ -995,8 +998,9 @@ def _iron_condor(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
     if not put_strikes or not call_strikes:
         return None
     tail = (1 - min_prob) / 2.0                       # split the breach budget both sides
-    kp_s = _nearest_strike(put_strikes, rnd.strike_for_prob_below(tail), "below")
-    kc_s = _nearest_strike(call_strikes, rnd.strike_for_prob_below(1 - tail), "above")
+    # TA-aware: bias each short toward the nearest support (put) / resistance (call) on the safe side.
+    kp_s = _snap_short_to_levels(put_strikes, rnd.strike_for_prob_below(tail), spot, "below", ta_levels)
+    kc_s = _snap_short_to_levels(call_strikes, rnd.strike_for_prob_below(1 - tail), spot, "above", ta_levels)
     if not kp_s or not kc_s or kp_s not in puts or kc_s not in calls:
         return None
     kp_l = _pick_wing(puts, kp_s, "below")
@@ -1054,7 +1058,8 @@ def _iron_condor(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
 
 def _jade_lizard(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
                  atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
-                 min_prob: float, min_income: float, european: bool, ticker: str) -> Optional[dict]:
+                 min_prob: float, min_income: float, european: bool, ticker: str,
+                 ta_levels: Optional[list[float]] = None) -> Optional[dict]:
     """Short put + short call spread, sized so net credit ≥ call-spread width ⇒ NO upside
     risk. Downside is CSP-style (the short put). P(keep) = P(put not assigned)."""
     if rnd is None:
@@ -1063,7 +1068,7 @@ def _jade_lizard(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
     call_strikes = sorted(k for k in calls if k > spot)
     if not put_strikes or not call_strikes:
         return None
-    kp = _headline_put(rnd, put_strikes, spot, min_prob)      # CSP-style short put
+    kp = _headline_put(rnd, put_strikes, spot, min_prob, ta_levels)   # CSP-style short put — TA-biased
     if not kp or kp not in puts or not _executable(puts[kp])[0]:
         return None
     p_keep, method = _prob_keep(rnd, kp, "P", spot, dte, r, puts[kp].iv or atm_iv)
@@ -1729,9 +1734,12 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
                  r: float, sofr_pct: float, hv: Optional[float], structures: list[str],
                  european: bool, next_earnings: Optional[str], min_prob: float,
                  min_income: float, ticker: str, focus: Optional[dict] = None,
-                 owns_underlying: bool = False) -> tuple[list[dict], dict]:
+                 owns_underlying: bool = False,
+                 ta_levels: Optional[list[float]] = None) -> tuple[list[dict], dict]:
     """All qualifying opportunities for one expiration + an expiry summary. ``owns_underlying`` = the user
-    holds the shares → short calls are COVERED; otherwise they are NAKED (Reg-T margin)."""
+    holds the shares → short calls are COVERED; otherwise they are NAKED (Reg-T margin). ``ta_levels`` =
+    structural price levels (S/R, value area, dealer gamma walls/flip) that bias multi-leg SHORT strikes
+    toward the nearest safe-side level (TA-aware selection); None on the plain (non-desk) scan path."""
     calls, puts = _split_chain(chain)
     strikes_all = sorted(set(calls) | set(puts))
     rnd = _build_rnd(calls, puts, strikes_all, spot, dte)
@@ -1776,7 +1784,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     # ---- Short strangle — neutral, UNDEFINED-RISK income (naked put + call) ----
     if "short_strangle" in structures:
         o = _short_strangle(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
-                            richness, min_prob, min_income, european, ticker)
+                            richness, min_prob, min_income, european, ticker, ta_levels)
         if o:
             opps.append(o)
 
@@ -1784,7 +1792,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     # Scan candidate long wings and keep the most capital-efficient (best ROC) one
     # that still clears the premium floor — the narrowest spread is usually best.
     if "credit_spread" in structures:
-        kp_short = _headline_put(rnd, put_strikes, spot, min_prob)
+        kp_short = _headline_put(rnd, put_strikes, spot, min_prob, ta_levels)
         if kp_short in puts:
             longs = sorted((puts[k] for k in puts if k < kp_short),
                            key=lambda q: kp_short - q.strike)[:25]
@@ -1795,7 +1803,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
                                     min_income=min_income, ticker=ticker)
             if o:
                 opps.append(o)
-        kc_short = _headline_call(rnd, call_strikes, spot, min_prob)
+        kc_short = _headline_call(rnd, call_strikes, spot, min_prob, ta_levels)
         if kc_short in calls:
             longs = sorted((calls[k] for k in calls if k > kc_short),
                            key=lambda q: q.strike - kc_short)[:25]
@@ -1810,14 +1818,14 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     # ---- Iron Condor (neutral, defined risk both sides) ----
     if "iron_condor" in structures:
         o = _iron_condor(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
-                         richness, min_prob, min_income, european, ticker)
+                         richness, min_prob, min_income, european, ticker, ta_levels)
         if o:
             opps.append(o)
 
     # ---- Jade Lizard (short put + call spread, no upside risk) ----
     if "jade_lizard" in structures:
         o = _jade_lizard(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
-                         richness, min_prob, min_income, european, ticker)
+                         richness, min_prob, min_income, european, ticker, ta_levels)
         if o:
             opps.append(o)
 
@@ -1857,19 +1865,48 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     return opps, summary
 
 
-def _headline_call(rnd, call_strikes: list[float], spot: float, min_prob: float) -> Optional[float]:
-    """The 85%-safe call strike: read off the RND inverse, snapped up to a listed strike."""
+_SNAP_BAND_PCT = 0.05    # a structural level within 5% of the RND-target strike may bias it (a bounded shift)
+
+
+def _snap_short_to_levels(strikes: list[float], target: float, spot: float, side: str,
+                          ta_levels: Optional[list[float]]) -> float:
+    """Bias a multi-leg SHORT strike toward the nearest strong STRUCTURAL level on its SAFE side, without
+    ever reducing safety below the RND-probability target. ``side`` = 'below' (short put → align to a
+    support and sit just below it) / 'above' (short call → align to a resistance and sit just above it).
+    ``ta_levels`` = classical support/resistance + volume-profile value-area edges + dealer gamma walls /
+    flip. Fires only when a qualifying level sits within ``_SNAP_BAND_PCT`` of the target AND at least as
+    far OTM (so keep-probability can only rise, never drop below the user's min_prob); else returns the
+    plain RND-target strike. Selection-time twin of the desk's 'Structure' score factor (same placement)."""
+    base = _nearest_strike(strikes, target, side)
+    if not base or spot <= 0 or not ta_levels:
+        return base
+    if side == "below":                                  # short put → a SUPPORT (below spot) at/below target
+        cands = [L for L in ta_levels if L and L < spot and L <= target and (target - L) / spot <= _SNAP_BAND_PCT]
+        if not cands:
+            return base
+        return _nearest_strike(strikes, max(cands), "below") or base   # sit JUST BELOW the nearest support
+    cands = [L for L in ta_levels if L and L > spot and L >= target and (L - target) / spot <= _SNAP_BAND_PCT]
+    if not cands:                                        # short call → a RESISTANCE (above spot) at/above target
+        return base
+    return _nearest_strike(strikes, min(cands), "above") or base       # sit JUST ABOVE the nearest resistance
+
+
+def _headline_call(rnd, call_strikes: list[float], spot: float, min_prob: float,
+                   ta_levels: Optional[list[float]] = None) -> Optional[float]:
+    """The 85%-safe call strike: read off the RND inverse, snapped up to a listed strike — then biased
+    toward a nearby resistance / call-wall on the safe side (TA-aware selection)."""
     if not call_strikes:
         return None
     target = rnd.strike_for_prob_below(min_prob) if rnd is not None else spot * (1 + 0.08)
-    return _nearest_strike(call_strikes, max(target, spot), "above")
+    return _snap_short_to_levels(call_strikes, max(target, spot), spot, "above", ta_levels)
 
 
-def _headline_put(rnd, put_strikes: list[float], spot: float, min_prob: float) -> Optional[float]:
+def _headline_put(rnd, put_strikes: list[float], spot: float, min_prob: float,
+                  ta_levels: Optional[list[float]] = None) -> Optional[float]:
     if not put_strikes:
         return None
     target = rnd.strike_for_prob_below(1 - min_prob) if rnd is not None else spot * (1 - 0.08)
-    return _nearest_strike(put_strikes, min(target, spot), "below")
+    return _snap_short_to_levels(put_strikes, min(target, spot), spot, "below", ta_levels)
 
 
 # ---------------------------------------------------------------------------
@@ -1888,12 +1925,16 @@ async def run_derivative_income(
     target_expiration: Optional[str] = None,
     focus: Optional[dict] = None,
     owns_underlying: bool = False,
+    ta_levels: Optional[list[float]] = None,
 ) -> dict:
     """Deep-scan one underlying for income opportunities (≥``min_prob`` no-assignment,
     ≥``min_income`` premium), ranked by annualized yield vs SOFR.
 
     ``focus`` = {structure, expiration, legs:[{strike, right, action}]} injects the
-    caller's EXACT placed trade as a candidate (filters off) — for lifecycle scoring."""
+    caller's EXACT placed trade as a candidate (filters off) — for lifecycle scoring.
+    ``ta_levels`` = structural price levels (S/R, value area, dealer gamma walls/flip) supplied by the
+    desk so multi-leg SHORT strikes bias toward the nearest safe-side level (TA-aware selection); the
+    plain single-scan / portfolio callers pass None → unchanged RND-probability strikes."""
     ticker = _norm_ticker(ticker)
     structures = structures or ["covered_call", "cash_secured_put", "short_strangle",
                                 "credit_spread", "iron_condor", "jade_lizard", "calendar"]
@@ -1903,7 +1944,9 @@ async def run_derivative_income(
     exp_key = target_expiration or (target_dte if target_dte else "monthly")
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
-                 f"{'own' if owns_underlying else 'naked'}:v2")   # owns → covered call · else naked-call BPR
+                 f"{'own' if owns_underlying else 'naked'}:"
+                 f"{'snap' if ta_levels else 'plain'}:v3")   # owns → covered call · else naked-call BPR;
+                 #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:
         cached = await get_cached(db, cache_key)
@@ -1955,7 +1998,7 @@ async def run_derivative_income(
         opps, summary = _scan_expiry(
             chain, spot, dte, exp, today, sofr_frac, sofr_pct, hv, structures,
             european, ctx.get("next_earnings"), min_prob, min_income, ticker,
-            focus=focus, owns_underlying=owns_underlying,
+            focus=focus, owns_underlying=owns_underlying, ta_levels=ta_levels,
         )
         opportunities.extend(opps)
         expiry_summaries.append(summary)

@@ -240,6 +240,11 @@ def _head_shoulders(z, df, close, atr, inverse=False):
         else:
             if not (hp > lsp and hp > rsp and _similar(lsp, rsp, 0.06)):
                 continue
+        # the neckline connects the two troughs — they MUST sit at ~the same level (a roughly
+        # horizontal neckline). Troughs at very different prices ($287 vs $331) produce an absurd
+        # steep-diagonal neckline (the HD false positive).
+        if not _similar(t1["price"], t2["price"], 0.05):
+            continue
         m, b = _fit_line([t1["idx"], t2["idx"]], [t1["price"], t2["price"]])
         neck_now = _at(m, b, len(df) - 1)
         neck_head = _at(m, b, head["idx"])
@@ -756,6 +761,19 @@ def compute_chart_patterns(stock) -> dict | None:
                    and abs(p["breakout"]["level"] - q["breakout"]["level"]) / close < 0.03 for q in patterns):
                 continue
             patterns.append(p)
+        # A forming BULLISH reversal AND a forming BEARISH reversal at once (often sharing pivots,
+        # e.g. HD's Double Top whose Peak-1 is the Double Bottom's neckline) = a choppy RANGE, not a
+        # setup. Keep the decisively stronger side; if it's a coin-flip (<0.08 apart), show neither.
+        fr = [p for p in patterns if p["category"] == "reversal" and p["status"] != "broken_out"]
+        bull = max((p for p in fr if p["direction"] == "bullish"), key=lambda p: p["confidence"], default=None)
+        bear = max((p for p in fr if p["direction"] == "bearish"), key=lambda p: p["confidence"], default=None)
+        if bull and bear:
+            if abs(bull["confidence"] - bear["confidence"]) < 0.08:
+                drop = {id(p) for p in fr if p["direction"] in ("bullish", "bearish")}
+            else:
+                weaker = bull if bull["confidence"] <= bear["confidence"] else bear
+                drop = {id(p) for p in fr if p["direction"] == weaker["direction"]}
+            patterns = [p for p in patterns if id(p) not in drop]
         patterns = patterns[:3]
         return {
             "price": round(close, 2),

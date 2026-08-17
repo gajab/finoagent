@@ -8,9 +8,10 @@
  * and Spitznagel CAGR lift — plus a plain-language verdict + actions.
  */
 import { useState } from 'react';
-import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2 } from 'lucide-react';
-import { fetchBookTailRisk } from '../../api';
+import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2, Sparkles } from 'lucide-react';
+import { fetchBookTailRisk, fetchBookHedgeAdvice } from '../../api';
 import type { BookTailRiskResult } from '../../api';
+import CollapsibleSection from './CollapsibleSection';
 
 const money = (v: number | null | undefined, d = 0) =>
   v == null ? '—' : `${v < 0 ? '−' : ''}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
@@ -28,6 +29,9 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
   const [data, setData] = useState<BookTailRiskResult | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [assignOpen, setAssignOpen] = useState(false);   // scenario lab — collapsed by default
+  const [advice, setAdvice] = useState<string | null>(null);        // LLM hedging strategy
+  const [adviceLoading, setAdviceLoading] = useState(false);
+  const [adviceErr, setAdviceErr] = useState<string | null>(null);
 
   const run = async () => {
     setOpen(true); setLoading(true); setErr(null);
@@ -36,6 +40,16 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
       if (r.error) setErr(r.error); else setData(r);
     } catch (e: any) { setErr(e?.message || 'Failed'); }
     finally { setLoading(false); }
+  };
+
+  const askLlm = async () => {
+    if (!data) return;
+    setAdviceLoading(true); setAdviceErr(null);
+    try {
+      const r = await fetchBookHedgeAdvice(quoteSource);
+      if (r.error) setAdviceErr(r.error); else setAdvice(r.advice || null);
+    } catch (e: any) { setAdviceErr(e?.message || 'Failed to get hedging strategy'); }
+    finally { setAdviceLoading(false); }
   };
 
   const v = data?.verdict;
@@ -47,7 +61,7 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
         className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-warning/[0.06] transition-colors text-left">
         <div className="w-7 h-7 rounded-lg bg-warning/15 flex items-center justify-center text-warning shrink-0"><ShieldAlert className="w-4 h-4" /></div>
         <div className="flex-1 min-w-0">
-          <div className="font-semibold text-sm text-warning">Book Tail Risk · short-vol desk</div>
+          <div className="font-semibold text-sm text-warning">Manage Book</div>
           <div className="text-[10px] text-base-content/40">Beta-weighted greeks · two-sided stress · 1-mo CVaR · assignment lab · ranked hedges</div>
         </div>
         {loading ? <Loader2 className="w-4 h-4 animate-spin text-warning" />
@@ -148,6 +162,13 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                             {data.naked_assignment.call_capital > 0 && <> + {money(data.naked_assignment.call_capital)} delivery notional on {data.naked_assignment.n_naked_calls} naked short call{data.naked_assignment.n_naked_calls !== 1 ? 's' : ''}</>}.
                             {' '}<span className="text-base-content/40">Covered calls &amp; spread-protected legs excluded. A naked call's true buy-to-cover can exceed its strike notional if the stock has already run (upside is unbounded).</span>
                           </div>
+                          {/* Reconcile the three capital figures the user sees */}
+                          {data.book_capital != null && (
+                            <div className="text-[9px] text-base-content/40 mt-1 pt-1 border-t border-white/[0.06]">
+                              This ≈ <b>Book capital {money(data.book_capital)}</b> (whole option book, Σ cash-secured/committed notional) — they differ only by the covered / spread-protected shorts excluded here.
+                              The <b>“Deployed”</b> figure on a My Trades group is different by design: it’s that <b>filtered group’s</b> subset AND it’s the <b>Reg-T margin</b> (buying power on hold ≈ 20% of notional for naked shorts), not the full cash-secured notional — so it’s much smaller.
+                            </div>
+                          )}
                         </div>
                       )}
                       <div className="overflow-x-auto">
@@ -176,10 +197,9 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                 </div>
               )}
 
-              {/* Concentration */}
+              {/* Concentration — collapsible, collapsed by default */}
               {(data.concentration?.length ?? 0) > 0 && (
-                <div>
-                  <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><Layers className="w-3 h-3" /> Concentration · by underlying</div>
+                <CollapsibleSection title="Concentration · by underlying" accent="warning" icon={<Layers className="w-3 h-3" />}>
                   <div className="space-y-1">
                     {data.concentration!.map(c => (
                       <div key={c.ticker} className={`rounded-lg border p-2 ${c.flags.length ? 'border-warning/30 bg-warning/[0.05]' : 'border-white/10'}`}>
@@ -193,14 +213,17 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                       </div>
                     ))}
                   </div>
-                </div>
+                </CollapsibleSection>
               )}
 
-              {/* Hedge menu — ranked alternatives: SPX puts (linear) + VIX calls (convex black-swan) */}
-              {(data.hedge_menu?.length ?? 0) > 0 && (
-                <div className="rounded-xl border border-info/20 bg-info/[0.03] p-2.5 space-y-2">
+              {/* Hedge menu + What to do — joined in one collapsible, EXPANDED by default */}
+              {((data.hedge_menu?.length ?? 0) > 0 || (v?.actions?.length ?? 0) > 0) && (
+                <CollapsibleSection title="Tail-hedge menu + what to do" accent="info" icon={<Umbrella className="w-3.5 h-3.5" />} defaultOpen>
+                <div className="space-y-2">
+                {(data.hedge_menu?.length ?? 0) > 0 && (
+                <div className="rounded-xl border border-info/15 bg-info/[0.02] p-2.5 space-y-2">
                   <div className="text-[10px] uppercase tracking-wider text-info/80 font-semibold flex items-center gap-1">
-                    <Umbrella className="w-3.5 h-3.5" /> Tail-hedge menu · SPX puts + VIX black-swan
+                    SPX puts + VIX black-swan
                     <span className="ml-auto normal-case text-[9px] text-base-content/40">~{data.hedge_menu![0].dte_days}d</span>
                   </div>
                   <div className="overflow-x-auto">
@@ -241,17 +264,37 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                     A <b>positive CAGR</b> means capping the crash lifts compound growth; negative = pure insurance.
                   </p>
                 </div>
-              )}
-              {data.hedge_note && <div className="text-[11px] text-base-content/60">{data.hedge_note}</div>}
+                )}
+                {data.hedge_note && <div className="text-[11px] text-base-content/60">{data.hedge_note}</div>}
 
-              {/* Actions */}
-              {(v?.actions?.length ?? 0) > 0 && (
-                <div className="rounded-xl border border-white/10 p-2.5">
-                  <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><Compass className="w-3 h-3" /> What to do</div>
-                  <ul className="space-y-1">
-                    {v!.actions.map((a, i) => <li key={i} className="text-[11px] text-base-content/80 flex items-start gap-1.5"><span className="text-secondary mt-0.5">›</span>{a}</li>)}
-                  </ul>
+                {/* What to do — deterministic actions */}
+                {(v?.actions?.length ?? 0) > 0 && (
+                  <div className="rounded-xl border border-white/10 p-2.5">
+                    <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><Compass className="w-3 h-3" /> What to do</div>
+                    <ul className="space-y-1">
+                      {v!.actions.map((a, i) => <li key={i} className="text-[11px] text-base-content/80 flex items-start gap-1.5"><span className="text-secondary mt-0.5">›</span>{a}</li>)}
+                    </ul>
+                  </div>
+                )}
+
+                {/* LLM — best hedging strategy for the WHOLE book (fed only the computed numbers) */}
+                <div className="rounded-xl border border-secondary/20 bg-secondary/[0.03] p-2.5 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-3.5 h-3.5 text-secondary" />
+                    <span className="text-[10px] uppercase tracking-wider text-secondary/80 font-semibold">AI hedging strategy · whole book</span>
+                    <button className="btn btn-secondary btn-xs gap-1 ml-auto" disabled={adviceLoading} onClick={askLlm}>
+                      {adviceLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                      {adviceLoading ? 'Analyzing…' : advice ? 'Regenerate' : 'Get AI hedge plan'}
+                    </button>
+                  </div>
+                  {adviceErr && <div className="text-[11px] text-error flex items-start gap-1"><AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />{adviceErr}</div>}
+                  {advice && <div className="text-[11px] text-base-content/80 whitespace-pre-wrap leading-relaxed">{advice}</div>}
+                  {!advice && !adviceErr && !adviceLoading && (
+                    <p className="text-[10px] text-base-content/40">Sends only the computed book numbers (greeks, β, CVaR, crash P&Ls, hedge menu) to the model — it reasons over them for the best whole-book hedge, doing no arithmetic of its own.</p>
+                  )}
                 </div>
+                </div>
+                </CollapsibleSection>
               )}
 
               <p className="text-[9px] text-base-content/35">

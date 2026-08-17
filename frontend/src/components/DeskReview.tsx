@@ -3,14 +3,14 @@ import {
   Gauge, Loader2, AlertTriangle, Cpu, Shield, Briefcase, ChevronDown, ChevronUp,
   Trophy, Play, Terminal, Maximize2, X, MessageSquare, Activity, LineChart, Layers, Zap, Sparkles,
 } from 'lucide-react';
-import { runDeskReview, runDeskReviewAgents, runDeskMonitor, runDeskMonitorAnalyze } from '../api';
+import { runDeskReview, runDeskReviewAgents, runDeskMonitor, runDeskMonitorAnalyze, runDeskBlind } from '../api';
 import { RatingsHelpButton } from './RatingsHelp';
 import DeskDebateModal from './DeskDebateModal';
 import { OpportunitySummary, LegsTable } from './DerivativeIncome';
 import CollapsibleSection from './trades/CollapsibleSection';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
 import type { DeskReviewParams, DeskEvaluateParams } from '../api';
-import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan } from '../types';
+import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan, BlindRead } from '../types';
 
 const money = (n: number | null | undefined, d = 0) =>
   n == null ? '—' : `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`;
@@ -173,8 +173,8 @@ const GROUP_LABEL = 'text-[9px] uppercase tracking-wider text-base-content/40 mb
 // placed-trade lifecycle read (My Trades → Quant algorithmic → full desk score)
 // renders the IDENTICAL section the Derivative Income scan shows, fed by the
 // /desk-score payload. `t` carries the grade fields; `q` is desk_metrics.quant.
-export function QuantAnalysisSection({ t, q, defaultOpen = false }: {
-  t: DeskRankedTrade; q: any; defaultOpen?: boolean;
+export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant Analysis", subtitle = "base + factor + TA → desk score" }: {
+  t: DeskRankedTrade; q: any; defaultOpen?: boolean; title?: string; subtitle?: string;
 }) {
   const sub = q?.subscores;
   const base = Math.round(t.base_quality ?? q?.score ?? 0);
@@ -187,8 +187,8 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false }: {
   const rawSum = r1(base + adjNet + taNet);        // the true arithmetic sum (pre-clamp)
   const clamped = rawSum !== t.desk_score;         // desk_score is clamped to [0, 100]
   return (
-    <CollapsibleSection title="Quant Analysis" accent="secondary" defaultOpen={defaultOpen}
-      icon={<Cpu className="w-3 h-3" />} subtitle="base + factor + TA → desk score">
+    <CollapsibleSection title={title} accent="secondary" defaultOpen={defaultOpen}
+      icon={<Cpu className="w-3 h-3" />} subtitle={subtitle}>
       {/* Top: the TOTAL desk score (not the base) */}
       <div className={`flex items-center gap-2 rounded-lg border p-2 mb-2.5 ${gradeTone(t.algo_grade)}`}>
         <span className="text-sm font-bold uppercase tracking-wider">{q?.verdict || 'GRADE'}</span>
@@ -264,6 +264,18 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false }: {
           <p className="text-[10px] text-base-content/40">Neutral to the current regime — no technical tilt on this structure.</p>
         )}
         <GroupFoot label="Net TA" value={taNet} signed />
+        {/* Per-factor EVIDENCE — the concrete price points (support/wall/value-area levels, GEX, node
+            volume, drift) behind each score, so the rating is auditable, not a black box. */}
+        {tas.some(a => a.detail) && (
+          <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
+            {tas.filter(a => a.detail).map((a, i) => (
+              <li key={i} className="flex gap-2 text-[11px] leading-snug">
+                <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
+                <span className="text-base-content/65"><b className="text-base-content/85">{a.label}</b> · {a.detail}</span>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       {/* Reconciliation — how the pieces sum to the desk score */}
@@ -302,7 +314,7 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false }: {
           {(t.grade_demerits || []).map((r, i) => <li key={`d${i}`} className="flex gap-1.5 text-warning/80"><span className="opacity-50">−</span>{r}</li>)}
         </ul>
       )}
-      {t.ta_note && (
+      {!tas.some(a => a.detail) && t.ta_note && (
         <p className="text-[11px] text-base-content/55 mt-1.5"><span className="text-base-content/40">Technical read:</span> {t.ta_note}</p>
       )}
     </CollapsibleSection>
@@ -448,6 +460,51 @@ function MonitoringSection({ ticker, trade }: { ticker: string; trade: DeskRanke
   );
 }
 
+// Independent LLM read — NOT shown our score/grade, so it can't anchor to the rule model. A DECISION +
+// cited factor calls (never a fuzzy rating), and the divergence vs the desk grade the LLM never saw.
+function BlindReadCard({ data }: { data: BlindRead }) {
+  const b = data.blind;
+  const vTone = (v?: string | null) => {
+    const u = (v || '').toUpperCase();
+    if (u === 'ENTER') return 'text-success bg-success/10 border-success/30';
+    if (u === 'AVOID' || u === 'PASS') return 'text-error bg-error/10 border-error/30';
+    return 'text-warning bg-warning/10 border-warning/30';
+  };
+  const fSym = (c: string) => (c === 'FAVORABLE' ? '＋' : c === 'ADVERSE' ? '－' : '○');
+  const fTone = (c: string) => (c === 'FAVORABLE' ? 'text-success' : c === 'ADVERSE' ? 'text-error' : 'text-base-content/45');
+  const dv = data.divergence === 'agree'
+    ? { t: '✓ agrees with the desk', c: 'text-success bg-success/10 border-success/25' }
+    : data.divergence === 'disagree'
+      ? { t: '⚠ disagrees with the desk', c: 'text-error bg-error/10 border-error/25' }
+      : { t: '~ partial agreement', c: 'text-warning bg-warning/10 border-warning/25' };
+  return (
+    <div className="rounded-lg border border-info/25 bg-info/[0.04] p-3 mt-1 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[9px] uppercase tracking-wider text-info/70 flex items-center gap-1"><Sparkles className="w-3 h-3" /> Blind 2nd opinion</span>
+        <span className={`text-sm font-bold uppercase rounded px-2 py-0.5 border ${vTone(b.verdict)}`}>{b.verdict || '—'}</span>
+        <span className={`text-[10px] rounded px-1.5 py-0.5 border ${dv.c}`}>{dv.t}</span>
+        <span className="ml-auto text-[9px] text-base-content/40">desk was {data.rule.grade || '—'}{data.rule.vetoed ? ' · vetoed' : ''} · {data.rule.desk_score ?? '—'}</span>
+      </div>
+      {b.factors.length > 0 && (
+        <div className="grid sm:grid-cols-2 gap-x-4 gap-y-1">
+          {b.factors.map((f, i) => (
+            <div key={i} className="flex items-baseline gap-1.5 text-[11px]">
+              <span className={`font-bold shrink-0 ${fTone(f.call)}`}>{fSym(f.call)}</span>
+              <span className="text-base-content/50 shrink-0">{f.name}:</span>
+              <span className="text-base-content/75">{f.reason}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {b.edge && <p className="text-[11px] text-base-content/80"><span className="text-[9px] uppercase text-base-content/40">Edge · </span>{b.edge}</p>}
+      {b.break_scenario && <p className="text-[11px] text-base-content/80"><span className="text-[9px] uppercase text-error/50">Break · </span>{b.break_scenario}</p>}
+      <p className="text-[9px] text-base-content/35 border-t border-white/[0.06] pt-1">
+        Formed from the raw facts only — the LLM was NOT shown our score/grade, so it can't rubber-stamp the rules. It carries its OWN biases; treat as a second opinion, not truth. Divergence is the signal.
+      </p>
+    </div>
+  );
+}
+
 function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams; evaluate?: DeskEvaluateParams }) {
   const dm = t.desk_metrics;
   const q = dm.quant || {};
@@ -457,6 +514,22 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
   const [agents, setAgents] = useState<DeskAgentsResult | null>(null);
   const [debateLoading, setDebateLoading] = useState(false);
   const [debateErr, setDebateErr] = useState<string | null>(null);
+  // Independent, un-anchored second opinion (the LLM is NOT shown our score).
+  const [blind, setBlind] = useState<BlindRead | null>(null);
+  const [blindLoading, setBlindLoading] = useState(false);
+  const [blindErr, setBlindErr] = useState<string | null>(null);
+  const runBlind = async () => {
+    setBlindErr(null); setBlind(null); setBlindLoading(true);
+    try {
+      const b = await runDeskBlind(ticker, {
+        ...params,
+        focus: { structure: t.structure, expiration: t.expiration ?? null,
+                 short_strike: t.short_strike ?? t.put_short ?? t.call_short ?? null },
+      });
+      if (b.error) setBlindErr(b.error); else setBlind(b);
+    } catch (e: any) { setBlindErr(e?.message || 'Blind read failed'); }
+    finally { setBlindLoading(false); }
+  };
 
   const runDesk = async () => {
     setDebateOpen(true); setDebateErr(null); setAgents(null); setDebateLoading(true);
@@ -537,12 +610,22 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
 
       {/* Run Institutional Desk — the LLM debate on THIS trade, in the boardroom modal. Right-aligned,
           directly after the Quant Analysis section. */}
-      <div className="flex justify-end pt-1">
+      <div className="flex justify-end gap-2 pt-1">
+        {!evaluate && (
+          <button className="btn btn-outline btn-info btn-sm gap-1.5" onClick={runBlind} disabled={blindLoading}
+            title="An independent LLM read that is NOT shown our score/grade — an un-anchored second opinion. Divergence from the desk is the signal.">
+            {blindLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+            Blind 2nd opinion
+          </button>
+        )}
         <button className="btn btn-secondary btn-sm gap-1.5" onClick={runDesk} disabled={debateLoading}>
           {debateLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
           Run Institutional Desk
         </button>
       </div>
+      {blindLoading && <div className="text-[11px] text-base-content/50 text-right flex items-center justify-end gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Forming an independent read from the raw facts…</div>}
+      {blindErr && <div className="text-[11px] text-warning text-right">{blindErr}</div>}
+      {blind && <BlindReadCard data={blind} />}
 
       <DeskDebateModal
         open={debateOpen}

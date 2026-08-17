@@ -16,7 +16,6 @@ const PRIMARY_NAV = [
   { path: '/market',      icon: Globe,            label: 'Markets',     premiumOnly: false },
   { path: '/portfolio',   icon: Briefcase,        label: 'Portfolio',   premiumOnly: false },
   { path: '/tracking',    icon: Bookmark,         label: 'Tracking',    premiumOnly: false },
-  { path: '/trade-tracking', icon: Crosshair,     label: 'Trade Tracker', premiumOnly: false },
   { path: '/my-trades',   icon: ClipboardList,    label: 'Derivative Trades',      premiumOnly: false },
   { path: '/ai-research', icon: Sparkles,         label: 'AI Research', premiumOnly: false },
   { path: '/agents',      icon: Bot,              label: 'Agents',      premiumOnly: true  },

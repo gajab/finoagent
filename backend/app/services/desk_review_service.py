@@ -44,7 +44,8 @@ _MATERIAL_FAIL_BPS = -75
 # EXTREME skew (>15 vol pts) usually means the market is pricing a KNOWN tail event — challenge it, don't
 # bank it as free edge ("picking up pennies in front of a steamroller").
 _SKEW_ELEVATED_BPS = 700
-_SKEW_EXTREME_BPS = 1500
+_SKEW_EXTREME_BPS = 1500          # short-strike IV ≥ 15 vol-pts over ATM → EXTREME (double-edged; the market may price a known tail)
+_SKEW_RICH_BPS = 300             # ≥ 3 vol-pts over ATM → a RICH wing worth harvesting (you're paid extra for the skew)
 
 # Volatility Risk Premium (implied ÷ realized). ≥1 is favourable (implied over-priced = a seller's edge).
 # Below 1 = negative VRP: penalise IN PROPORTION to the gap, and HARD-BLOCK past the ratio floor — that is
@@ -191,11 +192,14 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     reg = inst.get("regime") or {}
     mode = reg.get("mode")
     s = opp.get("structure")
+    vp = inst.get("volume_profile") or {}
     factors: list[dict] = []
     notes: list[str] = []
 
     def add(label: str, pts: float, note: str):
-        factors.append({"label": label, "points": pts}); notes.append(note)
+        # ``detail`` = the concrete price-point evidence, surfaced per-factor in the UI so the user sees
+        # WHY the factor scored (which support/wall/value-area level, GEX value, node volume, etc.).
+        factors.append({"label": label, "points": pts, "detail": note}); notes.append(note)
 
     # Trend drift (μ) — the continuous EMA-slope angle REPLACES the old yes/no ±6/±5 regime-fit. A trend
     # that helps the short side is a tailwind (+), one that threatens it a headwind (−); neutral structures
@@ -212,27 +216,69 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
             aligned = 0.0
         pts = max(-_DRIFT_CAP, min(_DRIFT_CAP, round(aligned * _DRIFT_SCALE)))
         if pts != 0:
-            add("Trend drift", pts, f"trend velocity {round(mu * 100)}%/yr (annualized EMA slope, applied over your DTE) — {'tailwind' if pts > 0 else 'headwind'} for this structure")
+            _dte = int(opp.get("dte") or 0)
+            _hz = f" ≈ {'+' if mu > 0 else ''}{round(mu * _dte / 365 * 100, 1)}% over {_dte}d" if _dte else ""
+            add("Trend drift", pts, f"trend velocity {round(mu * 100)}%/yr (annualized EMA slope){_hz} — {'tailwind' if pts > 0 else 'headwind'} for this structure")
     if mode == "range" and s in _NEUTRAL_INCOME:
-        add("Range fit", 5, "neutral premium suits the range")
-    # Short strike protected by a value-area edge / order block on the safe side.
-    vp = inst.get("volume_profile") or {}
+        _va = f", value area ${round(vp['val'], 1)}–${round(vp['vah'], 1)}" if vp.get("val") and vp.get("vah") else ""
+        _poc = f"POC ${round(vp['poc'], 1)}" if vp.get("poc") else "range-bound tape"
+        add("Range fit", 5, f"{_poc}{_va} — neutral premium suits the range")
+    # Short strike protected by a value-area edge on the safe side.
     ss = opp.get("short_strike")
     if ss and vp.get("val") and vp.get("vah"):
+        _va = f"value area ${round(vp['val'], 1)}–${round(vp['vah'], 1)}"
         if s in _BULLISH_INCOME and ss <= vp["val"]:
-            add("Value area", 3, "short strike below the value area")
+            add("Value area", 3, f"short strike ${round(ss, 1)} below the value-area low ${round(vp['val'], 1)} ({_va})")
         elif s in _BEARISH_INCOME and ss >= vp["vah"]:
-            add("Value area", 3, "short strike above the value area")
+            add("Value area", 3, f"short strike ${round(ss, 1)} above the value-area high ${round(vp['vah'], 1)} ({_va})")
+    # Short strike DEFENDED by a strong structural level on the safe side — the pro "sell BEYOND the level"
+    # placement: price must break the level before it can reach your strike. Levels = classical S/R + dealer
+    # gamma walls / flip (Put-Support, Call-Resistance, gamma flip, HVL); value-area edges are scored above,
+    # so they're excluded here to avoid double-counting the same price. Scaled by how CLOSE the defending
+    # level sits to the strike (a level right at the strike is the operative defense; far off = weaker).
+    put_short = opp.get("put_short") or (ss if s in ("cash_secured_put", "put_credit_spread") else None)
+    call_short = opp.get("call_short") or (ss if s in ("covered_call", "call_credit_spread") else None)
+    named_levels = [(nm, float(v)) for nm, v in (           # (human name, price) — so the note NAMES the level
+        ("support", (ta or {}).get("supportLevel")), ("resistance", (ta or {}).get("resistanceLevel")),
+        ("gamma put-wall", (gex or {}).get("put_support")), ("gamma call-wall", (gex or {}).get("call_resistance")),
+        ("gamma flip", (gex or {}).get("flip_level")), ("high-volume level", (gex or {}).get("hvl")),
+    ) if v and float(v) > 0]
+    struct_pts, struct_notes = 0.0, []
+    if put_short and spot:                               # a level ABOVE the put & below spot must break first
+        defs = [(nm, L) for nm, L in named_levels if put_short <= L < spot]
+        if defs:
+            nm, lvl = min(defs, key=lambda t: t[1])      # nearest defending level above the strike
+            prox = 1.0 - min((lvl - put_short) / max(spot - put_short, 1e-6), 1.0)   # 1 = level right at the strike
+            struct_pts += round(2 + 2 * prox, 1); struct_notes.append(f"short put ${round(put_short, 1)} sits below {nm} ${round(lvl, 1)}")
+    if call_short and spot:                              # a level BELOW the call & above spot must break first
+        defs = [(nm, L) for nm, L in named_levels if spot < L <= call_short]
+        if defs:
+            nm, lvl = max(defs, key=lambda t: t[1])      # nearest defending level below the strike
+            prox = 1.0 - min((call_short - lvl) / max(call_short - spot, 1e-6), 1.0)
+            struct_pts += round(2 + 2 * prox, 1); struct_notes.append(f"short call ${round(call_short, 1)} sits above {nm} ${round(lvl, 1)}")
+    if struct_pts:   # ONE combined factor (both wings of a neutral structure sum here), capped so it can't dominate
+        add("Structure", round(min(struct_pts, 6.0), 1), "; ".join(struct_notes) + " — the level must break before the strike is threatened")
     # LVN slip-through — a short strike in a thin volume node has no absorption (Phase-3 friction test).
     lvn = _lvn_check(opp, vp, spot)
     if lvn:
         add(lvn["label"], lvn["points"], lvn["note"])
     # Dealer gamma regime (GEX proxy) — long gamma suppresses vol (a good backdrop for selling premium);
     # short gamma exacerbates it (dangerous). A STOCK-level positioning read applied to every trade.
-    if gex and gex.get("regime") == "long":
-        add("Gamma regime", 4, "dealers long gamma — vol-suppressed")
-    elif gex and gex.get("regime") == "short":
-        add("Gamma regime", -6, "dealers short gamma — vol-expansion risk")
+    if gex and gex.get("regime") in ("long", "short"):
+        _lg = gex["regime"] == "long"
+        _bits = []
+        if gex.get("gex_bn") is not None:
+            _bits.append(f"net GEX {gex['gex_bn']:+g}bn")
+        if gex.get("flip_level"):
+            _bits.append(f"flip ${round(gex['flip_level'], 1)}")
+        if gex.get("put_support"):
+            _bits.append(f"put-wall ${round(gex['put_support'], 1)}")
+        if gex.get("call_resistance"):
+            _bits.append(f"call-wall ${round(gex['call_resistance'], 1)}")
+        _ev = f" ({', '.join(_bits)})" if _bits else ""
+        add("Gamma regime", 4 if _lg else -6,
+            f"dealers {'LONG' if _lg else 'SHORT'} gamma{_ev} — "
+            f"{'vol-suppressed / mean-reverting (good backdrop for selling premium)' if _lg else 'vol-EXPANSION / trending (dealers chase moves — dangerous)'}")
     bonus = sum(f["points"] for f in factors)
     return bonus, ", ".join(notes), factors
 
@@ -367,6 +413,29 @@ def _gex_sync(ticker: str) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.debug("GEX read failed for %s: %s", ticker, exc)
         return {}
+
+
+def _structural_levels(ta: dict, gex: dict) -> list[float]:
+    """Flatten the technical read into absolute price levels the scan biases multi-leg SHORT strikes
+    toward: classical support/resistance, the volume-profile value-area edges (VAL/VAH), and the dealer
+    gamma walls / flip (Put-Support, Call-Resistance, gamma flip, HVL). The snap picks the nearest level
+    on each leg's SAFE side — no spot split here (the builder classifies by side at its own spot)."""
+    inst = (ta or {}).get("institutional") or {}
+    vp = inst.get("volume_profile") or {}
+    raw = [
+        (ta or {}).get("supportLevel"), (ta or {}).get("resistanceLevel"),
+        vp.get("val"), vp.get("vah"),
+        (gex or {}).get("put_support"), (gex or {}).get("call_resistance"),
+        (gex or {}).get("flip_level"), (gex or {}).get("hvl"),
+    ]
+    out: list[float] = []
+    for x in raw:
+        try:
+            if x is not None and float(x) > 0:
+                out.append(float(x))
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def _ta_summary(ta: dict) -> dict:
@@ -759,7 +828,7 @@ def _event_adjusted_yield(opp: dict, vsx: dict, next_earnings: Optional[str], to
 
 
 def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: Optional[float],
-                iv_rank: Optional[float], beta: Optional[float],
+                iv_rank: Optional[float], beta: Optional[float], iv_percentile: Optional[float] = None,
                 hv: Optional[float] = None, gex: Optional[dict] = None,
                 macd: Optional[dict] = None, overwrite: bool = False,
                 next_earnings: Optional[str] = None, today=None,
@@ -798,8 +867,17 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
         elif iv_hv > 1.25:
             demerits.append(f"paying up for vega (IV/HV {iv_hv}) — a calendar wants CHEAP, not rich, IV"); comp["vrp"] -= 4
     elif iv_hv is not None:
-        if iv_hv >= 1.1 and (iv_rank or 0) >= 50:
-            merits.append(f"rich VRP (IV/HV {iv_hv}, IV-rank {iv_rank})"); comp["vrp"] += 6
+        if iv_hv >= 1.05:
+            # CONTINUOUS rich-VRP reward — scales with BOTH how rich implied is vs realized AND the IV
+            # rank/percentile (a high rank alone earns some credit even at a modest IV/HV). NOTE: the rank
+            # & percentile here are vs the trailing 1y REALIZED-vol range (there is no historical-IV feed),
+            # so they are labelled honestly as realized-range-based, NOT a true IV-vs-IV rank.
+            rp = max(iv_rank or 0.0, iv_percentile or 0.0)     # 0–100, realized-range-based
+            vrp_pts = min(max(round((iv_hv - 1.0) * 8) + round((rp - 50) / 50.0 * 4), 0), 9)
+            if vrp_pts > 0:
+                comp["vrp"] += vrp_pts
+                merits.append(f"rich VRP +{vrp_pts} — IV/HV {iv_hv}, IV-rank {iv_rank}/pctile {iv_percentile} "
+                              f"(vs 1y realized-vol range)")
         elif iv_hv < 1.0:
             # VRP vs the FORWARD RV forecast (HAR), not just trailing HV. Trailing realized is often
             # spike-inflated by a PAST event (an earnings/gap day) and is mean-reverting DOWN — so
@@ -841,11 +919,29 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
         elif pmp is not None and pmp >= 85:
             merits.append(f"full-credit prob {pmp}%"); comp["moneyness"] += 3
 
-    # 4) Skew — extreme = 'pennies in front of a steamroller'.
-    sliv = _short_leg_iv(opp)
+    # 4) Skew / per-strike IV EDGE — TRADE the skew, don't merely avoid the extreme. The SHORT strike's OWN
+    #    IV vs ATM is the skew premium you harvest: a strike richer than ATM PAYS you extra for the distance
+    #    (a real, persistent edge — normal equity put-skew is exactly why selling OTM puts is well-paid); a
+    #    CHEAP strike leaves you underpaid for the risk. An EXTREME bump stays double-edged (the market may
+    #    be pricing a KNOWN tail there). This is also the per-strike "best-paid strike" signal.
+    iv_edge_vp = None
+    sliv = _short_leg_iv(opp)                            # the SHORT strike's OWN IV (per-strike, not ATM)
     ss_bps = round((sliv - atm_iv_pct) * 100) if (sliv is not None and atm_iv_pct is not None) else None
-    if ss_bps is not None and ss_bps >= _SKEW_EXTREME_BPS:
-        demerits.append(f"extreme skew ({ss_bps}bps)"); comp["skew"] -= 6
+    if ss_bps is not None and not is_cal:
+        iv_edge_vp = round(ss_bps / 100.0, 1)            # vol-pts the short strike is rich (+) / cheap (−) vs ATM
+        if ss_bps >= _SKEW_EXTREME_BPS:
+            comp["skew"] -= 5
+            demerits.append(f"EXTREME skew — short-strike IV {round(sliv, 1)}% is +{iv_edge_vp}vp over ATM: a fat "
+                            f"premium, but double-edged (the market may be pricing a KNOWN tail here) — size down")
+        elif ss_bps >= _SKEW_RICH_BPS:                   # rich wing → harvest the skew premium (best-paid strike)
+            pts = min(round((ss_bps - _SKEW_RICH_BPS) / 300.0) + 2, 5)
+            comp["skew"] += pts
+            merits.append(f"selling the RICH wing +{pts} — short-strike IV {round(sliv, 1)}% is +{iv_edge_vp}vp "
+                          f"over ATM {round(atm_iv_pct, 1)}%: you're paid EXTRA for the skew")
+        elif ss_bps <= -_SKEW_RICH_BPS:                  # selling a cheap strike → underpaid for the distance
+            comp["skew"] -= 3
+            demerits.append(f"selling the CHEAP wing — short-strike IV {round(sliv, 1)}% is {iv_edge_vp}vp UNDER "
+                            f"ATM {round(atm_iv_pct, 1)}%: underpaid for the strike's distance")
 
     # 5) Execution / liquidity.
     spreads = [l.get("bid_ask_spread_pct") for l in (opp.get("legs") or []) if l.get("bid_ask_spread_pct") is not None]
@@ -901,6 +997,7 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
 
     adj = sum(comp.values())
     return {"adj": adj, "merits": merits, "demerits": demerits, "blocking": blocking, "components": comp,
+            "iv_edge_vp": iv_edge_vp,   # short-strike IV vs ATM (vol-pts) — the per-strike skew premium / edge
             # Q-vs-P boundary read (for the number-line viz): implied vs physical 1σ moves + strike distance.
             "qp": {"implied_move_pct": imp_em, "physical_move_pct": phys_em, "dual_move_pct": dual_em,
                    "short_sigmas": nss, "iv_hv_ratio": iv_hv,
@@ -1340,16 +1437,25 @@ async def rank_desk(
     ``focus`` injects the caller's exact placed trade as a candidate so lifecycle
     scoring works even when its strike/expiry is off the scan grid."""
     ticker = _norm_ticker(ticker)
+    # Fetch the TECHNICAL read FIRST so the scan can bias multi-leg SHORT strikes toward real structural
+    # levels (S/R, value area, dealer gamma walls/flip). The SAME ta/gex/portfolio_fit are handed to
+    # _finalize_desk so the read happens ONCE — no double fetch, same total latency (already sequential).
+    ta, portfolio_fit, gex = await asyncio.gather(
+        asyncio.to_thread(_ta_sync, ticker),
+        asyncio.to_thread(_portfolio_fit_sync, ticker),
+        asyncio.to_thread(_gex_sync, ticker),
+    )
     scan = await run_derivative_income(
         ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
         structures=structures, quote_source=quote_source, user=user, db=db,
         target_expiration=target_expiration, focus=focus, owns_underlying=owns_underlying,
+        ta_levels=_structural_levels(ta, gex),
     )
     if scan.get("error"):
         return {"error": scan["error"]}
     return await _finalize_desk(scan, scan.get("opportunities", []), ticker,
                                 quote_source, owns_underlying, user, db, target_dte,
-                                collapse_strikes=True)
+                                collapse_strikes=True, ta=ta, portfolio_fit=portfolio_fit, gex=gex)
 
 
 # ── Risk triggers — the price-level management plan ──────────────────────
@@ -1844,22 +1950,26 @@ def _collapse_adjacent_strikes(ranked: list[dict], spot: float, band_abs: float,
 
 async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quote_source: str,
                          owns_underlying: bool, user: Optional["User"], db: Optional["AsyncSession"],
-                         target_dte: Optional[int] = None, collapse_strikes: bool = False) -> dict:
+                         target_dte: Optional[int] = None, collapse_strikes: bool = False,
+                         ta: Optional[dict] = None, portfolio_fit: Optional[dict] = None,
+                         gex: Optional[dict] = None) -> dict:
     """Score a set of candidate opportunities against the ticker's TA / regime / vol context and
     assemble the desk-review payload (chrome passthrough + ranked trades). Shared by ``rank_desk``
     (the full scan) and ``evaluate_desk_trade`` (one user-supplied trade).
 
     ``collapse_strikes`` thins near-adjacent same-structure strikes to best-in-band representatives
-    (the full scan wants this; single-trade evaluate does not)."""
+    (the full scan wants this; single-trade evaluate does not). ``ta``/``portfolio_fit``/``gex`` may be
+    pre-fetched by the caller (``rank_desk`` reuses them so the technical read isn't fetched twice)."""
     ctx = scan.get("context") or {}
     spot = float(ctx.get("spot") or scan.get("spot") or 0.0)
     sofr_pct = float(ctx.get("sofr_pct") or 5.0)
     hv = ((ctx.get("hv30_pct") or ctx.get("hv20_pct") or 0) / 100.0) or None
-    ta, portfolio_fit, gex = await asyncio.gather(
-        asyncio.to_thread(_ta_sync, ticker),
-        asyncio.to_thread(_portfolio_fit_sync, ticker),
-        asyncio.to_thread(_gex_sync, ticker),
-    )
+    if ta is None or portfolio_fit is None or gex is None:
+        ta, portfolio_fit, gex = await asyncio.gather(
+            asyncio.to_thread(_ta_sync, ticker),
+            asyncio.to_thread(_portfolio_fit_sync, ticker),
+            asyncio.to_thread(_gex_sync, ticker),
+        )
 
     max_dte = max((int(o.get("dte") or 0) for o in opportunities), default=int(target_dte or 45))
     events_pre = _events_in_window(scan, ta, max_dte)        # computed once — also feeds the grade
@@ -1889,6 +1999,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
         g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
+                        iv_percentile=vsx.get("iv_percentile"),
                         hv=phys_vol, gex=gex, macd=macd_accel, overwrite=overwrite,
                         next_earnings=(ctx or {}).get("next_earnings"), today=date.today(),
                         har_rv_pct=vsx.get("har_rv_pct"))
@@ -1902,7 +2013,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
             {"label": "Expectation", "points": round(c["expectation"], 1)},
             {"label": "VRP",         "points": round(c["vrp"], 1)},
             {"label": "Moneyness",   "points": round(c["moneyness"], 1)},
-            {"label": "Skew",        "points": round(c["skew"], 1)},
+            {"label": "Skew / IV-edge", "points": round(c["skew"], 1)},
             {"label": "Liquidity",   "points": round(c["liquidity"], 1)},
             {"label": "Beta",        "points": round(c["beta"], 1)},
             {"label": "Earnings timing", "points": round(c.get("event", 0.0), 1)},
@@ -1910,7 +2021,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         risk_triggers = _risk_triggers(opp, spot, ta, phys_vol)   # WATCH→DEFEND→EXIT ladder (TA + geometry)
         ea_yield, ea_share = _event_adjusted_yield(opp, vsx, (ctx or {}).get("next_earnings"), date.today())
         ranked.append({**opp, "desk_metrics": dm, "desk_score": desk_score, "ta_note": note,
-                       "risk_triggers": risk_triggers,
+                       "risk_triggers": risk_triggers, "iv_edge_vp": g.get("iv_edge_vp"),
                        "event_adjusted_yield_pct": ea_yield, "event_premium_share": ea_share,
                        "algo_grade": grade, "approval_odds": approval, "grade_merits": g["merits"],
                        "grade_demerits": g["demerits"], "grade_blocking": g["blocking"],
@@ -2584,6 +2695,123 @@ async def _run_agent(role: str, persona: dict, context: str, api_key: str, model
         "action_needed": action, "content": content, "model": model,
         # returned so the UI can expose exactly what each agent was given (debug/triage)
         "input_context": context, "system_prompt": persona["system"],
+    }
+
+
+# ── Blind independent read — an LLM second opinion NOT anchored to our score ─────────────────
+_BLIND_SYS = (
+    "You are an INDEPENDENT options strategist giving a SECOND OPINION on a premium-selling income trade. "
+    "You have deliberately NOT been shown any pre-computed score, grade, or ranking — form your OWN view "
+    "from the raw market facts alone.\n"
+    "HARD RULES:\n"
+    "• NEVER output a 1–10 / X-out-of-10 / star rating — a vibes score is useless and forbidden. DECIDE.\n"
+    "• EVERY judgment must cite a specific NUMBER from the data (IV, HV30, forward RV, cushion, σ, delta, "
+    "CVaR, keep-prob, an event date). If you can't cite a number, don't assert it.\n"
+    "• The quant math (greeks, CVaR, keep-prob, expected move) is GIVEN and correct — USE it, never recompute.\n"
+    "• Judge what a mechanical screen can't: does the vol / cushion / event / regime picture actually FIT "
+    "together, and what is the real risk. Be willing to DISAGREE with what a rule model would conclude."
+)
+_BLIND_GUIDE = (
+    "\n\nFill this template EXACTLY — nothing before or after it:\n"
+    "VERDICT: <ENTER | RESIZE | PASS | AVOID>\n"
+    "FACTORS:\n"
+    "- Volatility edge: <FAVORABLE | NEUTRAL | ADVERSE> — <cite IV vs HV30 vs the forward RV>\n"
+    "- Cushion / moneyness: <FAVORABLE | NEUTRAL | ADVERSE> — <cite cushion vs the 1σ expected move>\n"
+    "- Event / timing: <FAVORABLE | NEUTRAL | ADVERSE> — <cite the earnings/macro date vs expiry, or 'none in window'>\n"
+    "- Technical / regime: <FAVORABLE | NEUTRAL | ADVERSE> — <cite the level or regime>\n"
+    "- Liquidity / execution: <FAVORABLE | NEUTRAL | ADVERSE> — <cite the spread or OI>\n"
+    "EDGE: <the ONE concrete reason to do — or to skip — this, tied to a number>\n"
+    "BREAK: <the ONE scenario or price level that would invalidate it, tied to a number>"
+)
+
+
+def _blind_facts(r: dict, desk: dict) -> dict:
+    """RAW market facts for an independent read — deliberately EXCLUDES our desk_score / grade / factor
+    adjustments / algo verdict, so the LLM can't anchor to the rule model."""
+    dm = r.get("desk_metrics") or {}
+    vs = desk.get("vol_stats") or {}
+    return {
+        "trade": {"structure": r.get("structure"), "strikes": _strikes_json(r), "expiration": r.get("expiration"),
+                  "dte": r.get("dte"), "net_credit": r.get("premium"), "cushion_pct": r.get("cushion_pct"),
+                  "short_strike_pct_from_spot": r.get("short_strike_pct")},
+        "spot": desk.get("spot"), "sofr_pct": desk.get("sofr_pct"),
+        "volatility": {"atm_iv_pct": r.get("atm_iv_pct"), "hv30_pct": vs.get("hv30_pct"),
+                       "forward_rv_har_pct": vs.get("har_rv_pct"), "iv_over_hv": r.get("iv_hv_ratio"),
+                       "iv_minus_har_vp": vs.get("iv_vs_har_pts"), "iv_rank": vs.get("iv_rank"),
+                       "iv_percentile": vs.get("iv_percentile"), "skew_pts": vs.get("skew_pts"),
+                       "expected_move_pct_1sigma": _expected_move_pct(r)},
+        "probability_from_option_market_RND": {"keep_prob_pct": r.get("prob_keep_pct")},
+        "quant_facts": {"pm_ratios": dm.get("pm") or {}, "risk": dm.get("risk") or {},   # from the RND payoff — not our score
+                        "greeks": dm.get("trader") or {}},
+        "yield": {"premium_annualized_pct": r.get("premium_annualized_pct")},
+        "implied_vs_realized_boundary": r.get("qp"),
+        "events_in_window": [e.get("text") for e in (desk.get("events") or [])],
+        "technical_read": r.get("ta_note"),
+    }
+
+
+def _parse_blind(content: str) -> dict:
+    verdict = None
+    m = re.search(r"VERDICT:\s*([A-Za-z_]+)", content)
+    if m:
+        v = m.group(1).strip().upper()
+        verdict = v if v in ("ENTER", "RESIZE", "PASS", "AVOID") else v
+    factors = []
+    for line in content.splitlines():
+        lm = re.match(r"\s*[-•]\s*([^:]+?):\s*(FAVORABLE|NEUTRAL|ADVERSE)\b\s*[—:-]*\s*(.*)", line, re.I)
+        if lm:
+            factors.append({"name": lm.group(1).strip(), "call": lm.group(2).strip().upper(),
+                            "reason": lm.group(3).strip()})
+
+    def _grab(key):
+        mm = re.search(rf"\b{key}:\s*(.+?)(?:\n[A-Z][A-Z ]+:|\Z)", content, re.S)
+        return mm.group(1).strip() if mm else None
+    return {"verdict": verdict, "factors": factors, "edge": _grab("EDGE"), "break_scenario": _grab("BREAK")}
+
+
+def _blind_divergence(llm_verdict: Optional[str], grade: Optional[str], blocking: bool) -> str:
+    """agree / partial / disagree between the independent LLM verdict and the (hidden-from-it) rule grade."""
+    g = (grade or "").upper()
+    rule = "avoid" if (blocking or g == "F") else ("favorable" if g in ("A", "B") else "neutral")
+    v = (llm_verdict or "").upper()
+    llm = "favorable" if v == "ENTER" else ("avoid" if v in ("PASS", "AVOID") else "neutral")
+    if rule == llm:
+        return "agree"
+    return "disagree" if {rule, llm} == {"favorable", "avoid"} else "partial"
+
+
+async def blind_read(ticker: str, api_key: str, target_dte: Optional[int] = None, min_prob: float = 0.85,
+                     min_income: float = 20.0, structures: Optional[list[str]] = None,
+                     quote_source: str = "yfinance", model: str = "gpt-4o", focus: Optional[dict] = None,
+                     user: Optional["User"] = None, db: Optional["AsyncSession"] = None,
+                     target_expiration: Optional[str] = None) -> dict:
+    """An INDEPENDENT LLM second opinion on ONE trade, BLIND to our desk score/grade — so its read isn't
+    anchored to (or biased by) the rule model. Returns a DECISION + cited factor calls (NO fuzzy rating),
+    and the divergence vs the rule grade the LLM never saw."""
+    desk = await rank_desk(ticker, target_dte, min_prob, min_income, structures, quote_source,
+                           user, db, target_expiration=target_expiration, focus=focus)
+    if desk.get("error"):
+        return desk
+    ranked = desk.get("ranked") or []
+    if not ranked:
+        return {"error": "No candidate trade to read."}
+    idx = 0
+    if focus:
+        fi = _find_focus_index(ranked, focus.get("structure"), focus.get("expiration"), focus.get("short_strike"))
+        idx = fi if fi is not None else 0
+    r = ranked[idx]
+    context = "RAW MARKET FACTS (no score, grade, or ranking is shown to you):\n" + json.dumps(
+        _blind_facts(r, desk), indent=1, default=str)
+    content = await call_llm(api_key=api_key, model=model, max_tokens=750, temperature=0.2,
+                             messages=[{"role": "system", "content": _BLIND_SYS},
+                                       {"role": "user", "content": context + _BLIND_GUIDE}])
+    parsed = _parse_blind(content)
+    return {
+        "trade_label": r.get("label"),
+        "blind": {**parsed, "content": content, "model": model},
+        "rule": {"grade": r.get("algo_grade"), "desk_score": r.get("desk_score"),
+                 "vetoed": bool(r.get("grade_blocking"))},
+        "divergence": _blind_divergence(parsed.get("verdict"), r.get("algo_grade"), bool(r.get("grade_blocking"))),
     }
 
 

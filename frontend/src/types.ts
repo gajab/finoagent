@@ -3834,8 +3834,8 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   grade_merits?: string[];
   grade_blocking?: string[];    // hard fails (structurally broken, etc.)
   base_quality?: number;        // the algorithmic_quant base score BEFORE regime/factor adjustments
-  grade_adjustments?: { label: string; points: number }[];  // signed option-math contributions → desk_score
-  ta_factors?: { label: string; points: number }[];         // signed technical/regime contributions → desk_score
+  grade_adjustments?: { label: string; points: number; detail?: string }[];  // signed option-math contributions → desk_score
+  ta_factors?: { label: string; points: number; detail?: string }[];         // signed technical/regime contributions → desk_score (detail = price-point evidence)
   qp?: {                        // Q-vs-P: implied (risk-neutral) vs physical (realized) read
     implied_vol_pct?: number | null; realized_vol_pct?: number | null; weight_vol_pct?: number | null;
     iv_hv_ratio?: number | null;                     // < 1 = negative VRP (implied under-prices risk)
@@ -3861,6 +3861,7 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   risk_triggers?: RiskTrigger[];                     // WATCH→DEFEND→EXIT price ladder (TA + geometry)
   event_adjusted_yield_pct?: number | null;          // annualized yield with the earnings/event premium stripped
   event_premium_share?: number | null;               // fraction of the premium that is event (not harvestable) premium
+  iv_edge_vp?: number | null;                         // short-strike IV vs ATM (vol-pts) — the per-strike skew premium / edge
 }
 
 // One rung of the tail-risk management plan — a price level + the corrective action to take there.
@@ -3874,6 +3875,22 @@ export interface RiskTrigger {
   action: string;                                    // the corrective action at this level
   basis: string;                                     // the technical level / σ band it's anchored to
   why?: string;                                      // the TA reasoning for THIS level
+}
+
+// Independent LLM "blind" read — un-anchored to our score. A decision + cited factor calls, not a fuzzy rating.
+export interface BlindFactor { name: string; call: string; reason: string; }   // call = FAVORABLE|NEUTRAL|ADVERSE
+export interface BlindRead {
+  trade_label?: string;
+  blind: {
+    verdict?: string | null;                          // ENTER | RESIZE | PASS | AVOID
+    factors: BlindFactor[];
+    edge?: string | null;
+    break_scenario?: string | null;
+    content?: string; model?: string;
+  };
+  rule: { grade?: string | null; desk_score?: number | null; vetoed?: boolean };   // what the LLM was NOT shown
+  divergence: 'agree' | 'disagree' | 'partial';
+  error?: string;
 }
 
 // On-demand live monitoring plan — real advanced-TA structures (order blocks, POCs, liquidity pools,

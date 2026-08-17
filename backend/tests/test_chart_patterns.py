@@ -73,11 +73,17 @@ class TestReversal:
         assert p["target"]["price"] > p["breakout"]["level"]
 
     def test_head_and_shoulders_bearish(self):
-        df = _df(_path([100, 115, 107, 125, 107, 113, 96]))
+        df = _df(_path([100, 115, 107, 125, 107, 113, 96]))     # level necklines (both ~107)
         z = _zigzag(df, order=5)
         p = _head_shoulders(z, df, float(df["Close"].values[-1]), _atr(df), inverse=False)
         assert p and p["type"] == "head_shoulders" and p["direction"] == "bearish"
         assert p["target"]["price"] < p["breakout"]["level"]
+
+    def test_head_shoulders_rejected_when_troughs_uneven(self):
+        # neckline troughs at very different levels (90 vs 108) → absurd diagonal neckline (HD bug)
+        df = _df(_path([100, 115, 90, 125, 108, 113, 96]))
+        z = _zigzag(df, order=5)
+        assert _head_shoulders(z, df, float(df["Close"].values[-1]), _atr(df), inverse=False) is None
 
 
 class TestContinuation:

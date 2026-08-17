@@ -9,7 +9,7 @@
  * factors + the Q-vs-P (implied vs realized) boundary — then the lifecycle
  * overlay. Fully deterministic; no LLM.
  */
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Loader2, Cpu, AlertTriangle } from 'lucide-react';
 import { runDeskScore } from '../../api';
 import type { QuantExit, LivePnlResponse, SavedStrategyItem, DeskScoreResult } from '../../api';
@@ -167,6 +167,58 @@ export default function QuantExitCard({ q, trade, pnl, deskFocus }: {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+
+/**
+ * QuantAnalysisLoader — the DEEP desk-score experience (the SAME as the Derivative Income
+ * scan: base quality + option-math factors + TA + Q-vs-P boundary + the holder-re-signed
+ * Management Analysis) as a LAZY panel. It runs on mount, so wrapped in a CollapsibleSection
+ * it only fetches when the user opens the panel — replacing the always-on "Management read".
+ */
+export function QuantAnalysisLoader({ trade, pnl, deskFocus }: {
+  trade: SavedStrategyItem;
+  pnl: LivePnlResponse;
+  deskFocus?: { structure: string; expiration?: string | null; short_strike?: number | null } | null;
+}) {
+  const [full, setFull] = useState<DeskScoreResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!deskFocus) { setErr('A fresh-chain desk score isn’t defined for this structure.'); return; }
+      setLoading(true); setErr(null);
+      try {
+        const r = await runDeskScore(trade.id, pnl, deskFocus, pnl.quote_source || 'yfinance');
+        if (!alive) return;
+        if (!r.matched) setErr(r.error || 'This trade is not among the current desk candidates.');
+        else setFull(r);
+      } catch (e: any) { if (alive) setErr(e?.message || 'Desk score failed'); }
+      finally { if (alive) setLoading(false); }
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (loading) return (
+    <div className="flex items-center gap-2 text-xs text-base-content/50 py-3">
+      <Loader2 className="w-4 h-4 animate-spin" /> Running the desk on this exact trade…
+    </div>
+  );
+  if (err) return (
+    <div className="text-[11px] text-base-content/50 flex items-start gap-1.5 py-1">
+      <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0 text-base-content/40" /><span>{err}</span>
+    </div>
+  );
+  if (!full) return null;
+  return (
+    <div className="space-y-2">
+      {full.management_analysis && <ManagementAnalysis ma={full.management_analysis} qp={full.qp} />}
+      <QuantAnalysisSection t={full.opp} q={full.opp?.desk_metrics?.quant} defaultOpen />
     </div>
   );
 }

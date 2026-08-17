@@ -93,6 +93,25 @@ app = FastAPI(
     default_response_class=SafeJSONResponse,
 )
 
+
+# Log the FULL traceback for any unhandled error (otherwise a 500 is opaque — e.g. the
+# "P&L refresh failed: Internal Server Error" on one trade), and echo a short cause to the
+# client so it's diagnosable instead of a blank 500. FastAPI's own handlers still deal with
+# HTTPException / validation errors (more specific → they win); this only sees the un-caught.
+@app.exception_handler(Exception)
+async def _log_unhandled(request, exc):  # noqa: ANN001
+    import logging
+    import traceback
+    from fastapi.responses import JSONResponse
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    if isinstance(exc, StarletteHTTPException):   # pass raised HTTP errors through unchanged
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    logging.getLogger("app.unhandled").error(
+        "Unhandled error on %s %s\n%s", request.method, request.url.path,
+        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    )
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
 # Proxy headers middleware — trust X-Forwarded-Proto / X-Forwarded-For from
 # reverse proxies like ngrok so request.url_for() generates correct URLs.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
@@ -267,22 +286,39 @@ _SPA_ROUTES = {
     "roth-ira-conversion", "college-529",
 }
 
+class CacheControlledStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
 if _frontend_dist.is_dir():
-    # Serve static assets (JS, CSS, images)
-    app.mount("/assets", StaticFiles(directory=str(_frontend_dist / "assets")), name="static-assets")
+    # Serve static assets (JS, CSS, images) with aggressive caching
+    app.mount("/assets", CacheControlledStaticFiles(directory=str(_frontend_dist / "assets")), name="static-assets")
 
     # Catch-all: static files, prerendered SEO pages, then SPA routing
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         base = _frontend_dist.resolve()
         file_path = (base / full_path).resolve()
+        
+        no_cache_headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+        
         if not file_path.is_relative_to(base):
-            return FileResponse(str(base / "index.html"), status_code=404)
+            return FileResponse(str(base / "index.html"), status_code=404, headers=no_cache_headers)
+        
         if file_path.is_file():
-            return FileResponse(str(file_path))
+            headers = no_cache_headers if file_path.suffix == ".html" else {}
+            return FileResponse(str(file_path), headers=headers)
+            
         # Extension-less URLs for prerendered SEO pages, e.g. /agentic-trading
         html_path = base / f"{full_path.strip('/')}.html"
         if full_path and html_path.is_file():
-            return FileResponse(str(html_path), media_type="text/html")
+            return FileResponse(str(html_path), media_type="text/html", headers=no_cache_headers)
+            
         status = 200 if full_path.split("/", 1)[0] in _SPA_ROUTES else 404
-        return FileResponse(str(base / "index.html"), status_code=status)
+        return FileResponse(str(base / "index.html"), status_code=status, headers=no_cache_headers)

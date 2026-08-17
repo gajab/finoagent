@@ -843,6 +843,18 @@ export async function runDeskReviewAgents(
   });
 }
 
+// Independent LLM second opinion on ONE trade — BLIND to our score/grade (un-anchored). Decision + cited
+// factor calls (no fuzzy rating) + the divergence vs the rule grade.
+export async function runDeskBlind(
+  ticker: string,
+  params: DeskReviewParams & { model?: string; focus?: DeskFocusTrade },
+): Promise<import('./types').BlindRead> {
+  return apiFetch<import('./types').BlindRead>(`/api/stock/${encodeURIComponent(ticker)}/desk-review/blind`, {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
 // Evaluate a user-entered multi-leg trade — returns the same DeskReviewResult shape as the
 // single-ticker scan (chrome + ranked=[the one trade]) so the UI renders it identically.
 export async function evaluateDeskTrade(ticker: string, params: DeskEvaluateParams): Promise<DeskReviewResult> {
@@ -1515,9 +1527,19 @@ export async function fetchBookTailRisk(quoteSource = 'yfinance'): Promise<BookT
   return apiFetch<BookTailRiskResult>(`/api/saved-strategies/book-tail-risk?quote_source=${encodeURIComponent(quoteSource)}`);
 }
 
+// LLM hedging strategy for the whole book — model is fed ONLY the computed numbers.
+export async function fetchBookHedgeAdvice(quoteSource = 'yfinance'): Promise<{ advice?: string; error?: string; data_sent?: any }> {
+  return apiFetch(`/api/saved-strategies/book-hedge-advice?quote_source=${encodeURIComponent(quoteSource)}`);
+}
+
 export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance', marginMode?: string): Promise<LivePnlResponse> {
   const mm = marginMode || (typeof localStorage !== 'undefined' && localStorage.getItem('margin.mode') === 'portfolio' ? 'portfolio' : 'reg_t');
   return apiFetch<LivePnlResponse>(`/api/saved-strategies/${id}/live-pnl?quote_source=${encodeURIComponent(quoteSource)}&margin_mode=${encodeURIComponent(mm)}`);
+}
+
+// Persist the last-refreshed P&L (trimmed) so My Trades shows last-known numbers on landing.
+export async function saveTradePnlSnapshot(id: number, snapshot: Record<string, any>): Promise<{ saved: boolean; last_pnl_at: string }> {
+  return apiFetch(`/api/saved-strategies/${id}/pnl-snapshot`, { method: 'PUT', body: JSON.stringify({ snapshot }) });
 }
 
 export async function fetchTradeAdvisor(id: number, pnlSnapshot: LivePnlResponse, userQuestion?: string): Promise<{ content: string; model: string }> {

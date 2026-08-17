@@ -768,6 +768,85 @@ async def book_tail_risk(
     return await compute_book_tail_risk(strategies, quote_source, user, db)
 
 
+@router.get("/book-hedge-advice")
+async def book_hedge_advice(
+    quote_source: str = "yfinance",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """LLM hedging strategy for the WHOLE book. The model is fed ONLY the pre-computed
+    numbers (greeks, β, CVaR, full-reprice stress P&Ls, the ranked hedge menu with each
+    candidate's cost / CVaR-cut / CAGR, concentration, assignment capital) — NO opinions,
+    NO verdict text — and is explicitly told to do NO arithmetic, only reason over the data."""
+    from ..services.book_tail_risk import compute_book_tail_risk
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))
+    strategies = list(result.scalars().all())
+    if not strategies:
+        return {"error": "No active trades to analyze."}
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        return {"error": "OpenAI API key not configured. Add it in Settings."}
+
+    d = await compute_book_tail_risk(strategies, quote_source, user, db)
+    if d.get("error"):
+        return {"error": d["error"]}
+
+    def _pick(obj, keys):
+        return {k: obj.get(k) for k in keys if obj.get(k) is not None}
+
+    # DATA-ONLY payload — strip every opinion (verdict prose, assumptions text, hedge_note).
+    book_data = {
+        "positions": d.get("positions"),
+        "net_greeks": _pick(d, ("net_delta", "net_gamma", "net_vega", "net_theta")),
+        "beta_weighted_delta_spy_shares": d.get("beta_delta_spy"),
+        "beta_delta_notional_usd": d.get("beta_delta_notional"),
+        "avg_beta": d.get("avg_beta"),
+        "short_vol": d.get("short_vol"),
+        "book_capital_usd": d.get("book_capital"),
+        "annual_income_usd": d.get("annual_income"),
+        "theta_pct_of_capital_per_day": d.get("theta_net_liq_pct"),
+        "carry_yield_pct_annual": d.get("carry_yield_pct"),
+        "risk_horizon": d.get("horizon"),
+        "var_95_usd": d.get("var_95"), "cvar_95_usd": d.get("cvar_95"),
+        "var_99_usd": d.get("var_99"), "cvar_99_usd": d.get("cvar_99"),
+        "cvar_95_pct_of_capital": d.get("cvar_capital_pct"),
+        "market_vol_pct": (d.get("assumptions") or {}).get("mkt_vol_pct"),
+        "stress_scenarios_full_reprice": [
+            _pick(s, ("label", "move_pct", "pnl", "pct_of_capital")) for s in (d.get("crash_scenarios") or [])],
+        "concentration_by_underlying": [
+            _pick(c, ("ticker", "beta", "trades", "short_legs", "gamma_share_pct", "laddered")) for c in (d.get("concentration") or [])],
+        "naked_assignment_capital": d.get("naked_assignment"),
+        "hedge_menu": [
+            _pick(h, ("label", "instrument", "kind", "long_strike", "short_strike", "contracts",
+                      "annual_bleed", "offsets_pct", "cvar_reduction", "efficiency", "cagr_lift_pct",
+                      "cost_effective", "sleeve_capital", "dte_days"))
+            for h in (d.get("hedge_menu") or [])],
+    }
+
+    system = (
+        "You are an institutional derivatives risk manager advising a retail client on hedging a "
+        "premium-selling (short-vol) option book. You are given a JSON where EVERY number is ALREADY "
+        "COMPUTED. Do NOT perform ANY arithmetic, do NOT recompute, do NOT invent numbers — reason "
+        "ONLY over the values provided and cite them. Recommend the single best hedge (or a small "
+        "combination) for the WHOLE book to cut its tail risk cost-effectively. Ground your pick in the "
+        "hedge_menu candidates using their cvar_reduction, annual_bleed (cost), efficiency, and "
+        "cagr_lift_pct; note the net beta-weighted delta direction, that short-vol loses on a big move "
+        "EITHER way (see stress_scenarios both signs), and any concentration. Be concrete and concise: "
+        "a 2-3 sentence rationale then up to 4 bullet actions naming specific hedge_menu rows. No preamble."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "BOOK RISK DATA (all figures pre-computed):\n" + json.dumps(book_data, default=str)},
+    ]
+    try:
+        advice = await call_llm(api_key=api_key, model="gpt-4o", messages=messages,
+                                max_tokens=600, temperature=0.3)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"LLM call failed: {exc}"}
+    return {"advice": advice, "data_sent": book_data}
+
+
 @router.post("/manual-trade", response_model=SavedStrategyOut, status_code=201)
 async def create_manual_trade(
     body: ManualTradeIn,
@@ -1419,6 +1498,39 @@ def build_payoff(
         "expected_value": expected_value,
         "kelly_fraction": kelly_fraction,
     }
+
+
+class PnlSnapshotIn(BaseModel):
+    snapshot: dict
+
+
+@router.put("/{strategy_id}/pnl-snapshot")
+async def save_pnl_snapshot(
+    strategy_id: int,
+    body: PnlSnapshotIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Persist the last-refreshed P&L snapshot (trimmed, from the frontend) so My Trades can
+    show the last-known numbers on landing — before any refresh. Stored in the JSON
+    `parameters` column (`last_pnl` + `last_pnl_at`); no schema migration needed."""
+    import datetime as dt
+    result = await db.execute(
+        select(SavedStrategy).where(SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id)
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    try:
+        params = json.loads(strategy.parameters) if strategy.parameters else {}
+    except (json.JSONDecodeError, TypeError):
+        params = {}
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    params["last_pnl"] = body.snapshot
+    params["last_pnl_at"] = now_iso
+    strategy.parameters = json.dumps(params, default=str)
+    await db.commit()
+    return {"saved": True, "last_pnl_at": now_iso}
 
 
 @router.get("/{strategy_id}/live-pnl")
