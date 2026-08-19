@@ -837,7 +837,7 @@ def _best_credit_spread(structure: str, label: str, short_q: OptionQuote,
 def _short_strangle(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
                     atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
                     min_prob: float, min_income: float, european: bool, ticker: str,
-                    ta_levels: Optional[list[float]] = None) -> Optional[dict]:
+                    ta_levels: Optional[dict] = None, sig_frac: Optional[float] = None) -> Optional[dict]:
     """Neutral, UNDEFINED-RISK income: short OTM put + short OTM call (naked both wings). Income while
     the underlying stays between the shorts. Collects more premium than the iron condor in exchange for
     an open tail; sized by naked margin, not cash. P(keep) = P(in band). The iron condor is its
@@ -850,8 +850,8 @@ def _short_strangle(calls: dict, puts: dict, spot: float, dte: int, exp: str, rn
         return None
     tail = (1 - min_prob) / 2.0                       # split the breach budget both sides
     # TA-aware: bias each short toward the nearest support (put) / resistance (call) on the safe side.
-    kp_s = _snap_short_to_levels(put_strikes, rnd.strike_for_prob_below(tail), spot, "below", ta_levels)
-    kc_s = _snap_short_to_levels(call_strikes, rnd.strike_for_prob_below(1 - tail), spot, "above", ta_levels)
+    kp_s = _snap_short_to_levels(put_strikes, rnd.strike_for_prob_below(tail), spot, "below", ta_levels, sig_frac)
+    kc_s = _snap_short_to_levels(call_strikes, rnd.strike_for_prob_below(1 - tail), spot, "above", ta_levels, sig_frac)
     if not kp_s or not kc_s or kp_s not in puts or kc_s not in calls:
         return None
     if not all(_executable(q)[0] for q in (puts[kp_s], calls[kc_s])):
@@ -988,7 +988,7 @@ def _pick_wing(qmap: dict, short_strike: float, side: str) -> Optional[float]:
 def _iron_condor(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
                  atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
                  min_prob: float, min_income: float, european: bool, ticker: str,
-                 ta_levels: Optional[list[float]] = None) -> Optional[dict]:
+                 ta_levels: Optional[dict] = None, sig_frac: Optional[float] = None) -> Optional[dict]:
     """Neutral, defined-risk both sides: short put spread + short call spread. Income if
     the underlying stays between the short strikes. P(keep) = P(in band)."""
     if rnd is None:
@@ -999,8 +999,8 @@ def _iron_condor(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
         return None
     tail = (1 - min_prob) / 2.0                       # split the breach budget both sides
     # TA-aware: bias each short toward the nearest support (put) / resistance (call) on the safe side.
-    kp_s = _snap_short_to_levels(put_strikes, rnd.strike_for_prob_below(tail), spot, "below", ta_levels)
-    kc_s = _snap_short_to_levels(call_strikes, rnd.strike_for_prob_below(1 - tail), spot, "above", ta_levels)
+    kp_s = _snap_short_to_levels(put_strikes, rnd.strike_for_prob_below(tail), spot, "below", ta_levels, sig_frac)
+    kc_s = _snap_short_to_levels(call_strikes, rnd.strike_for_prob_below(1 - tail), spot, "above", ta_levels, sig_frac)
     if not kp_s or not kc_s or kp_s not in puts or kc_s not in calls:
         return None
     kp_l = _pick_wing(puts, kp_s, "below")
@@ -1059,7 +1059,7 @@ def _iron_condor(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
 def _jade_lizard(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
                  atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
                  min_prob: float, min_income: float, european: bool, ticker: str,
-                 ta_levels: Optional[list[float]] = None) -> Optional[dict]:
+                 ta_levels: Optional[dict] = None, sig_frac: Optional[float] = None) -> Optional[dict]:
     """Short put + short call spread, sized so net credit ≥ call-spread width ⇒ NO upside
     risk. Downside is CSP-style (the short put). P(keep) = P(put not assigned)."""
     if rnd is None:
@@ -1068,7 +1068,7 @@ def _jade_lizard(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
     call_strikes = sorted(k for k in calls if k > spot)
     if not put_strikes or not call_strikes:
         return None
-    kp = _headline_put(rnd, put_strikes, spot, min_prob, ta_levels)   # CSP-style short put — TA-biased
+    kp = _headline_put(rnd, put_strikes, spot, min_prob, ta_levels, sig_frac)   # CSP-style short put — TA-biased
     if not kp or kp not in puts or not _executable(puts[kp])[0]:
         return None
     p_keep, method = _prob_keep(rnd, kp, "P", spot, dte, r, puts[kp].iv or atm_iv)
@@ -1735,16 +1735,17 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
                  european: bool, next_earnings: Optional[str], min_prob: float,
                  min_income: float, ticker: str, focus: Optional[dict] = None,
                  owns_underlying: bool = False,
-                 ta_levels: Optional[list[float]] = None) -> tuple[list[dict], dict]:
+                 ta_levels: Optional[dict] = None) -> tuple[list[dict], dict]:
     """All qualifying opportunities for one expiration + an expiry summary. ``owns_underlying`` = the user
     holds the shares → short calls are COVERED; otherwise they are NAKED (Reg-T margin). ``ta_levels`` =
-    structural price levels (S/R, value area, dealer gamma walls/flip) that bias multi-leg SHORT strikes
-    toward the nearest safe-side level (TA-aware selection); None on the plain (non-desk) scan path."""
+    {"levels": [S/R, value area, dealer gamma walls/flip], "atr_pct": daily ATR%} that biases multi-leg
+    SHORT strikes an ATR-sized buffer beyond a wall (TA-aware selection); None on the plain scan path."""
     calls, puts = _split_chain(chain)
     strikes_all = sorted(set(calls) | set(puts))
     rnd = _build_rnd(calls, puts, strikes_all, spot, dte)
     atm_iv = _atm_iv(rnd, calls, puts, spot)
     iv_hv_ratio, richness = _richness(atm_iv, hv)
+    sig_frac = _sigma_frac(atm_iv, hv, dte)              # 1σ move to expiry (max IV/HV · √T) — sizes the structural buffer
     quant = _quant_block(rnd, calls, puts, strikes_all, spot, dte, atm_iv)
 
     exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
@@ -1784,7 +1785,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     # ---- Short strangle — neutral, UNDEFINED-RISK income (naked put + call) ----
     if "short_strangle" in structures:
         o = _short_strangle(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
-                            richness, min_prob, min_income, european, ticker, ta_levels)
+                            richness, min_prob, min_income, european, ticker, ta_levels, sig_frac)
         if o:
             opps.append(o)
 
@@ -1792,7 +1793,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     # Scan candidate long wings and keep the most capital-efficient (best ROC) one
     # that still clears the premium floor — the narrowest spread is usually best.
     if "credit_spread" in structures:
-        kp_short = _headline_put(rnd, put_strikes, spot, min_prob, ta_levels)
+        kp_short = _headline_put(rnd, put_strikes, spot, min_prob, ta_levels, sig_frac)
         if kp_short in puts:
             longs = sorted((puts[k] for k in puts if k < kp_short),
                            key=lambda q: kp_short - q.strike)[:25]
@@ -1803,7 +1804,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
                                     min_income=min_income, ticker=ticker)
             if o:
                 opps.append(o)
-        kc_short = _headline_call(rnd, call_strikes, spot, min_prob, ta_levels)
+        kc_short = _headline_call(rnd, call_strikes, spot, min_prob, ta_levels, sig_frac)
         if kc_short in calls:
             longs = sorted((calls[k] for k in calls if k > kc_short),
                            key=lambda q: q.strike - kc_short)[:25]
@@ -1818,14 +1819,14 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     # ---- Iron Condor (neutral, defined risk both sides) ----
     if "iron_condor" in structures:
         o = _iron_condor(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
-                         richness, min_prob, min_income, european, ticker, ta_levels)
+                         richness, min_prob, min_income, european, ticker, ta_levels, sig_frac)
         if o:
             opps.append(o)
 
     # ---- Jade Lizard (short put + call spread, no upside risk) ----
     if "jade_lizard" in structures:
         o = _jade_lizard(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
-                         richness, min_prob, min_income, european, ticker, ta_levels)
+                         richness, min_prob, min_income, european, ticker, ta_levels, sig_frac)
         if o:
             opps.append(o)
 
@@ -1866,47 +1867,82 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
 
 
 _SNAP_BAND_PCT = 0.05    # a structural level within 5% of the RND-target strike may bias it (a bounded shift)
+# Defense-zone sizing — how much room must separate a structural WALL from the SHORT strike. Sized in ATR
+# (volatility-adjusted, the way vol desks size structural zones) AT THE WALL PRICE — the battleground level —
+# NOT off spot: a wall far from spot must be judged by ITS OWN local volatility, not where the stock trades now.
+# --- Structural BUFFER: place the strike this far BEYOND a wall (cushion so a normal wall-test doesn't breach
+#     it), sized off the 1σ EXPECTED MOVE to expiry AT THE WALL — em = wall · max(IV,HV)·√(DTE/365): volatility-
+#     adjusted, forward-looking & EVENT-AWARE (IV widens σ before earnings), horizon-scaled = the Q/P boundary.
+#     There is deliberately NO 'reach ceiling' — a FAR wall still defends when you sell BEHIND it. A strike with
+#     NO wall between it and spot is judged UNDEFENDED by the Structure factor (penalised), never silently ignored.
+_BUF_SIGMA_STRONG = 0.20   # 0.20σ beyond a STRONG wall (dealer gamma wall / high-volume node — it holds, sell close)
+_BUF_SIGMA_STD    = 0.30   # 0.30σ beyond a STANDARD wall (pivot S/R, value-area edge, gamma flip — more cushion)
+_STRONG_WALLS = {"gamma put-wall", "gamma call-wall", "high-volume level"}   # (all others = standard)
+_STRUCT_FB_BUF_PCT = 0.010   # no-vol fallback: buffer as a % OF THE WALL price (still wall-anchored)
+
+
+def _sigma_frac(iv: Optional[float], hv: Optional[float], dte: Optional[int]) -> Optional[float]:
+    """1σ expected move TO EXPIRY as a FRACTION of price = max(implied, realized vol)·√(DTE/365) — the desk's
+    dual Q/P boundary. Event-aware (IV lifts σ before earnings) + horizon-scaled. iv/hv are DECIMALS."""
+    vol = max(iv or 0.0, hv or 0.0)
+    return vol * math.sqrt(max(int(dte or 30), 1) / 365.0) if vol > 0 else None
+
+
+def _wall_buffer(wall: float, sig_frac: Optional[float], strong: bool = False) -> float:
+    """The cushion ($) a short strike should sit BEYOND a wall — a fraction of the 1σ expected move to expiry
+    AT THE WALL (em = wall·sig_frac): 0.20σ for a STRONG wall (holds → sell close), 0.30σ for a standard one.
+    Event-aware + horizon-scaled; %-of-wall fallback when the expected move is unavailable."""
+    if sig_frac and sig_frac > 0:
+        return (_BUF_SIGMA_STRONG if strong else _BUF_SIGMA_STD) * wall * sig_frac
+    return _STRUCT_FB_BUF_PCT * wall
 
 
 def _snap_short_to_levels(strikes: list[float], target: float, spot: float, side: str,
-                          ta_levels: Optional[list[float]]) -> float:
-    """Bias a multi-leg SHORT strike toward the nearest strong STRUCTURAL level on its SAFE side, without
-    ever reducing safety below the RND-probability target. ``side`` = 'below' (short put → align to a
-    support and sit just below it) / 'above' (short call → align to a resistance and sit just above it).
-    ``ta_levels`` = classical support/resistance + volume-profile value-area edges + dealer gamma walls /
-    flip. Fires only when a qualifying level sits within ``_SNAP_BAND_PCT`` of the target AND at least as
-    far OTM (so keep-probability can only rise, never drop below the user's min_prob); else returns the
-    plain RND-target strike. Selection-time twin of the desk's 'Structure' score factor (same placement)."""
+                          ta_levels: Optional[dict], sig_frac: Optional[float] = None) -> float:
+    """Place a multi-leg SHORT strike a VOLATILITY-SIZED BUFFER beyond the nearest structural wall — a short
+    put a buffer BELOW a support, a short call a buffer ABOVE a resistance — so breaking the wall doesn't
+    breach the strike at once. The buffer is a fraction of the 1σ expected move to expiry AT THE WALL (0.20σ
+    for a STRONG wall = gamma wall / high-volume node, 0.30σ for a standard pivot/value-area/flip — see
+    `_defense_zone`), so it scales with vol, widens before earnings (IV), and horizon-scales. ``ta_levels`` =
+    {"named": [(name, price)], ...}. Safe-side only: the strike stays ≥ as far OTM as the RND target."""
     base = _nearest_strike(strikes, target, side)
     if not base or spot <= 0 or not ta_levels:
         return base
-    if side == "below":                                  # short put → a SUPPORT (below spot) at/below target
-        cands = [L for L in ta_levels if L and L < spot and L <= target and (target - L) / spot <= _SNAP_BAND_PCT]
-        if not cands:
-            return base
-        return _nearest_strike(strikes, max(cands), "below") or base   # sit JUST BELOW the nearest support
-    cands = [L for L in ta_levels if L and L > spot and L >= target and (L - target) / spot <= _SNAP_BAND_PCT]
-    if not cands:                                        # short call → a RESISTANCE (above spot) at/above target
+    named = ta_levels.get("named") or []
+    band = _SNAP_BAND_PCT * spot
+    below = side == "below"
+    best = None
+    for nm, L in named:
+        if not L or (L >= spot if below else L <= spot):   # wall must sit BETWEEN spot and the strike's side
+            continue
+        buf = _wall_buffer(L, sig_frac, nm in _STRONG_WALLS)
+        strike_at = (L - buf) if below else (L + buf)      # a buffer beyond the wall
+        safe = (strike_at <= target) if below else (strike_at >= target)   # never less safe than the RND target
+        if safe and abs(target - strike_at) <= band:
+            better = best is None or (L > best[1] if below else L < best[1])   # wall nearest spot = richest safe strike
+            if better:
+                best = (strike_at, L)
+    if not best:
         return base
-    return _nearest_strike(strikes, min(cands), "above") or base       # sit JUST ABOVE the nearest resistance
+    return _nearest_strike(strikes, best[0], "below" if below else "above") or base
 
 
 def _headline_call(rnd, call_strikes: list[float], spot: float, min_prob: float,
-                   ta_levels: Optional[list[float]] = None) -> Optional[float]:
+                   ta_levels: Optional[dict] = None, sig_frac: Optional[float] = None) -> Optional[float]:
     """The 85%-safe call strike: read off the RND inverse, snapped up to a listed strike — then biased
     toward a nearby resistance / call-wall on the safe side (TA-aware selection)."""
     if not call_strikes:
         return None
     target = rnd.strike_for_prob_below(min_prob) if rnd is not None else spot * (1 + 0.08)
-    return _snap_short_to_levels(call_strikes, max(target, spot), spot, "above", ta_levels)
+    return _snap_short_to_levels(call_strikes, max(target, spot), spot, "above", ta_levels, sig_frac)
 
 
 def _headline_put(rnd, put_strikes: list[float], spot: float, min_prob: float,
-                  ta_levels: Optional[list[float]] = None) -> Optional[float]:
+                  ta_levels: Optional[dict] = None, sig_frac: Optional[float] = None) -> Optional[float]:
     if not put_strikes:
         return None
     target = rnd.strike_for_prob_below(1 - min_prob) if rnd is not None else spot * (1 - 0.08)
-    return _snap_short_to_levels(put_strikes, min(target, spot), spot, "below", ta_levels)
+    return _snap_short_to_levels(put_strikes, min(target, spot), spot, "below", ta_levels, sig_frac)
 
 
 # ---------------------------------------------------------------------------
@@ -1925,15 +1961,15 @@ async def run_derivative_income(
     target_expiration: Optional[str] = None,
     focus: Optional[dict] = None,
     owns_underlying: bool = False,
-    ta_levels: Optional[list[float]] = None,
+    ta_levels: Optional[dict] = None,
 ) -> dict:
     """Deep-scan one underlying for income opportunities (≥``min_prob`` no-assignment,
     ≥``min_income`` premium), ranked by annualized yield vs SOFR.
 
     ``focus`` = {structure, expiration, legs:[{strike, right, action}]} injects the
     caller's EXACT placed trade as a candidate (filters off) — for lifecycle scoring.
-    ``ta_levels`` = structural price levels (S/R, value area, dealer gamma walls/flip) supplied by the
-    desk so multi-leg SHORT strikes bias toward the nearest safe-side level (TA-aware selection); the
+    ``ta_levels`` = {"levels": [S/R, value area, dealer gamma walls/flip], "atr_pct": daily ATR%} supplied
+    by the desk so multi-leg SHORT strikes sit an ATR-sized buffer beyond a wall (TA-aware selection); the
     plain single-scan / portfolio callers pass None → unchanged RND-probability strikes."""
     ticker = _norm_ticker(ticker)
     structures = structures or ["covered_call", "cash_secured_put", "short_strangle",
@@ -1945,7 +1981,7 @@ async def run_derivative_income(
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
                  f"{'own' if owns_underlying else 'naked'}:"
-                 f"{'snap' if ta_levels else 'plain'}:v3")   # owns → covered call · else naked-call BPR;
+                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v3")   # owns → covered call · else naked-call BPR;
                  #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:

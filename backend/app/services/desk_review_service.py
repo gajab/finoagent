@@ -28,6 +28,7 @@ from .lifecycle_service import compute_pretrade_metrics, terminal_payoff_curve, 
 from .llm_service import call_llm
 from .derivative_income_service import (
     run_derivative_income, _norm_ticker, _macro_events_in_window, _reports_earnings,
+    _wall_buffer, _sigma_frac, _STRONG_WALLS, _BUF_SIGMA_STRONG, _BUF_SIGMA_STD,
 )
 
 if TYPE_CHECKING:
@@ -46,6 +47,12 @@ _MATERIAL_FAIL_BPS = -75
 _SKEW_ELEVATED_BPS = 700
 _SKEW_EXTREME_BPS = 1500          # short-strike IV ≥ 15 vol-pts over ATM → EXTREME (double-edged; the market may price a known tail)
 _SKEW_RICH_BPS = 300             # ≥ 3 vol-pts over ATM → a RICH wing worth harvesting (you're paid extra for the skew)
+# The Structure factor: is the short strike DEFENDED (behind a wall, with a σ-sized cushion from `_wall_buffer`)
+# or UNDEFENDED (open air to spot)? ALWAYS emitted (+/0/−) so every trade shows its structural situation.
+_STRUCT_PEAK_STRONG = 4.0        # max Structure credit — strike a full buffer behind a STRONG wall (gamma wall / HVL)
+_STRUCT_PEAK_STD = 3.0           # …a standard wall (pivot S/R, value-area edge, gamma flip)
+_STRUCT_UNDEF_PENALTY = 4.0      # max penalty for an UNDEFENDED (open-air) strike, at-the-money; fades to 0 by…
+_UNDEFENDED_SAFE_SIGMA = 1.5     # …≥1.5σ from spot — with no wall, probability alone defends it (Structure = 0)
 
 # Volatility Risk Premium (implied ÷ realized). ≥1 is favourable (implied over-priced = a seller's edge).
 # Below 1 = negative VRP: penalise IN PROPORTION to the gap, and HARD-BLOCK past the ratio floor — that is
@@ -183,7 +190,7 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
 
 
 def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
-                  spot: Optional[float] = None) -> tuple[float, str, list]:
+                  spot: Optional[float] = None, hv: Optional[float] = None) -> tuple[float, str, list]:
     """Does this trade fit the regime / smart-money structure? Evaluated on the MEDIUM-TERM read
     (6-month history, DAILY bars) — the swing horizon that governs a multi-week income option, not
     intraday noise or multi-year lag. Returns (score_bonus ±, note, factors) where `factors` is the
@@ -223,41 +230,61 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
         _va = f", value area ${round(vp['val'], 1)}–${round(vp['vah'], 1)}" if vp.get("val") and vp.get("vah") else ""
         _poc = f"POC ${round(vp['poc'], 1)}" if vp.get("poc") else "range-bound tape"
         add("Range fit", 5, f"{_poc}{_va} — neutral premium suits the range")
-    # Short strike protected by a value-area edge on the safe side.
+    # STRUCTURE — is the short strike behind a WALL (defended) or in OPEN AIR (undefended)? Walls = classical
+    # S/R + value-area edges + dealer gamma walls/flip/HVL. DEFENDED (a wall between the strike and spot, with a
+    # σ-sized cushion beyond it) → +; UNDEFENDED (no wall to spot) → naked premium, PENALISED unless the strike
+    # is ≥ _UNDEFENDED_SAFE_SIGMA from spot (probability alone then defends it → 0). NO 'reach ceiling' — a FAR
+    # wall still counts when you sell BEHIND it. ALWAYS emitted (+/0/−) so every trade shows its structure.
     ss = opp.get("short_strike")
-    if ss and vp.get("val") and vp.get("vah"):
-        _va = f"value area ${round(vp['val'], 1)}–${round(vp['vah'], 1)}"
-        if s in _BULLISH_INCOME and ss <= vp["val"]:
-            add("Value area", 3, f"short strike ${round(ss, 1)} below the value-area low ${round(vp['val'], 1)} ({_va})")
-        elif s in _BEARISH_INCOME and ss >= vp["vah"]:
-            add("Value area", 3, f"short strike ${round(ss, 1)} above the value-area high ${round(vp['vah'], 1)} ({_va})")
-    # Short strike DEFENDED by a strong structural level on the safe side — the pro "sell BEYOND the level"
-    # placement: price must break the level before it can reach your strike. Levels = classical S/R + dealer
-    # gamma walls / flip (Put-Support, Call-Resistance, gamma flip, HVL); value-area edges are scored above,
-    # so they're excluded here to avoid double-counting the same price. Scaled by how CLOSE the defending
-    # level sits to the strike (a level right at the strike is the operative defense; far off = weaker).
     put_short = opp.get("put_short") or (ss if s in ("cash_secured_put", "put_credit_spread") else None)
     call_short = opp.get("call_short") or (ss if s in ("covered_call", "call_credit_spread") else None)
-    named_levels = [(nm, float(v)) for nm, v in (           # (human name, price) — so the note NAMES the level
+    named_all = [(nm, float(v)) for nm, v in (
         ("support", (ta or {}).get("supportLevel")), ("resistance", (ta or {}).get("resistanceLevel")),
+        ("value-area low", vp.get("val")), ("value-area high", vp.get("vah")),
         ("gamma put-wall", (gex or {}).get("put_support")), ("gamma call-wall", (gex or {}).get("call_resistance")),
         ("gamma flip", (gex or {}).get("flip_level")), ("high-volume level", (gex or {}).get("hvl")),
     ) if v and float(v) > 0]
+    sig_frac = _sigma_frac((opp.get("atm_iv_pct") or 0.0) / 100.0, hv, opp.get("dte"))   # 1σ move to expiry (event-aware)
     struct_pts, struct_notes = 0.0, []
-    if put_short and spot:                               # a level ABOVE the put & below spot must break first
-        defs = [(nm, L) for nm, L in named_levels if put_short <= L < spot]
-        if defs:
-            nm, lvl = min(defs, key=lambda t: t[1])      # nearest defending level above the strike
-            prox = 1.0 - min((lvl - put_short) / max(spot - put_short, 1e-6), 1.0)   # 1 = level right at the strike
-            struct_pts += round(2 + 2 * prox, 1); struct_notes.append(f"short put ${round(put_short, 1)} sits below {nm} ${round(lvl, 1)}")
-    if call_short and spot:                              # a level BELOW the call & above spot must break first
-        defs = [(nm, L) for nm, L in named_levels if spot < L <= call_short]
-        if defs:
-            nm, lvl = max(defs, key=lambda t: t[1])      # nearest defending level below the strike
-            prox = 1.0 - min((call_short - lvl) / max(call_short - spot, 1e-6), 1.0)
-            struct_pts += round(2 + 2 * prox, 1); struct_notes.append(f"short call ${round(call_short, 1)} sits above {nm} ${round(lvl, 1)}")
-    if struct_pts:   # ONE combined factor (both wings of a neutral structure sum here), capped so it can't dominate
-        add("Structure", round(min(struct_pts, 6.0), 1), "; ".join(struct_notes) + " — the level must break before the strike is threatened")
+    for short_k, is_put in ((put_short, True), (call_short, False)):
+        if not (short_k and spot and short_k > 0):
+            continue
+        leg, verb = ("put", "below") if is_put else ("call", "above")
+        em = (spot * sig_frac) if (sig_frac and sig_frac > 0) else None      # 1σ expected move to expiry ($)
+        defenders = [(nm, L) for nm, L in named_all
+                     if ((short_k < L < spot) if is_put else (spot < L < short_k))]   # walls BETWEEN strike & spot
+        if defenders:
+            strong_defs = [(nm, L) for nm, L in defenders if nm in _STRONG_WALLS]
+            nm, L = min(strong_defs or defenders, key=lambda t: abs(t[1] - short_k))   # nearest STRONG wall, else nearest
+            strong = nm in _STRONG_WALLS
+            gap = abs(L - short_k)
+            buf = _wall_buffer(L, sig_frac, strong)          # σ-sized cushion the strike wants beyond the wall
+            peak = _STRUCT_PEAK_STRONG if strong else _STRUCT_PEAK_STD
+            credit = peak * min(gap / buf, 1.0) if buf > 0 else peak    # ~0 AT the wall → full peak once the cushion is met
+            struct_pts += round(credit, 1)
+            _g = f"{round(gap / em, 2)}σ (${round(gap, 1)})" if em else f"${round(gap, 1)}"
+            _emn = f"1σ move ${round(em, 1)}; " if em else ""
+            _bσ = _BUF_SIGMA_STRONG if strong else _BUF_SIGMA_STD
+            _cush = "cushion met" if gap >= buf else "THIN — strike is right at the wall"
+            struct_notes.append(f"{leg} ${round(short_k, 1)} DEFENDED — {_g} {verb} the {'strong ' if strong else ''}"
+                                f"{nm} ${round(L, 1)} ({_emn}a {'strong' if strong else 'standard'} wall wants a "
+                                f"{_bσ}σ/${round(buf, 1)} buffer, {_cush})")
+        else:
+            sig_spot = (abs(spot - short_k) / em) if em else None           # distance from spot in σ (expected moves)
+            if sig_spot is None or sig_spot >= _UNDEFENDED_SAFE_SIGMA:
+                _sd = f"{round(sig_spot, 2)}σ ≥ {_UNDEFENDED_SAFE_SIGMA}σ from spot" if sig_spot is not None else "distance n/a"
+                struct_notes.append(f"{leg} ${round(short_k, 1)} UNDEFENDED (no wall to spot ${round(spot, 1)}) but "
+                                    f"{_sd} — probability alone defends it")
+            else:
+                pen = _STRUCT_UNDEF_PENALTY * (_UNDEFENDED_SAFE_SIGMA - sig_spot) / _UNDEFENDED_SAFE_SIGMA
+                struct_pts -= round(pen, 1)
+                struct_notes.append(f"{leg} ${round(short_k, 1)} UNDEFENDED — no wall between spot ${round(spot, 1)} and the "
+                                    f"strike, only {round(sig_spot, 2)}σ out (< {_UNDEFENDED_SAFE_SIGMA}σ) → naked premium in open air")
+    if put_short or call_short:   # ALWAYS emit (even 0) so every trade shows its structural situation
+        add("Structure", round(max(-6.0, min(struct_pts, 6.0)), 1),
+            ("; ".join(struct_notes) if struct_notes else "no short leg to place against structure")
+            + f" · buffer & 1σ are the event-aware expected move (max IV/HV·√T at the wall); with no wall, a strike "
+            f"needs ≥{_UNDEFENDED_SAFE_SIGMA}σ from spot to lean on probability instead of structure")
     # LVN slip-through — a short strike in a thin volume node has no absorption (Phase-3 friction test).
     lvn = _lvn_check(opp, vp, spot)
     if lvn:
@@ -415,27 +442,26 @@ def _gex_sync(ticker: str) -> dict:
         return {}
 
 
-def _structural_levels(ta: dict, gex: dict) -> list[float]:
-    """Flatten the technical read into absolute price levels the scan biases multi-leg SHORT strikes
-    toward: classical support/resistance, the volume-profile value-area edges (VAL/VAH), and the dealer
-    gamma walls / flip (Put-Support, Call-Resistance, gamma flip, HVL). The snap picks the nearest level
-    on each leg's SAFE side — no spot split here (the builder classifies by side at its own spot)."""
+def _structural_levels(ta: dict, gex: dict) -> dict:
+    """The structural walls the scan biases multi-leg SHORT strikes toward, each as (name, price) so the snap
+    can tell a STRONG wall (dealer gamma wall / high-volume node → sell closer, it holds) from a standard
+    pivot / value-area edge / gamma flip. Returns {"named": [(name, price)]}."""
     inst = (ta or {}).get("institutional") or {}
     vp = inst.get("volume_profile") or {}
     raw = [
-        (ta or {}).get("supportLevel"), (ta or {}).get("resistanceLevel"),
-        vp.get("val"), vp.get("vah"),
-        (gex or {}).get("put_support"), (gex or {}).get("call_resistance"),
-        (gex or {}).get("flip_level"), (gex or {}).get("hvl"),
+        ("support", (ta or {}).get("supportLevel")), ("resistance", (ta or {}).get("resistanceLevel")),
+        ("value-area low", vp.get("val")), ("value-area high", vp.get("vah")),
+        ("gamma put-wall", (gex or {}).get("put_support")), ("gamma call-wall", (gex or {}).get("call_resistance")),
+        ("gamma flip", (gex or {}).get("flip_level")), ("high-volume level", (gex or {}).get("hvl")),
     ]
-    out: list[float] = []
-    for x in raw:
+    named: list = []
+    for nm, x in raw:
         try:
             if x is not None and float(x) > 0:
-                out.append(float(x))
+                named.append((nm, float(x)))
         except (TypeError, ValueError):
             pass
-    return out
+    return {"named": named}
 
 
 def _ta_summary(ta: dict) -> dict:
@@ -1948,6 +1974,26 @@ def _collapse_adjacent_strikes(ranked: list[dict], spot: float, band_abs: float,
     return reps
 
 
+# Maps each option-math factor BAR to the merit/demerit line(s) that produced it, by distinctive substrings,
+# so every bar can carry its own inline evidence (symmetry with the TA-factor bars) instead of only the ± list.
+_ADJ_MATCH: dict[str, tuple] = {   # distinctive substrings — chosen so each merit/demerit maps to exactly ONE bar
+    "Expectation":     ("in expectation", "risk-neutral edge"),
+    "VRP":             ("iv/hv", "iv/har", "rich vrp", "negative vrp", "cheap vs", "crushed vol"),
+    "Moneyness":       ("near-atm", "atm short leg", "thin cushion", "deep cushion", "full-credit prob", "directional"),
+    "Skew / IV-edge":  ("wing", "skew"),
+    "Liquidity":       ("spread",),
+    "Beta":            ("beta", "overlay on held"),
+    "Earnings timing": ("earnings", "iv-crush", "vega-ramp", "clean window", "post-event", "harvest"),
+}
+
+
+def _adj_detail(label: str, notes: list[str]) -> Optional[str]:
+    """The merit/demerit evidence behind one option-math bar (joined), matched by keyword; None if none."""
+    kws = _ADJ_MATCH.get(label, ())
+    hits = [n for n in notes if any(k in n.lower() for k in kws)]
+    return "; ".join(hits) if hits else None
+
+
 async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quote_source: str,
                          owns_underlying: bool, user: Optional["User"], db: Optional["AsyncSession"],
                          target_dte: Optional[int] = None, collapse_strikes: bool = False,
@@ -1995,7 +2041,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         base = (dm.get("quant") or {}).get("score")
         if base is None:
             base = (opp.get("confidence") or {}).get("score") or 50
-        bonus, note, ta_factors = _ta_alignment(opp, ta, gex, spot)
+        bonus, note, ta_factors = _ta_alignment(opp, ta, gex, spot, hv=hv)
         # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
         g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
@@ -2009,14 +2055,12 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         # factors are their OWN group (ta_factors), kept separate from the option-math adjustments:
         #   desk_score = base_quality + Σ(grade_adjustments) + Σ(ta_factors).
         c = g["components"]
+        _notes = (g["merits"] or []) + (g["demerits"] or [])   # attach each bar's own evidence line (symmetry w/ TA)
         grade_adjustments = [
-            {"label": "Expectation", "points": round(c["expectation"], 1)},
-            {"label": "VRP",         "points": round(c["vrp"], 1)},
-            {"label": "Moneyness",   "points": round(c["moneyness"], 1)},
-            {"label": "Skew / IV-edge", "points": round(c["skew"], 1)},
-            {"label": "Liquidity",   "points": round(c["liquidity"], 1)},
-            {"label": "Beta",        "points": round(c["beta"], 1)},
-            {"label": "Earnings timing", "points": round(c.get("event", 0.0), 1)},
+            {"label": lbl, "points": round(c[key], 1), "detail": _adj_detail(lbl, _notes)}
+            for lbl, key in (("Expectation", "expectation"), ("VRP", "vrp"), ("Moneyness", "moneyness"),
+                             ("Skew / IV-edge", "skew"), ("Liquidity", "liquidity"), ("Beta", "beta"),
+                             ("Earnings timing", "event"))
         ]
         risk_triggers = _risk_triggers(opp, spot, ta, phys_vol)   # WATCH→DEFEND→EXIT ladder (TA + geometry)
         ea_yield, ea_share = _event_adjusted_yield(opp, vsx, (ctx or {}).get("next_earnings"), date.today())

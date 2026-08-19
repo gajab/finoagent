@@ -250,6 +250,17 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
             {adjs.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
           </div>
           <GroupFoot label="Net adjustment" value={adjNet} signed />
+          {/* Per-bar EVIDENCE — each option-math factor carries its own reason inline (symmetry with TA). */}
+          {adjs.some(a => a.detail) && (
+            <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
+              {adjs.filter(a => a.detail).map((a, i) => (
+                <li key={i} className="flex gap-2 text-[11px] leading-snug">
+                  <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
+                  <span className="text-base-content/65"><b className="text-base-content/85">{a.label}</b> · {a.detail}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 
@@ -307,8 +318,9 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
         );
       })()}
 
-      {/* The detailed 'why' — option-math reasons, then the technical read. */}
-      {((t.grade_merits && t.grade_merits.length > 0) || (t.grade_demerits && t.grade_demerits.length > 0)) && (
+      {/* The detailed 'why' — FALLBACK only: the option-math bars now carry their evidence inline (above),
+          so this combined ± list shows only for payloads without per-bar detail. */}
+      {!adjs.some(a => a.detail) && ((t.grade_merits && t.grade_merits.length > 0) || (t.grade_demerits && t.grade_demerits.length > 0)) && (
         <ul className="text-[11px] space-y-0.5 mt-2.5">
           {(t.grade_merits || []).map((r, i) => <li key={`m${i}`} className="flex gap-1.5 text-success/80"><span className="opacity-50">+</span>{r}</li>)}
           {(t.grade_demerits || []).map((r, i) => <li key={`d${i}`} className="flex gap-1.5 text-warning/80"><span className="opacity-50">−</span>{r}</li>)}
