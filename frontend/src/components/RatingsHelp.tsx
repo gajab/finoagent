@@ -107,16 +107,82 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                   <i> Explore → Quant Analysis</i>):
                 </p>
                 <ul className="text-[12px] text-base-content/65 leading-snug mt-1.5 space-y-1">
-                  <li>➊ <b>Base quality</b> — read off one probability-weighted outcome curve:
-                    <span className="font-mono text-[11px]"> Edge · Win-prob · Sortino · Tail · Carry</span>.</li>
+                  <li>➊ <b>Base quality</b> — a <b>safe-income</b> read off one probability-weighted outcome curve
+                    (<span className="font-mono text-[11px]">Edge · Win-prob · Sortino · Tail · Carry</span>), anchored on
+                    what matters for premium selling: <b>Safety</b> (keep-probability) and <b>Income</b> (premium yield
+                    vs the cash hurdle) <b>dominate</b>; Omega, risk-adjusted return and the honest deep-tail (99% CVaR)
+                    are secondary checks. <span className="opacity-70">It rewards a <i>safe</i> trade that beats cash by a
+                    bit of alpha — not risk-neutral profit (fairly-priced income has ~0 of that; the seller's vol edge is
+                    the <b>VRP</b> factor below).</span></li>
                   <li>➋ <b>Option-math adjustments</b> (± on the base): <b>VRP</b>, <b>Moneyness</b> (how close the short
-                    strike sits), <b>Skew</b>, <b>Liquidity</b> and <b>Beta</b>.</li>
+                    strike sits), <b>Skew / IV-edge</b>, <b>Liquidity</b> and <b>Beta</b>.</li>
                   <li>➌ <b>TA factors</b> (± on the base) — the technical read on <b>6-month daily</b> bars, the swing
                     horizon that governs a multi-week option (see the chips below).</li>
                 </ul>
                 <p className="text-[12px] text-base-content/55 leading-snug mt-1.5">
                   <span className="font-mono text-[11px]">base + Σ adjustments + Σ TA</span>, clamped to 0–100 → the letter.
                   A genuinely broken trade (loses in expectation, or a blocking flag) is <b>vetoed</b>, not padded.
+                </p>
+              </div>
+
+              {/* Structure — walls, buffer, sigma */}
+              <div>
+                <SectionLabel>Structure — the wall behind your strike</SectionLabel>
+                <p className="text-[12px] text-base-content/65 leading-snug">
+                  A safe-income short strike should sit <b>behind a structural wall</b> — a level price must break
+                  before it can reach you. The <b>Structure</b> factor scores exactly this and is <b>always shown</b>
+                  (+, 0 or −), so every trade tells you its structural situation.
+                </p>
+                <ul className="text-[12px] text-base-content/65 leading-snug mt-1.5 space-y-1">
+                  <li><b>Walls</b> (any of): pivot <b>support / resistance</b>, the volume-profile <b>value-area</b> edges,
+                    the dealer <b>gamma put-wall / call-wall / flip</b>, and the <b>high-volume node</b>.</li>
+                  <li><b>Strong</b> walls = dealer gamma walls &amp; high-volume nodes — they hold, so you can sell closer.
+                    <b> Standard</b> = pivots, value-area edges, gamma flip.</li>
+                  <li><span className="text-success"><b>Defended</b></span> — a wall sits between the strike and spot →
+                    <b> +</b> (up to <b>+4</b> strong / <b>+3</b> standard, once the strike clears the buffer past the wall;
+                    ~0 if it's sitting right at the wall). A <b>far</b> wall still counts when you sell behind it — there's
+                    <b> no reach cap</b>.</li>
+                  <li><span className="text-error"><b>Undefended</b></span> — open air, no wall between strike and spot →
+                    <b> −</b> (naked premium), <i>unless</i> the strike is <b>≥ 1.5σ from spot</b>, where probability alone
+                    defends it (then <b>0</b>). The closer to spot, the bigger the penalty.</li>
+                </ul>
+                <p className="text-[12px] text-base-content/55 leading-snug mt-1.5">
+                  <b>Buffer</b> — how far the strike sits <i>beyond</i> a wall: <b>0.20σ</b> past a strong wall,
+                  <b> 0.30σ</b> past a standard one. <b>σ (1σ)</b> is the <b>event-aware expected move to expiry</b> at the
+                  wall = <span className="font-mono text-[11px]">price × max(IV,HV) × √(DTE/365)</span> — it scales with
+                  volatility and <b>widens before earnings</b> (IV lifts it). Premium is the go/no-go, never a reason to
+                  creep closer into open air.
+                </p>
+              </div>
+
+              {/* Breach risk — the touch probability */}
+              <div>
+                <SectionLabel>Breach risk — will it ever go ITM?</SectionLabel>
+                <p className="text-[12px] text-base-content/65 leading-snug">
+                  The worst outcome for premium income is the short going <b>ITM</b>. Note that's a <b>touch</b> event,
+                  not just an expiry state: a strike can <i>finish</i> OTM yet spend days ITM. So the desk scores the
+                  honest <b>P(touch)</b> — the chance the strike is breached at <b>any</b> point before expiry — which by
+                  the reflection principle is <b>≈ 2× the finish-ITM odds</b> (a "90%-keep" strike ≈ 20% breach).
+                </p>
+                <ul className="text-[12px] text-base-content/65 leading-snug mt-1.5 space-y-1">
+                  <li><b>Breach risk</b> — P(touch), computed <b>drift-aware</b> (a stock trending <i>toward</i> the strike
+                    is correctly more likely to reach it). ≤ 25% is the comfort zone; above it the strike is penalized,
+                    steering selection to <b>deeper, harder-to-reach</b> strikes.</li>
+                  <li><b>Fortified</b> — the strike is <i>both</i> deep (low touch) <i>and</i> behind a wall: structure and
+                    distance both have to fail. The lowest-breach placement.</li>
+                  <li><b>Calm tape / clean window</b> — a range-bound / mean-reverting regime (probes of the strike tend to
+                    revert rather than persist into assignment), and the σ itself is <b>event-aware</b>, so a window with
+                    <b> no earnings/events</b> keeps the breach cone narrow while an upcoming print widens it.</li>
+                  <li><b>Vol-expansion / Defensibility / Systemic beta</b> — path risks: a short-gamma tape can widen the
+                    breach cone; <b>Defensibility</b> rewards a strike you can roll <i>away-and-out for a credit</i> (a put
+                    down, a call up — defend for free) and docks near-expiry / debit-to-roll trades; <b>Systemic beta</b>
+                    docks a high-beta short leg when the <b>market moves against it</b> — a short <b>put</b> when the SPX is
+                    trending <b>down</b>, a short <b>call</b> when it's trending <b>up</b> — which the single-name touch
+                    prob can't see.</li>
+                </ul>
+                <p className="text-[12px] text-base-content/55 leading-snug mt-1.5">
+                  <b>Win %</b> is still the finish-OTM (keep-at-expiry) probability; <b>Breach risk</b> is the stricter
+                  "never goes ITM" read — the one that matters most for avoiding assignment.
                 </p>
               </div>
 
@@ -146,12 +212,14 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                 </Chip>
 
                 <Chip icon={<Sparkles className="w-4 h-4 text-secondary" />}
-                  title={<>Regime &amp; factor adjustments · 6-mo daily (± on base) — e.g. <span className="text-error">Regime fit −5</span>, <span className="text-error">Gamma regime</span></>}>
-                  Each signed bar is one factor's points added to (green) or taken off (red) the base score.
-                  <b> Regime fit</b> — does the structure suit the trend? (a bearish structure in a bullish regime scores −).
-                  <b> Value area</b> — is the short strike protected by the volume-profile edge? <b>Gamma regime</b> — the
-                  dealer-gamma chip above, applied to every trade. They're computed on <b>6-month daily</b> bars — long enough
-                  to catch the swing regime, short enough not to lag a multi-week trade.
+                  title={<>TA factors · 6-mo daily (± on base) — e.g. <span className="text-success">Trend drift +6</span>, <span className="text-error">Gamma regime −6</span></>}>
+                  Each signed bar is one technical factor's points on the base score, all computed on <b>6-month daily</b>
+                  bars (the swing horizon for a multi-week option). <b>Trend drift</b> — the annualized EMA-slope velocity:
+                  a tailwind (+) for the short side or a headwind (−). <b>Structure</b> — is the strike behind a wall
+                  (see the section above). <b>Gamma regime</b> — the dealer-gamma chip above, applied to every trade.
+                  <b> Range fit</b> — a range-bound tape suits neutral premium. <b>LVN slip</b> — a strike sitting in a thin
+                  volume node has no absorption (−). A <b>MACD acceleration</b> spike against the short side is a separate
+                  timing <b>veto</b>. (RSI &amp; Bollinger are shown for context but don't move the deterministic score.)
                 </Chip>
               </div>
 

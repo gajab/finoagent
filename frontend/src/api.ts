@@ -789,6 +789,33 @@ export async function runDeskMonitorAnalyze(ticker: string, trade: {
     { method: 'POST', body: JSON.stringify(trade) });
 }
 
+export type DerivativeIncomeWatchlistItem = {
+  ticker: string;
+  current_price: number | null;
+  today_pct: number | null;
+  week52_low: number | null;
+  week52_high: number | null;
+  atm_iv: number | null;
+  hv30: number | null;
+};
+
+export async function fetchDerivativeIncomeWatchlist(refresh = false): Promise<DerivativeIncomeWatchlistItem[]> {
+  return apiFetch(`/api/stock/strategies/derivative-income/watchlist?refresh=${refresh}`);
+}
+
+export async function addDerivativeIncomeWatchlist(ticker: string): Promise<void> {
+  return apiFetch(`/api/stock/strategies/derivative-income/watchlist`, {
+    method: 'POST',
+    body: JSON.stringify({ ticker }),
+  });
+}
+
+export async function deleteDerivativeIncomeWatchlist(ticker: string): Promise<void> {
+  return apiFetch(`/api/stock/strategies/derivative-income/watchlist/${encodeURIComponent(ticker)}`, {
+    method: 'DELETE',
+  });
+}
+
 export async function runDerivativeIncomePortfolio(params: {
   offset?: number;
   limit?: number;

@@ -143,6 +143,58 @@ _DI_DEFAULT_STRUCTURES = ["covered_call", "cash_secured_put", "collar", "credit_
                           "iron_condor", "jade_lizard", "calendar"]
 
 
+class WatchlistItem(BaseModel):
+    ticker: str
+    current_price: float | None = None
+    today_pct: float | None = None
+    week52_low: float | None = None
+    week52_high: float | None = None
+    atm_iv: float | None = None
+    hv30: float | None = None
+
+@router.get("/strategies/derivative-income/watchlist", response_model=list[WatchlistItem])
+async def derivative_income_watchlist(
+    refresh: bool = False,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..services.derivative_income_service import get_derivative_income_watchlist
+    try:
+        return await get_derivative_income_watchlist(db, user.id, refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Watchlist failed: {exc}")
+
+class WatchlistAddIn(BaseModel):
+    ticker: str
+
+@router.post("/strategies/derivative-income/watchlist")
+async def add_derivative_income_watchlist_item(
+    body: WatchlistAddIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..services.derivative_income_service import get_user_watchlist_tickers, set_user_watchlist_tickers
+    t = body.ticker.upper().strip()
+    tickers = await get_user_watchlist_tickers(db, user.id)
+    if t not in tickers:
+        tickers.append(t)
+        await set_user_watchlist_tickers(db, user.id, tickers)
+    return {"status": "ok"}
+
+@router.delete("/strategies/derivative-income/watchlist/{ticker}")
+async def remove_derivative_income_watchlist_item(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..services.derivative_income_service import get_user_watchlist_tickers, set_user_watchlist_tickers
+    t = ticker.upper().strip()
+    tickers = await get_user_watchlist_tickers(db, user.id)
+    if t in tickers:
+        tickers.remove(t)
+        await set_user_watchlist_tickers(db, user.id, tickers)
+    return {"status": "ok"}
+
 class DerivativeIncomePortfolioIn(BaseModel):
     offset: int = Field(default=0, ge=0, description="Pagination offset into top holdings by value")
     limit: int = Field(default=10, ge=1, le=10, description="Holdings analyzed per page (≤10 to spare the quote API)")

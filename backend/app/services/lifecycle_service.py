@@ -395,8 +395,15 @@ def _kelly_fraction(rets: np.ndarray, w: np.ndarray) -> Optional[float]:
 
 
 def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_loss,
-                      max_profit, kelly, dte_days: int, sofr_pct: float = 5.0) -> dict:
+                      max_profit, kelly, dte_days: int, sofr_pct: float = 5.0,
+                      income_mode: bool = False) -> dict:
     """Deterministic entry recommendation from the whole payoff distribution.
+
+    ``income_mode`` RE-ANCHORS the blend for premium-income selling — the goal there is a SAFE trade that
+    beats cash by a bit of alpha, NOT risk-neutral profit (fair-priced income has ~0 risk-neutral alpha, so
+    the default edge/Sortino lenses read ~0). In income mode SAFETY (keep-prob) + INCOME (premium yield vs
+    the cash hurdle) dominate, and the risk-neutral lenses are de-weighted; the vol edge (VRP) is added by
+    the grade factors on top. The lifecycle/hold path leaves it False (unchanged).
 
     Blends five standard quant lenses into a 0-100 score:
       • Edge     — Omega (probability-weighted gains ÷ losses)
@@ -413,16 +420,30 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
 
     omega, pop = pm.get("omega"), pm.get("pop")
     sortino, exp_ret = pm.get("sortino"), pm.get("expected_return_pct")
-
-    s_edge = clamp(((omega or 0) - 0.8) / (2.0 - 0.8)) if omega is not None else 0.4
-    s_pop = clamp(((pop or 0) - 50.0) / (90.0 - 50.0)) if pop is not None else 0.4
-    s_sortino = clamp((sortino or 0) / 2.0) if sortino is not None else 0.4
     tail_frac = (cvar95 / capital) if (capital and capital > 0 and cvar95 is not None) else 0.5
-    s_tail = clamp(1.0 - tail_frac / 0.40)
     hurdle = (sofr_pct / 100.0) * (dte_days / 365.0) * 100.0 if dte_days else 0.0
-    s_carry = clamp(((exp_ret or 0) - hurdle) / (abs(hurdle) + 3.0) + 0.5)
+    prem_ann = ((max_profit / capital) * (365.0 / dte_days) * 100.0
+                if (max_profit and capital and capital > 0 and dte_days) else None)   # gross premium yield %/yr
 
-    wts = {"edge": 0.28, "pop": 0.22, "sortino": 0.20, "tail": 0.18, "carry": 0.12}
+    if income_mode:
+        # SAFE-INCOME anchoring — SAFETY (keep-prob) + INCOME (premium yield vs the cash hurdle) DOMINATE; the
+        # risk-neutral lenses (edge = Omega, risk-adj = Sortino) are re-anchored gently and de-weighted; the
+        # tail uses a gentler slope so a rare, contained assignment doesn't zero the score. See the docstring.
+        s_edge = clamp(((omega or 0) - 0.88) / (1.15 - 0.88)) if omega is not None else 0.4    # Omega ≥ ~0.9 = fair+
+        s_pop = clamp(((pop or 0) - 70.0) / (92.0 - 70.0)) if pop is not None else 0.4         # keep-prob 70→92%
+        s_sortino = clamp(((sortino or 0) + 0.2) / 1.2) if sortino is not None else 0.4
+        s_tail = clamp(1.0 - tail_frac / 0.90)
+        s_carry = (clamp((prem_ann - sofr_pct) / (sofr_pct + 10.0) + 0.4) if prem_ann is not None
+                   else clamp(((exp_ret or 0) - hurdle) / (abs(hurdle) + 3.0) + 0.5))          # premium yield vs cash
+        wts = {"edge": 0.12, "pop": 0.34, "sortino": 0.10, "tail": 0.14, "carry": 0.30}
+    else:
+        s_edge = clamp(((omega or 0) - 0.8) / (2.0 - 0.8)) if omega is not None else 0.4
+        s_pop = clamp(((pop or 0) - 50.0) / (90.0 - 50.0)) if pop is not None else 0.4
+        s_sortino = clamp((sortino or 0) / 2.0) if sortino is not None else 0.4
+        s_tail = clamp(1.0 - tail_frac / 0.40)
+        s_carry = clamp(((exp_ret or 0) - hurdle) / (abs(hurdle) + 3.0) + 0.5)
+        wts = {"edge": 0.28, "pop": 0.22, "sortino": 0.20, "tail": 0.18, "carry": 0.12}
+
     score = round((s_edge*wts["edge"] + s_pop*wts["pop"] + s_sortino*wts["sortino"]
                    + s_tail*wts["tail"] + s_carry*wts["carry"]) * 100)
 
@@ -435,7 +456,9 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
         reasons.append(f"Sortino {sortino:.2f}")
     if capital and cvar95 is not None:
         reasons.append(f"CVaR95 {tail_frac*100:.0f}% of capital (expected shortfall, not deep tail)")
-    if exp_ret is not None:
+    if income_mode and prem_ann is not None:
+        reasons.append(f"premium yield {prem_ann:.1f}%/yr vs {sofr_pct:.1f}% cash (the income alpha)")
+    elif exp_ret is not None:
         reasons.append(f"exp. return {exp_ret:+.1f}% vs {hurdle:.1f}% hurdle")
     if kelly is not None:
         reasons.append(f"Kelly {kelly*100:.0f}%")
@@ -798,12 +821,15 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
     base = base_read["base"]
     contribs: list[dict] = []
 
-    # TA factors — kept as-is; they already read "does the position hold?".
+    # TA factors — kept as-is; they already read "does the position hold?". Carry each factor's OWN evidence
+    # (breach/touch %, which wall & how far, fortified, defensibility, systemic beta, …) so the hold/close
+    # read EXPLAINS itself the same way the entry desk does, re-pointed at the position you're holding.
     for f in (ta_factors or []):
         pts = round(float(f.get("points", 0) or 0))
         if pts:
             contribs.append({"label": f.get("label"), "pts": pts, "favorable": pts > 0,
-                             "note": "supports your strike holding" if pts > 0 else "pressures your short strike"})
+                             "note": f.get("detail") or ("supports your strike holding" if pts > 0
+                                                         else "pressures your short strike")})
 
     # Option-math factors — re-signed / re-weighted per the holder policy. (Tail is NOT
     # re-added here — the base's CVaR Tail lens already carries downside; adding the
@@ -946,7 +972,8 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
     pop_val = pm.get("pop")
     tail_pctile = 99 if (pop_val is not None and pop_val > 95) else 95
     tail_cvar = cvar99 if (tail_pctile == 99 and cvar99 is not None) else cvar95
-    quant = algorithmic_quant(pm, tail_cvar, capital, max_loss, max_profit, kelly, dte_days, sofr_pct)
+    quant = algorithmic_quant(pm, tail_cvar, capital, max_loss, max_profit, kelly, dte_days, sofr_pct,
+                              income_mode=True)   # the desk path is premium income — re-anchor off risk-neutral alpha
     vrp_ratio = (implied / realized) if (implied and realized) else None   # < 1 = negative VRP
     return {
         "trader": {**trader, "avg_iv_pct": round(avg_iv * 100, 1) if (avg_iv and avg_iv > 0) else None},

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   Gauge, Loader2, AlertTriangle, Cpu, Shield, Briefcase, ChevronDown, ChevronUp,
-  Trophy, Play, Terminal, Maximize2, X, MessageSquare, Activity, LineChart, Layers, Zap, Sparkles,
+  Play, Terminal, Maximize2, X, MessageSquare, Activity, LineChart, Layers, Zap, Sparkles,
 } from 'lucide-react';
 import { runDeskReview, runDeskReviewAgents, runDeskMonitor, runDeskMonitorAnalyze, runDeskBlind } from '../api';
 import { RatingsHelpButton } from './RatingsHelp';
@@ -232,11 +232,11 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
         <div className="mb-2.5">
           <div className={GROUP_LABEL}>Base quality — payoff distribution</div>
           <div className="flex flex-wrap gap-2">
-            <SubBar label="Edge" v={sub.edge} hint="Modeled pricing edge — expected value vs. the option's market price. Higher = you're paid more than fair value." />
-            <SubBar label="PoP" v={sub.pop} hint="Probability of profit at expiry (risk-neutral). Higher = more likely to finish in the money." />
-            <SubBar label="Sortino" v={sub.sortino} hint="Reward per unit of downside risk — penalizes losses, not upside volatility. Higher = better." />
-            <SubBar label="Tail" v={sub.tail} hint="Tail-risk quality — how contained the worst-case (CVaR) loss is. Higher = smaller, safer left tail." />
-            <SubBar label="Carry" v={sub.carry} hint="Premium/theta carry earned vs. the risk-free rate. Higher = better paid to hold the risk." />
+            <SubBar label="Safety" v={sub.pop} hint="Safety — probability you keep the FULL premium (the short leg expires OTM). The #1 driver of safe income; dominant weight." />
+            <SubBar label="Income" v={sub.carry} hint="Income — annualized premium yield vs the cash (SOFR) hurdle. This is the alpha you harvest; higher = better paid over cash." />
+            <SubBar label="Edge" v={sub.edge} hint="Edge — Omega: probability-weighted gains vs losses. ~1 = fairly priced; higher = you keep more than you risk." />
+            <SubBar label="Tail" v={sub.tail} hint="Tail — how contained the honest deep (99% CVaR) loss is vs capital. Higher = safer, smaller left tail." />
+            <SubBar label="Risk-adj" v={sub.sortino} hint="Risk-adjusted return (Sortino) — reward per unit of downside deviation. A secondary check for income." />
           </div>
           <GroupFoot label="Base quality" value={base} />
         </div>
@@ -907,38 +907,10 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
       )}
 
       {rev && rev.ranked.length > 0 && (() => {
-        const top = rev.ranked[0];
-        const ts = rev.ta_summary;
         return (
           <div className="space-y-3">
-            {/* Algo's best pick */}
-            <div className="rounded-xl border border-success/25 bg-success/[0.06] p-3">
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <span className="flex items-center gap-1.5 text-sm font-bold text-success">
-                  <Trophy className="w-4 h-4" /> Algorithmic pick: {top.label}
-                </span>
-                <span className={`inline-flex items-baseline gap-1 rounded-lg border px-2 py-0.5 text-lg font-bold ${gradeTone(top.algo_grade)}`}
-                  title="Desk grade — overall trade quality (A best → F worst)">
-                  {top.algo_grade || '—'}<span className="text-[10px] font-medium opacity-60">grade</span>
-                </span>
-              </div>
-              {top.grade_demerits && top.grade_demerits.length > 0 && (
-                <p className="text-[10px] text-base-content/45 mt-1">Watch-outs: {top.grade_demerits.join(' · ')}</p>
-              )}
-              <p className="text-xs text-base-content/60 mt-0.5">
-                {strikeStr(top)}{top.short_strike_pct != null && ` (${top.short_strike_pct >= 0 ? '+' : ''}${top.short_strike_pct}%)`} · {top.dte}d · exp {top.expiration}
-                {' — '}Win {winPct(top.prob_keep_pct)} · prem {money(top.premium)} · Omega {ratio(top.desk_metrics.pm.omega)} · CVaR95 {money(top.desk_metrics.risk.cvar_95)}
-              </p>
-              <p className="text-[11px] text-base-content/50 mt-1">
-                Market: <b>{ts.state}</b> ({ts.bias}) · RSI {ts.rsi != null ? ts.rsi.toFixed(0) : '—'} · POC {money(ts.poc)} · trend {ts.trend}
-              </p>
-              <button className="btn btn-secondary btn-xs gap-1 mt-2" onClick={() => setExpanded(expanded === 0 ? null : 0)}>
-                <Maximize2 className="w-3 h-3" /> {expanded === 0 ? 'Hide analysis' : 'Explore this trade'}
-              </button>
-            </div>
-
-            {/* Events are already shown once at the top of the scan (collapsible) — not repeated here. */}
-
+            {/* No separate 'top pick' card — the #1 row of the ranked table below IS the desk's pick
+                (sorted best→worst). Events already show once at the top of the scan. */}
             {/* Full ranked table */}
             <div className="overflow-x-auto">
               <table className="table table-xs w-full">

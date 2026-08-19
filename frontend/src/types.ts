@@ -3862,6 +3862,7 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   event_adjusted_yield_pct?: number | null;          // annualized yield with the earnings/event premium stripped
   event_premium_share?: number | null;               // fraction of the premium that is event (not harvestable) premium
   iv_edge_vp?: number | null;                         // short-strike IV vs ATM (vol-pts) — the per-strike skew premium / edge
+  prob_touch_pct?: number | null;                     // P(short EVER goes ITM before expiry) — drift-aware touch, ~2× expiry-ITM
 }
 
 // One rung of the tail-risk management plan — a price level + the corrective action to take there.

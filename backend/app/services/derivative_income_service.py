@@ -372,6 +372,33 @@ def _prob_reach(rnd, strike: float, spot: float, dte: int,
     return None
 
 
+def _prob_touch(strike: float, spot: float, dte_days: int, sigma: Optional[float],
+                mu: float = 0.0) -> Optional[float]:
+    """Probability the underlying TOUCHES ``strike`` at ANY time before expiry (first-passage / barrier hit)
+    under GBM with real-world drift ``mu`` (annualized) and vol ``sigma`` (annualized). This is the honest
+    "does the short ever go ITM" measure — ≈ 2× the expiry-ITM probability when drift ≈ 0, and it RISES when
+    the stock drifts TOWARD the strike (mu folded straight into the path, not just the endpoint). Down barrier
+    (K < spot, a short put) → P(min ≤ K); up barrier (K > spot, a short call) → P(max ≥ K)."""
+    if not (strike and spot and dte_days and dte_days > 0 and sigma and sigma > 0) or strike == spot:
+        return None
+    T = dte_days / 365.0
+    sT = sigma * math.sqrt(T)
+    if sT <= 0:
+        return None
+    b = math.log(strike / spot)                         # log-distance to the barrier (<0 below spot, >0 above)
+    nu = mu - 0.5 * sigma * sigma                        # Itô log-drift
+    def _N(x): return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    down = strike < spot
+    t1 = _N((b - nu * T) / sT) if down else _N((-b + nu * T) / sT)   # = P(finish on the far side) = expiry-ITM
+    try:                                                 # the reflection term (paths that touched then recovered)
+        t2 = math.exp(2.0 * nu * b / (sigma * sigma)) * (_N((b + nu * T) / sT) if down else _N((-b - nu * T) / sT))
+        if not math.isfinite(t2):
+            t2 = 0.0                                     # deep barrier → reflection term is negligible anyway
+    except OverflowError:
+        t2 = 0.0
+    return max(0.0, min(1.0, t1 + t2))
+
+
 def _expected_intrinsic(rnd, strike: float, right: str) -> Optional[float]:
     """Risk-neutral E[intrinsic at expiry] per share via ∫ payoff·f(K) dK."""
     if rnd is None:
@@ -1945,6 +1972,37 @@ def _headline_put(rnd, put_strikes: list[float], spot: float, min_prob: float,
     return _snap_short_to_levels(put_strikes, min(target, spot), spot, "below", ta_levels, sig_frac)
 
 
+def _roll_credit(opp: dict, spot: float, chains_cache: list) -> Optional[float]:
+    """DEFENSIBILITY — the net credit (as a % of the short's own premium) from rolling the primary short leg
+    OUT ~one cycle AND one strike further OTM: sell the further-dated / further-OTM option, buy back the
+    current short. > 0 → you can roll down-and-out for a CREDIT (defend the strike for free if it's tested);
+    < 0 → a protective roll costs a debit. None when the scan holds no later expiry to roll into."""
+    legs = opp.get("legs") or []
+    shorts = [l for l in legs if str(l.get("action", "")).upper().startswith("S")
+              and l.get("strike") and l.get("mid")]
+    if not shorts or not chains_cache or not spot:
+        return None
+    dte0 = int(opp.get("dte") or 0)
+    sh = min(shorts, key=lambda l: abs(float(l["strike"]) - spot))       # primary short = nearest spot
+    K = float(sh["strike"]); cur_mid = float(sh["mid"])
+    if cur_mid <= 0:
+        return None
+    is_put = str(sh.get("type", "")).upper().startswith("P") or K < spot
+    later = [(d, e, c, p) for (d, e, c, p) in chains_cache if d > dte0 + 5]   # a real roll-OUT (≥ ~a week further)
+    if not later:
+        return None
+    _d, _e, calls2, puts2 = min(later, key=lambda t: abs(t[0] - (dte0 + 30)))   # closest to +1 cycle
+    book = puts2 if is_put else calls2
+    ks = sorted(book.keys())
+    further = [k for k in ks if k < K] if is_put else [k for k in ks if k > K]  # one strike further OTM
+    Kr = (max(further) if is_put else min(further)) if further else K
+    q = book.get(Kr)
+    new_mid = float(getattr(q, "mid", 0) or 0) if q is not None else 0.0
+    if new_mid <= 0:
+        return None
+    return round((new_mid - cur_mid) / cur_mid * 100.0, 1)               # roll credit as % of the current premium
+
+
 # ---------------------------------------------------------------------------
 # Public — single ticker
 # ---------------------------------------------------------------------------
@@ -2050,6 +2108,15 @@ async def run_derivative_income(
             opportunities.extend(_scan_calendars(chains_cache, spot, sofr_frac, min_income, hv))
         except Exception as exc:  # noqa: BLE001
             logger.debug("calendar scan failed for %s: %s", ticker, exc)
+
+    # DEFENSIBILITY — can the short be rolled DOWN + OUT for a credit if tested? Needs the multi-expiry cache.
+    for o in opportunities:
+        try:
+            rc = _roll_credit(o, spot, chains_cache)
+            if rc is not None:
+                o["roll_credit_pct"] = rc
+        except Exception:  # noqa: BLE001
+            pass
 
     opportunities.sort(key=lambda o: o.get("premium_annualized_pct", 0), reverse=True)
     best_by_structure: dict[str, dict] = {}
@@ -2255,3 +2322,91 @@ async def run_portfolio_derivative_income(
     }
     await set_cached(db, cache_key, payload, ttl_seconds=TTL_PORTFOLIO)
     return payload
+
+
+async def get_user_watchlist_tickers(db, user_id: int) -> list[str]:
+    from .cache_service import get_cached
+    cache_key = f"user:{user_id}:di_watchlist_tickers"
+    cached = await get_cached(db, cache_key)
+    if cached and "tickers" in cached:
+        return cached["tickers"]
+    return ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AMD", "NFLX"]
+
+async def set_user_watchlist_tickers(db, user_id: int, tickers: list[str]):
+    from .cache_service import set_cached
+    cache_key = f"user:{user_id}:di_watchlist_tickers"
+    await set_cached(db, cache_key, {"tickers": tickers}, ttl_seconds=315360000)
+
+async def get_derivative_income_watchlist(db, user_id: int, refresh: bool = False) -> list[dict]:
+    import asyncio
+    import yfinance as yf
+    from .cache_service import get_cached, set_cached
+    
+    tickers = await get_user_watchlist_tickers(db, user_id)
+    if not tickers:
+        return []
+        
+    final_items = []
+    missing_tickers = []
+    
+    if not refresh:
+        for t in tickers:
+            cached = await get_cached(db, f"di_watchlist_metric:{t}")
+            if cached:
+                final_items.append(cached)
+            else:
+                missing_tickers.append(t)
+    else:
+        missing_tickers = tickers
+        
+    if not missing_tickers:
+        return final_items
+        
+    def _fetch_item(t: str):
+        try:
+            stock = yf.Ticker(t)
+            hist = stock.history(period="1y")
+            if hist is None or hist.empty: return None
+            closes = hist["Close"].dropna()
+            if len(closes) < 30: return None
+            
+            price = round(float(closes.iloc[-1]), 2)
+            prev = round(float(closes.iloc[-2]), 2)
+            pct = round((price - prev) / prev * 100, 2)
+            
+            ctx = _context_sync(t)
+            
+            atm_iv = None
+            exps = stock.options
+            if exps:
+                chain = stock.option_chain(exps[0])
+                calls = chain.calls
+                if not calls.empty:
+                    idx = (abs(calls["strike"] - price)).idxmin()
+                    atm_iv = round(float(calls.loc[idx]["impliedVolatility"]) * 100, 1)
+                    
+            return {
+                "ticker": t,
+                "current_price": price,
+                "today_pct": pct,
+                "week52_low": ctx.get("week52_low"),
+                "week52_high": ctx.get("week52_high"),
+                "atm_iv": atm_iv,
+                "hv30": round(ctx["hv30"] * 100, 1) if ctx.get("hv30") else None
+            }
+        except Exception:
+            return None
+
+    loop = asyncio.get_running_loop()
+    tasks = [loop.run_in_executor(None, _fetch_item, t) for t in missing_tickers]
+    results = await asyncio.gather(*tasks)
+    
+    for r in results:
+        if r is not None:
+            final_items.append(r)
+            await set_cached(db, f"di_watchlist_metric:{r['ticker']}", r, ttl_seconds=86400 * 7)
+            
+    order_map = {t: i for i, t in enumerate(tickers)}
+    final_items.sort(key=lambda x: order_map.get(x["ticker"], 999))
+    
+    return final_items

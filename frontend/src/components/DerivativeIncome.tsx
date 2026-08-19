@@ -4,9 +4,10 @@ import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
   AlertCircle, ChevronDown, ChevronUp, Activity, Landmark,
-  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2,
+  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw
 } from 'lucide-react';
-import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations } from '../api';
+import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations, fetchDerivativeIncomeWatchlist, addDerivativeIncomeWatchlist, deleteDerivativeIncomeWatchlist } from '../api';
+import type { DerivativeIncomeWatchlistItem } from '../api';
 import type { DeskEvaluateParams, EvaluateLeg } from '../api';
 import type {
   DerivativeIncomeResult, DerivativeIncomeOpportunity, DerivativeIncomePortfolioResult,
@@ -19,7 +20,7 @@ import { TechnicalAnalysis } from './TechnicalAnalysis';
 import PreTradeAdvisor, { type AdvisorMetric, type QuantSignal } from './PreTradeAdvisor';
 import { DeskReview, SingleTradeDeskReview } from './DeskReview';
 
-type Mode = 'single' | 'portfolio' | 'evaluate';
+type Mode = 'single' | 'portfolio' | 'evaluate' | 'watchlist';
 
 /** Build the pricing-confidence signals (RND/SVI/chain/expected move/Heston) that
  * now live inside each opportunity's Quant desk card. */
@@ -879,6 +880,150 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
 
 // ─────────────────────────── main ───────────────────────────
 
+function WatchList({ onSelect }: { onSelect: (ticker: string) => void }) {
+  const [items, setItems] = useState<DerivativeIncomeWatchlistItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [sortCol, setSortCol] = useState<keyof DerivativeIncomeWatchlistItem>('ticker');
+  const [sortDesc, setSortDesc] = useState(false);
+  const [ivFilter, setIvFilter] = useState(false);
+  
+  const [newTicker, setNewTicker] = useState('');
+  const [adding, setAdding] = useState(false);
+
+  const fetchData = (refresh = false) => {
+    setLoading(true);
+    fetchDerivativeIncomeWatchlist(refresh).then(data => {
+      setItems(data);
+      setError(null);
+    }).catch(err => {
+      setError(err.message);
+    }).finally(() => {
+      setLoading(false);
+    });
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, []);
+
+  const handleSort = (col: keyof DerivativeIncomeWatchlistItem) => {
+    if (sortCol === col) setSortDesc(!sortDesc);
+    else { setSortCol(col); setSortDesc(true); }
+  };
+
+  const handleAdd = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTicker.trim()) return;
+    setAdding(true);
+    try {
+      await addDerivativeIncomeWatchlist(newTicker);
+      setNewTicker('');
+      fetchData(true);
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleDelete = async (ticker: string) => {
+    try {
+      await deleteDerivativeIncomeWatchlist(ticker);
+      setItems(items => items.filter(i => i.ticker !== ticker));
+    } catch (err: any) {
+      alert(err.message);
+    }
+  };
+
+  const filtered = items.filter(item => {
+    if (ivFilter && (item.atm_iv == null || item.hv30 == null || item.atm_iv <= item.hv30)) return false;
+    return true;
+  });
+
+  const sorted = [...filtered].sort((a, b) => {
+    const va = a[sortCol];
+    const vb = b[sortCol];
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    const res = va < vb ? -1 : va > vb ? 1 : 0;
+    return sortDesc ? -res : res;
+  });
+
+  if (loading && items.length === 0) return <div className="p-8 text-center text-base-content/50"><Loader2 className="w-5 h-5 animate-spin mx-auto mb-2" /> Loading watchlist...</div>;
+  if (error && items.length === 0) return <div className="p-8 text-center text-red-500">Error: {error}</div>;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-base-200/40 p-3 rounded-lg border border-white/[0.03]">
+        <div className="flex items-center gap-4">
+          <h3 className="font-medium text-sm flex items-center gap-2"><List className="w-4 h-4 text-primary" /> Income Strategy Watchlist</h3>
+          <button type="button" onClick={() => fetchData(true)} disabled={loading} className="btn btn-xs btn-ghost gap-1.5 text-base-content/60 hover:text-base-content">
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} /> Refresh All
+          </button>
+        </div>
+        
+        <div className="flex items-center gap-4 w-full sm:w-auto">
+          <label className="flex items-center gap-2 text-xs cursor-pointer">
+            <input type="checkbox" className="checkbox checkbox-sm" checked={ivFilter} onChange={e => setIvFilter(e.target.checked)} />
+            <span className="whitespace-nowrap">ATM IV &gt; HV 30</span>
+          </label>
+          <div className="divider divider-horizontal mx-0 w-1 opacity-20"></div>
+          <form onSubmit={handleAdd} className="join w-full sm:w-auto">
+            <input type="text" placeholder="Add Ticker..." value={newTicker} onChange={e => setNewTicker(e.target.value.toUpperCase())} className="input input-sm input-bordered join-item w-full sm:w-32 bg-base-100 uppercase" disabled={adding} />
+            <button type="submit" disabled={adding || !newTicker.trim()} className="btn btn-sm btn-primary join-item">
+              {adding ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />} Add
+            </button>
+          </form>
+        </div>
+      </div>
+      
+      <div className="overflow-x-auto rounded-lg border border-white/[0.03]">
+        <table className="table table-sm w-full">
+          <thead>
+            <tr className="bg-base-200/50 text-base-content/70">
+              <th onClick={() => handleSort('ticker')} className="cursor-pointer hover:text-base-content">Ticker</th>
+              <th onClick={() => handleSort('current_price')} className="cursor-pointer hover:text-base-content text-right">Price</th>
+              <th onClick={() => handleSort('today_pct')} className="cursor-pointer hover:text-base-content text-right">Today %</th>
+              <th onClick={() => handleSort('week52_low')} className="cursor-pointer hover:text-base-content text-right">52W Low</th>
+              <th onClick={() => handleSort('week52_high')} className="cursor-pointer hover:text-base-content text-right">52W High</th>
+              <th onClick={() => handleSort('atm_iv')} className="cursor-pointer hover:text-base-content text-right">ATM IV</th>
+              <th onClick={() => handleSort('hv30')} className="cursor-pointer hover:text-base-content text-right">HV 30</th>
+              <th className="text-center">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(item => (
+              <tr key={item.ticker} className="hover:bg-base-200/20">
+                <td className="font-medium">{item.ticker}</td>
+                <td className="text-right font-mono text-xs">{item.current_price?.toFixed(2) ?? '-'}</td>
+                <td className={`text-right font-mono text-xs ${item.today_pct && item.today_pct > 0 ? 'text-green-500' : item.today_pct && item.today_pct < 0 ? 'text-red-500' : ''}`}>
+                  {item.today_pct != null ? `${item.today_pct > 0 ? '+' : ''}${item.today_pct.toFixed(2)}%` : '-'}
+                </td>
+                <td className="text-right font-mono text-xs">{item.week52_low?.toFixed(2) ?? '-'}</td>
+                <td className="text-right font-mono text-xs">{item.week52_high?.toFixed(2) ?? '-'}</td>
+                <td className="text-right font-mono text-xs">{item.atm_iv != null ? `${item.atm_iv.toFixed(1)}%` : '-'}</td>
+                <td className="text-right font-mono text-xs">{item.hv30 != null ? `${item.hv30.toFixed(1)}%` : '-'}</td>
+                <td className="text-center">
+                  <div className="flex justify-center items-center gap-1">
+                    <button type="button" onClick={(e) => { e.preventDefault(); onSelect(item.ticker); }} className="btn btn-xs btn-ghost text-primary hover:bg-primary/10">
+                      Analyze
+                    </button>
+                    <button type="button" onClick={() => handleDelete(item.ticker)} className="btn btn-xs btn-ghost text-base-content/40 hover:text-red-500 hover:bg-red-500/10 px-1.5" title="Remove">
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export function DerivativeIncome() {
   const [mode, setMode] = useState<Mode>('single');
   const [ticker, setTicker] = useState('AAPL');
@@ -1017,12 +1162,16 @@ export function DerivativeIncome() {
         <button type="button" className={`btn btn-sm gap-1.5 ${mode === 'evaluate' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('evaluate')}>
           <ClipboardCheck className="w-3.5 h-3.5" /> Evaluate
         </button>
+        <button type="button" className={`btn btn-sm gap-1.5 ${mode === 'watchlist' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('watchlist')}>
+          <List className="w-3.5 h-3.5" /> WatchList
+        </button>
       </div>
 
       {mode === 'evaluate' && <EvaluateForm defaultQuoteSource={quoteSource} />}
+      {mode === 'watchlist' && <WatchList onSelect={(t) => { setTicker(t); setMode('single'); }} />}
 
       {/* Form */}
-      {mode !== 'evaluate' && (<>
+      {mode !== 'evaluate' && mode !== 'watchlist' && (<>
       <form onSubmit={mode === 'single' ? handleSingle : (e) => { e.preventDefault(); handlePortfolio(0); }}
         className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         {mode === 'single' && (

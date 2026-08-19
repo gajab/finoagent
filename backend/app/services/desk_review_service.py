@@ -28,7 +28,7 @@ from .lifecycle_service import compute_pretrade_metrics, terminal_payoff_curve, 
 from .llm_service import call_llm
 from .derivative_income_service import (
     run_derivative_income, _norm_ticker, _macro_events_in_window, _reports_earnings,
-    _wall_buffer, _sigma_frac, _STRONG_WALLS, _BUF_SIGMA_STRONG, _BUF_SIGMA_STD,
+    _wall_buffer, _sigma_frac, _STRONG_WALLS, _BUF_SIGMA_STRONG, _BUF_SIGMA_STD, _prob_touch,
 )
 
 if TYPE_CHECKING:
@@ -53,6 +53,11 @@ _STRUCT_PEAK_STRONG = 4.0        # max Structure credit — strike a full buffer
 _STRUCT_PEAK_STD = 3.0           # …a standard wall (pivot S/R, value-area edge, gamma flip)
 _STRUCT_UNDEF_PENALTY = 4.0      # max penalty for an UNDEFENDED (open-air) strike, at-the-money; fades to 0 by…
 _UNDEFENDED_SAFE_SIGMA = 1.5     # …≥1.5σ from spot — with no wall, probability alone defends it (Structure = 0)
+# BREACH RISK — the "does the short EVER go ITM" (touch) probability, drift-aware first-passage. The single
+# most important safe-income signal: assignment/ITM is a TOUCH event, ~2× the expiry-ITM odds.
+_TOUCH_OK = 0.25                 # P(touch) ≤ 25% = the comfort zone (no penalty); above it the strike is penalised
+_BREACH_MAX = 10.0               # max Breach-risk penalty (a very touch-prone strike)
+_BREACH_RAMP = 0.35              # …reached at _TOUCH_OK + 0.35 (i.e. P(touch) ≈ 60%)
 
 # Volatility Risk Premium (implied ÷ realized). ≥1 is favourable (implied over-priced = a seller's edge).
 # Below 1 = negative VRP: penalise IN PROPORTION to the gap, and HARD-BLOCK past the ratio floor — that is
@@ -190,7 +195,8 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
 
 
 def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
-                  spot: Optional[float] = None, hv: Optional[float] = None) -> tuple[float, str, list]:
+                  spot: Optional[float] = None, hv: Optional[float] = None,
+                  beta: Optional[float] = None, mkt_drift: Optional[float] = None) -> tuple[float, str, list]:
     """Does this trade fit the regime / smart-money structure? Evaluated on the MEDIUM-TERM read
     (6-month history, DAILY bars) — the swing horizon that governs a multi-week income option, not
     intraday noise or multi-year lag. Returns (score_bonus ±, note, factors) where `factors` is the
@@ -280,11 +286,93 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
                 struct_pts -= round(pen, 1)
                 struct_notes.append(f"{leg} ${round(short_k, 1)} UNDEFENDED — no wall between spot ${round(spot, 1)} and the "
                                     f"strike, only {round(sig_spot, 2)}σ out (< {_UNDEFENDED_SAFE_SIGMA}σ) → naked premium in open air")
-    if put_short or call_short:   # ALWAYS emit (even 0) so every trade shows its structural situation
-        add("Structure", round(max(-6.0, min(struct_pts, 6.0)), 1),
-            ("; ".join(struct_notes) if struct_notes else "no short leg to place against structure")
-            + f" · buffer & 1σ are the event-aware expected move (max IV/HV·√T at the wall); with no wall, a strike "
-            f"needs ≥{_UNDEFENDED_SAFE_SIGMA}σ from spot to lean on probability instead of structure")
+    if put_short or call_short:   # ALWAYS emit (even 0) so every trade shows its structural situation. The
+        # generic 'how buffer/1σ/reach work' explanation lives in the "How these ratings work" panel, not here.
+        add("Structure", round(max(-6.0, min(struct_pts, 6.0)),  1),
+            "; ".join(struct_notes) if struct_notes else "no short leg to place against structure")
+
+    # BREACH RISK — the honest "does the short EVER go ITM" probability (drift-aware first-passage / touch),
+    # NOT just P(finish OTM at expiry). Touch ≈ 2× the expiry-ITM odds and RISES when the stock drifts TOWARD
+    # the strike (mu folded into the path). Penalising it reframes 'safe' from finishes-OTM to never-breaches,
+    # steering selection to deeper, harder-to-reach strikes. Always emitted so every trade shows its breach odds.
+    _mu = (ta or {}).get("_drift_mu") or 0.0
+    _vol = max((opp.get("atm_iv_pct") or 0.0) / 100.0, hv or 0.0)          # dual vol — conservative (wider cone)
+    _dte_t = int(opp.get("dte") or 0)
+    touches = [t for t in (_prob_touch(k, spot, _dte_t, _vol, _mu)
+                           for k in (put_short, call_short) if k) if t is not None]
+    if touches and spot:
+        pt = max(touches)                                                 # worst (most breach-prone) leg
+        opp["prob_touch_pct"] = round(pt * 100, 1)                        # surface it on the trade
+        pen = 0.0 if pt <= _TOUCH_OK else -round(min((pt - _TOUCH_OK) / _BREACH_RAMP * _BREACH_MAX, _BREACH_MAX), 1)
+        add("Breach risk", pen,
+            f"P(touch) {round(pt * 100)}% — the chance the short is breached (goes ITM) at ANY point before "
+            f"expiry, drift-aware (trend {round(_mu * 100)}%/yr) & ~2× the expiry-ITM odds; "
+            + (f"within the ≤{round(_TOUCH_OK * 100)}% comfort zone" if pt <= _TOUCH_OK
+               else f"above ≤{round(_TOUCH_OK * 100)}% → penalised to steer toward deeper, harder-to-reach strikes"))
+
+    _touch_min = min(touches) if touches else None
+    # #4 FORTIFIED — the two touch-reducers TOGETHER: a deep cushion (low touch) AND behind a wall. The
+    #    combination is the lowest-breach placement — structure AND distance both have to fail — worth more
+    #    than either alone.
+    if struct_pts > 0 and _touch_min is not None and _touch_min <= 0.15:
+        add("Fortified", 2.0, f"deep cushion (P(touch) {round(_touch_min * 100)}% ≤ 15%) AND behind a wall — "
+            f"the lowest-breach placement: structure and distance both have to break")
+
+    # #3 CALM TAPE — a range-bound / mean-reverting regime is touch-FRIENDLY: a probe of the strike tends to
+    #    REVERT rather than persist into assignment (the GBM touch model can't see mean-reversion). Complements
+    #    'Range fit' (which already rewards neutral structures in a range) by covering directional income too.
+    if mode == "range" and s not in _NEUTRAL_INCOME:
+        add("Calm tape", 2.0, "range-bound / mean-reverting tape — probes of the strike tend to revert, so a "
+            "touch is less likely to persist into assignment than in a trending tape")
+
+    # #5 VOL-EXPANSION proximity — the touch prob is sized off TODAY'S vol; a SHORT-gamma tape (dealers chase
+    #    moves → vol EXPANDS) widens the real breach cone beyond that estimate, so dock a little extra when the
+    #    strike is already non-trivially breach-prone.
+    if gex and gex.get("regime") == "short" and _touch_min is not None and max(touches) > _TOUCH_OK * 0.6:
+        add("Vol-expansion", -2.0, "short-gamma tape can EXPAND vol → the real breach cone is wider than the "
+            "current-vol touch estimate; extra breach caution")
+
+    # #5 DEFENSIBILITY — can you DEFEND a tested strike? Best signal: the real roll_credit_pct (net credit to
+    #    roll the short DOWN + OUT one cycle). > 0 → you can defend for FREE. Near-expiry always docks (no time
+    #    to roll before assignment); the DTE proxy is the fallback when the scan holds no later expiry.
+    _rc = opp.get("roll_credit_pct")
+    # the DEFENSIVE roll goes AWAY from spot on the threatened side: a short PUT rolls DOWN to a LOWER strike,
+    # a short CALL rolls UP to a HIGHER strike (mirror). Pick the direction off the primary (nearest-spot) short.
+    if put_short and call_short and spot:
+        _prim_put = abs(put_short - spot) <= abs(call_short - spot)
+    else:
+        _prim_put = bool(put_short)
+    _dir, _tostrike = ("down", "lower") if _prim_put else ("up", "higher")
+    if _dte_t and _dte_t <= 7:
+        add("Defensibility", -2.5, f"{_dte_t} DTE — near-expiry gamma leaves almost no room to roll/defend the strike before assignment")
+    elif _rc is not None:
+        if _rc >= 0:
+            add("Defensibility", 1.5, f"roll {_dir} + out for a +{_rc}% CREDIT — if tested you can roll to a "
+                f"{_tostrike} strike next cycle and still collect, defending the strike for free")
+        else:
+            add("Defensibility", -1.5, f"a protective roll ({_dir} + out) costs a {abs(_rc)}% DEBIT — harder to "
+                f"defend the strike without paying up")
+    elif _dte_t and _dte_t <= 14:
+        add("Defensibility", -1.0, f"{_dte_t} DTE — under two weeks: limited room to roll for a credit if the strike is tested")
+
+    # #5 SYSTEMIC BETA × MARKET REGIME — a high-beta short leg breaches when the MARKET moves AGAINST that side:
+    #    a short PUT in a FALLING tape (a selloff drags the name DOWN through the put), a short CALL in a RALLYING
+    #    tape (a rip drags it UP through the call). The single-name touch prob can't see the market; scale by
+    #    β-leverage × how hard the SPX is trending against the leg.
+    if beta is not None and beta >= 1.2 and mkt_drift is not None:
+        adverse = None                                        # (leg word, event word, market magnitude)
+        if put_short and mkt_drift < -0.03:                   # market falling → threatens the short put
+            adverse = ("put", "selloff", -mkt_drift)
+        elif call_short and mkt_drift > 0.03:                 # market rallying → threatens the short call
+            adverse = ("call", "rally", mkt_drift)
+        if adverse:
+            _legw, _evt, _mag = adverse
+            sys_pen = -round(min((beta - 1.0) * min(_mag, 0.40) * 12.0, 4.0), 1)   # β-leverage × market move
+            if sys_pen < 0:
+                add("Systemic beta", sys_pen, f"beta {round(beta, 2)} into a {'falling' if _legw == 'put' else 'rallying'} "
+                    f"market (SPX drift {round(mkt_drift * 100)}%/yr) — a broad {_evt} drags this name through the "
+                    f"short {_legw} (systemic breach the single-name touch prob can't see)")
+
     # LVN slip-through — a short strike in a thin volume node has no absorption (Phase-3 friction test).
     lvn = _lvn_check(opp, vp, spot)
     if lvn:
@@ -398,7 +486,22 @@ def _portfolio_fit_sync(ticker: str) -> dict:
             return {}
         beta = float(np.cov(s, m)[0, 1] / var_m)
         corr = float(np.corrcoef(s, m)[0, 1])
+        # MARKET regime — the SPY's own trend drift (annualized EMA-slope μ, same construction as the stock's
+        # _drift_mu). Feeds the beta×market-regime breach check: a high-beta short put breaches when the MARKET
+        # weakens, even if the name itself looks fine.
+        market_drift = None
+        try:
+            spy = closes["SPY"].dropna()
+            if len(spy) >= 30:
+                ema = spy.ewm(span=21, adjust=False).mean().values
+                y = np.log(ema[-21:]); x = np.arange(len(y))
+                w = np.exp(np.log(2) / 7.0 * (x - x[-1]))               # half-life ~7d, current direction dominates
+                market_drift = round(float(np.polyfit(x, y, 1, w=np.sqrt(w))[0]) * 252, 4)
+        except Exception:  # noqa: BLE001
+            pass
+        mb = ("up" if (market_drift or 0) > 0.05 else "down" if (market_drift or 0) < -0.05 else "flat")
         return {"beta_1y_spx": round(beta, 2), "correlation_spx": round(corr, 2),
+                "market_drift": market_drift, "market_bias": mb,
                 "note": "high correlation => behaves like a leveraged SPY position (little idiosyncratic edge); "
                         "low => genuine single-name alpha"}
     except Exception as exc:  # noqa: BLE001
@@ -2041,7 +2144,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         base = (dm.get("quant") or {}).get("score")
         if base is None:
             base = (opp.get("confidence") or {}).get("score") or 50
-        bonus, note, ta_factors = _ta_alignment(opp, ta, gex, spot, hv=hv)
+        bonus, note, ta_factors = _ta_alignment(opp, ta, gex, spot, hv=hv, beta=beta,
+                                                mkt_drift=(portfolio_fit or {}).get("market_drift"))
         # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
         g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,

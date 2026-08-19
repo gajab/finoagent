@@ -111,6 +111,18 @@ export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
           <div className="text-right text-[10px] font-semibold mt-1 text-base-content/60">
             Net factors <span className={ma.factors_net >= 0 ? 'text-success' : 'text-error'}>{sgn(ma.factors_net)}</span>
           </div>
+          {/* Per-factor EVIDENCE — the WHY behind each hold/close factor, inline (like the entry desk's Quant
+              Analysis): breach/touch %, which wall & how far, fortified, defensibility, systemic beta, … */}
+          {ma.contributions.some(c => c.note) && (
+            <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
+              {ma.contributions.filter(c => c.note).map((c, i) => (
+                <li key={i} className="flex gap-2 text-[11px] leading-snug">
+                  <span className={`font-mono font-semibold shrink-0 tabular-nums ${c.pts >= 0 ? 'text-success' : 'text-error'}`}>{sgn(c.pts)}</span>
+                  <span className="text-base-content/65"><b className="text-base-content/85">{c.label}</b> · {c.note}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 
