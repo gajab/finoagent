@@ -82,8 +82,16 @@ _MACD_ACCEL_VETO = 0.004         # |Δhistogram over ~3 sessions| ÷ spot beyond
 
 _STOCK_STRUCTURES = {"covered_call"}               # hold 100 shares/contract
 _BULLISH_INCOME = {"cash_secured_put", "put_credit_spread", "jade_lizard"}
-_BEARISH_INCOME = {"call_credit_spread"}
+# Short-CALL income where an up-move is the ENEMY (assignment = a loss, not a capped gain): a naked call
+# fears a rally exactly like a call credit spread — down/flat drift keeps it OTM. Covered calls are
+# deliberately EXCLUDED: their assignment is a capped positive outcome, so a rally is not a headwind and
+# must not trip the MACD-accel veto below.
+_BEARISH_INCOME = {"call_credit_spread", "naked_call"}
 _NEUTRAL_INCOME = {"iron_condor", "jade_lizard", "short_strangle"}
+# Fallback ONLY (the short strikes are normally read straight off the opp's legs in _ta_alignment): which
+# single-short-leg structures carry their short_strike on the put vs the call side.
+_PUT_SHORT_STRUCTS = {"cash_secured_put", "put_credit_spread", "naked_put"}
+_CALL_SHORT_STRUCTS = {"covered_call", "call_credit_spread", "naked_call"}
 
 
 def _fin(x) -> Optional[float]:
@@ -194,6 +202,37 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
     )
 
 
+def _resolve_short_strikes(opp: dict) -> tuple[Optional[float], Optional[float]]:
+    """(put_short, call_short) — the primary short strike on each side, read off the opp's ACTUAL short
+    legs (SELL puts / SELL calls). This is the single source of truth so EVERY structure resolves —
+    naked_call, covered_call, CSP, verticals, strangle, condor, jade, custom/calendar — rather than a
+    hardcoded structure list that silently dropped naked_call (call_short → None → Structure, Breach and
+    the corrective-action ladder all skipped). Explicit put_short/call_short keys win when a builder set
+    them; short_strike + the *_SHORT_STRUCTS sets are the last-resort fallback. Primary short per side =
+    the leg NEAREST spot (highest short put / lowest short call)."""
+    s = opp.get("structure")
+    ss = opp.get("short_strike")
+    sp: list[float] = []
+    sc: list[float] = []
+    for l in (opp.get("legs") or []):
+        if not str(l.get("action", "")).upper().startswith("S"):     # short legs only
+            continue
+        try:
+            k = float(l.get("strike"))
+        except (TypeError, ValueError):
+            continue
+        if k <= 0:
+            continue
+        t = str(l.get("type", "")).upper()
+        if t.startswith("P"):
+            sp.append(k)
+        elif t.startswith("C"):
+            sc.append(k)
+    put_short = opp.get("put_short") or (max(sp) if sp else None) or (ss if s in _PUT_SHORT_STRUCTS else None)
+    call_short = opp.get("call_short") or (min(sc) if sc else None) or (ss if s in _CALL_SHORT_STRUCTS else None)
+    return put_short, call_short
+
+
 def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
                   spot: Optional[float] = None, hv: Optional[float] = None,
                   beta: Optional[float] = None, mkt_drift: Optional[float] = None) -> tuple[float, str, list]:
@@ -241,9 +280,9 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     # σ-sized cushion beyond it) → +; UNDEFENDED (no wall to spot) → naked premium, PENALISED unless the strike
     # is ≥ _UNDEFENDED_SAFE_SIGMA from spot (probability alone then defends it → 0). NO 'reach ceiling' — a FAR
     # wall still counts when you sell BEHIND it. ALWAYS emitted (+/0/−) so every trade shows its structure.
-    ss = opp.get("short_strike")
-    put_short = opp.get("put_short") or (ss if s in ("cash_secured_put", "put_credit_spread") else None)
-    call_short = opp.get("call_short") or (ss if s in ("covered_call", "call_credit_spread") else None)
+    # The short strikes to place against structure / breach — read off the opp's ACTUAL short legs so
+    # EVERY structure resolves (naked_call included; see _resolve_short_strikes).
+    put_short, call_short = _resolve_short_strikes(opp)
     named_all = [(nm, float(v)) for nm, v in (
         ("support", (ta or {}).get("supportLevel")), ("resistance", (ta or {}).get("resistanceLevel")),
         ("value-area low", vp.get("val")), ("value-area high", vp.get("vah")),
@@ -1720,14 +1759,11 @@ def _risk_triggers(opp: dict, spot: Optional[float], ta: dict, phys_vol: Optiona
 
     # The ladder tracks the underlying moving TOWARD the short strike (where it's exercised/assigned) — the
     # adverse direction for a premium seller: DOWN for short puts, UP for short calls. A covered call is a
-    # SHORT CALL → up-side only (a falling stock is GOOD for it), with covered-call framing.
-    put_short = opp.get("put_short") or (opp.get("short_strike")
-                    if struct in ("cash_secured_put", "put_credit_spread") else None)
+    # SHORT CALL → up-side only (a falling stock is GOOD for it), with covered-call framing. Short strikes
+    # come from the shared resolver so a naked_call builds its up-side ladder too (was silently skipped).
+    put_short, call_short = _resolve_short_strikes(opp)
     if put_short:
         build("down", float(put_short))
-
-    call_short = opp.get("call_short") or (opp.get("short_strike")
-                    if struct in ("call_credit_spread", "covered_call") else None)
     if call_short:
         build("up", float(call_short), covered=(struct == "covered_call"))
 
@@ -1932,7 +1968,8 @@ async def monitor_trade(ticker: str, trade: dict) -> dict:
     if not spot or not ctx.get("levels"):
         return {"error": "No live technical levels available for monitoring right now.",
                 "triggers": [], "strike_rationale": [], "gamma_note": None}
-    return build_monitor_plan(trade.get("structure"), trade.get("put_short"), trade.get("call_short"),
+    _ps, _cs = _resolve_short_strikes(trade)   # resolve off legs/structure so a naked_call gets its up-side ladder
+    return build_monitor_plan(trade.get("structure"), _ps, _cs,
                               float(trade.get("credit") or 0), spot, int(trade.get("dte") or 30), ctx)
 
 
@@ -1968,7 +2005,8 @@ async def monitor_analyze(ticker: str, trade: dict, api_key: str, model: str = "
     spot = float(trade.get("spot") or ctx.get("spot") or 0)
     if not spot or not ctx.get("levels"):
         return {"error": "No live technical levels available for the deep read right now."}
-    plan = build_monitor_plan(trade.get("structure"), trade.get("put_short"), trade.get("call_short"),
+    _ps, _cs = _resolve_short_strikes(trade)   # resolve off legs/structure so a naked_call gets its up-side ladder
+    plan = build_monitor_plan(trade.get("structure"), _ps, _cs,
                               float(trade.get("credit") or 0), spot, int(trade.get("dte") or 30), ctx)
     lv = sorted((ctx.get("levels") or []), key=lambda L: abs((L.get("price") or spot) - spot))
     level_lines = [f"  {round(p, 2)} ({(p - spot) / spot * 100:+.1f}%) · {L.get('label')} [{L.get('kind')}]"

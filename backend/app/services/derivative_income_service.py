@@ -1729,6 +1729,11 @@ def _build_evaluate_opp(legs: list[dict], stock: Optional[dict], chains_by_exp: 
         "expiration": near_exp, "dte": near_dte,
         "short_strike": round(short_strike, 2) if short_strike else round(spot, 2),
         "short_strike_pct": round((short_strike - spot) / spot * 100, 1) if short_strike else None,
+        # PRIMARY short per side (nearest spot) — so the desk's structural / breach / fortified / systemic-beta
+        # factors fire on a bring-your-own EVALUATE trade EXACTLY as on a scanned one (they read put_short/
+        # call_short; the scan builders set these, so the evaluate opp must too — else the two would diverge).
+        "put_short": round(max(shorts_put), 2) if shorts_put else None,
+        "call_short": round(min(shorts_call), 2) if shorts_call else None,
         "short_delta": round(gsum("delta"), 3),
         "stock_shares": shares,           # explicit signed shares → desk metrics include the stock leg
         "prob_keep_pct": prob_keep_pct, "prob_assign_pct": round(max(0.0, 100 - prob_keep_pct), 1),

@@ -618,7 +618,10 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
         <PmGrid pm={dm.pm} />
       </CollapsibleSection>
 
-      <QuantAnalysisSection t={t} q={q} />
+      {/* In EVALUATE, this IS the point of the page — the desk's full read on the user's own trade.
+          Open the panel by default so Structure, Breach risk and every factor are visible with zero
+          clicks (in a scan it stays closed so an expanded row leads with the summary/greeks). */}
+      <QuantAnalysisSection t={t} q={q} defaultOpen={!!evaluate} />
 
       {/* Run Institutional Desk — the LLM debate on THIS trade, in the boardroom modal. Right-aligned,
           directly after the Quant Analysis section. */}
@@ -831,7 +834,11 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
     // adopt it, no fetch. Reset the debate/expansion when it changes.
     if (controlled) {
       setRev(data ?? null); setErr(null); setLoading(false);
-      setAgents(null); setAgentsErr(null); setExpanded(null);
+      setAgents(null); setAgentsErr(null);
+      // EVALUATE (or any single-trade result): auto-OPEN the row so the full Quant Analysis — Structure,
+      // Breach risk and every factor — is visible immediately, not hidden one click away. (Single-ticker
+      // scans with many candidates stay collapsed so the ranked table reads cleanly.)
+      setExpanded((evaluate || (data?.ranked?.length ?? 0) === 1) ? 0 : null);
       return;
     }
     // Uncontrolled (v2 desk tab): the RANKING is algorithmic (no LLM cost), so auto-load it with the
