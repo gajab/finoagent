@@ -1,6 +1,10 @@
 export { PositionSummary } from './PositionSummary';
-export { ExitSignalGauge } from './ExitSignalGauge';
+export { ExitSignalGauge, EntryRatingGauge } from './ExitSignalGauge';
 export { TechnicalSignals } from './TechnicalSignals';
+export { TradeSetupPanel } from './TradeSetupPanel';
+export { PillarOwnershipFlow } from './PillarOwnershipFlow';
+export { PillarCatalyst } from './PillarCatalyst';
+export { PillarQuality } from './PillarQuality';
 export { PillarCard } from './PillarCard';
 export { PillarFundamental } from './PillarFundamental';
 export { PillarMacro } from './PillarMacro';

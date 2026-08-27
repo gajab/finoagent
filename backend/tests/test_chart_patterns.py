@@ -94,6 +94,25 @@ class TestContinuation:
         assert p and p["type"] == "ascending_triangle" and p["direction"] == "bullish"
         assert p["breakout"]["side"] == "up" and p["target"]["price"] > p["breakout"]["level"]
 
+    def test_falling_wedge_requires_lower_highs(self):
+        from app.services.chart_pattern_service import _wedge
+        # lower highs AND lower lows, converging → valid falling wedge (bullish)
+        df = _df(_path([100, 130, 100, 120, 96, 112, 94]))
+        z = _zigzag(df, order=5)
+        p = _wedge(z, df, float(df["Close"].values[-1]), _atr(df))
+        assert p and p["type"] == "falling_wedge" and p["direction"] == "bullish"
+        # a HIGHER high in the sequence (140 > 130) is NOT a lower-high → rejected (the GOOG bug)
+        df2 = _df(_path([100, 130, 100, 140, 96, 112, 94]))
+        z2 = _zigzag(df2, order=5)
+        assert _wedge(z2, df2, float(df2["Close"].values[-1]), _atr(df2)) is None
+
+    def test_wedge_stop_matches_invalidation_text(self):
+        from app.services.chart_pattern_service import _wedge
+        df = _df(_path([100, 130, 100, 120, 96, 112, 94]))
+        z = _zigzag(df, order=5)
+        p = _wedge(z, df, float(df["Close"].values[-1]), _atr(df))
+        assert p and str(p["stop"]) in p["education"]["invalidates"]   # chart Stop == "invalidated at" text
+
     def test_cup_handle_requires_level_rims(self):
         from app.services.chart_pattern_service import _cup_handle
         # valid cup: a U from 620→558→620 (level rims) then a shallow handle
@@ -112,7 +131,18 @@ class TestFibonacci:
         fib = _fibonacci(z, df, 140.0)
         assert fib and fib["direction"] == "up"
         by = {round(l["ratio"], 3): l["price"] for l in fib["levels"]}
-        assert abs(by[0.618] - (150 - 0.618 * 50)) < 0.5      # 61.8% ≈ 119.1
+        assert abs(by[0.618] - (150 - 0.618 * 50)) < 1.0      # 61.8% retracement ≈ 119.1
+
+    def test_extensions_project_targets_above_the_swing(self):
+        # the "price after breakout" targets: 127–262% extensions sit ABOVE the up-swing high
+        df = _df(_path([130, 100, 150, 120]))
+        z = _zigzag(df, order=5)
+        fib = _fibonacci(z, df, 140.0)
+        assert fib and fib.get("extensions")
+        hi = fib["swing"]["to"]["price"]; lo = fib["swing"]["from"]["price"]; rng = hi - lo
+        assert all(e["price"] > hi for e in fib["extensions"])          # all extensions above the swing high
+        by = {round(e["ratio"], 3): e["price"] for e in fib["extensions"]}
+        assert abs(by[1.618] - (lo + 1.618 * rng)) < 1.0               # 161.8% extension target
 
 
 class TestComputeInvariants:

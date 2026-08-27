@@ -841,6 +841,7 @@ export type DeskReviewParams = {
   structures?: string[];
   quote_source?: string;
   owns_underlying?: boolean;   // already hold the shares → covered calls scored as an income overlay
+  earnings_aware?: boolean;    // discount walls the earnings gap can leap + penalise strikes inside ~1.5× the event move
 };
 
 export async function runDeskReview(ticker: string, params: DeskReviewParams): Promise<DeskReviewResult> {
@@ -858,6 +859,7 @@ export type DeskEvaluateParams = {
   legs: EvaluateLeg[];
   quote_source?: string;
   owns_underlying?: boolean;
+  earnings_aware?: boolean;
 };
 
 export async function runDeskReviewAgents(
@@ -1534,6 +1536,8 @@ export interface BookHedgeCandidate {
 export interface BookTailRiskResult {
   positions: number;
   error?: string;
+  stored?: boolean;          // true when served from the persisted snapshot
+  computed_at?: string;      // ISO time the stored snapshot was computed
   net_delta?: number; net_gamma?: number; net_vega?: number; net_theta?: number;
   net_delta_notional?: number; beta_delta_notional?: number; beta_delta_spy?: number | null;
   book_capital?: number; annual_income?: number; capital_basis?: string;
@@ -1550,13 +1554,34 @@ export interface BookTailRiskResult {
   verdict?: { level: string; summary: string; actions: string[] };
   assumptions?: { beta: string; mkt_vol_pct?: number; tail?: string; crash_prob_annual_pct: number; hedge_rolls_per_year: number };
 }
-export async function fetchBookTailRisk(quoteSource = 'yfinance'): Promise<BookTailRiskResult> {
-  return apiFetch<BookTailRiskResult>(`/api/saved-strategies/book-tail-risk?quote_source=${encodeURIComponent(quoteSource)}`);
+// refresh=false → the STORED snapshot (page load); refresh=true → recompute live + overwrite the store.
+export async function fetchBookTailRisk(quoteSource = 'yfinance', refresh = false): Promise<BookTailRiskResult> {
+  return apiFetch<BookTailRiskResult>(`/api/saved-strategies/book-tail-risk?quote_source=${encodeURIComponent(quoteSource)}&refresh=${refresh ? 1 : 0}`);
 }
 
 // LLM hedging strategy for the whole book — model is fed ONLY the computed numbers.
 export async function fetchBookHedgeAdvice(quoteSource = 'yfinance'): Promise<{ advice?: string; error?: string; data_sent?: any }> {
   return apiFetch(`/api/saved-strategies/book-hedge-advice?quote_source=${encodeURIComponent(quoteSource)}`);
+}
+
+export interface RepairAlternative {
+  name: string; category: string; mechanics: string; rationale?: string; risk_note: string;
+  net_cash: number;
+  scenarios: { move_pct: number; spot: number; pnl: number }[];
+  max_loss: number | null; max_gain: number; breakevens: number[];
+  greeks: { delta: number; gamma: number; theta: number; vega: number }; theta_day: number;
+  defined_risk: boolean; upside_risk_free: boolean; pop_pct: number | null;
+  turns_profitable: boolean;
+  legs?: { action: string; right: string; strike: number; qty: number; dte_days: number | null }[];
+}
+export interface RepairMenuResult {
+  error?: string; ticker?: string; tested?: boolean; cushion_pct?: number;
+  short_right?: 'P' | 'C'; short_strike?: number; spot?: number; dte_days?: number; contracts?: number;
+  unrealized_pnl?: number; pricing?: string; structure?: string; alternatives?: RepairAlternative[];
+}
+// Institutional repair menu for a tested short-premium trade (roll / spread / hedge / wheel / close).
+export async function fetchTradeRepairMenu(id: number, quoteSource = 'yfinance'): Promise<RepairMenuResult> {
+  return apiFetch(`/api/saved-strategies/${id}/repair-menu?quote_source=${encodeURIComponent(quoteSource)}`);
 }
 
 export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance', marginMode?: string): Promise<LivePnlResponse> {
@@ -2210,6 +2235,25 @@ export interface HighlightFundamentalSignal {
   dividend_yield: number | null;
 }
 
+export interface HighlightCatalyst {
+  kind: 'earnings' | 'analyst' | 'valuation' | 'technical' | 'sector' | 'macro' | 'quality' | string;
+  title: string;
+  detail: string;
+  date: string | null;
+  days_until: number | null;
+  sentiment: 'bullish' | 'bearish' | 'neutral' | 'event' | string;
+  importance: 'high' | 'medium' | 'low' | string;
+}
+
+export interface HighlightVerdict {
+  label: string;                 // Strong Hold | Hold | Caution | Consider Exit | Strong Exit
+  score: number;                 // 0-100, higher = stronger hold
+  pillars_score: number | null;
+  technical_score: number | null;
+  risk_score: number | null;
+  summary: string | null;
+}
+
 export interface HighlightHolding {
   ticker: string;
   company_name: string | null;
@@ -2227,6 +2271,8 @@ export interface HighlightHolding {
   fundamentals: HighlightFundamentalSignal;
   news: HighlightNewsItem[];
   hypothesis: string;
+  verdict?: HighlightVerdict | null;
+  catalysts?: HighlightCatalyst[];
 }
 
 export interface HighlightResponse {

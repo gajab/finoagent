@@ -749,23 +749,53 @@ async def import_order(
     }
 
 
+_BOOK_TR_TTL = 90 * 86400   # persist the last "Manage Book" result ~90 days (until next refresh)
+
+
+def _book_tr_key(user_id: int) -> str:
+    return f"book_tail_risk:v1:{user_id}"
+
+
 @router.get("/book-tail-risk")
 async def book_tail_risk(
     quote_source: str = "yfinance",
+    refresh: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Book-level short-vol / tail-risk desk: aggregate the OPTION-LAYER greeks of
-    every open trade, flag laddered/concentrated shorts as one bet, replay crash
-    scenarios on the aggregate, and size an INDEX (SPX, European) put-spread tail
-    hedge with the Spitznagel cost-vs-drag test. On-demand (fetches quotes)."""
+    """Book-level short-vol / tail-risk desk ("Manage Book"): aggregate the OPTION-LAYER
+    greeks of every open trade, flag laddered/concentrated shorts as one bet, replay crash
+    scenarios on the aggregate, and size INDEX / VIX tail hedges with the Spitznagel
+    cost-vs-drag test.
+
+    Persistence: the last computed result is stored per-user in the DB cache. On page load
+    (``refresh=false``) we return that STORED snapshot (fast, no quote fetch) so the panel
+    shows last-known numbers immediately. ``refresh=true`` (user clicks Refresh) recomputes
+    from live quotes and OVERWRITES the stored snapshot."""
     from ..services.book_tail_risk import compute_book_tail_risk
+    from ..services.cache_service import get_cached, set_cached
+    import datetime as dt
+    key = _book_tr_key(user.id)
+
+    if not refresh:                                   # page load → serve the stored snapshot
+        stored = await get_cached(db, key)
+        if stored:
+            return {**stored, "stored": True}
+        return {"stored": False, "positions": 0}      # nothing stored yet → UI shows "Analyze book"
+
     result = await db.execute(select(SavedStrategy).where(
         SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))
     strategies = list(result.scalars().all())
     if not strategies:
-        return {"positions": 0, "error": "No active trades to analyze."}
-    return await compute_book_tail_risk(strategies, quote_source, user, db)
+        return {"positions": 0, "error": "No active trades to analyze.", "stored": False}
+    computed = await compute_book_tail_risk(strategies, quote_source, user, db)
+    if not computed.get("error"):
+        computed["computed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        try:
+            await set_cached(db, key, computed, ttl_seconds=_BOOK_TR_TTL)
+        except Exception:  # noqa: BLE001 — persistence must never break the response
+            pass
+    return {**computed, "stored": not computed.get("error")}
 
 
 @router.get("/book-hedge-advice")
@@ -779,16 +809,21 @@ async def book_hedge_advice(
     candidate's cost / CVaR-cut / CAGR, concentration, assignment capital) — NO opinions,
     NO verdict text — and is explicitly told to do NO arithmetic, only reason over the data."""
     from ..services.book_tail_risk import compute_book_tail_risk
-    result = await db.execute(select(SavedStrategy).where(
-        SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))
-    strategies = list(result.scalars().all())
-    if not strategies:
-        return {"error": "No active trades to analyze."}
+    from ..services.cache_service import get_cached
     api_key = await get_user_api_key(db, user.id, "openai_api_key")
     if not api_key:
         return {"error": "OpenAI API key not configured. Add it in Settings."}
 
-    d = await compute_book_tail_risk(strategies, quote_source, user, db)
+    # Advise on exactly what the user SEES — reuse the stored "Manage Book" snapshot if present
+    # (fast, consistent); only recompute if nothing's been stored yet.
+    d = await get_cached(db, _book_tr_key(user.id))
+    if not d:
+        result = await db.execute(select(SavedStrategy).where(
+            SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))
+        strategies = list(result.scalars().all())
+        if not strategies:
+            return {"error": "No active trades to analyze."}
+        d = await compute_book_tail_risk(strategies, quote_source, user, db)
     if d.get("error"):
         return {"error": d["error"]}
 
@@ -1531,6 +1566,97 @@ async def save_pnl_snapshot(
     strategy.parameters = json.dumps(params, default=str)
     await db.commit()
     return {"saved": True, "last_pnl_at": now_iso}
+
+
+@router.get("/{strategy_id}/repair-menu")
+async def get_repair_menu(
+    strategy_id: int,
+    quote_source: str = "yfinance",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Institutional REPAIR MENU for a tested short-premium trade (CSP short put / short call
+    run over by an adverse move): roll out, roll away & out, cap into a spread, delta-hedge with
+    stock/futures, take assignment → wheel, or close — each model-priced and laddered across spot
+    scenarios so the user can weigh turning it around vs. banking the loss."""
+    import datetime as dt
+    from ..services.quote_providers import get_provider
+    from ..services.hedging_service import _split_chain
+    from ..services.trade_repair_service import repair_alternatives
+
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    raw = json.loads(strategy.legs_data) if strategy.legs_data else []
+    entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
+    roll_days = 45
+
+    # Build the FULL position: every option leg with its sign + per-share entry credit/debit.
+    legs, near_exp = [], None
+    for i, l in enumerate(raw):
+        typ = str(l.get("type", "")).lower()
+        if not l.get("strike") or ("call" not in typ and "put" not in typ):
+            continue
+        right = "P" if "put" in typ else "C"
+        sign = -1 if "SELL" in str(l.get("action", "")).upper() else 1
+        ep = entry_prices[i].get("price") if i < len(entry_prices) and isinstance(entry_prices[i], dict) else None
+        entry = abs(float(ep)) if ep else abs(float(l.get("premium") or l.get("mid") or 0.0))
+        legs.append({"strike": float(l["strike"]), "right": right, "sign": sign,
+                     "qty": int(l.get("qty") or l.get("contracts") or 1), "entry": entry})
+        near_exp = near_exp or str(l.get("expiration") or l.get("expiry") or "")[:10]
+    if not legs:
+        return {"error": "No option legs to repair — the repair menu is for short-premium trades (CSPs / short calls / spreads / condors)."}
+
+    provider = get_provider(quote_source, user=user, db=db)
+    try:
+        uq = await provider.get_underlying_price(strategy.ticker)
+        spot = float(getattr(uq, "price", None) or getattr(uq, "last", None) or 0.0)
+    except Exception:  # noqa: BLE001
+        spot = 0.0
+    if spot <= 0:
+        return {"error": "Couldn't fetch the underlying price to build the repair menu."}
+
+    try:
+        dte_days = max(1, (dt.date.fromisoformat(near_exp) - dt.date.today()).days)
+    except (ValueError, TypeError):
+        dte_days = 30
+
+    # LIVE chains for the near (trade) expiry AND the far (+roll_days) expiry → {tenor: {strike:{P/C:{mid,iv}}}}.
+    async def _chain_for(target_dte: int) -> tuple:
+        try:
+            exps = await provider.get_option_expirations(strategy.ticker)
+            exp = min(exps, key=lambda e: abs((dt.date.fromisoformat(str(e)[:10]) - dt.date.today()).days - target_dte))
+            adte = max(1, (dt.date.fromisoformat(str(exp)[:10]) - dt.date.today()).days)
+            calls, puts = _split_chain(await provider.get_option_chain(strategy.ticker, exp))
+            book: dict = {}
+            for side, rt in ((puts, "P"), (calls, "C")):
+                for k, q in (side or {}).items():
+                    mid = getattr(q, "mid", None)
+                    iv = getattr(q, "iv", None)
+                    book.setdefault(float(k), {})[rt] = {"mid": float(mid) if mid else None,
+                                                         "iv": float(iv) if iv else None}
+            return adte, book
+        except Exception:  # noqa: BLE001 — no chain → pure BS fallback in the engine
+            return target_dte, {}
+
+    (n_dte, near_book), (f_dte, far_book) = await _chain_for(dte_days), await _chain_for(dte_days + roll_days)
+    chains = {k: v for k, v in ((n_dte, near_book), (f_dte, far_book)) if v}
+    atm_iv = 0.30
+    near_atm = min(near_book.keys(), key=lambda k: abs(k - spot)) if near_book else None
+    if near_atm is not None:
+        for rt in ("P", "C"):
+            v = (near_book[near_atm].get(rt) or {}).get("iv")
+            if v:
+                atm_iv = v
+                break
+
+    menu = repair_alternatives(legs=legs, spot=spot, dte_days=dte_days, roll_days=roll_days,
+                               atm_iv=atm_iv, chains=chains or None)
+    menu["ticker"] = strategy.ticker
+    return menu
 
 
 @router.get("/{strategy_id}/live-pnl")

@@ -5,7 +5,7 @@ import json
 import math
 import os
 import typing
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,18 +28,29 @@ from .services.scheduler_service import scheduler_loop
 # Lifespan — initialise DB on startup, start scheduler
 # ---------------------------------------------------------------------------
 
+# MCP servers mounted over Streamable HTTP (populated after the app is built, below).
+# Their streamable-HTTP session managers must be kept running for the app's lifetime.
+_mcp_instances: list = []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     # Start the agent scheduler as a background task
     scheduler_task = asyncio.create_task(scheduler_loop())
-    yield
-    # Shutdown: cancel the scheduler
-    scheduler_task.cancel()
     try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        pass
+        # Run each mounted MCP server's streamable-HTTP session manager for the app's life.
+        async with AsyncExitStack() as stack:
+            for _m in _mcp_instances:
+                await stack.enter_async_context(_m.session_manager.run())
+            yield
+    finally:
+        # Shutdown: cancel the scheduler
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +166,21 @@ app.include_router(tracking_router.router)
 app.include_router(trade_tracking_router.router)
 app.include_router(pick_shovel_v2_router.router)
 app.include_router(debt_entry_router.router)
+
+
+# ---------------------------------------------------------------------------
+# MCP servers — expose backend analytics as Model-Context-Protocol tools over
+# Streamable HTTP at /mcp/<name> (same host/port as the web app), so a remote agent
+# (e.g. Gemini CLI) connects to a URL. See app/mcp_server/http_mount.py. Mounted BEFORE
+# the SPA catch-all so /mcp/* isn't swallowed by it. Additive: a failure here (e.g. the
+# `mcp` package missing) is logged and never blocks web-app startup.
+# ---------------------------------------------------------------------------
+try:
+    from .mcp_server.http_mount import mount_mcp_servers
+    _mcp_instances.extend(mount_mcp_servers(app))
+except Exception as _mcp_exc:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger(__name__).warning("MCP servers not mounted: %s", _mcp_exc)
 
 
 # ---------------------------------------------------------------------------

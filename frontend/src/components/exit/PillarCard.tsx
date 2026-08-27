@@ -12,25 +12,26 @@ interface Props {
   children: React.ReactNode;
 }
 
+// Health convention: higher = healthier / stronger.
 function scoreBadge(score: number): string {
-  if (score >= 60) return 'bg-error/15 text-error border-error/20';
+  if (score >= 75) return 'bg-success/15 text-success border-success/20';
+  if (score >= 60) return 'bg-info/15 text-info border-info/20';
   if (score >= 40) return 'bg-warning/15 text-warning border-warning/20';
-  if (score >= 25) return 'bg-info/15 text-info border-info/20';
-  return 'bg-success/15 text-success border-success/20';
+  return 'bg-error/15 text-error border-error/20';
 }
 
 function scoreLabel(score: number): string {
-  if (score >= 60) return 'High Risk';
-  if (score >= 40) return 'Moderate';
-  if (score >= 25) return 'Low Risk';
-  return 'Healthy';
+  if (score >= 75) return 'Healthy';
+  if (score >= 60) return 'Solid';
+  if (score >= 40) return 'Watch';
+  return 'Weak';
 }
 
 function scoreBarColor(score: number): string {
-  if (score >= 60) return 'bg-error';
+  if (score >= 75) return 'bg-success';
+  if (score >= 60) return 'bg-info';
   if (score >= 40) return 'bg-warning';
-  if (score >= 25) return 'bg-info';
-  return 'bg-success';
+  return 'bg-error';
 }
 
 export function PillarCard({ title, icon, score, description, ticker, pillarKey, children }: Props) {

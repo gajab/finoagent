@@ -69,9 +69,25 @@ class TestManagementDeskScore:
         vol = next(c for c in r["contributions"] if c["label"] == "Vol decay")
         assert vol["pts"] > 0 and vol["favorable"] is True
 
-    def test_liquidity_reframed_as_exit_cost(self):
+    def test_liquidity_kept_as_context_lightly_weighted(self):
+        # Liquidity stays "Liquidity" (roll/close friction) — NOT renamed to a punitive "Exit cost",
+        # and downweighted (0.35): a scan Liquidity of −8 becomes ≈ −3 for a holder.
         r = self._scan_like()
-        assert any(c["label"] == "Exit cost" for c in r["contributions"])
+        liq = next((c for c in r["contributions"] if c["label"] == "Liquidity"), None)
+        assert liq is not None and liq["pts"] == round(-8 * 0.35)
+        assert not any(c["label"] == "Exit cost" for c in r["contributions"])
+
+    def test_breach_risk_always_shown_even_at_zero(self):
+        # Breach risk (P-touch) is THE hold metric — surfaced even at 0 pts (benign = reassuring).
+        r = self._scan_like(ta_factors=[{"label": "Breach risk", "points": 0}])
+        assert any(c["label"] == "Breach risk" for c in r["contributions"])
+
+    def test_earnings_timing_is_a_hold_risk_not_dropped(self):
+        # An entry-timing demerit (sold before earnings) becomes a HOLD risk once you're in — kept
+        # (not flipped), lightly downweighted: scan −8 → ≈ −6 for the holder.
+        r = self._scan_like(grade_adjustments=[{"label": "Earnings timing", "points": -8}])
+        et = next((c for c in r["contributions"] if c["label"] == "Earnings timing"), None)
+        assert et is not None and et["pts"] == round(-8 * 0.7) and et["favorable"] is False
 
     def test_banked_winner_still_closes(self):
         r = self._scan_like(captured_pct=90.0)

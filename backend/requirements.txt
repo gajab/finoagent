@@ -39,3 +39,6 @@ ibind[oauth]>=0.1.0
 pycryptodome>=3.20.0
 # GCP Secret Manager — optional, only used when GCP_PROJECT_ID is set
 google-cloud-secret-manager>=2.20.0
+# MCP — serves backend analytics as Model-Context-Protocol tools (app/mcp_server/*),
+# mounted over Streamable HTTP at /mcp/<name>.
+mcp>=2.0.0

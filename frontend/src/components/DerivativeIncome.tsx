@@ -165,6 +165,21 @@ function Week52Bar({ ctx }: { ctx: DerivativeIncomeContext }) {
   );
 }
 
+// Recent price-change badge — spot vs the prior session close, green up / red down. Shown wherever the
+// stock price appears (single scanner, evaluate, opportunity cards).
+export function PriceChange({ pct, abs, className = '' }: { pct?: number | null; abs?: number | null; className?: string }) {
+  if (pct == null || !isFinite(pct)) return null;
+  const up = pct >= 0;
+  return (
+    <span className={`inline-flex items-baseline gap-1 text-sm font-semibold tabular-nums ${up ? 'text-success' : 'text-error'} ${className}`}
+      title="Change vs the prior session close">
+      <span>{up ? '▲' : '▼'}</span>
+      {abs != null && isFinite(abs) && <span>{money(Math.abs(abs), 2)}</span>}
+      <span>({up ? '+' : ''}{pct.toFixed(2)}%)</span>
+    </span>
+  );
+}
+
 function TickerHeader({ result, ctx, shares, costBasis }: {
   // Only ticker + expiry_summaries are read here — narrowed so both the scan result and the
   // folded desk-review payload satisfy it.
@@ -182,6 +197,7 @@ function TickerHeader({ result, ctx, shares, costBasis }: {
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <span className="text-lg font-bold">{result.ticker}</span>
             <span className="text-2xl font-bold tabular-nums">{money(ctx.spot, 2)}</span>
+            <PriceChange pct={ctx.change_pct} abs={ctx.change_abs} />
             {shares != null && <span className="text-sm text-base-content/70">{shares.toLocaleString()} sh</span>}
             {costBasis != null && (
               <span className="text-sm text-base-content/60">
@@ -614,6 +630,7 @@ interface DiParams {
   structures: string[];
   quote_source: string;
   owns_underlying?: boolean;
+  earnings_aware?: boolean;
 }
 
 // One portfolio holding: compact best-opportunity summary + an expandable, lazily
@@ -726,6 +743,7 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
   const [quoteSource, setQuoteSource] = useState<'yfinance' | 'ibkr'>(defaultQuoteSource);
   const [legs, setLegs] = useState<EvaluateLeg[]>([{ action: 'SELL', type: 'PUT', strike: 0, expiration: '' }]);
   const [owns, setOwns] = useState(false);   // "I hold the underlying" — the sole stock signal
+  const [eaAware, setEaAware] = useState(true);   // earnings-aware scoring for the evaluated trade
 
   useEffect(() => {   // one-shot prefill handed off from a TA setup card ("Research in Evaluate")
     try {
@@ -785,6 +803,7 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
       legs: legs.filter(l => l.strike > 0 && l.expiration),
       quote_source: quoteSource,
       owns_underlying: owns,
+      earnings_aware: eaAware,
     };
     setLoading(true); setError(null); setResult(null); setSubmitted(null);
     try {
@@ -859,6 +878,11 @@ function EvaluateForm({ defaultQuoteSource }: { defaultQuoteSource: 'yfinance' |
         <label className="flex items-start gap-2 cursor-pointer text-[11px] text-base-content/70 rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
           <input type="checkbox" className="checkbox checkbox-xs checkbox-secondary mt-0.5" checked={owns} onChange={e => setOwns(e.target.checked)} />
           <span>I already hold the shares — a short call is scored as a <b>covered-call income overlay</b> (no fresh-capital / beta penalty) instead of a naked call, and a long put + short call becomes a <b>collar</b>.</span>
+        </label>
+
+        <label className="flex items-start gap-2 cursor-pointer text-[11px] text-base-content/70 rounded-xl border border-white/[0.06] bg-base-200/20 p-3">
+          <input type="checkbox" className="checkbox checkbox-xs checkbox-warning mt-0.5" checked={eaAware} onChange={e => setEaAware(e.target.checked)} />
+          <span><b>Earnings-aware scoring</b> — if a print falls before expiry, <b>discount the walls</b> a gap can leap and <b>penalise a strike inside ~1.5× the isolated event move</b>. Impacted metrics show <b>with / without</b> for comparison.</span>
         </label>
 
         <div className="flex items-center gap-2 justify-end flex-wrap">
@@ -1043,6 +1067,7 @@ export function DerivativeIncome() {
   const [quoteSource] = useState<'yfinance' | 'ibkr'>(
     () => (localStorage.getItem('incomeDesk.quoteSource') === 'ibkr' ? 'ibkr' : 'yfinance'));
   const [ownsShares, setOwnsShares] = useState(false);   // already hold the stock → covered call = overlay
+  const [earningsAware, setEarningsAware] = useState(true);   // discount walls the earnings gap can leap + size vs the event move
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1101,6 +1126,7 @@ export function DerivativeIncome() {
       structures,
       quote_source: quoteSource,
       owns_underlying: mode === 'portfolio' ? true : ownsShares,   // holdings are owned by definition
+      earnings_aware: earningsAware,
     };
   };
 
@@ -1232,6 +1258,11 @@ export function DerivativeIncome() {
               <span>I already hold the shares — score covered calls as an <b>income overlay</b> on the position (returns as yield on held stock, no fresh-capital or beta penalty), not a buy-write.</span>
             </label>
           )}
+          <label className="flex items-start gap-2 mt-2 cursor-pointer text-[11px] text-base-content/70">
+            <input type="checkbox" className="checkbox checkbox-xs checkbox-warning mt-0.5" checked={earningsAware}
+              onChange={e => setEarningsAware(e.target.checked)} />
+            <span><b>Earnings-aware ranking</b> — across a print before expiry, <b>discount the walls</b> an earnings gap can leap through and <b>penalise strikes inside ~1.5× the isolated event move</b> (the jump the diffusion σ can't see). Impacted metrics show <b>with / without</b> for comparison. No effect when no earnings falls in the window.</span>
+          </label>
         </div>
         <div className="form-control lg:col-span-4 gap-1">
           {mode === 'single' ? (

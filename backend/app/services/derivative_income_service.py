@@ -266,7 +266,8 @@ def _context_sync(ticker: str) -> dict:
     date, from ONE 1-year history pull. Best-effort: returns ``None`` defaults if
     yfinance is unavailable for the name."""
     out: dict = {"hv10": None, "hv20": None, "hv30": None, "next_earnings": None,
-                 "week52_high": None, "week52_low": None, "hv_series": None, "har_rv30": None}
+                 "week52_high": None, "week52_low": None, "hv_series": None, "har_rv30": None,
+                 "prev_close": None, "last_close": None}
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
@@ -276,6 +277,11 @@ def _context_sync(ticker: str) -> dict:
             if len(closes) > 5:
                 out["week52_high"] = round(float(closes.max()), 2)
                 out["week52_low"] = round(float(closes.min()), 2)
+            # Prior-session close → the recent-change badge (spot vs prev close). last_close is the most
+            # recent bar; prev_close is the one before, so the change is well-defined open OR closed.
+            if len(closes) >= 2:
+                out["last_close"] = round(float(closes.iloc[-1]), 2)
+                out["prev_close"] = round(float(closes.iloc[-2]), 2)
             # Realized (historical) vol at 10/20/30 TRADING-day windows: sample std (ddof=1) of daily
             # log returns, annualized by √252, on split/div-adjusted closes. HV30 is the desk baseline
             # every IV/HV comparison keys off; HV10/HV20 show the short-window term structure of realized.
@@ -1762,6 +1768,29 @@ def _build_evaluate_opp(legs: list[dict], stock: Optional[dict], chains_by_exp: 
     return opp
 
 
+def _earnings_implied_move_pct(calls: dict, puts: dict, spot: float, dte: int,
+                               hv: Optional[float]) -> Optional[float]:
+    """The isolated EARNINGS gap as a FRACTION of spot. The ATM straddle prices the market's TOTAL expected
+    move to expiry (event-inflated); the baseline DIFFUSION move (from HV, which carries no event) is stripped
+    out — variance is additive, so M_event = √(M_total² − M_diffusion²). This is the single-day jump the
+    diffusion σ (IV·√T) smears across the whole horizon and therefore understates. Returns None when the ATM
+    straddle can't be priced or the straddle is fully explained by diffusion (no isolable event excess)."""
+    if not spot or spot <= 0:
+        return None
+    common_ks = [k for k in calls if k in puts]                 # strikes quoted on BOTH sides
+    if not common_ks:
+        return None
+    atm_k = min(common_ks, key=lambda k: abs(k - spot))         # nearest-to-spot straddle
+    cq, pq = calls[atm_k], puts[atm_k]
+    if not (cq.mid and pq.mid and cq.mid > 0 and pq.mid > 0):
+        return None
+    m_total = (cq.mid + pq.mid) / spot                          # straddle-implied TOTAL move to expiry (fraction)
+    m_diff = (hv * math.sqrt(max(dte, 1) / 365.0)) if hv else 0.0   # baseline diffusion (no event)
+    m_event = math.sqrt(max(m_total ** 2 - m_diff ** 2, 0.0))
+    m_event = min(m_event, 0.60)                                # sanity clamp against a mispriced/illiquid straddle
+    return m_event or None
+
+
 def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: date,
                  r: float, sofr_pct: float, hv: Optional[float], structures: list[str],
                  european: bool, next_earnings: Optional[str], min_prob: float,
@@ -1796,10 +1825,20 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
 
     # ---- Short calls (OTM) — COVERED if the user holds the shares, else NAKED (Reg-T margin) ----
     if "covered_call" in structures:
+        # CRITICAL: when the user does NOT hold the shares the short call is a NAKED call — build it with
+        # structure_id "naked_call" (NOT "covered_call"), otherwise the desk models 100 phantom shares
+        # (covered_call ∈ _STOCK_STRUCTURES) and grades it on the STOCK's downside payoff → a safe naked
+        # call tanks to D/F in the scan while evaluate (which correctly uses "naked_call") grades it A.
+        _struct = "covered_call" if owns_underlying else "naked_call"
         _cc_label = "Covered Call" if owns_underlying else "Naked Call (Reg-T margin)"
-        cc = [o for k in call_strikes
-              if (o := _single_leg_income("covered_call", _cc_label, calls[k],
-                                          sofr_pct=sofr_pct, covered=owns_underlying, **common))]
+        cc = []
+        for k in call_strikes:
+            o = _single_leg_income(_struct, _cc_label, calls[k],
+                                   sofr_pct=sofr_pct, covered=owns_underlying, **common)
+            if o:
+                if not owns_underlying:
+                    o["unbounded_loss"] = True     # naked call — upside risk is unbounded (matches the evaluate build)
+                cc.append(o)
         # Prioritize SAFER strikes (higher keep-prob) — surface the ladder above min_prob, not just the
         # nearest-money / highest-yield strikes; yield breaks ties.
         opps += sorted(cc, key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0),
@@ -1883,6 +1922,14 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
         oi_by_strike[q.strike] = oi_by_strike.get(q.strike, 0) + (q.oi or 0)
     max_oi_strike = max(oi_by_strike, key=oi_by_strike.get) if any(oi_by_strike.values()) else None
 
+    # Earnings-implied GAP (isolated single-event jump) — attached as DATA to every opp so an earnings-aware
+    # ranking can size strikes against the discrete gap and discount walls the gap can leap (the scoring gate
+    # is a separate user flag; the gap itself is always computed when earnings falls before expiry).
+    earnings_gap_pct = _earnings_implied_move_pct(calls, puts, spot, dte, hv) if earnings_before else None
+    if earnings_gap_pct is not None:
+        for o in opps:
+            o["earnings_gap_pct"] = round(earnings_gap_pct * 100, 1)
+
     summary = {
         "expiration": exp, "dte": dte, "monthly": _is_monthly_expiry(exp_date),
         "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
@@ -1891,6 +1938,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
         "rnd_available": rnd is not None,
         "max_oi_strike": max_oi_strike,
         "earnings_before_expiry": earnings_before,
+        "earnings_gap_pct": round(earnings_gap_pct * 100, 1) if earnings_gap_pct is not None else None,
         "macro_events": macro,
         "quant": quant,
         "n_opportunities": len(opps),
@@ -2044,7 +2092,10 @@ async def run_derivative_income(
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
                  f"{'own' if owns_underlying else 'naked'}:"
-                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v3")   # owns → covered call · else naked-call BPR;
+                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v5")   # owns → covered call · else naked-call BPR;
+                 # v4: not-owned short calls now build as structure=naked_call (correct payoff/grade), untradeable-leg
+                 #     filter, + context.change_pct/prev_close — all change the cached shape.
+                 # v5: opp.earnings_gap_pct (isolated event move) attached when earnings is before expiry.
                  #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:
@@ -2123,6 +2174,22 @@ async def run_derivative_income(
         except Exception:  # noqa: BLE001
             pass
 
+    # #2 UNTRADEABLE-LEG filter — drop any opportunity with a real bid≤0 or ask≤0 on ANY leg: no two-sided
+    # market means you can't reliably open OR close it. The provider already synthesizes an INDICATIVE
+    # bid/ask from lastPrice off-hours, so a leg still showing 0 here is genuinely dead. Exempt the user's
+    # own focus/evaluate trade (_is_focus) — they explicitly asked to score THAT trade regardless.
+    def _all_legs_tradeable(o: dict) -> bool:
+        if o.get("_is_focus"):
+            return True
+        for l in (o.get("legs") or []):
+            try:
+                if float(l.get("bid") or 0) <= 0 or float(l.get("ask") or 0) <= 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+    opportunities = [o for o in opportunities if _all_legs_tradeable(o)]
+
     opportunities.sort(key=lambda o: o.get("premium_annualized_pct", 0), reverse=True)
     best_by_structure: dict[str, dict] = {}
     for o in opportunities:
@@ -2153,8 +2220,19 @@ async def run_derivative_income(
     for m in _macro_events_in_window(today, today + timedelta(days=EVENTS_HORIZON_DAYS)):
         events.append({"level": "info", "scope": "common", "text": m})
 
+    # Recent price change (for the spot badge). Reference close: if spot already equals the last historical
+    # bar, that bar IS today's close → compare to the PRIOR close; otherwise spot is a fresher intraday
+    # print than the last bar → compare to that last close. Robust whether the market is open or closed.
+    _lc, _pc = ctx.get("last_close"), ctx.get("prev_close")
+    _ref = (_pc if (_lc and _pc and abs(spot - _lc) < 0.001 * _lc) else _lc) or _pc
+    change_abs = round(spot - _ref, 2) if _ref else None
+    change_pct = round((spot - _ref) / _ref * 100, 2) if _ref else None
+
     context = {
         "spot": round(spot, 2),
+        "prev_close": _ref,
+        "change_abs": change_abs,
+        "change_pct": change_pct,
         "shares_per_contract": CONTRACT_MULTIPLIER,
         "notional_per_contract": round(spot * CONTRACT_MULTIPLIER, 2),
         "week52": week52,
@@ -2262,7 +2340,7 @@ async def run_portfolio_derivative_income(
     page = holdings[offset: offset + limit]
 
     cache_key = (f"derivinc:pf:{user.id}:{offset}:{limit}:{target_dte or 'monthly'}:"
-                 f"{min_prob:.2f}:{int(min_income)}:{quote_source}:v1")
+                 f"{min_prob:.2f}:{int(min_income)}:{quote_source}:v2")   # v2: naked_call grading + row change_pct
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return cached
@@ -2301,6 +2379,8 @@ async def run_portfolio_derivative_income(
         entry.update({
             "best_opportunity": best,
             "spot": scan.get("spot"),
+            "change_pct": (scan.get("context") or {}).get("change_pct"),   # recent price change for the row badge
+            "change_abs": (scan.get("context") or {}).get("change_abs"),
             "exercise_style": scan.get("exercise_style"),
             "next_earnings": scan.get("next_earnings"),
             "iv_hv_ratio": scan["expiry_summaries"][0]["iv_hv_ratio"] if scan.get("expiry_summaries") else None,

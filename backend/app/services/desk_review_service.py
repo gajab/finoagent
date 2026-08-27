@@ -79,6 +79,28 @@ _DRIFT_CAP = 8
 # (a −42%/yr reading is preserved) and only trims the noise-driven tails.
 _DRIFT_MU_CAP = 0.60
 _MACD_ACCEL_VETO = 0.004         # |Δhistogram over ~3 sessions| ÷ spot beyond this = accelerating counter-trend
+# A momentum-acceleration signal only HARD-holds a trade when the strike is actually REACHABLE — a timing
+# wobble is noise for a deep, wall-defended strike. Exposure = near-money OR non-trivial touch. When exposed
+# → a WAIT (timing) hold, NOT a structural F. When deep → the accel is folded (graded) into the Trend-drift
+# factor and does not block. This is what makes the veto make holistic sense.
+_TIMING_BLOCK_SIGMA = 1.10       # nearest short within ~1.1σ (dual move) → a momentum accel can realistically reach it
+_TIMING_BLOCK_TOUCH = 18.0       # …or P(touch) ≥ 18% → exposed → WAIT (timing) block
+_MOMENTUM_DRAG_K = 6.0           # graded momentum drag: points per unit of |accel_norm| in excess of the threshold
+_MOMENTUM_DRAG_CAP = 6.0         # cap on the graded momentum drag folded into Trend drift (pts)
+
+# UNDEFINED-RISK (unbounded-loss) demerit — naked calls / short strangles carry an UNBOUNDED tail that the
+# base score's CVaR95 term deliberately omits (it uses expected shortfall, not the deep worst case). Price it
+# EXPLICITLY, scaled by the DEEP tail (CVaR99 ÷ capital) the score ignores AND by reachability: a deep,
+# low-touch strike's unbounded tail is remote (small hit) while a near-money one is not (large hit). Exposure-
+# scaled, mirroring the timing redesign — never a flat structural veto.
+_UNDEFINED_RISK_BASE = 12.0      # demerit at full exposure × the deep-tail multiplier
+_UNDEFINED_DEMERIT_CAP = 15.0    # cap on the undefined-risk demerit (pts)
+_UNDEFINED_REACH_FLOOR = 0.35    # a naked structure ALWAYS carries irreducible unbounded tail (gap / takeover) → floor
+_UNDEFINED_TOUCH_FULL = 25.0     # P(touch) ≥ 25% → full exposure weight
+
+
+def _clampf(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 _STOCK_STRUCTURES = {"covered_call"}               # hold 100 shares/contract
 _BULLISH_INCOME = {"cash_secured_put", "put_credit_spread", "jade_lizard"}
@@ -235,11 +257,17 @@ def _resolve_short_strikes(opp: dict) -> tuple[Optional[float], Optional[float]]
 
 def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
                   spot: Optional[float] = None, hv: Optional[float] = None,
-                  beta: Optional[float] = None, mkt_drift: Optional[float] = None) -> tuple[float, str, list]:
+                  beta: Optional[float] = None, mkt_drift: Optional[float] = None,
+                  earnings_aware: bool = False) -> tuple[float, str, list]:
     """Does this trade fit the regime / smart-money structure? Evaluated on the MEDIUM-TERM read
     (6-month history, DAILY bars) — the swing horizon that governs a multi-week income option, not
     intraday noise or multi-year lag. Returns (score_bonus ±, note, factors) where `factors` is the
-    itemized [{label, points}] breakdown of how the technicals moved the score."""
+    itemized [{label, points}] breakdown of how the technicals moved the score.
+
+    ``earnings_aware`` (user opt-in): when earnings falls before expiry, DISCOUNT the Structure credit for
+    walls the earnings GAP can leap (#1) and add an ``Earnings gap`` breach penalty when the strike sits
+    inside ~1.5× the isolated event move (#2). Impacted factors carry ``baseline_points`` (the value WITHOUT
+    the earnings adjustment) so the UI can show a with/without comparison."""
     inst = (ta or {}).get("institutional") or {}
     reg = inst.get("regime") or {}
     mode = reg.get("mode")
@@ -247,15 +275,29 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     vp = inst.get("volume_profile") or {}
     factors: list[dict] = []
     notes: list[str] = []
+    # Earnings-gap context: the isolated event move (%) is attached to the opp ONLY when earnings is before
+    # expiry; the user flag gates whether it actually moves the score. `_eg_frac` = gap as a fraction of spot.
+    _eg_pct = opp.get("earnings_gap_pct")
+    earnings_on = bool(earnings_aware and _eg_pct and spot)
+    _eg_frac = (_eg_pct / 100.0) if _eg_pct else None
 
-    def add(label: str, pts: float, note: str):
+    def add(label: str, pts: float, note: str, baseline: Optional[float] = None):
         # ``detail`` = the concrete price-point evidence, surfaced per-factor in the UI so the user sees
         # WHY the factor scored (which support/wall/value-area level, GEX value, node volume, etc.).
-        factors.append({"label": label, "points": pts, "detail": note}); notes.append(note)
+        # ``baseline_points`` (+ ``earnings_impacted``) = the value WITHOUT the earnings adjustment, for the
+        # with/without comparison — set only when it actually differs from the applied points.
+        f = {"label": label, "points": pts, "detail": note}
+        if baseline is not None and round(baseline, 1) != round(pts, 1):
+            f["baseline_points"] = round(baseline, 1)
+            f["earnings_impacted"] = True
+        factors.append(f); notes.append(note)
 
-    # Trend drift (μ) — the continuous EMA-slope angle REPLACES the old yes/no ±6/±5 regime-fit. A trend
-    # that helps the short side is a tailwind (+), one that threatens it a headwind (−); neutral structures
-    # dislike ANY strong drift. Points scale with the actual angle (severity), not a binary regime label.
+    # MOMENTUM (μ velocity + MACD acceleration) — ONE coherent factor. The continuous EMA-slope angle sets
+    # the base tailwind/headwind (a trend that helps the short side is +, one that threatens it −; neutral
+    # structures dislike ANY strong drift). MACD acceleration (the 2nd derivative) then MODULATES it:
+    # velocity and acceleration are the SAME signal's derivatives, so a tailwind that's decelerating is a
+    # WEAKER tailwind — not a full tailwind alongside a separate veto. Acceleration against the short side
+    # dampens/flips; acceleration with it reinforces. Points scale with severity, capped.
     mu = (ta or {}).get("_drift_mu")
     if mu is not None:
         if s in _BULLISH_INCOME:
@@ -267,10 +309,27 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
         else:
             aligned = 0.0
         pts = max(-_DRIFT_CAP, min(_DRIFT_CAP, round(aligned * _DRIFT_SCALE)))
-        if pts != 0:
+        _vel_pts = pts                                           # velocity-only score, BEFORE the acceleration modulation
+        # Fold in MACD acceleration for directional income (bull/bear); neutral structures already penalise
+        # any trend via −|μ|, so an extra accel term would double-count.
+        _accel_note = ""
+        _macd = _macd_accel(ta, spot) if s in (_BULLISH_INCOME | _BEARISH_INCOME) else None
+        if _macd is not None and abs(_macd["accel_norm"]) > _MACD_ACCEL_VETO:
+            an = _macd["accel_norm"]
+            with_short = an if s in _BULLISH_INCOME else -an     # +: accel keeps the short OTM · −: accel threatens it
+            drag = int(min(_MOMENTUM_DRAG_CAP, round((abs(an) - _MACD_ACCEL_VETO) / _MACD_ACCEL_VETO * _MOMENTUM_DRAG_K)))
+            drag = drag if with_short >= 0 else -drag
+            if drag:
+                pts = int(max(-_DRIFT_CAP, min(_DRIFT_CAP, pts + drag)))
+                # Spell out the arithmetic: velocity score → modulation → net, so "faded −6" is self-explaining.
+                _accel_note = (f"; MACD acceleration is {'WITH' if with_short >= 0 else 'AGAINST'} the short "
+                               f"(Δhist {_macd['accel']}) → {'tailwind' if _vel_pts >= 0 else 'headwind'} "
+                               f"{_vel_pts:+d} {'reinforced' if with_short >= 0 else 'faded'} by {abs(drag)} pts → net {pts:+d}")
+        if pts != 0 or _accel_note:
             _dte = int(opp.get("dte") or 0)
             _hz = f" ≈ {'+' if mu > 0 else ''}{round(mu * _dte / 365 * 100, 1)}% over {_dte}d" if _dte else ""
-            add("Trend drift", pts, f"trend velocity {round(mu * 100)}%/yr (annualized EMA slope){_hz} — {'tailwind' if pts > 0 else 'headwind'} for this structure")
+            _dir = "tailwind" if pts > 0 else "headwind" if pts < 0 else "neutral"
+            add("Trend drift", pts, f"trend velocity {round(mu * 100)}%/yr (annualized EMA slope){_hz} — {_dir} for this structure{_accel_note}")
     if mode == "range" and s in _NEUTRAL_INCOME:
         _va = f", value area ${round(vp['val'], 1)}–${round(vp['vah'], 1)}" if vp.get("val") and vp.get("vah") else ""
         _poc = f"POC ${round(vp['poc'], 1)}" if vp.get("poc") else "range-bound tape"
@@ -291,6 +350,7 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     ) if v and float(v) > 0]
     sig_frac = _sigma_frac((opp.get("atm_iv_pct") or 0.0) / 100.0, hv, opp.get("dte"))   # 1σ move to expiry (event-aware)
     struct_pts, struct_notes = 0.0, []
+    _def_wall_dists: list[float] = []            # |wall − spot| for each DEFENDED leg — how far a gap must leap to clear it
     for short_k, is_put in ((put_short, True), (call_short, False)):
         if not (short_k and spot and short_k > 0):
             continue
@@ -307,6 +367,7 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
             peak = _STRUCT_PEAK_STRONG if strong else _STRUCT_PEAK_STD
             credit = peak * min(gap / buf, 1.0) if buf > 0 else peak    # ~0 AT the wall → full peak once the cushion is met
             struct_pts += round(credit, 1)
+            _def_wall_dists.append(abs(L - spot))                       # distance a gap must cover to reach this defending wall
             _g = f"{round(gap / em, 2)}σ (${round(gap, 1)})" if em else f"${round(gap, 1)}"
             _emn = f"1σ move ${round(em, 1)}; " if em else ""
             _bσ = _BUF_SIGMA_STRONG if strong else _BUF_SIGMA_STD
@@ -325,10 +386,44 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
                 struct_pts -= round(pen, 1)
                 struct_notes.append(f"{leg} ${round(short_k, 1)} UNDEFENDED — no wall between spot ${round(spot, 1)} and the "
                                     f"strike, only {round(sig_spot, 2)}σ out (< {_UNDEFENDED_SAFE_SIGMA}σ) → naked premium in open air")
+    # #1 EARNINGS-AWARE: walls are a CONTINUOUS-tape defense; an earnings GAP leaps through them. Discount the
+    # structural CREDIT by how much of the distance to the (innermost, most-gappable) defending wall the event
+    # move covers — if the gap reaches the wall, that wall stops defending across the print.
+    _struct_baseline = round(max(-6.0, min(struct_pts, 6.0)), 1)
+    if earnings_on and struct_pts > 0 and _def_wall_dists:
+        _gap_abs = _eg_frac * spot
+        _clear = _clampf(_gap_abs / min(_def_wall_dists), 0.0, 1.0)   # 1.0 = the gap reaches/clears the nearest wall
+        if _clear > 0:
+            struct_pts = struct_pts * (1.0 - _clear)
+            struct_notes.append(f"EARNINGS-AWARE: the ~{round(_eg_pct, 1)}% event gap (±${round(_gap_abs, 1)}) leaps "
+                                f"{round(_clear * 100)}% of the way to the nearest defending wall — walls are continuous-"
+                                f"tape defense a gap ignores, so structural credit is discounted {round(_clear * 100)}%")
+    _struct_final = round(max(-6.0, min(struct_pts, 6.0)), 1)
     if put_short or call_short:   # ALWAYS emit (even 0) so every trade shows its structural situation. The
         # generic 'how buffer/1σ/reach work' explanation lives in the "How these ratings work" panel, not here.
-        add("Structure", round(max(-6.0, min(struct_pts, 6.0)),  1),
-            "; ".join(struct_notes) if struct_notes else "no short leg to place against structure")
+        add("Structure", _struct_final,
+            "; ".join(struct_notes) if struct_notes else "no short leg to place against structure",
+            baseline=_struct_baseline)
+
+    # #2 EARNINGS GAP — size the strike against the ISOLATED event move, not the smeared diffusion σ. The gap
+    # is a single-day JUMP the touch model can't see; require the strike beyond ~1.5× it (a real surprise runs
+    # 2-3× the implied), and penalise (worst leg) when it sits inside that band. Baseline WITHOUT earnings = 0.
+    if earnings_on and (put_short or call_short):
+        _gap_abs = _eg_frac * spot
+        _band = _EARN_GAP_MULT * _gap_abs
+        _pens = []
+        for _sk in (put_short, call_short):
+            if _sk and _band > 0:
+                _cush = abs(_sk - spot)
+                if _cush < _band:
+                    _pens.append((min((_band - _cush) / _band * _EARN_GAP_MAX, _EARN_GAP_MAX), _sk, _cush))
+        if _pens:
+            _pen, _wk, _wc = max(_pens, key=lambda t: t[0])   # worst (most gap-exposed) leg
+            add("Earnings gap", -round(_pen, 1),
+                f"strike ${round(_wk, 1)} is only ${round(_wc, 1)} ({round(_wc / _gap_abs, 2)}× the ~{round(_eg_pct, 1)}% "
+                f"event move) from spot — inside the {_EARN_GAP_MULT}× earnings-gap band (±${round(_band, 1)}); an "
+                f"earnings JUMP the diffusion touch can't see can breach it. Prefer a strike ≥ {_EARN_GAP_MULT}× the gap "
+                f"or an expiry that doesn't straddle the print", baseline=0.0)
 
     # BREACH RISK — the honest "does the short EVER go ITM" probability (drift-aware first-passage / touch),
     # NOT just P(finish OTM at expiry). Touch ≈ 2× the expiry-ITM odds and RISES when the stock drifts TOWARD
@@ -921,6 +1016,8 @@ def _opp_bps(opp: dict, dm: dict, sofr_pct: float) -> Optional[int]:
 _EARN_HOLD_PENALTY = 8.0    # holding a short through the pre-earnings IV RAMP (short vega into rising IV)
 _EARN_CLEAN_BONUS = 3.0     # the window ENDS before earnings → clean theta/VRP harvest, no event gap
 _EARN_CRUSH_BONUS = 4.0     # earnings imminent + short strike OUTSIDE the implied move → a real IV-crush harvest
+_EARN_GAP_MULT = 1.5        # earnings-aware #2: require the strike beyond 1.5× the isolated event move (surprises run 2-3×)
+_EARN_GAP_MAX = 10.0        # max "Earnings gap" breach penalty when the strike sits well inside the gap band
 
 
 def _earnings_timing_factor(opp: dict, next_earnings: Optional[str], today) -> tuple:
@@ -1002,14 +1099,18 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
                 next_earnings: Optional[str] = None, today=None,
                 har_rv_pct: Optional[float] = None) -> dict:
     pm = (dm or {}).get("pm") or {}
-    merits, demerits, blocking = [], [], []
+    # blocking = STRUCTURAL/quality hard-fails → grade F (avoid). timing_hold = a good trade held on TIMING
+    # (momentum against a REACHABLE strike) → WAIT, distinct from F. Kept separate so a fortified trade is
+    # never mislabelled junk for a short-term wobble.
+    merits, demerits, blocking, timing_hold = [], [], [], []
     # VRP ratio is GAP-AWARE: implied ÷ the physical vol used everywhere (max of HV and ATR), so the
     # grade, the veto and the number-line all agree. Falls back to the scan's HV-based ratio.
     iv_hv = round((atm_iv_pct / 100.0) / hv, 2) if (atm_iv_pct and hv and hv > 0) else opp.get("iv_hv_ratio")
     # Itemized signed contributions (points) by factor — so the UI can show each adjustment as a bar
     # and the desk score is auditable: desk_score = base_quality + regime + Σ(these).
     comp: dict[str, float] = {"expectation": 0.0, "vrp": 0.0, "moneyness": 0.0,
-                              "skew": 0.0, "liquidity": 0.0, "beta": 0.0, "event": 0.0}
+                              "skew": 0.0, "liquidity": 0.0, "beta": 0.0, "event": 0.0,
+                              "undefined_risk": 0.0}
     if today is None:
         today = date.today()
     is_cal = opp.get("structure") == "calendar"   # LONG-vega, ATM-by-design → the short-vol penalties invert
@@ -1138,21 +1239,58 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     # (Event density intentionally NOT a flat demerit — routine macro spans every multi-week trade, and an
     #  earnings print is DOUBLE-EDGED, not simply bad; event TIMING is a qualitative call for the desk.)
 
+    # 7b) UNDEFINED-RISK (unbounded loss) — a naked call / short strangle can lose an UNBOUNDED amount, which
+    #     the base score's CVaR95 tail term deliberately omits. Price that deep tail EXPLICITLY: scale by how
+    #     fat the 1% tail is (CVaR99 ÷ capital — naked structures run 2-4×) AND by reachability (a deep,
+    #     low-touch strike's unbounded tail is remote; a near-money one is live). Overwrite (income overlay on
+    #     held shares) is EXEMPT — that short call is covered, its loss is bounded.
+    if opp.get("max_loss") is None and not overwrite:      # max_loss None = unbounded (naked call / short strangle)
+        _cap = opp.get("collateral") or opp.get("notional_capital")
+        _cvar99 = (dm.get("risk") or {}).get("cvar_99")
+        _tail_mult = _clampf((_cvar99 / _cap) / 3.0, 0.5, 1.5) if (_cvar99 and _cap and _cap > 0) else 1.0
+        _pt = opp.get("prob_touch_pct")                    # set by _ta_alignment (runs first)
+        if _pt is not None:
+            _reach = _clampf(_pt / _UNDEFINED_TOUCH_FULL, _UNDEFINED_REACH_FLOOR, 1.0)
+        elif nss is not None:
+            _reach = _clampf((2.0 - nss) / 1.5, _UNDEFINED_REACH_FLOOR, 1.0)   # deep (high σ) → floor · near-money → full
+        else:
+            _reach = 0.5
+        _ur = -round(min(_UNDEFINED_RISK_BASE * _tail_mult * _reach, _UNDEFINED_DEMERIT_CAP), 1)
+        if _ur < 0:
+            comp["undefined_risk"] += _ur
+            _pctxt = (f"P(touch) {round(_pt)}%" if _pt is not None
+                      else (f"{round(nss, 2)}σ to the strike" if nss is not None else "unknown reach"))
+            _c99txt = f"CVaR99 {round(_cvar99 / _cap * 100)}% of capital" if (_cvar99 and _cap) else "unbounded loss"
+            demerits.append(f"undefined-risk (unbounded loss): {_c99txt} — a deep tail the CVaR95 base term omits; "
+                            f"{_pctxt} → {'remote' if _reach <= 0.45 else 'live'} exposure")
+
     # 8) Dealer gamma HARD FILTER — a SHORT-gamma tape (dealers chase moves → vol expansion) runs
     #    DELTA-NEUTRAL premium over both ways: veto iron condors. Directional income is only penalised
     #    (via the TA "Gamma regime" factor), not blocked.
     if gex and gex.get("regime") == "short" and opp.get("structure") == "iron_condor":
         blocking.append("short-gamma tape vetoes delta-neutral (iron condor) — vol expansion runs it over both ways")
 
-    # 9) MACD ACCELERATION — a SEPARATE timing veto (the Trend-drift factor is velocity; THIS is
-    #    acceleration). If momentum is actively accelerating AGAINST the short side past the threshold,
-    #    veto — you'd be stepping in front of a speeding-up move.
+    # 9) MACD ACCELERATION — a TIMING signal (Trend-drift is velocity; THIS is acceleration). It only
+    #    HARD-holds the trade when the strike is actually REACHABLE (near-money OR non-trivial touch) — then
+    #    it's a WAIT ("good trade, wrong moment"), not a structural F. On a deep, wall-defended strike the
+    #    accel is already folded (graded) into the Trend-drift factor and must NOT block: you're not stepping
+    #    in front of a move that can't reach you. Exposure-gated so the veto makes holistic sense.
     if macd and macd.get("accel_norm") is not None:
         an, h, struct = macd["accel_norm"], (macd.get("histogram") or 0.0), opp.get("structure")
-        if struct in _BULLISH_INCOME and an < -_MACD_ACCEL_VETO and h < 0:
-            blocking.append(f"MACD accelerating down against short puts (Δhist {macd.get('accel')}) — counter-trend timing veto")
-        elif struct in _BEARISH_INCOME and an > _MACD_ACCEL_VETO and h > 0:
-            blocking.append(f"MACD accelerating up against short calls (Δhist {macd.get('accel')}) — counter-trend timing veto")
+        against = ((struct in _BULLISH_INCOME and an < -_MACD_ACCEL_VETO and h < 0)
+                   or (struct in _BEARISH_INCOME and an > _MACD_ACCEL_VETO and h > 0))
+        if against:
+            _pt = opp.get("prob_touch_pct")                       # set by _ta_alignment (runs first)
+            exposed = ((_pt is not None and _pt >= _TIMING_BLOCK_TOUCH)
+                       or (nss is not None and nss < _TIMING_BLOCK_SIGMA))
+            _side = "short puts" if struct in _BULLISH_INCOME else "short calls"
+            _dir = "down" if struct in _BULLISH_INCOME else "up"
+            if exposed:
+                _reach = (f"P(touch) {round(_pt)}%" if _pt is not None
+                          else (f"{round(nss, 2)}σ to the strike" if nss is not None else "near the money"))
+                timing_hold.append(f"MACD accelerating {_dir} against {_side} (Δhist {macd.get('accel')}) and the "
+                                   f"strike is reachable ({_reach}) — WAIT for momentum to stabilise (timing, not quality)")
+            # else: deep/fortified — no hold; the momentum drag already sits in the Trend-drift factor.
 
     # N) Earnings TIMING — the vega-ramp / IV-crush nuance (avoid selling INTO the ramp; harvest the crush
     #    or the clean post-event window). What pure VRP/moneyness can't see.
@@ -1164,7 +1302,8 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
         demerits.append(et_demerit)
 
     adj = sum(comp.values())
-    return {"adj": adj, "merits": merits, "demerits": demerits, "blocking": blocking, "components": comp,
+    return {"adj": adj, "merits": merits, "demerits": demerits, "blocking": blocking,
+            "timing_hold": timing_hold, "components": comp,
             "iv_edge_vp": iv_edge_vp,   # short-strike IV vs ATM (vol-pts) — the per-strike skew premium / edge
             # Q-vs-P boundary read (for the number-line viz): implied vs physical 1σ moves + strike distance.
             "qp": {"implied_move_pct": imp_em, "physical_move_pct": phys_em, "dual_move_pct": dual_em,
@@ -1175,19 +1314,27 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
                                             and (nss * dual_em) < phys_em)}}
 
 
-def _grade_letter(score: int, blocking: list) -> tuple[str, str]:
-    """Map the final desk score (+ any hard block) to a letter grade and an LLM-approval likelihood."""
+def _grade_letter(score: int, blocking: list, timing_hold: Optional[list] = None) -> tuple[str, str]:
+    """Map the final desk score (+ any hard block) to a letter grade and an approval likelihood.
+
+    Three tiers, so QUALITY and TIMING stay separate: a STRUCTURAL block → F/auto_reject (avoid); a TIMING
+    hold (good trade, momentum against a reachable strike) KEEPS its quality letter but reads WAIT (revisit
+    when momentum stabilises) — NOT the same F as a broken trade; otherwise the normal score→letter map."""
     if blocking:
         return "F", "auto_reject"
     if score >= 78:
-        return "A", "high"
-    if score >= 65:
-        return "B", "high"
-    if score >= 52:
-        return "C", "medium"
-    if score >= 38:
-        return "D", "low"
-    return "F", "low"
+        letter, approval = "A", "high"
+    elif score >= 65:
+        letter, approval = "B", "high"
+    elif score >= 52:
+        letter, approval = "C", "medium"
+    elif score >= 38:
+        letter, approval = "D", "low"
+    else:
+        letter, approval = "F", "low"
+    if timing_hold:
+        approval = "wait"        # quality letter stands; the desk is holding on TIMING, not rejecting
+    return letter, approval
 
 
 def _candidate_extra(r: dict, meta: dict, max_oi_strike: Optional[float]) -> dict:
@@ -1390,7 +1537,8 @@ def _candidate_json(i: int, r: dict, meta: dict) -> dict:
         "algo_grade": r.get("algo_grade"),              # A–F after the full deterministic overlay
         "approval_odds": r.get("approval_odds"),        # high | medium | low | auto_reject (LLM-approval likelihood)
         "algo_demerits": r.get("grade_demerits") or [], # every deterministic mark AGAINST the trade
-        "algo_blocking": r.get("grade_blocking") or [], # hard fails — a graded trade that reached you should have none
+        "algo_blocking": r.get("grade_blocking") or [], # STRUCTURAL hard fails — a graded trade that reached you should have none
+        "algo_timing_hold": r.get("grade_timing_hold") or [], # TIMING holds (WAIT) — good trade, momentum against a reachable strike
         "algo_quant": {"score": q.get("score"), "verdict": q.get("verdict"), "reasons": q.get("reasons")},
         "ta_alignment": r.get("ta_note") or None,
         "pricing": {"net_premium": r.get("premium"), "premium_annualized_pct": r.get("premium_annualized_pct"),
@@ -1598,6 +1746,7 @@ async def rank_desk(
     target_expiration: Optional[str] = None,
     focus: Optional[dict] = None,
     owns_underlying: bool = False,
+    earnings_aware: bool = False,
 ) -> dict:
     """Rank ALL candidate income trades (best → worst) by a blended desk score:
     the algorithmic Quant 0–100 score adjusted for technical/regime alignment.
@@ -1623,7 +1772,8 @@ async def rank_desk(
         return {"error": scan["error"]}
     return await _finalize_desk(scan, scan.get("opportunities", []), ticker,
                                 quote_source, owns_underlying, user, db, target_dte,
-                                collapse_strikes=True, ta=ta, portfolio_fit=portfolio_fit, gex=gex)
+                                collapse_strikes=True, ta=ta, portfolio_fit=portfolio_fit, gex=gex,
+                                earnings_aware=earnings_aware)
 
 
 # ── Risk triggers — the price-level management plan ──────────────────────
@@ -2125,6 +2275,7 @@ _ADJ_MATCH: dict[str, tuple] = {   # distinctive substrings — chosen so each m
     "Liquidity":       ("spread",),
     "Beta":            ("beta", "overlay on held"),
     "Earnings timing": ("earnings", "iv-crush", "vega-ramp", "clean window", "post-event", "harvest"),
+    "Undefined risk":  ("undefined-risk", "unbounded loss"),
 }
 
 
@@ -2139,7 +2290,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
                          owns_underlying: bool, user: Optional["User"], db: Optional["AsyncSession"],
                          target_dte: Optional[int] = None, collapse_strikes: bool = False,
                          ta: Optional[dict] = None, portfolio_fit: Optional[dict] = None,
-                         gex: Optional[dict] = None) -> dict:
+                         gex: Optional[dict] = None, earnings_aware: bool = False) -> dict:
     """Score a set of candidate opportunities against the ticker's TA / regime / vol context and
     assemble the desk-review payload (chrome passthrough + ranked trades). Shared by ``rank_desk``
     (the full scan) and ``evaluate_desk_trade`` (one user-supplied trade).
@@ -2164,7 +2315,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
     atm_iv_pct, iv_rank = vsx.get("iv_atm_pct"), vsx.get("iv_rank")
     beta = (portfolio_fit or {}).get("beta_1y_spx")
     mu = ta.get("_drift_mu")                          # EMA-slope drift (annualized) — Trend-drift + drift-adj keep
-    macd_accel = _macd_accel(ta, spot)               # MACD acceleration — the SEPARATE timing veto
+    macd_accel = _macd_accel(ta, spot)               # MACD acceleration — folds into Trend drift + gates the timing hold
     r_free = sofr_pct / 100.0
     phys_vol, atr_vol = _gap_aware_vol(hv, ta.get("_atr_pct"))   # Keltner/ATR gap-aware physical vol
     gap_aware = bool(atr_vol and hv and atr_vol > hv)
@@ -2183,7 +2334,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         if base is None:
             base = (opp.get("confidence") or {}).get("score") or 50
         bonus, note, ta_factors = _ta_alignment(opp, ta, gex, spot, hv=hv, beta=beta,
-                                                mkt_drift=(portfolio_fit or {}).get("market_drift"))
+                                                mkt_drift=(portfolio_fit or {}).get("market_drift"),
+                                                earnings_aware=earnings_aware)
         # Fold EVERY deterministic institutional factor (VRP / moneyness / skew / liquidity / tail /
         # beta / events) into the score + a hard-BLOCK filter, so the trade reaching the LLM is vetted.
         g = _algo_grade(opp, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
@@ -2192,7 +2344,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
                         next_earnings=(ctx or {}).get("next_earnings"), today=date.today(),
                         har_rv_pct=vsx.get("har_rv_pct"))
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
-        grade, approval = _grade_letter(desk_score, g["blocking"])
+        grade, approval = _grade_letter(desk_score, g["blocking"], g.get("timing_hold"))
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
         # factors are their OWN group (ta_factors), kept separate from the option-math adjustments:
         #   desk_score = base_quality + Σ(grade_adjustments) + Σ(ta_factors).
@@ -2202,7 +2354,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
             {"label": lbl, "points": round(c[key], 1), "detail": _adj_detail(lbl, _notes)}
             for lbl, key in (("Expectation", "expectation"), ("VRP", "vrp"), ("Moneyness", "moneyness"),
                              ("Skew / IV-edge", "skew"), ("Liquidity", "liquidity"), ("Beta", "beta"),
-                             ("Earnings timing", "event"))
+                             ("Earnings timing", "event"), ("Undefined risk", "undefined_risk"))
         ]
         risk_triggers = _risk_triggers(opp, spot, ta, phys_vol)   # WATCH→DEFEND→EXIT ladder (TA + geometry)
         ea_yield, ea_share = _event_adjusted_yield(opp, vsx, (ctx or {}).get("next_earnings"), date.today())
@@ -2211,6 +2363,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
                        "event_adjusted_yield_pct": ea_yield, "event_premium_share": ea_share,
                        "algo_grade": grade, "approval_odds": approval, "grade_merits": g["merits"],
                        "grade_demerits": g["demerits"], "grade_blocking": g["blocking"],
+                       "grade_timing_hold": g.get("timing_hold") or [],   # WAIT (timing) reasons — distinct from a structural veto
                        "base_quality": round(base, 1), "grade_adjustments": grade_adjustments,
                        "ta_factors": ta_factors,
                        # Q-vs-P: the boundary read (imp/phys moves + strike distance) and the vol pair
@@ -2225,7 +2378,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
     # BLOCKING trades (structurally broken, etc.) sink to the bottom; then desk score, Sortino, yield —
     # so the top-ranked trade has already cleared every mechanical filter the LLM desk applies.
     ranked.sort(key=lambda r: (
-        not r["grade_blocking"],
+        not r["grade_blocking"],            # structural veto → very bottom
+        not r.get("grade_timing_hold"),     # then WAIT (timing) → below clean, above vetoed
         r["desk_score"],
         (r["desk_metrics"].get("pm") or {}).get("sortino") or 0,
         r.get("premium_annualized_pct") or 0,
@@ -2302,6 +2456,10 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         "ranked": ranked,
         "algo_top_pick": ranked[0] if ranked else None,
         "n_trades": len(ranked),
+        # Earnings-aware ranking: whether the user opted in AND an expiry in the scan actually straddles a
+        # print (so the toggle had something to bite on) — drives the with/without comparison UI.
+        "earnings_aware": bool(earnings_aware),
+        "earnings_in_window": any(s.get("earnings_before_expiry") for s in (scan.get("expiry_summaries") or [])),
         "note": scan.get("note"),
         "data_source_note": scan.get("data_source_note"),   # IBKR→yfinance fallback flag, if any
     }
@@ -2314,6 +2472,7 @@ async def evaluate_desk_trade(
     owns_underlying: bool = False,
     user: Optional["User"] = None,
     db: Optional["AsyncSession"] = None,
+    earnings_aware: bool = False,
 ) -> dict:
     """Evaluate ONE user-supplied multi-leg trade (options and/or stock) on the FULL desk
     pipeline — identical chrome + metrics + grade as the single-ticker scan, but for the user's
@@ -2412,7 +2571,8 @@ async def evaluate_desk_trade(
     opp["is_custom"] = bool(is_custom)
     opp.setdefault("label", label)
 
-    desk = await _finalize_desk(scan, [opp], ticker, quote_source, owns_underlying, user, db)
+    desk = await _finalize_desk(scan, [opp], ticker, quote_source, owns_underlying, user, db,
+                                earnings_aware=earnings_aware)
     desk["note"] = (f"Evaluated a user-supplied {label}."
                     + (" Custom / calendar structure — the desk grade is indicative." if is_custom else ""))
     desk["evaluate"] = {"structure": structure_id, "label": label, "is_custom": is_custom,

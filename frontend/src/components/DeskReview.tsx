@@ -186,15 +186,29 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
   const sgn = (n: number) => `${n > 0 ? '+' : ''}${n}`;
   const rawSum = r1(base + adjNet + taNet);        // the true arithmetic sum (pre-clamp)
   const clamped = rawSum !== t.desk_score;         // desk_score is clamped to [0, 100]
+  // ONE coherent desk verdict — a STRUCTURAL veto (avoid), a TIMING hold (good trade, wait), else the grade.
+  // Replaces the old base-quant "ENTER" headline that could sit next to a desk veto (the incoherent read).
+  const vetoed = (t.grade_blocking || []).length > 0;
+  const waiting = !vetoed && (t.grade_timing_hold || []).length > 0;
+  const deskState = vetoed ? { label: 'VETOED', cls: 'text-error' }
+                  : waiting ? { label: 'WAIT · TIMING', cls: 'text-warning' }
+                  : { label: 'DESK GRADE', cls: '' };
   return (
     <CollapsibleSection title={title} accent="secondary" defaultOpen={defaultOpen}
       icon={<Cpu className="w-3 h-3" />} subtitle={subtitle}>
-      {/* Top: the TOTAL desk score (not the base) */}
+      {/* Top: the desk's ONE verdict (state + grade), never a base-quant word that contradicts a veto */}
       <div className={`flex items-center gap-2 rounded-lg border p-2 mb-2.5 ${gradeTone(t.algo_grade)}`}>
-        <span className="text-sm font-bold uppercase tracking-wider">{q?.verdict || 'GRADE'}</span>
-        <span className="text-xs text-base-content/50">desk grade · point build-up below</span>
+        <span className={`text-sm font-bold uppercase tracking-wider ${deskState.cls}`}>{deskState.label}</span>
+        <span className="text-xs text-base-content/50">quality grade · point build-up below</span>
         <span className="ml-auto inline-flex items-baseline gap-1 text-lg font-bold">{t.algo_grade || '—'}<span className="text-[10px] text-base-content/40">grade</span></span>
       </div>
+
+      {/* A TIMING hold is not a quality knock — the grade stands, the desk is just waiting for momentum to settle */}
+      {waiting && (
+        <div className="rounded-lg border border-warning/30 bg-warning/[0.06] p-2 mb-2.5 text-[11px] text-warning/90 leading-snug">
+          <b>WAIT — timing, not quality.</b> {(t.grade_timing_hold || []).join(' · ')}
+        </div>
+      )}
 
       {/* Q-vs-P boundary — the implied-vs-physical read the base score is now weighted on */}
       {t.qp && <QpBoundary qp={t.qp} />}
@@ -266,7 +280,11 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
 
       {/* 3) TA factors — the technical read (6-mo daily) that tilts the score */}
       <div className="mb-2">
-        <div className={GROUP_LABEL}>TA factors — regime &amp; structure · 6-mo daily (± on base)</div>
+        <div className={GROUP_LABEL}>TA factors — regime &amp; structure · 6-mo daily (± on base)
+          {tas.some(a => a.earnings_impacted) && (
+            <span className="ml-2 badge badge-xs badge-warning badge-outline align-middle normal-case">earnings-aware · with/without below</span>
+          )}
+        </div>
         {tas.length > 0 ? (
           <div className="flex flex-wrap gap-2">
             {tas.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
@@ -282,7 +300,15 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
             {tas.filter(a => a.detail).map((a, i) => (
               <li key={i} className="flex gap-2 text-[11px] leading-snug">
                 <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
-                <span className="text-base-content/65"><b className="text-base-content/85">{a.label}</b> · {a.detail}</span>
+                <span className="text-base-content/65">
+                  <b className="text-base-content/85">{a.label}</b>
+                  {a.earnings_impacted && a.baseline_points != null && (
+                    <span className="ml-1 inline-flex items-baseline gap-1 rounded bg-warning/15 border border-warning/30 px-1 text-[9px] text-warning/90 align-middle whitespace-nowrap">
+                      earnings: <span className="line-through opacity-60">{a.baseline_points > 0 ? '+' : ''}{a.baseline_points}</span>→<b>{a.points > 0 ? '+' : ''}{a.points}</b>
+                    </span>
+                  )}
+                  {' · '}{a.detail}
+                </span>
               </li>
             ))}
           </ul>
@@ -295,6 +321,8 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
         {clamped
           ? <> → <b className={gradeTextTone(t.algo_grade)}>{t.desk_score}</b> <span className="opacity-70">({rawSum > 100 ? 'capped at 100' : 'floored at 0'})</span></>
           : <> <b className={gradeTextTone(t.algo_grade)}>desk score</b></>}
+        {vetoed && <> → <b className="text-error">VETOED</b> <span className="opacity-70">(blocked regardless of score)</span></>}
+        {waiting && <> → <b className="text-warning">WAIT</b> <span className="opacity-70">(quality holds; timing hold)</span></>}
       </p>
 
       {/* Key drivers — EVERY non-zero factor (option-math + technical), biggest mover first, so the
@@ -561,10 +589,16 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
   };
   return (
     <div className="p-3 space-y-2">
-      {(t.grade_blocking && t.grade_blocking.length > 0) && (
+      {(t.grade_blocking && t.grade_blocking.length > 0) ? (
         <div className="rounded-lg border border-error/40 bg-error/[0.08] p-2 text-[11px] flex items-start gap-1.5">
           <span className="font-bold text-error shrink-0">⛔ VETOED</span>
           <span className="text-error/80">{t.grade_blocking.join(' · ')}</span>
+        </div>
+      ) : (t.grade_timing_hold && t.grade_timing_hold.length > 0) && (
+        // TIMING hold — a good trade, wrong moment. Distinct from a structural veto (amber, not red).
+        <div className="rounded-lg border border-warning/40 bg-warning/[0.08] p-2 text-[11px] flex items-start gap-1.5">
+          <span className="font-bold text-warning shrink-0">⏸ WAIT · TIMING</span>
+          <span className="text-warning/80">{t.grade_timing_hold.join(' · ')}</span>
         </div>
       )}
       {/* Hero summary — identical to the standalone opportunity card */}
@@ -916,6 +950,20 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
       {rev && rev.ranked.length > 0 && (() => {
         return (
           <div className="space-y-3">
+            {/* Earnings-aware ranking is live AND a print actually straddles the window → the ranking has
+                discounted walls the gap can leap + priced the event move. Per-factor with/without is in each
+                row's Quant Analysis. */}
+            {rev.earnings_aware && rev.earnings_in_window && (
+              <div className="rounded-lg border border-warning/30 bg-warning/[0.06] px-3 py-2 text-[11px] text-warning/90 leading-snug">
+                <b>Earnings-aware ranking is ON</b> and a print falls before an expiry in this scan — structural
+                credit is discounted for walls an earnings gap can leap, and strikes inside ~1.5× the isolated
+                event move are penalised. Expand a row → <b>Quant Analysis</b> to see each impacted metric
+                <b> with / without</b> the earnings adjustment.
+              </div>
+            )}
+            {rev.earnings_aware && !rev.earnings_in_window && (
+              <div className="text-[10px] text-base-content/45">Earnings-aware ranking on — no print falls in the scanned window, so it had no effect here.</div>
+            )}
             {/* No separate 'top pick' card — the #1 row of the ranked table below IS the desk's pick
                 (sorted best→worst). Events already show once at the top of the scan. */}
             {/* Full ranked table */}
@@ -940,11 +988,13 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                     const open = expanded === i;
                     const vetoed = (t.grade_blocking || []).length > 0;
                     const vetoReason = (t.grade_blocking || []).join('; ');
+                    const waiting = !vetoed && (t.grade_timing_hold || []).length > 0;   // timing hold — good trade, wrong moment
+                    const waitReason = (t.grade_timing_hold || []).join('; ');
                     return (
                       <React.Fragment key={i}>
                         <tr onClick={() => setExpanded(open ? null : i)}
-                          title={vetoed ? `VETOED — ${vetoReason}` : (open ? 'Collapse' : 'Click to explore this trade')}
-                          className={`cursor-pointer transition-colors ${open ? 'bg-secondary/[0.12]' : vetoed ? 'opacity-40 hover:opacity-70' : i === 0 ? 'bg-success/5 hover:bg-success/10' : 'hover:bg-secondary/[0.06]'}`}>
+                          title={vetoed ? `VETOED — ${vetoReason}` : waiting ? `WAIT (timing) — ${waitReason}` : (open ? 'Collapse' : 'Click to explore this trade')}
+                          className={`cursor-pointer transition-colors ${open ? 'bg-secondary/[0.12]' : vetoed ? 'opacity-40 hover:opacity-70' : waiting ? 'bg-warning/[0.06] hover:bg-warning/[0.12]' : i === 0 ? 'bg-success/5 hover:bg-success/10' : 'hover:bg-secondary/[0.06]'}`}>
                           <td className="font-bold">
                             <span className="inline-flex items-center gap-1">
                               {open ? <ChevronUp className="w-3.5 h-3.5 text-secondary" /> : <ChevronDown className="w-3.5 h-3.5 text-secondary/60" />}
@@ -954,9 +1004,10 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                           <td>
                             {vetoed
                               ? <span className="text-sm font-bold text-error border border-error/50 rounded px-1" title={`VETOED — ${vetoReason}`}>V</span>
-                              : <span className={`text-sm font-bold ${gradeTextTone(t.algo_grade)}`}
-                                  title={`grade ${t.algo_grade || '—'}${(t.grade_demerits || []).length ? ' — ' + (t.grade_demerits || []).join('; ') : ''}`}>
-                                  {t.algo_grade || '—'}</span>}
+                              : <span className={`inline-flex items-center gap-1 text-sm font-bold ${gradeTextTone(t.algo_grade)}`}
+                                  title={`grade ${t.algo_grade || '—'}${waiting ? ` · WAIT (timing) — ${waitReason}` : ''}${(t.grade_demerits || []).length ? ' — ' + (t.grade_demerits || []).join('; ') : ''}`}>
+                                  {t.algo_grade || '—'}
+                                  {waiting && <span className="text-[8px] font-semibold text-warning border border-warning/50 rounded px-0.5 leading-tight">WAIT</span>}</span>}
                           </td>
                           <td className="whitespace-nowrap">{t.label}</td>
                           <td className="font-mono text-[11px] whitespace-nowrap">

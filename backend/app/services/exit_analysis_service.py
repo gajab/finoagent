@@ -110,10 +110,16 @@ SECTOR_PE_MEDIAN = {
 # ---------------------------------------------------------------------------
 
 def _safe(val, default=None):
-    """Convert NaN/Inf to default."""
+    """Convert NaN/Inf/None to ``default``.
+
+    NOTE: ``safe_float`` defaults to 0.0, so it would turn NaN into 0.0 *before*
+    we could detect it — silently masking missing data as zero (e.g. an unreported
+    EPS reading as a −100% surprise). Pass ``default=None`` so NaN/Inf/parse-errors
+    come back as None and are correctly treated as missing here.
+    """
     if val is None:
         return default
-    f = safe_float(val)
+    f = safe_float(val, default=None)
     if f is None or math.isnan(f) or math.isinf(f):
         return default
     return f
@@ -366,16 +372,29 @@ def _compute_fundamental(stock, info: dict) -> dict:
         elif ic > 10:
             score -= 3
 
-    # Earnings surprises — try multiple yfinance attributes
+    # Earnings surprises — try multiple yfinance attributes.
+    # earnings_dates is sorted newest-first and INCLUDES upcoming (unreported)
+    # dates; those have no Reported EPS (NaN, or a 0.0 placeholder that would read
+    # as a spurious −100% surprise). Skip any date that is in the future or has no
+    # reported actual, and keep the 4 most recent *reported* quarters.
     data["earnings_surprises"] = []
     try:
-        # Try earnings_dates first (newer yfinance)
         ed = getattr(stock, "earnings_dates", None)
         if ed is not None and not ed.empty:
-            for idx, row in ed.head(4).iterrows():
+            for idx, row in ed.iterrows():
+                # Skip not-yet-reported (future) earnings dates.
+                try:
+                    idx_ts = idx if isinstance(idx, pd.Timestamp) else pd.Timestamp(idx)
+                    now_cmp = pd.Timestamp.now(tz=idx_ts.tzinfo) if idx_ts.tzinfo is not None else pd.Timestamp.now()
+                    if idx_ts > now_cmp:
+                        continue
+                except Exception:
+                    pass
                 actual = _safe(row.get("Reported EPS"), None)
+                if actual is None:
+                    continue  # reported date passed but EPS not populated — skip
                 estimate = _safe(row.get("EPS Estimate"), None)
-                if actual is not None and estimate is not None and estimate != 0:
+                if estimate is not None and estimate != 0:
                     surprise_pct = round((actual - estimate) / abs(estimate) * 100, 1)
                 else:
                     surprise_pct = 0
@@ -384,6 +403,8 @@ def _compute_fundamental(stock, info: dict) -> dict:
                     "quarter": quarter_str[:10],
                     "surprise_pct": surprise_pct,
                 })
+                if len(data["earnings_surprises"]) >= 4:
+                    break
         # Fallback to earnings_history
         if not data["earnings_surprises"]:
             eh = getattr(stock, "earnings_history", None)
@@ -876,90 +897,91 @@ def _compute_valuation(info: dict, current_price: float) -> dict:
 
 
 def _compute_sentiment(info: dict, current_price: float) -> dict:
-    """Pillar 6: Market Sentiment & Flow.
-    Evaluates short interest, insider activity, and analyst consensus."""
+    """Pillar 6: Market Sentiment & Momentum.
+
+    Price-based positioning — where the stock trades in its 52-week range, distance
+    from the high, trend vs the 50/200-day moving averages, and relative strength vs
+    the S&P 500. Short interest & ownership now live in the Ownership & Flow pillar;
+    analyst consensus & targets in Catalyst & Revisions — so this pillar no longer
+    double-counts them."""
     score = 25
+    data: dict = {}
 
-    # Short interest
-    short_pct = info.get("shortPercentOfFloat")
-    if short_pct is not None:
-        short_pct = short_pct * 100  # Convert to percentage if it's a decimal
-        if short_pct > 20:
-            score += 25
-        elif short_pct > 10:
+    hi = _safe(info.get("fiftyTwoWeekHigh"))
+    lo = _safe(info.get("fiftyTwoWeekLow"))
+    ma50 = _safe(info.get("fiftyDayAverage"))
+    ma200 = _safe(info.get("twoHundredDayAverage"))
+    cp = current_price or _safe(info.get("currentPrice")) or _safe(info.get("regularMarketPrice"))
+
+    # 52-week range position
+    range_pos = None
+    if hi is not None and lo is not None and hi > lo and cp:
+        range_pos = round((cp - lo) / (hi - lo) * 100, 1)
+        if range_pos < 20:
             score += 15
-        elif short_pct > 5:
-            score += 5
-        elif short_pct < 2:
-            score -= 5
+        elif range_pos < 40:
+            score += 6
+        elif range_pos > 80:
+            score -= 8
+        elif range_pos > 60:
+            score -= 3
+    data["range_position_pct"] = range_pos
 
-    short_ratio = info.get("shortRatio")  # Days to cover
-    if short_ratio is not None:
-        if short_ratio > 10:
-            score += 15
-        elif short_ratio > 5:
-            score += 8
-
-    # Insider & Institutional
-    insider_pct = info.get("heldPercentInsiders")
-    if insider_pct is not None:
-        insider_pct = insider_pct * 100
-        if insider_pct < 1:
-            score += 5
-        elif insider_pct > 10:
-            score -= 5
-
-    inst_pct = info.get("heldPercentInstitutions")
-    if inst_pct is not None:
-        inst_pct = inst_pct * 100
-        if inst_pct < 20:
+    # Distance from the 52-week high (negative = below the high)
+    pct_from_high = None
+    if hi and cp and hi > 0:
+        pct_from_high = round((cp - hi) / hi * 100, 1)
+        if pct_from_high <= -30:
             score += 10
-        elif inst_pct > 80:
+        elif pct_from_high <= -20:
+            score += 5
+        elif pct_from_high >= -3:
             score -= 5
+    data["pct_from_52w_high"] = pct_from_high
 
-    # Analyst consensus
-    consensus = info.get("recommendationKey", "none").lower()
-    if consensus in ["strong_sell", "sell"]:
-        score += 25
-    elif consensus == "underperform":
-        score += 15
-    elif consensus in ["hold", "none"]:
-        score += 5
-    elif consensus in ["buy", "strong_buy"]:
+    # Trend vs moving averages
+    above_50 = (cp > ma50) if (cp and ma50) else None
+    above_200 = (cp > ma200) if (cp and ma200) else None
+    data["above_50dma"] = above_50
+    data["above_200dma"] = above_200
+    if above_200 is True:
         score -= 5
+    elif above_200 is False:
+        score += 12
+    if above_50 is True:
+        score -= 3
+    elif above_50 is False:
+        score += 6
 
-    # Target upside
-    target = info.get("targetMeanPrice")
-    upside = None
-    if target and current_price and current_price > 0:
-        upside = ((target - current_price) / current_price) * 100
-        if upside < -10:
-            score += 20
-        elif upside < 0:
-            score += 10
-        elif upside > 20:
-            score -= 10
+    # Relative strength vs the S&P 500 (trailing 1 year)
+    one_yr = _safe(info.get("52WeekChange"))
+    sp_yr = _safe(info.get("SandP52WeekChange"))
+    data["one_year_return_pct"] = round(one_yr * 100, 1) if one_yr is not None else None
+    rel = None
+    if one_yr is not None and sp_yr is not None:
+        rel = round((one_yr - sp_yr) * 100, 1)
+        if rel <= -15:
+            score += 12
+        elif rel < 0:
+            score += 5
+        elif rel >= 15:
+            score -= 8
+        elif rel > 0:
+            score -= 3
+    data["relative_to_sp_pct"] = rel
 
-    if score >= 60:
-        sentiment_label = "Highly Bearish"
+    if score >= 55:
+        sentiment_label = "Weak / Downtrend"
     elif score >= 40:
-        sentiment_label = "Bearish"
+        sentiment_label = "Soft"
     elif score >= 25:
         sentiment_label = "Neutral"
     elif score >= 15:
-        sentiment_label = "Bullish"
+        sentiment_label = "Constructive"
     else:
-        sentiment_label = "Highly Bullish"
+        sentiment_label = "Strong / Uptrend"
+    data["sentiment_label"] = sentiment_label
 
-    data = {
-        "short_pct_of_float": short_pct,
-        "short_ratio": short_ratio,
-        "insider_ownership_pct": insider_pct,
-        "institutional_ownership_pct": inst_pct,
-        "analyst_consensus": consensus.replace("_", " ").title(),
-        "target_upside_pct": upside,
-        "sentiment_label": sentiment_label,
-    }
     return {"score": _clamp(score), "data": data}
 
 
@@ -1165,6 +1187,497 @@ def _compute_sector_rotation(info: dict, hist_1y: pd.DataFrame) -> dict:
         data["rotation_signal"] = "Data Unavailable"
 
     return {"score": _clamp(score), "data": data}
+
+
+# ---------------------------------------------------------------------------
+# Pillar 8 — Ownership & Flow
+# ---------------------------------------------------------------------------
+
+def _compute_ownership_flow(stock, info: dict) -> dict:
+    """Pillar 8: Ownership & Flow.
+
+    Short interest (level, days-to-cover, month-over-month change), institutional
+    and insider ownership, and net insider activity. Baseline 25 — rising short
+    interest and heavy insider selling push exit; falling shorts / insider buying
+    pull toward hold. Semantics match the other pillars (higher = more exit pressure)."""
+    score = 25
+    data: dict = {}
+
+    inst_pct = _safe(info.get("heldPercentInstitutions"))
+    insider_pct = _safe(info.get("heldPercentInsiders"))
+    short_pct = _safe(info.get("shortPercentOfFloat"))
+    short_ratio = _safe(info.get("shortRatio"))  # days-to-cover
+    shares_short = _safe(info.get("sharesShort"))
+    shares_short_prior = _safe(info.get("sharesShortPriorMonth"))
+
+    data["institution_pct"] = round(inst_pct * 100, 1) if inst_pct is not None else None
+    data["insider_pct"] = round(insider_pct * 100, 1) if insider_pct is not None else None
+    data["short_pct_float"] = round(short_pct * 100, 1) if short_pct is not None else None
+    data["days_to_cover"] = round(short_ratio, 1) if short_ratio is not None else None
+
+    # Short interest level
+    if short_pct is not None:
+        sp = short_pct * 100
+        if sp >= 20:
+            score += 20
+        elif sp >= 10:
+            score += 12
+        elif sp >= 5:
+            score += 5
+        elif sp < 2:
+            score -= 5
+    # Days to cover
+    if short_ratio is not None:
+        if short_ratio >= 8:
+            score += 8
+        elif short_ratio >= 5:
+            score += 4
+
+    # Short interest change month-over-month
+    short_change = None
+    if shares_short is not None and shares_short_prior and shares_short_prior > 0:
+        short_change = round((shares_short - shares_short_prior) / shares_short_prior * 100, 1)
+        if short_change >= 20:
+            score += 10
+        elif short_change >= 5:
+            score += 5
+        elif short_change <= -20:
+            score -= 8
+        elif short_change <= -5:
+            score -= 4
+    data["short_change_pct"] = short_change
+
+    # Net insider activity — prefer the info summary, best-effort fall back to the feed.
+    insider_net_pct = None
+    nspa = info.get("netSharePurchaseActivity")
+    if isinstance(nspa, dict):
+        insider_net_pct = _safe(nspa.get("netPercentInsiderShares"))
+        if insider_net_pct is not None:
+            insider_net_pct = round(insider_net_pct * 100, 2)
+    insider_signal = "N/A"
+    if insider_net_pct is not None:
+        if insider_net_pct <= -1.0:
+            score += 10; insider_signal = "Net selling"
+        elif insider_net_pct < 0:
+            score += 4; insider_signal = "Mild selling"
+        elif insider_net_pct >= 1.0:
+            score -= 8; insider_signal = "Net buying"
+        elif insider_net_pct > 0:
+            score -= 3; insider_signal = "Mild buying"
+        else:
+            insider_signal = "Flat"
+    data["insider_net_pct"] = insider_net_pct
+    data["insider_signal"] = insider_signal
+
+    if inst_pct is not None and inst_pct > 0.95:
+        score += 3  # very crowded ownership
+
+    return {"score": _clamp(score), "data": data}
+
+
+# ---------------------------------------------------------------------------
+# Pillar 9 — Catalyst & Analyst Revisions
+# ---------------------------------------------------------------------------
+
+def _compute_catalyst_revisions(stock, info: dict) -> dict:
+    """Pillar 9: Catalyst & Analyst Revisions.
+
+    Analyst consensus & momentum, price-target upside, earnings growth & proximity,
+    and (best-effort) the EPS-estimate revision trend. Cut estimates / downgrades /
+    downside targets push exit; raised estimates and upside pull toward hold/entry."""
+    score = 25
+    data: dict = {}
+
+    rec_mean = _safe(info.get("recommendationMean"))  # 1=Strong Buy .. 5=Sell
+    data["recommendation_mean"] = round(rec_mean, 2) if rec_mean is not None else None
+    data["recommendation_key"] = info.get("recommendationKey")
+    data["num_analysts"] = _safe(info.get("numberOfAnalystOpinions"))
+    if rec_mean is not None:
+        if rec_mean >= 3.5:
+            score += 15
+        elif rec_mean >= 3.0:
+            score += 8
+        elif rec_mean <= 2.0:
+            score -= 8
+        elif rec_mean <= 2.5:
+            score -= 3
+
+    tmp = _safe(info.get("targetMeanPrice"))
+    cp = _safe(info.get("currentPrice")) or _safe(info.get("regularMarketPrice"))
+    upside = None
+    if tmp and cp and cp > 0:
+        upside = round((tmp - cp) / cp * 100, 1)
+        if upside <= -10:
+            score += 15
+        elif upside < 0:
+            score += 8
+        elif upside >= 25:
+            score -= 10
+        elif upside >= 10:
+            score -= 5
+    data["target_upside_pct"] = upside
+
+    eqg = _safe(info.get("earningsQuarterlyGrowth"))
+    data["earnings_qtr_growth_pct"] = round(eqg * 100, 1) if eqg is not None else None
+    if eqg is not None:
+        if eqg <= -0.20:
+            score += 10
+        elif eqg < 0:
+            score += 5
+        elif eqg >= 0.25:
+            score -= 5
+
+    # Next-earnings proximity (event risk, not directional)
+    next_days = None
+    try:
+        ts = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
+        if ts:
+            dt = datetime.utcfromtimestamp(int(ts))
+            next_days = (dt.date() - datetime.utcnow().date()).days
+            if next_days is not None and next_days < 0:
+                next_days = None
+    except Exception:
+        next_days = None
+    data["days_to_earnings"] = next_days
+    if next_days is not None and 0 <= next_days <= 7:
+        score += 3  # binary event imminent
+
+    # EPS estimate revisions — best-effort (needs scraping in prod)
+    revision_trend = None
+    revision_net = None
+    try:
+        er = getattr(stock, "eps_revisions", None)
+        if er is not None and not er.empty:
+            def _cell(row_key, col):
+                try:
+                    if row_key in er.index and col in er.columns:
+                        return _safe(er.loc[row_key, col])
+                except Exception:
+                    return None
+                return None
+            up = (_cell("0q", "upLast30days") or 0) + (_cell("+1q", "upLast30days") or 0)
+            down = (_cell("0q", "downLast30days") or 0) + (_cell("+1q", "downLast30days") or 0)
+            revision_net = int(up - down)
+            if revision_net <= -2:
+                score += 12; revision_trend = "cutting"
+            elif revision_net < 0:
+                score += 5; revision_trend = "mildly cutting"
+            elif revision_net >= 2:
+                score -= 10; revision_trend = "raising"
+            elif revision_net > 0:
+                score -= 4; revision_trend = "mildly raising"
+            else:
+                revision_trend = "flat"
+    except Exception:
+        pass
+    data["eps_revision_trend"] = revision_trend
+    data["eps_revision_net"] = revision_net
+
+    return {"score": _clamp(score), "data": data}
+
+
+# ---------------------------------------------------------------------------
+# Pillar 10 — Quality & Capital Allocation
+# ---------------------------------------------------------------------------
+
+def _shares_trend(stock) -> tuple:
+    """Share-count trend from the balance sheet: falling = buybacks, rising = dilution.
+    Returns (label, annualized_buyback_yield_pct) — positive yield = net buyback."""
+    try:
+        bs = stock.balance_sheet
+        if bs is None or bs.empty:
+            return None, None
+        row = None
+        for key in ["Ordinary Shares Number", "Share Issued", "Common Stock Shares Outstanding"]:
+            if key in bs.index:
+                row = bs.loc[key]
+                break
+        if row is None:
+            return None, None
+        vals = [v for v in (_safe(x) for x in row.tolist()) if v is not None and v > 0]
+        if len(vals) < 2:
+            return None, None
+        latest, oldest = vals[0], vals[-1]  # balance-sheet columns are newest-first
+        n = len(vals) - 1
+        yld = round((1 - (latest / oldest) ** (1 / n)) * 100, 2)  # +ve = buyback
+        chg = (latest - oldest) / oldest
+        if chg <= -0.02:
+            return "buyback", yld
+        if chg >= 0.02:
+            return "dilution", yld
+        return "stable", yld
+    except Exception:
+        return None, None
+
+
+def _compute_quality_capital(stock, info: dict) -> dict:
+    """Pillar 10: Quality & Capital Allocation.
+
+    Return on capital (ROE/ROA), free-cash-flow conversion, gross-margin level, and
+    share-count trend (buybacks vs dilution). Durable, cash-generative, shareholder-
+    friendly businesses score LOW (hold/entry); weak returns, poor cash conversion and
+    dilution score high. A 'reward compounders' lens the deterioration pillars miss."""
+    score = 25
+    data: dict = {}
+
+    roe = _safe(info.get("returnOnEquity"))
+    roa = _safe(info.get("returnOnAssets"))
+    data["roe"] = round(roe * 100, 1) if roe is not None else None
+    data["roa"] = round(roa * 100, 1) if roa is not None else None
+    if roe is not None:
+        if roe >= 0.20:
+            score -= 12
+        elif roe >= 0.12:
+            score -= 6
+        elif roe < 0:
+            score += 15
+        elif roe < 0.05:
+            score += 6
+
+    # ROIC = NOPAT / (Debt + Equity − Cash) — the sharpest quality read. From the
+    # audited statements (operating income × (1 − effective tax rate)).
+    roic = None
+    try:
+        inc = stock.income_stmt
+        bs = stock.balance_sheet
+        if inc is not None and not inc.empty and bs is not None and not bs.empty:
+            ic_col, bc_col = inc.columns[0], bs.columns[0]
+
+            def _row(df, col, keys):
+                for k in keys:
+                    if k in df.index:
+                        v = _safe(df.at[k, col])
+                        if v is not None:
+                            return v
+                return None
+
+            op = _row(inc, ic_col, ["Operating Income", "OperatingIncome", "EBIT", "Ebit"])
+            pretax = _row(inc, ic_col, ["Pretax Income", "PretaxIncome", "Income Before Tax"])
+            tax = _row(inc, ic_col, ["Tax Provision", "TaxProvision", "Income Tax Expense"])
+            eq = _row(bs, bc_col, ["Stockholders Equity", "StockholdersEquity", "Total Equity Gross Minority Interest"])
+            debt = _row(bs, bc_col, ["Total Debt", "TotalDebt"])
+            cash = _row(bs, bc_col, ["Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash Cash Equivalents And Short Term Investments"])
+            if op is not None and eq is not None:
+                tr = 0.21
+                if pretax and tax is not None and pretax != 0:
+                    t = tax / pretax
+                    if 0.0 <= t <= 0.6:
+                        tr = t
+                invested = eq + (debt or 0) - (cash or 0)
+                if invested and invested > 0:
+                    roic = round(op * (1 - tr) / invested * 100, 1)
+    except Exception:
+        pass
+    data["roic"] = roic
+    if roic is not None:
+        if roic >= 15:
+            score -= 10
+        elif roic >= 10:
+            score -= 5
+        elif roic < 0:
+            score += 12
+        elif roic < 5:
+            score += 5
+
+    # FCF conversion = Free Cash Flow / Net Income. Prefer the cash-flow statement —
+    # yfinance's info["freeCashflow"] is often a partial/levered figure and unreliable.
+    conv = None
+    ni_stmt = None
+    try:
+        cf = stock.cashflow
+        inc = stock.income_stmt
+        fcf_s = None
+        if cf is not None and not cf.empty:
+            c = cf.columns[0]
+            for k in ["Free Cash Flow", "FreeCashFlow"]:
+                if k in cf.index:
+                    fcf_s = _safe(cf.loc[k, c]); break
+            if fcf_s is None:
+                ocf = capex = None
+                for k in ["Operating Cash Flow", "OperatingCashFlow", "Cash Flow From Continuing Operating Activities"]:
+                    if k in cf.index:
+                        ocf = _safe(cf.loc[k, c]); break
+                for k in ["Capital Expenditure", "CapitalExpenditure"]:
+                    if k in cf.index:
+                        capex = _safe(cf.loc[k, c]); break
+                if ocf is not None and capex is not None:
+                    fcf_s = ocf + capex  # capex is negative
+        if inc is not None and not inc.empty:
+            c = inc.columns[0]
+            for k in ["Net Income", "NetIncome"]:
+                if k in inc.index:
+                    ni_stmt = _safe(inc.loc[k, c]); break
+        if fcf_s is not None and ni_stmt and ni_stmt > 0:
+            conv = round(fcf_s / ni_stmt, 2)
+    except Exception:
+        pass
+    if conv is None:  # fall back to info fields
+        fcf_i = _safe(info.get("freeCashflow"))
+        ni_i = _safe(info.get("netIncomeToCommon"))
+        if fcf_i is not None and ni_i and ni_i > 0:
+            conv = round(fcf_i / ni_i, 2)
+        if ni_stmt is None:
+            ni_stmt = ni_i
+    if conv is not None:
+        if conv >= 1.0:
+            score -= 8
+        elif conv >= 0.7:
+            score -= 3
+        elif conv < 0.4:
+            score += 10
+        elif conv < 0.7:
+            score += 4
+    elif ni_stmt is not None and ni_stmt < 0:
+        score += 10  # unprofitable
+    data["fcf_conversion"] = conv
+
+    gm = _safe(info.get("grossMargins"))
+    data["gross_margin"] = round(gm * 100, 1) if gm is not None else None
+    if gm is not None:
+        if gm >= 0.5:
+            score -= 5
+        elif gm < 0.2:
+            score += 5
+
+    shares_trend, buyback_yield = _shares_trend(stock)
+    data["shares_trend"] = shares_trend
+    data["buyback_yield_pct"] = buyback_yield
+    if shares_trend == "dilution":
+        score += 8
+    elif shares_trend == "buyback":
+        score -= 6
+
+    return {"score": _clamp(score), "data": data}
+
+
+# ---------------------------------------------------------------------------
+# Modern Technical — the trade-setup engine (bias / regime / structure / setups)
+# ---------------------------------------------------------------------------
+
+def _compute_modern_technical(stock) -> dict:
+    """Modern TA via the shared trade-setup engine — the same bias / regime / market
+    structure / ranked-setup reads used on the Strategies page — plus derived entry and
+    exit timing scores. Degrades to ``{"available": False}`` if the engine can't run."""
+    try:
+        from .trade_setup_service import compute_trade_setups
+        ts = compute_trade_setups(stock)
+    except Exception:
+        ts = None
+    if not ts:
+        return {"available": False}
+
+    dossier = ts.get("dossier") or {}
+    bias = dossier.get("bias") or {}
+    direction = bias.get("direction", "neutral")
+    strength = bias.get("strength", "weak")
+    bscore = _safe(bias.get("score"), 0) or 0
+    regime = bias.get("regime") or dossier.get("regime") or "transitional"
+    setups = ts.get("setups") or []
+
+    def _best_rr(want_dir: str):
+        best = None
+        for s in setups:
+            if s.get("direction") != want_dir:
+                continue
+            rrs = [t.get("rr") for t in (s.get("targets") or []) if t.get("rr") is not None]
+            rr = max(rrs) if rrs else s.get("risk_reward")
+            if rr is not None and (best is None or rr > best):
+                best = rr
+        return round(best, 2) if best is not None else None
+
+    best_long_rr = _best_rr("long")
+    best_short_rr = _best_rr("short")
+    regime_l = str(regime).lower()
+
+    # Entry timing (higher = better entry window)
+    entry = 50 + bscore * 8
+    if any(k in regime_l for k in ("trend", "up")):
+        entry += 8
+    if best_long_rr is not None and best_long_rr >= 2:
+        entry += 12
+    elif best_long_rr is not None and best_long_rr >= 1.5:
+        entry += 6
+    entry_timing = _clamp(entry)
+
+    # Exit pressure (higher = exit): mirror of the bias, plus a clean short setup
+    ex = 50 - bscore * 8
+    if best_short_rr is not None and best_short_rr >= 2:
+        ex += 10
+    if any(k in regime_l for k in ("down", "distribut")):
+        ex += 6
+    exit_pressure = _clamp(ex)
+
+    return {
+        "available": True,
+        "bias": {"direction": direction, "strength": strength, "score": round(float(bscore), 2),
+                 "rationale": bias.get("rationale")},
+        "regime": regime,
+        "best_long_rr": best_long_rr,
+        "best_short_rr": best_short_rr,
+        "entry_timing_score": entry_timing,
+        "exit_pressure_score": exit_pressure,
+        "setups": setups[:5],
+        "confluence_zones": (ts.get("confluence_zones") or [])[:6],
+        "price": ts.get("price"),
+        "context": ts.get("context"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Entry rating — the buy-side complement to the exit score
+# ---------------------------------------------------------------------------
+
+def _entry_label(score: int) -> str:
+    if score >= 72:
+        return "Strong Buy"
+    if score >= 58:
+        return "Accumulate"
+    if score >= 45:
+        return "Watch"
+    if score >= 32:
+        return "Cautious"
+    return "Avoid"
+
+
+def _compute_entry_rating(pillar_scores_by_name: dict, modern_tech: dict, hold_health: int) -> dict:
+    """Entry Attractiveness (0-100, higher = better entry).
+
+    Anchored to the position's overall HOLD health (65%) so the two ratings stay
+    coherent — a strong hold can't read as a weak buy, and vice-versa — then tilted
+    (35%) by the entry-specific factors that genuinely differ between buying now vs
+    already holding: technical entry-timing, valuation cheapness and catalyst momentum.
+    Pillar scores arrive as exit-pressure (higher=worse), so they are inverted here."""
+    def health(name: str) -> float:
+        return 100 - float(pillar_scores_by_name.get(name, 50))
+
+    val_health = health("Valuation")
+    cat_health = health("Catalyst & Revisions")
+    timing = float(modern_tech.get("entry_timing_score", 50)) if modern_tech.get("available") else 50.0
+
+    entry_specific = 0.40 * timing + 0.35 * val_health + 0.25 * cat_health
+    entry_score = _clamp(0.65 * float(hold_health) + 0.35 * entry_specific)
+
+    contribs = [
+        ("Hold-health anchor", float(hold_health)),
+        ("Technical timing", timing),
+        ("Valuation", val_health),
+        ("Catalyst momentum", cat_health),
+    ]
+    supports = sorted([c for c in contribs if c[1] >= 60], key=lambda x: -x[1])[:3]
+    headwinds = sorted([c for c in contribs if c[1] <= 42], key=lambda x: x[1])[:3]
+
+    return {
+        "score": entry_score,
+        "label": _entry_label(entry_score),
+        "components": {
+            "hold_anchor": round(float(hold_health)),
+            "technical_timing": round(timing),
+            "valuation_attractiveness": round(val_health),
+            "catalyst": round(cat_health),
+        },
+        "supports": [{"factor": f, "score": round(s)} for f, s in supports],
+        "headwinds": [{"factor": f, "score": round(s)} for f, s in headwinds],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1763,7 +2276,7 @@ def _compute_risk_score(risk: dict, liquidity: dict) -> int:
 
 
 def _score_to_label(score: int) -> str:
-    """Convert a 0-100 score to a human-readable label."""
+    """Convert a 0-100 PRESSURE score (higher = more exit pressure) to a label."""
     if score >= 70:
         return "Strong Exit"
     elif score >= 55:
@@ -1773,6 +2286,21 @@ def _score_to_label(score: int) -> str:
     elif score >= 22:
         return "Hold"
     return "Strong Hold"
+
+
+def _health_label(health: int) -> str:
+    """Convert a 0-100 HEALTH score (higher = healthier / stronger hold) to a label.
+    This is the user-facing convention: every displayed score reads higher = better.
+    Thresholds are aligned with ``_entry_label`` so Hold and Entry read consistently."""
+    if health >= 72:
+        return "Strong Hold"
+    elif health >= 58:
+        return "Hold"
+    elif health >= 45:
+        return "Caution"
+    elif health >= 32:
+        return "Consider Exit"
+    return "Strong Exit"
 
 
 def _compute_liquidity(hist_1y: pd.DataFrame, current_price: float, shares: float = 100) -> dict:
@@ -2048,8 +2576,16 @@ def _run_exit_analysis_sync(
     p6 = _compute_sentiment(info, current_price)
     p7 = _compute_sector_rotation(info, hist_1y)
 
+    # Pillars 8-10 (Ownership & Flow, Catalyst & Revisions, Quality & Capital)
+    p8 = _compute_ownership_flow(stock, info)
+    p9 = _compute_catalyst_revisions(stock, info)
+    p10 = _compute_quality_capital(stock, info)
+
     # Technical signals + price chart data
     tech = _compute_technical_signals(stock, info, hist_6m)
+
+    # Modern technical — the shared trade-setup engine (bias / regime / structure / ranked setups)
+    modern_tech = _compute_modern_technical(stock)
 
     # Price/Volume chart data for the holding period
     price_chart = _compute_price_chart(stock, info, "", hist_1y, current_price)
@@ -2077,10 +2613,27 @@ def _run_exit_analysis_sync(
     # Risk composite score
     risk_score = _compute_risk_score(risk, liquidity)
 
-    # Overall score — 3 dimensions
-    pillar_scores = [p1["score"], p2["score"], p3["score"], p4["score"], p5["score"], p6["score"], p7["score"]]
-    pillar_avg = sum(pillar_scores) / len(pillar_scores)
-    tech_avg = (tech["swing"]["composite_score"] + tech["longterm"]["composite_score"]) / 2
+    # Overall EXIT score — 10 pillars + technical + risk
+    pillar_names = ["Fundamental", "Macro", "Structural", "Geopolitical",
+                    "Valuation", "Sentiment", "Sector Rotation",
+                    "Ownership & Flow", "Catalyst & Revisions", "Quality & Capital"]
+    pillar_objs = [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10]
+    pillar_scores = [p["score"] for p in pillar_objs]
+    # Weighted average — the core business / valuation / technical-flow pillars matter
+    # more to a hold decision than the softer contextual pillars (macro, geopolitical,
+    # sector), so the overall Hold score isn't dragged around by context. Order matches
+    # pillar_names: Fundamental, Macro, Structural, Geopolitical, Valuation, Sentiment,
+    # Sector Rotation, Ownership & Flow, Catalyst & Revisions, Quality & Capital.
+    _PILLAR_W = [0.16, 0.05, 0.08, 0.05, 0.14, 0.08, 0.06, 0.10, 0.12, 0.16]
+    pillar_avg = sum(w * s for w, s in zip(_PILLAR_W, pillar_scores))
+
+    # Technical dimension — blend the modern engine's exit-pressure read with the legacy
+    # swing/long-term composite so the score reflects the new TA model.
+    legacy_tech_avg = (tech["swing"]["composite_score"] + tech["longterm"]["composite_score"]) / 2
+    if modern_tech.get("available"):
+        tech_avg = legacy_tech_avg * 0.5 + modern_tech["exit_pressure_score"] * 0.5
+    else:
+        tech_avg = legacy_tech_avg
 
     # Weighted: Pillars 50%, Technical 25%, Risk 25%
     overall_score = _clamp(pillar_avg * 0.50 + tech_avg * 0.25 + risk_score * 0.25)
@@ -2091,10 +2644,10 @@ def _run_exit_analysis_sync(
     tech_label = _score_to_label(_clamp(tech_avg))
     risk_label = _score_to_label(risk_score)
 
-    # --- Generate qualitative summary explaining WHY this score ---
-    pillar_names = ["Fundamental", "Macro", "Structural", "Geopolitical",
-                    "Valuation", "Portfolio", "Sector Rotation"]
-    pillar_objs = [p1, p2, p3, p4, p5, p6, p7]
+    # Entry Attractiveness — anchored to the overall HOLD health so the two ratings
+    # stay coherent (overall_score is exit-pressure here; hold health is its inverse).
+    pillar_scores_by_name = {n: s for n, s in zip(pillar_names, pillar_scores)}
+    entry_rating = _compute_entry_rating(pillar_scores_by_name, modern_tech, _clamp(100 - overall_score))
 
     # Find top concern pillars (sorted desc by score)
     ranked = sorted(zip(pillar_names, pillar_objs, pillar_scores),
@@ -2238,6 +2791,77 @@ def _run_exit_analysis_sync(
         if themes:
             narratives.append(f"Regulatory themes detected: {', '.join(themes[:3])}.")
 
+    # Ownership & Flow narrative
+    p8_data = p8.get("data", {})
+    if p8["score"] >= 40:
+        parts = []
+        if (p8_data.get("short_pct_float") or 0) >= 10:
+            parts.append(f"{p8_data['short_pct_float']:.0f}% short float")
+        if (p8_data.get("short_change_pct") or 0) >= 5:
+            parts.append("rising short interest")
+        if p8_data.get("insider_signal") in ("Net selling", "Mild selling"):
+            parts.append("insider selling")
+        if parts:
+            narratives.append(f"Ownership & flow: {', '.join(parts)}.")
+    elif p8["score"] <= 18:
+        narratives.append("Ownership is stable with light short interest.")
+
+    # Catalyst & Revisions narrative
+    p9_data = p9.get("data", {})
+    if p9["score"] >= 40:
+        parts = []
+        if p9_data.get("eps_revision_trend") in ("cutting", "mildly cutting"):
+            parts.append("analysts cutting EPS estimates")
+        up9 = p9_data.get("target_upside_pct")
+        if up9 is not None and up9 < 0:
+            parts.append(f"mean target {up9:.0f}% below price")
+        rm = p9_data.get("recommendation_mean")
+        if rm is not None and rm >= 3:
+            parts.append("soft analyst consensus")
+        if parts:
+            narratives.append(f"Catalysts weak: {', '.join(parts)}.")
+    elif p9["score"] <= 18:
+        parts = []
+        if p9_data.get("eps_revision_trend") in ("raising", "mildly raising"):
+            parts.append("estimates being raised")
+        up9 = p9_data.get("target_upside_pct")
+        if up9 is not None and up9 >= 10:
+            parts.append(f"{up9:.0f}% upside to mean target")
+        narratives.append("Catalysts supportive" + (f": {', '.join(parts)}." if parts else "."))
+
+    # Quality & Capital narrative
+    p10_data = p10.get("data", {})
+    if p10["score"] >= 40:
+        parts = []
+        if (p10_data.get("roe") is not None) and p10_data["roe"] < 5:
+            parts.append("low return on equity")
+        conv = p10_data.get("fcf_conversion")
+        if conv is not None and conv < 0.5:
+            parts.append("weak FCF conversion")
+        if p10_data.get("shares_trend") == "dilution":
+            parts.append("share dilution")
+        if parts:
+            narratives.append(f"Quality concerns: {', '.join(parts)}.")
+    elif p10["score"] <= 18:
+        parts = []
+        roe10 = p10_data.get("roe")
+        if roe10 is not None and roe10 >= 15:
+            parts.append(f"{roe10:.0f}% ROE")
+        if p10_data.get("shares_trend") == "buyback":
+            parts.append("net buybacks")
+        narratives.append("High-quality capital allocation" + (f": {', '.join(parts)}." if parts else "."))
+
+    # Modern technical narrative
+    if modern_tech.get("available"):
+        mb = modern_tech.get("bias", {})
+        d = mb.get("direction", "neutral")
+        if d in ("bullish", "bearish"):
+            rr = modern_tech.get("best_long_rr") if d == "bullish" else modern_tech.get("best_short_rr")
+            rr_txt = f", best setup {rr:.1f}:1 R:R" if rr else ""
+            narratives.append(
+                f"Trade-setup engine reads {mb.get('strength', '')} {d} in a {modern_tech.get('regime')} regime{rr_txt}."
+            )
+
     # === TECHNICAL NARRATIVES ===
     # Swing technical: granular per-indicator
     rsi_val = tech["swing"].get("rsi_value", 50)
@@ -2368,6 +2992,48 @@ def _run_exit_analysis_sync(
     else:
         summary_line = f"Strong fundamentals, positive technicals and favorable risk profile support continued holding."
 
+    # Entry-side narrative
+    _e_sup = ", ".join(s["factor"].lower() for s in entry_rating["supports"]) or None
+    _e_head = ", ".join(h["factor"].lower() for h in entry_rating["headwinds"]) or None
+    if entry_rating["score"] >= 58:
+        entry_rating["narrative"] = f"Entry looks attractive ({entry_rating['label']})" + (f" — supported by {_e_sup}." if _e_sup else ".")
+    elif entry_rating["score"] >= 45:
+        entry_rating["narrative"] = f"A watch-list entry ({entry_rating['label']})" + (f" — held back by {_e_head}." if _e_head else ".")
+    else:
+        entry_rating["narrative"] = f"Poor entry point here ({entry_rating['label']})" + (f" — {_e_head}." if _e_head else ".")
+
+    # ==== HEALTH convention: flip every displayed score so higher = better ====
+    # The pillar / technical / risk math above is "pressure" (higher = worse); the
+    # user-facing contract is the opposite (higher = healthier / stronger hold),
+    # matching the Entry rating. Entry was already computed on pressure above, so the
+    # flip happens only now, at the display boundary.
+    overall_health = _clamp(100 - overall_score)
+    overall_health_label = _health_label(overall_health)
+    pillar_health = _clamp(100 - pillar_avg)
+    tech_health = _clamp(100 - tech_avg)
+    risk_health = _clamp(100 - risk_score)
+
+    for _p in pillar_objs:
+        _p["score"] = _clamp(100 - _p["score"])
+    for _d in key_drivers:
+        _d["score"] = _clamp(100 - _d["score"])
+    for _s in strengths:
+        _s["score"] = _clamp(100 - _s["score"])
+
+    quant_summary["pillar_avg"] = pillar_health
+    quant_summary["pillar_label"] = _health_label(pillar_health)
+    quant_summary["tech_avg"] = tech_health
+    quant_summary["tech_label"] = _health_label(tech_health)
+    quant_summary["risk_score"] = risk_health
+    quant_summary["risk_label"] = _health_label(risk_health)
+    quant_summary["swing_score"] = _clamp(100 - swing_composite)
+    quant_summary["longterm_score"] = _clamp(100 - lt_composite)
+    quant_summary["highest_pillar"] = {"name": quant_summary["highest_pillar"]["name"],
+                                       "score": _clamp(100 - quant_summary["highest_pillar"]["score"])}
+    quant_summary["lowest_pillar"] = {"name": quant_summary["lowest_pillar"]["name"],
+                                      "score": _clamp(100 - quant_summary["lowest_pillar"]["score"])}
+    quant_summary["pillar_scores"] = {n: _clamp(100 - v) for n, v in quant_summary["pillar_scores"].items()}
+
     signal_summary = {
         "overall_narrative": summary_line,
         "key_drivers": key_drivers,
@@ -2379,12 +3045,14 @@ def _run_exit_analysis_sync(
     return {
         "success": True,
         "ticker": ticker,
-        "overall_score": overall_score,
-        "overall_label": overall_label,
+        "overall_score": overall_health,
+        "overall_label": overall_health_label,
+        "score_convention": "health",  # higher = healthier / stronger hold
+        "entry": entry_rating,
         "dimension_scores": {
-            "pillars": {"score": _clamp(pillar_avg), "label": pillar_label, "weight": 0.50},
-            "technical": {"score": _clamp(tech_avg), "label": tech_label, "weight": 0.25},
-            "risk": {"score": risk_score, "label": risk_label, "weight": 0.25},
+            "pillars": {"score": pillar_health, "label": _health_label(pillar_health), "weight": 0.50},
+            "technical": {"score": tech_health, "label": _health_label(tech_health), "weight": 0.25},
+            "risk": {"score": risk_health, "label": _health_label(risk_health), "weight": 0.25},
         },
         "signal_summary": signal_summary,
         "pillars": {
@@ -2395,8 +3063,12 @@ def _run_exit_analysis_sync(
             "valuation": p5,
             "sentiment": p6,
             "sector_rotation": p7,
+            "ownership_flow": p8,
+            "catalyst_revisions": p9,
+            "quality_capital": p10,
         },
         "technical_signals": tech,
+        "technical_modern": modern_tech,
         "price_chart": price_chart,
         "options_protection": options_protection,
         "risk": risk,

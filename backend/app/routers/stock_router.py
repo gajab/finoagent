@@ -2389,6 +2389,7 @@ class DeskReviewIn(BaseModel):
     structures: list[str] = Field(default_factory=lambda: list(_DI_DEFAULT_STRUCTURES))
     quote_source: str = Field(default="yfinance")
     owns_underlying: bool = Field(default=False, description="User already holds the shares → score covered calls as an income overlay, not a fresh buy-write")
+    earnings_aware: bool = Field(default=False, description="Discount walls the earnings GAP can leap + penalise strikes inside ~1.5× the isolated event move; impacted factors carry a with/without baseline")
 
 
 class FocusTrade(BaseModel):
@@ -2411,6 +2412,7 @@ class DeskEvaluateIn(BaseModel):
     legs: list[EvaluateLegIn] = Field(default_factory=list)
     quote_source: str = Field(default="yfinance")
     owns_underlying: bool = Field(default=False, description="Hold the underlying → a short call is a COVERED call (income overlay), not naked; enables the collar")
+    earnings_aware: bool = Field(default=False, description="Earnings-aware scoring: discount walls the event gap can leap + penalise strikes inside ~1.5× the isolated move")
 
 
 class DeskReviewAgentsIn(DeskReviewIn):
@@ -2437,6 +2439,7 @@ async def compute_desk_review(
             min_income=body.min_income, structures=body.structures,
             quote_source=body.quote_source, user=user, db=db,
             target_expiration=body.target_expiration, owns_underlying=body.owns_underlying,
+            earnings_aware=body.earnings_aware,
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])
@@ -2463,7 +2466,7 @@ async def compute_desk_evaluate(
         result = await evaluate_desk_trade(
             ticker, legs=[l.model_dump() for l in body.legs],
             quote_source=body.quote_source, owns_underlying=body.owns_underlying,
-            user=user, db=db,
+            user=user, db=db, earnings_aware=body.earnings_aware,
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])
@@ -2806,15 +2809,27 @@ async def build_130_30(
 @router.post("/{ticker}/exit-analysis")
 async def get_exit_analysis(
     ticker: str,
+    db: AsyncSession = Depends(get_db),
 ):
-    """Compute comprehensive quantitative exit analysis with 6-pillar scoring."""
+    """Entry & Exit analysis: 10 pillars + the modern trade-setup engine + risk.
+
+    Cached (15 min) because it now also runs the trade-setup engine. The cache key is
+    versioned (v2) — the response shape changed (dual entry/exit rating, 10 pillars,
+    modern technical), so any old cached payload must not be served."""
     if ticker.startswith("."):
         ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"exit_analysis:{ticker}:v4"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return cached
 
     try:
         result = await run_exit_analysis(ticker=ticker)
         if result.get("error"):
             raise HTTPException(400, result["error"])
+        await set_cached(db, cache_key, result, ttl_seconds=900)
         return result
     except HTTPException:
         raise

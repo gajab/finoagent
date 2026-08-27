@@ -7,14 +7,20 @@
  * offers a MENU of index (SPX, European) tail hedges ranked by risk-reduction-per-$
  * and Spitznagel CAGR lift — plus a plain-language verdict + actions.
  */
-import { useState } from 'react';
-import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2, Sparkles } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2, Sparkles, RefreshCw } from 'lucide-react';
 import { fetchBookTailRisk, fetchBookHedgeAdvice } from '../../api';
 import type { BookTailRiskResult } from '../../api';
 import CollapsibleSection from './CollapsibleSection';
 
 const money = (v: number | null | undefined, d = 0) =>
   v == null ? '—' : `${v < 0 ? '−' : ''}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
+
+const ago = (iso?: string) => {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
+};
 
 const LEVEL: Record<string, { tone: string; bg: string }> = {
   Dangerous: { tone: 'text-error', bg: 'border-error/30 bg-error/[0.06]' },
@@ -25,7 +31,8 @@ const LEVEL: Record<string, { tone: string; bg: string }> = {
 
 export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
   const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(false);      // initial STORED-snapshot load
+  const [refreshing, setRefreshing] = useState(false); // user-triggered live recompute
   const [data, setData] = useState<BookTailRiskResult | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [assignOpen, setAssignOpen] = useState(false);   // scenario lab — collapsed by default
@@ -33,13 +40,28 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
   const [adviceLoading, setAdviceLoading] = useState(false);
   const [adviceErr, setAdviceErr] = useState<string | null>(null);
 
-  const run = async () => {
-    setOpen(true); setLoading(true); setErr(null);
+  // On mount: load the STORED snapshot (no recompute) so the panel shows last-known numbers.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      setLoading(true);
+      try {
+        const r = await fetchBookTailRisk(quoteSource, false);
+        if (alive && r.stored && !r.error) setData(r);
+      } catch { /* no stored snapshot — user can Analyze */ }
+      finally { if (alive) setLoading(false); }
+    })();
+    return () => { alive = false; };
+  }, [quoteSource]);
+
+  // Refresh = recompute from live quotes AND overwrite the stored snapshot in the DB.
+  const refresh = async () => {
+    setRefreshing(true); setErr(null); setOpen(true);
     try {
-      const r = await fetchBookTailRisk(quoteSource);
-      if (r.error) setErr(r.error); else setData(r);
+      const r = await fetchBookTailRisk(quoteSource, true);
+      if (r.error) setErr(r.error); else { setData(r); setAdvice(null); }
     } catch (e: any) { setErr(e?.message || 'Failed'); }
-    finally { setLoading(false); }
+    finally { setRefreshing(false); }
   };
 
   const askLlm = async () => {
@@ -57,22 +79,39 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
 
   return (
     <div className="rounded-2xl border border-warning/20 bg-warning/[0.03] overflow-hidden">
-      <button onClick={() => (data || loading ? setOpen(o => !o) : run())}
-        className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-warning/[0.06] transition-colors text-left">
-        <div className="w-7 h-7 rounded-lg bg-warning/15 flex items-center justify-center text-warning shrink-0"><ShieldAlert className="w-4 h-4" /></div>
-        <div className="flex-1 min-w-0">
-          <div className="font-semibold text-sm text-warning">Manage Book</div>
-          <div className="text-[10px] text-base-content/40">Beta-weighted greeks · two-sided stress · 1-mo CVaR · assignment lab · ranked hedges</div>
-        </div>
-        {loading ? <Loader2 className="w-4 h-4 animate-spin text-warning" />
-          : data ? (open ? <ChevronUp className="w-4 h-4 text-base-content/30" /> : <ChevronDown className="w-4 h-4 text-base-content/30" />)
-          : <span className="btn btn-warning btn-xs">Analyze book</span>}
-      </button>
+      <div className="w-full flex items-center gap-2.5 px-4 py-3 hover:bg-warning/[0.06] transition-colors">
+        <button onClick={() => (data ? setOpen(o => !o) : refresh())}
+          className="flex items-center gap-2.5 flex-1 min-w-0 text-left">
+          <div className="w-7 h-7 rounded-lg bg-warning/15 flex items-center justify-center text-warning shrink-0"><ShieldAlert className="w-4 h-4" /></div>
+          <div className="flex-1 min-w-0">
+            <div className="font-semibold text-sm text-warning">Manage Book</div>
+            <div className="text-[10px] text-base-content/40 truncate">
+              {data?.computed_at
+                ? `Updated ${ago(data.computed_at)} · click to ${open ? 'collapse' : 'view'}`
+                : 'Beta-weighted greeks · two-sided stress · 1-mo CVaR · assignment lab · ranked hedges'}
+            </div>
+          </div>
+        </button>
+        {(loading && !data) ? <Loader2 className="w-4 h-4 animate-spin text-warning shrink-0" />
+          : data ? (
+            <>
+              <button className="btn btn-ghost btn-xs gap-1 shrink-0" onClick={refresh} disabled={refreshing}
+                title="Recompute from live quotes and save the latest to the DB">
+                {refreshing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                {refreshing ? 'Refreshing…' : 'Refresh'}
+              </button>
+              <button onClick={() => setOpen(o => !o)} className="shrink-0">
+                {open ? <ChevronUp className="w-4 h-4 text-base-content/30" /> : <ChevronDown className="w-4 h-4 text-base-content/30" />}
+              </button>
+            </>
+          ) : refreshing ? <Loader2 className="w-4 h-4 animate-spin text-warning shrink-0" />
+          : <button className="btn btn-warning btn-xs shrink-0" onClick={refresh}>Analyze book</button>}
+      </div>
 
-      {open && (loading || data || err) && (
+      {open && (refreshing || data || err) && (
         <div className="border-t border-warning/10 p-3 space-y-3">
           {err && <div className="text-xs text-error flex items-center gap-1"><AlertTriangle className="w-3.5 h-3.5" />{err}</div>}
-          {loading && !data && <div className="text-xs text-base-content/40 flex items-center gap-2 py-2"><Loader2 className="w-4 h-4 animate-spin" />Repricing the book across crash scenarios and Monte-Carlo tails…</div>}
+          {refreshing && !data && <div className="text-xs text-base-content/40 flex items-center gap-2 py-2"><Loader2 className="w-4 h-4 animate-spin" />Repricing the book across crash scenarios and Monte-Carlo tails…</div>}
 
           {data && (
             <>

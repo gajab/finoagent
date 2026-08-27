@@ -1,0 +1,4 @@
+# The MCP server itself only needs the MCP SDK.
+# Everything else (yfinance, numpy/scipy, QuantLib, the FinoAgent `app` package, …)
+# is imported from the backend and already lives in backend/venv.
+mcp>=2.0.0

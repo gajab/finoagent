@@ -115,14 +115,27 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                     bit of alpha — not risk-neutral profit (fairly-priced income has ~0 of that; the seller's vol edge is
                     the <b>VRP</b> factor below).</span></li>
                   <li>➋ <b>Option-math adjustments</b> (± on the base): <b>VRP</b>, <b>Moneyness</b> (how close the short
-                    strike sits), <b>Skew / IV-edge</b>, <b>Liquidity</b> and <b>Beta</b>.</li>
+                    strike sits), <b>Skew / IV-edge</b>, <b>Liquidity</b>, <b>Beta</b>, and <b>Undefined risk</b> — an
+                    explicit demerit for <b>unbounded-loss</b> structures (naked calls, short strangles): the base
+                    score's tail term uses CVaR<sub>95</sub> and deliberately omits the deep worst case, so this prices
+                    the <b>CVaR<sub>99</sub></b> tail, scaled by how <i>reachable</i> the strike is — a deep, low-touch
+                    naked call takes a small hit, a near-money one a large one (it can push the grade to F). Exempt when
+                    you own the shares (the call is then covered → bounded).</li>
                   <li>➌ <b>TA factors</b> (± on the base) — the technical read on <b>6-month daily</b> bars, the swing
                     horizon that governs a multi-week option (see the chips below).</li>
                 </ul>
                 <p className="text-[12px] text-base-content/55 leading-snug mt-1.5">
                   <span className="font-mono text-[11px]">base + Σ adjustments + Σ TA</span>, clamped to 0–100 → the letter.
-                  A genuinely broken trade (loses in expectation, or a blocking flag) is <b>vetoed</b>, not padded.
+                  Two things sit <i>outside</i> the score, so <b>quality and timing never contradict</b>:
                 </p>
+                <ul className="text-[12px] text-base-content/65 leading-snug mt-1.5 space-y-1">
+                  <li><span className="text-error"><b>VETOED</b></span> — a <b>structurally</b> broken trade (loses in
+                    expectation, crushed vol, delta-neutral into short gamma) → grade <b>F</b>, avoid. The quality score is
+                    irrelevant here.</li>
+                  <li><span className="text-warning"><b>WAIT · timing</b></span> — a <b>good</b> trade at the <b>wrong
+                    moment</b>: momentum accelerating against a strike that's <i>actually reachable</i>. It <b>keeps its
+                    quality grade</b> but the desk holds until momentum settles — <i>not</i> the same as a veto.</li>
+                </ul>
               </div>
 
               {/* Structure — walls, buffer, sigma */}
@@ -153,6 +166,15 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                   volatility and <b>widens before earnings</b> (IV lifts it). Premium is the go/no-go, never a reason to
                   creep closer into open air.
                 </p>
+                <div className="mt-2 rounded-lg border border-warning/25 bg-warning/[0.05] p-2 text-[11px] text-base-content/70 leading-snug">
+                  <b className="text-warning/90">Earnings-aware ranking</b> (opt-in checkbox before you scan) — walls are a
+                  <b> continuous-tape</b> defense; an earnings <b>gap jumps through them</b>. When a print falls before expiry it:
+                  <b> ➊</b> discounts the <b>Structure</b> credit for walls the isolated event move can leap, and
+                  <b> ➋</b> adds an <b>Earnings gap</b> penalty when the strike sits inside <b>~1.5×</b> that move (a real
+                  surprise runs 2–3× the implied). The event move is <b>isolated</b> from the straddle (total move minus the
+                  baseline diffusion), so it's the single-day jump the diffusion σ smears away. Every impacted metric shows
+                  its value <b>with / without</b> the adjustment so you can see exactly what earnings did.
+                </div>
               </div>
 
               {/* Breach risk — the touch probability */}
@@ -214,12 +236,15 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                 <Chip icon={<Sparkles className="w-4 h-4 text-secondary" />}
                   title={<>TA factors · 6-mo daily (± on base) — e.g. <span className="text-success">Trend drift +6</span>, <span className="text-error">Gamma regime −6</span></>}>
                   Each signed bar is one technical factor's points on the base score, all computed on <b>6-month daily</b>
-                  bars (the swing horizon for a multi-week option). <b>Trend drift</b> — the annualized EMA-slope velocity:
-                  a tailwind (+) for the short side or a headwind (−). <b>Structure</b> — is the strike behind a wall
-                  (see the section above). <b>Gamma regime</b> — the dealer-gamma chip above, applied to every trade.
-                  <b> Range fit</b> — a range-bound tape suits neutral premium. <b>LVN slip</b> — a strike sitting in a thin
-                  volume node has no absorption (−). A <b>MACD acceleration</b> spike against the short side is a separate
-                  timing <b>veto</b>. (RSI &amp; Bollinger are shown for context but don't move the deterministic score.)
+                  bars (the swing horizon for a multi-week option). <b>Trend drift</b> — <b>momentum as one signal</b>: the
+                  annualized EMA-slope <i>velocity</i> (a tailwind + or headwind − for the short side) <i>modulated</i> by
+                  MACD <i>acceleration</i> — a tailwind that's decelerating is faded, not paid in full. <b>Structure</b> — is
+                  the strike behind a wall (see the section above). <b>Gamma regime</b> — the dealer-gamma chip above,
+                  applied to every trade. <b>Range fit</b> — a range-bound tape suits neutral premium. <b>LVN slip</b> — a
+                  strike sitting in a thin volume node has no absorption (−). When that momentum accelerates against a strike
+                  that's <b>actually reachable</b> (near-money / non-trivial P(touch)) it becomes a <span className="text-warning"><b>WAIT · timing</b></span>
+                  hold — but on a deep, wall-defended strike it's just the faded drift above, never a veto. (RSI &amp;
+                  Bollinger are shown for context but don't move the deterministic score.)
                 </Chip>
               </div>
 

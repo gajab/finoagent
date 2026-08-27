@@ -44,6 +44,7 @@ export default function ChartPatternsPanel({ ticker }: { ticker: string }) {
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [ticker]);
 
   const selected = data?.patterns.find(p => p.type === selType) || data?.patterns[0] || null;
+  const fib = data?.fibonacci;
 
   const option = useMemo(() => {
     if (!data) return {};
@@ -92,6 +93,11 @@ export default function ChartPatternsPanel({ ticker }: { ticker: string }) {
       data.fibonacci.levels.forEach(l => markLineData.push({
         yAxis: l.price, lineStyle: { color: '#a78bfa', type: 'dashed', width: 1 },
         label: { formatter: `${(l.ratio * 100).toFixed(1)}% ${money(l.price)}`, position: 'insideStartBottom', color: '#a78bfa', fontSize: 9 },
+      }));
+      // extension targets (price after breakout) — green, projected beyond the swing
+      (data.fibonacci.extensions || []).forEach(l => markLineData.push({
+        yAxis: l.price, lineStyle: { color: '#22c55e', type: 'dashed', width: 1 },
+        label: { formatter: `${(l.ratio * 100).toFixed(1)}% tgt ${money(l.price)}`, position: 'insideEndTop', color: '#22c55e', fontSize: 9 },
       }));
     }
     return {
@@ -187,6 +193,47 @@ export default function ChartPatternsPanel({ ticker }: { ticker: string }) {
                 <p><span className="font-semibold text-success">Confirms when:</span> <span className="text-base-content/70">{selected.education.confirms}</span></p>
                 <p><span className="font-semibold text-error">Invalidated if:</span> <span className="text-base-content/70">{selected.education.invalidates}</span></p>
               </div>
+            </div>
+          )}
+
+          {/* Fibonacci detail — retracements (support) + extensions (breakout targets) */}
+          {showFib && fib && (
+            <div className="rounded-xl border border-secondary/30 bg-secondary/5 p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-bold text-secondary">Fibonacci</span>
+                  <span className="text-[11px] text-base-content/60">{fib.direction === 'up' ? '↑' : '↓'} swing {money(fib.swing.from.price)} → {money(fib.swing.to.price)}</span>
+                  <span className={`badge badge-xs ${fib.position === 'broken_out' ? 'badge-success' : 'badge-ghost'}`}>
+                    {fib.position === 'broken_out' ? 'broken out — targets live' : 'inside swing'}
+                  </span>
+                </div>
+                {fib.next_target && (
+                  <span className="text-xs">Next target <b className="text-success">{money(fib.next_target.price)}</b> ({(fib.next_target.ratio * 100).toFixed(1)}%)</span>
+                )}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wide text-base-content/50 mb-1">Retracements (pullback support)</div>
+                  <div className="flex flex-wrap gap-1">
+                    {fib.levels.map(l => (
+                      <span key={l.ratio} className="inline-flex items-center gap-1 rounded bg-base-100 border border-base-300 px-1.5 py-0.5 text-[10px]">
+                        <span className="text-[#a78bfa] font-semibold">{(l.ratio * 100).toFixed(1)}%</span> {money(l.price)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wide text-base-content/50 mb-1">Extensions (targets after breakout)</div>
+                  <div className="flex flex-wrap gap-1">
+                    {(fib.extensions || []).map(l => (
+                      <span key={l.ratio} className="inline-flex items-center gap-1 rounded bg-base-100 border border-success/30 px-1.5 py-0.5 text-[10px]">
+                        <span className="text-success font-semibold">{(l.ratio * 100).toFixed(1)}%</span> {money(l.price)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <p className="text-[11px] text-base-content/60 leading-snug">{fib.education.where} {fib.education.confirms}</p>
             </div>
           )}
 

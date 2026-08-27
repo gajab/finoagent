@@ -2,8 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   X, Check, AlertTriangle, Sparkles, RefreshCw,
   TrendingUp, TrendingDown, Layers, Calendar, ChevronRight,
-  Shield, DollarSign, Brain, BarChart2, BookOpen, Clock, Bot,
-  ExternalLink, ArrowLeft, RotateCcw
+  Shield, ShieldCheck, ShieldAlert, ShieldX, DollarSign, Brain, BarChart2, BookOpen, Clock, Bot,
+  ExternalLink, ArrowLeft, RotateCcw, Gauge, Target, Zap, Activity, Compass, Globe
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -12,8 +12,50 @@ import {
   dismissPortfolioHighlight,
   resetPortfolioHighlights,
   trackCompany,
-  HighlightHolding
+  HighlightHolding,
+  HighlightCatalyst
 } from '../api';
+
+// ── Verdict styling (health convention: higher score = stronger hold) ───────────
+// Thresholds mirror ExitSignalGauge so the card reads the same as the Exit tab.
+function verdictConfig(score: number) {
+  if (score >= 61) return { text: 'text-emerald-500', bar: 'bg-emerald-500', ring: 'border-emerald-500/30', soft: 'bg-emerald-500/10', Icon: ShieldCheck };
+  if (score >= 45) return { text: 'text-sky-500', bar: 'bg-sky-500', ring: 'border-sky-500/30', soft: 'bg-sky-500/10', Icon: Shield };
+  if (score >= 30) return { text: 'text-amber-500', bar: 'bg-amber-500', ring: 'border-amber-500/30', soft: 'bg-amber-500/10', Icon: ShieldAlert };
+  return { text: 'text-rose-500', bar: 'bg-rose-500', ring: 'border-rose-500/30', soft: 'bg-rose-500/10', Icon: ShieldX };
+}
+
+// ── Catalyst styling — icon by kind, accent by directional sentiment ─────────────
+function catalystKindIcon(kind: string) {
+  switch (kind) {
+    case 'earnings': return Calendar;
+    case 'analyst': return Gauge;
+    case 'valuation': return Target;
+    case 'technical': return Activity;
+    case 'sector': return Compass;
+    case 'macro': return Globe;
+    case 'quality': return Zap;
+    default: return Sparkles;
+  }
+}
+
+function catalystSentiment(sentiment: string) {
+  switch (sentiment) {
+    case 'bullish': return { text: 'text-emerald-500', dot: 'bg-emerald-500', chip: 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20' };
+    case 'bearish': return { text: 'text-rose-500', dot: 'bg-rose-500', chip: 'text-rose-500 bg-rose-500/10 border-rose-500/20' };
+    case 'event': return { text: 'text-amber-500', dot: 'bg-amber-500', chip: 'text-amber-500 bg-amber-500/10 border-amber-500/20' };
+    default: return { text: 'text-base-content/50', dot: 'bg-base-content/30', chip: 'text-base-content/50 bg-base-200/50 border-white/10' };
+  }
+}
+
+function catalystTiming(cat: HighlightCatalyst): string | null {
+  if (cat.days_until != null) return cat.days_until <= 0 ? 'Now' : `${cat.days_until}d`;
+  if (cat.date) {
+    const parts = cat.date.split('-');
+    if (parts.length === 3) return `${parts[1]}/${parts[2]}`;
+  }
+  return null;
+}
 
 interface PortfolioHighlightsProps {
   onClose: () => void;
@@ -26,6 +68,7 @@ export function PortfolioHighlights({ onClose }: PortfolioHighlightsProps) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [totalHoldings, setTotalHoldings] = useState(0);
   const [locallyDismissed, setLocallyDismissed] = useState<string[]>([]);
+  const [catalystsOpen, setCatalystsOpen] = useState(false); // Catalysts to Watch: collapsed by default
 
   // Gesture state
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
@@ -35,6 +78,9 @@ export function PortfolioHighlights({ onClose }: PortfolioHighlightsProps) {
   const [cardActionStatus, setCardActionStatus] = useState<'none' | 'swiped_left' | 'swiped_right'>('none');
 
   const cardRef = useRef<HTMLDivElement>(null);
+
+  // Each card starts with Catalysts collapsed for a lean, no-scroll first glance.
+  useEffect(() => { setCatalystsOpen(false); }, [currentIndex]);
 
   const loadHighlights = async () => {
     setLoading(true);
@@ -458,6 +504,42 @@ export function PortfolioHighlights({ onClose }: PortfolioHighlightsProps) {
                   </div>
                 </div>
 
+                {/* Section 1b: Dashboard Verdict — Exit / Hold / Strong Hold (10 pillars + technical + risk) */}
+                {activeCard.verdict && (() => {
+                  const v = activeCard.verdict!;
+                  const cfg = verdictConfig(v.score);
+                  const VIcon = cfg.Icon;
+                  const dims = [
+                    { l: 'P', title: 'Pillars', s: v.pillars_score },
+                    { l: 'T', title: 'Technical', s: v.technical_score },
+                    { l: 'R', title: 'Risk', s: v.risk_score },
+                  ];
+                  return (
+                    <div className={`flex items-center gap-3 rounded-2xl border ${cfg.ring} ${cfg.soft} px-3.5 py-2.5`}>
+                      <VIcon className={`w-6 h-6 flex-shrink-0 ${cfg.text}`} />
+                      <div className="leading-none min-w-0">
+                        <div className="text-[8px] uppercase tracking-widest text-base-content/40 font-bold mb-1">Dashboard Verdict</div>
+                        <div className={`font-black text-sm ${cfg.text}`}>{v.label}</div>
+                      </div>
+                      <div className="flex items-baseline gap-0.5 ml-0.5 flex-shrink-0">
+                        <span className={`text-2xl font-black tabular-nums ${cfg.text}`}>{v.score}</span>
+                        <span className="text-[9px] text-base-content/30 font-semibold">/100</span>
+                      </div>
+                      <div className="ml-auto flex items-center gap-2 sm:gap-2.5 flex-shrink-0">
+                        {dims.map((d) => d.s != null && (
+                          <div key={d.l} className="flex flex-col items-center gap-1" title={`${d.title}: ${d.s}/100`}>
+                            <span className="text-[8px] font-bold text-base-content/40">{d.l}</span>
+                            <div className="w-7 sm:w-9 h-1.5 rounded-full bg-base-content/10 overflow-hidden">
+                              <div className={`h-full rounded-full ${verdictConfig(d.s).bar}`} style={{ width: `${d.s}%` }} />
+                            </div>
+                            <span className="text-[8px] tabular-nums text-base-content/50">{d.s}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
                 {/* Section 2: Portfolio Exposure, Cost, overall P&L, 5D Sparkline */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-base-200/40 border border-white/[0.04] p-3 rounded-2xl">
                   {/* Left Column: Exposure metrics */}
@@ -594,6 +676,64 @@ export function PortfolioHighlights({ onClose }: PortfolioHighlightsProps) {
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{activeCard.hypothesis}</ReactMarkdown>
                   </div>
                 </div>
+
+                {/* Section 4b: Catalysts to Watch — collapsible (collapsed by default), placed after the thesis */}
+                {activeCard.catalysts && activeCard.catalysts.length > 0 && (() => {
+                  const cats = activeCard.catalysts!;
+                  const top = cats[0];
+                  const topTiming = catalystTiming(top);
+                  const hasKey = cats.some(c => c.importance === 'high');
+                  return (
+                    <div className="rounded-2xl border border-white/[0.04] bg-base-200/25 overflow-hidden">
+                      <button
+                        onClick={() => setCatalystsOpen(o => !o)}
+                        className="w-full flex items-center gap-2 px-3 py-2.5 hover:bg-base-200/40 transition-colors text-left"
+                        aria-expanded={catalystsOpen}
+                      >
+                        <Zap className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
+                        <span className="text-[10px] uppercase font-bold tracking-wider text-base-content/50 flex-shrink-0">Catalysts to Watch</span>
+                        <span className="text-[9px] font-bold text-amber-500 bg-amber-500/10 border border-amber-500/20 rounded-md px-1.5 py-0.5 flex-shrink-0">{cats.length}</span>
+                        {!catalystsOpen && (
+                          <span className="text-[10px] text-base-content/45 flex items-center gap-1.5 min-w-0">
+                            {hasKey && <span className="w-1.5 h-1.5 rounded-full bg-rose-500 flex-shrink-0" />}
+                            <span className="truncate">{top.title}{topTiming ? ` · ${topTiming}` : ''}</span>
+                          </span>
+                        )}
+                        <ChevronRight className={`w-4 h-4 text-base-content/30 ml-auto flex-shrink-0 transition-transform ${catalystsOpen ? 'rotate-90' : ''}`} />
+                      </button>
+                      {catalystsOpen && (
+                        <div className="px-3 pb-3 pt-0.5 space-y-1.5">
+                          {cats.map((cat, idx) => {
+                            const KindIcon = catalystKindIcon(cat.kind);
+                            const sent = catalystSentiment(cat.sentiment);
+                            const timing = catalystTiming(cat);
+                            return (
+                              <div key={idx} className="flex items-start gap-2.5 p-2.5 rounded-xl bg-base-100/40 border border-white/[0.03]">
+                                <div className={`mt-0.5 w-6 h-6 rounded-lg flex items-center justify-center flex-shrink-0 border ${sent.chip}`}>
+                                  <KindIcon className="w-3.5 h-3.5" />
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="text-xs font-bold text-base-content/80">{cat.title}</span>
+                                    {cat.importance === 'high' && (
+                                      <span className="text-[8px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-md bg-rose-500/10 text-rose-500 border border-rose-500/20">Key</span>
+                                    )}
+                                  </div>
+                                  <p className="text-[11px] text-base-content/55 leading-snug mt-0.5">{cat.detail}</p>
+                                </div>
+                                {timing && (
+                                  <span className={`flex-shrink-0 text-[10px] font-bold tabular-nums px-2 py-0.5 rounded-lg border ${sent.chip}`}>
+                                    {timing}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {/* Section 5: News Widget */}
                 {activeCard.news && activeCard.news.length > 0 && (

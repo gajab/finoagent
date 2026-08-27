@@ -763,22 +763,27 @@ def management_exit(*, pop_pct: Optional[float], captured_pct: Optional[float],
 # (weight, holder-note). weight 1.0 = keep · 0 = drop · negative = FLIP the sign
 # (the entry demerit becomes a holder positive, or vice-versa).
 _MGMT_FACTOR_POLICY: dict = {
-    # ── does the short strike survive? — keep, same sign ───────────────────
-    "Trend drift":  (1.0,  "trend relative to your short strike"),
-    "Value area":   (1.0,  "spot's location within the value area"),
-    "Gamma regime": (1.0,  "dealer-gamma vol regime (suppressed = your strike holds)"),
-    "Moneyness":    (1.0,  "cushion from spot to your short strike"),
+    # ── does the short strike survive? — KEEP, same sign (common with the entry desk) ──
+    "Moneyness":    (1.0,  "cushion from spot to your short strike — the further out, the safer the hold"),
     # ── vol — FLIP, but GENTLY: cheap/falling implied is a clear holder positive
     # (decaying, cheap to buy back). Rich remaining implied is NOT a pure demerit the
     # way the entry score treats it — it's also premium still to collect; only the
     # spike RISK is a negative, so we damp the flip (−0.6 → −0.3) and the base's
     # Reward/Tail lenses carry the rest. (This is the "penalised for lower vol" fix.)
     "VRP":          (-0.3, "cheap/falling implied is GOOD once you're short (decaying, cheap to buy back); rich implied is mostly still-collectable premium, only a spike hurts"),
-    # ── exit mechanics — reframed, downweighted ────────────────────────────
-    "Liquidity":    (0.5,  "bid/ask width is the cost to CLOSE now, not to enter"),
+    # ── earnings — an ENTRY-timing demerit that becomes a HOLD RISK once you're in: the
+    # binary gap is now yours to defend/close before the print, not a reason to skip. Kept
+    # (not flipped), lightly downweighted — you can still act, unlike at entry.
+    "Earnings timing": (0.7, "earnings BEFORE expiry — a binary gap you now HOLD through; theta is event compensation, not free decay. Defend / close / roll past the print rather than let the fat premium lull you"),
+    # ── liquidity — the cost to ROLL or CLOSE if you need to act. Real, but NOT a reason to
+    # hold-or-fold on its own (renamed from the punitive "Exit cost", downweighted 0.5→0.35).
+    "Liquidity":    (0.35, "bid/ask width — the cost to ROLL or CLOSE if you have to act (a friction to plan around, not a hold-vs-close signal by itself)"),
     # ── expected value — a loss at high keep-prob is a remote tail ──────────
     "Expectation":  (0.4,  "a losing expectation here is the remote tail, not the base case"),
-    # ── entry-only, irrelevant once held ───────────────────────────────────
+    # ── entry-only, irrelevant / double-counted once held ──────────────────
+    # Skew: the tail it warns about is already in the base's CVaR lens.
+    # Beta: the position's market risk is carried by the TA "Systemic beta" factor (kept
+    #       as-is), so re-adding the entry Beta demerit would double-count it.
     "Skew":         (0.0,  ""),
     "Beta":         (0.0,  ""),
 }
@@ -825,11 +830,15 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
     # (breach/touch %, which wall & how far, fortified, defensibility, systemic beta, …) so the hold/close
     # read EXPLAINS itself the same way the entry desk does, re-pointed at the position you're holding.
     for f in (ta_factors or []):
+        label = f.get("label")
         pts = round(float(f.get("points", 0) or 0))
-        if pts:
-            contribs.append({"label": f.get("label"), "pts": pts, "favorable": pts > 0,
+        # Breach risk (P-touch — the chance the short goes ITM before expiry) is THE hold metric
+        # for a placed trade: always surface it, even at 0 pts (a benign breach is reassuring info).
+        if pts or label == "Breach risk":
+            contribs.append({"label": label, "pts": pts, "favorable": pts >= 0,
                              "note": f.get("detail") or ("supports your strike holding" if pts > 0
-                                                         else "pressures your short strike")})
+                                                         else "pressures your short strike" if pts < 0
+                                                         else "within the comfort zone — the short is unlikely to be breached before expiry")})
 
     # Option-math factors — re-signed / re-weighted per the holder policy. (Tail is NOT
     # re-added here — the base's CVaR Tail lens already carries downside; adding the
@@ -847,10 +856,8 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
             disp = "Vol decay" if pts > 0 else "Vol premium"
             note = ("cheap / falling implied vol — your shorts are decaying and cheap to buy back" if pts > 0
                     else "rich implied still in your shorts — more premium to collect, but a vol spike would hurt")
-        elif label == "Liquidity":
-            disp = "Exit cost"
         else:
-            disp = label
+            disp = label   # Liquidity, Moneyness, Earnings timing, Expectation keep their own names
         contribs.append({"label": disp, "pts": pts, "favorable": pts > 0, "note": note})
 
     # Dynamic greeks — the CONVEXITY the static score misses. Short gamma tightening into

@@ -174,13 +174,13 @@ def _double_top(z, df, close, atr):
             lines=[_line(df, b["idx"], neck, len(df) - 1, neck, "Neckline (support)", "neckline")],
             breakout={"level": round(neck, 2), "side": "down"},
             target=_tgt(tgt, close, "neckline − pattern height"),
-            stop=peak + 0.4 * atr, as_of_idx=c["idx"],
+            stop=round(peak + 0.4 * atr, 2), as_of_idx=c["idx"],
             education={
                 "what": "Two peaks at roughly the same price with a trough between — buyers twice failed to break higher. A bearish reversal.",
                 "where": f"Peak 1 ≈ ${p1} and Peak 2 ≈ ${p2} are the two 'M' tops; the neckline is the trough at ${round(neck,2)}.",
                 "how_to_spot": "Look for an 'M': two highs within ~3% of each other separated by a clear dip. The dip low is the neckline.",
                 "confirms": f"A daily close below the ${round(neck,2)} neckline confirms it; the measured target is ${round(tgt,2)} (neckline minus the peak-to-neckline height).",
-                "invalidates": f"A close back above the peaks (~${round(peak,2)}) invalidates the top.",
+                "invalidates": f"A close back above the peaks at ${round(peak + 0.4 * atr, 2)} — that's the protective stop.",
             })
     return None
 
@@ -213,13 +213,13 @@ def _double_bottom(z, df, close, atr):
             lines=[_line(df, b["idx"], neck, len(df) - 1, neck, "Neckline (resistance)", "neckline")],
             breakout={"level": round(neck, 2), "side": "up"},
             target=_tgt(tgt, close, "neckline + pattern height"),
-            stop=trough - 0.4 * atr, as_of_idx=c["idx"],
+            stop=round(trough - 0.4 * atr, 2), as_of_idx=c["idx"],
             education={
                 "what": "Two troughs at roughly the same price with a peak between — sellers twice failed to push lower. A bullish reversal ('W').",
                 "where": f"Bottom 1 ≈ ${p1} and Bottom 2 ≈ ${p2} are the two lows; the neckline is the peak at ${round(neck,2)}.",
                 "how_to_spot": "Look for a 'W': two lows within ~3% of each other with a bounce between. The bounce high is the neckline.",
                 "confirms": f"A daily close above the ${round(neck,2)} neckline confirms it; the measured target is ${round(tgt,2)}.",
-                "invalidates": f"A close below the lows (~${round(trough,2)}) invalidates the bottom.",
+                "invalidates": f"A close below the lows at ${round(trough - 0.4 * atr, 2)} — that's the protective stop.",
             })
     return None
 
@@ -266,6 +266,7 @@ def _head_shoulders(z, df, close, atr, inverse=False):
         conf = 0.55 + 0.2 * (1 - abs(lsp - rsp) / max(lsp, rsp)) + (0.2 if broke else 0.0)
         direction = "bullish" if inverse else "bearish"
         name = "Inverse Head & Shoulders" if inverse else "Head & Shoulders"
+        stop = round((min(lsp, rsp) - 0.4 * atr) if inverse else (max(lsp, rsp) + 0.4 * atr), 2)
         return _pattern(
             "inverse_head_shoulders" if inverse else "head_shoulders", name, "reversal", direction,
             "broken_out" if broke else "forming", min(0.95, conf),
@@ -274,8 +275,7 @@ def _head_shoulders(z, df, close, atr, inverse=False):
             lines=[_line(df, t1["idx"], t1["price"], len(df) - 1, neck_now, "Neckline", "neckline")],
             breakout={"level": round(neck_now, 2), "side": "up" if inverse else "down"},
             target=_tgt(tgt, close, "neckline ± head height"),
-            stop=(min(lsp, rsp) - 0.4 * atr) if inverse else (max(lsp, rsp) + 0.4 * atr),
-            as_of_idx=rs["idx"],
+            stop=stop, as_of_idx=rs["idx"],
             education={
                 "what": (("A bottoming pattern: a low (head) between two higher lows (shoulders) — sellers exhausted. Bullish reversal."
                           if inverse else
@@ -283,7 +283,8 @@ def _head_shoulders(z, df, close, atr, inverse=False):
                 "where": f"Left shoulder ${lsp}, head ${hp}, right shoulder ${rsp}; the neckline runs through the two intervening turns.",
                 "how_to_spot": "Three pushes where the middle is the most extreme and the outer two are similar. Draw the neckline through the two reaction points between them.",
                 "confirms": f"A close {'above' if inverse else 'below'} the neckline (~${round(neck_now,2)}) confirms; measured target ${round(tgt,2)}.",
-                "invalidates": f"A close back beyond the head (${hp}) invalidates it.",
+                "invalidates": (f"A close back {'below' if inverse else 'above'} the right shoulder at ${stop} — "
+                                f"that's the protective stop (the head at ${hp} is the last-ditch line).")
             })
     return None
 
@@ -377,13 +378,13 @@ def _triangle(z, df, close, atr):
             lines=[_line(df, first, lvl, x_now, lvl, "Flat resistance", "resistance"), sup_line()],
             breakout={"level": round(lvl, 2), "side": "up"},
             target=_tgt(lvl + height, close, "resistance + triangle height"),
-            stop=sup - 0.4 * atr, as_of_idx=x_now,
+            stop=round(sup - 0.4 * atr, 2), as_of_idx=x_now,
             education={
                 "what": "A flat ceiling with rising lows — buyers get more aggressive while sellers defend one price. Bullish continuation.",
                 "where": f"Resistance is flat near ${round(lvl,2)}; support rises from ${ls[0]['price']} to ${round(sup,2)}.",
                 "how_to_spot": "Horizontal line across the highs, an up-sloping line under the lows, squeezing toward the ceiling.",
                 "confirms": f"A close above ${round(lvl,2)} breaks out; target ${round(lvl+height,2)} (add the triangle height).",
-                "invalidates": f"Losing the rising support (~${round(sup,2)}) breaks the pattern.",
+                "invalidates": f"A close below the rising support at ${round(sup - 0.4 * atr, 2)} — that's the protective stop.",
             })
     if lo_flat and falling_highs:
         lvl = float(np.mean([p["price"] for p in ls])); broke = close < lvl
@@ -394,13 +395,13 @@ def _triangle(z, df, close, atr):
             lines=[_line(df, first, lvl, x_now, lvl, "Flat support", "support"), res_line()],
             breakout={"level": round(lvl, 2), "side": "down"},
             target=_tgt(lvl - height, close, "support − triangle height"),
-            stop=res + 0.4 * atr, as_of_idx=x_now,
+            stop=round(res + 0.4 * atr, 2), as_of_idx=x_now,
             education={
                 "what": "A flat floor with falling highs — sellers get more aggressive while buyers defend one price. Bearish continuation.",
                 "where": f"Support is flat near ${round(lvl,2)}; resistance falls from ${hs[0]['price']} to ${round(res,2)}.",
                 "how_to_spot": "Horizontal line across the lows, a down-sloping line over the highs, squeezing toward the floor.",
                 "confirms": f"A close below ${round(lvl,2)} breaks down; target ${round(lvl-height,2)}.",
-                "invalidates": f"Reclaiming the falling resistance (~${round(res,2)}) breaks the pattern.",
+                "invalidates": f"A close above the falling resistance at ${round(res + 0.4 * atr, 2)} — that's the protective stop.",
             })
     if falling_highs and rising_lows:
         broke = close > res or close < sup
@@ -442,6 +443,9 @@ def _flag(z, df, close, atr, bull=True):
         return None
     broke = (close > lvl) if bull else (close < lvl)
     tgt = (lvl + pole) if bull else (lvl - pole)
+    # Single source of truth: the stop = the flag's far boundary + a buffer, and the invalidation
+    # text cites the SAME number (a flag is broken by a close out the wrong side of its channel).
+    stop = round((c["price"] - 0.4 * atr) if bull else (c["price"] + 0.4 * atr), 2)
     name = "Bull Flag" if bull else "Bear Flag"
     return _pattern(
         "bull_flag" if bull else "bear_flag", name, "continuation", "bullish" if bull else "bearish",
@@ -451,7 +455,7 @@ def _flag(z, df, close, atr, bull=True):
                _line(df, b["idx"], lvl, len(df) - 1, lvl, "Breakout", "resistance" if bull else "support")],
         breakout={"level": round(lvl, 2), "side": "up" if bull else "down"},
         target=_tgt(tgt, close, "breakout ± pole height"),
-        stop=(c["price"] - 0.4 * atr) if bull else (c["price"] + 0.4 * atr), as_of_idx=c["idx"],
+        stop=stop, as_of_idx=c["idx"],
         education={
             "what": (("A sharp rally (the pole) then a shallow, orderly pullback (the flag) — a pause that refreshes. Bullish continuation."
                       if bull else
@@ -459,7 +463,9 @@ def _flag(z, df, close, atr, bull=True):
             "where": f"The pole runs ${a['price']}→${b['price']}; the flag is the shallow drift back to ${c['price']}.",
             "how_to_spot": "One strong, near-vertical thrust, then a small counter-trend channel retracing less than half of it.",
             "confirms": f"A close {'above' if bull else 'below'} the ${round(lvl,2)} flag {'high' if bull else 'low'} resumes the move; target ${round(tgt,2)} (project the pole from the breakout).",
-            "invalidates": f"A retrace deeper than ~50% of the pole (past ${round((b['price']-0.5*pole) if bull else (b['price']+0.5*pole),2)}) kills it.",
+            "invalidates": (f"A close back {'below' if bull else 'above'} the flag {'low' if bull else 'high'} at "
+                            f"${stop} breaks the flag — that's the protective stop (a healthy flag also shouldn't "
+                            f"retrace more than ~half the pole)."),
         })
 
 
@@ -513,13 +519,13 @@ def _cup_handle(z, df, close, atr):
         lines=[_line(df, n - win - handle, rim, n - 1, rim, "Rim (buy line)", "resistance")],
         breakout={"level": round(rim, 2), "side": "up"},
         target=_tgt(tgt, close, "rim + cup depth"),
-        stop=handle_low - 0.4 * atr, as_of_idx=n - 1,
+        stop=round(handle_low - 0.4 * atr, 2), as_of_idx=n - 1,
         education={
             "what": "A rounded 'U' base (the cup) followed by a small, shallow drift lower (the handle) near the rim — accumulation before a breakout. Bullish.",
             "where": f"The cup base is ~${round(base,2)}, the rim (buy line) is ${round(rim,2)}, and the recent drift is the handle.",
             "how_to_spot": "A smooth bowl (not a sharp V) that returns to its starting rim, then a tight pullback of a few percent in the last couple of weeks.",
             "confirms": f"A close above the ${round(rim,2)} rim on rising volume triggers; target ${round(tgt,2)} (rim + cup depth).",
-            "invalidates": f"A handle deeper than the mid-cup (below ${round(rim-0.5*depth,2)}) signals the base isn't ready.",
+            "invalidates": f"A close below the handle low at ${round(handle_low - 0.4 * atr, 2)} — that's the protective stop (a handle that sinks past the mid-cup isn't a proper handle either).",
         })
 
 
@@ -566,14 +572,29 @@ def _wedge(z, df, close, atr):
     if len(z) < 4:
         return None
     recent = z[-6:]
-    hs = [p for p in recent if p["kind"] == "H"]
-    ls = [p for p in recent if p["kind"] == "L"]
+    hs = sorted([p for p in recent if p["kind"] == "H"], key=lambda p: p["idx"])
+    ls = sorted([p for p in recent if p["kind"] == "L"], key=lambda p: p["idx"])
     if len(hs) < 2 or len(ls) < 2:
+        return None
+    hp = [p["price"] for p in hs]; lp = [p["price"] for p in ls]
+    desc = lambda v: all(v[i] > v[i + 1] for i in range(len(v) - 1))   # strictly lower
+    asc = lambda v: all(v[i] < v[i + 1] for i in range(len(v) - 1))    # strictly higher
+    # A wedge is defined by its PIVOTS: a falling wedge is lower-highs AND lower-lows; a rising wedge
+    # is higher-highs AND higher-lows. Reject anything that isn't monotonic (the GOOG bug labelled a
+    # $382 higher-high a "falling high"). This also prevents boundary violations by construction.
+    falling = desc(hp) and desc(lp)
+    rising = asc(hp) and asc(lp)
+    if not (falling or rising):
         return None
     x_now = len(df) - 1
     first = min(p["idx"] for p in hs + ls)
-    mh, bh = _fit_line([p["idx"] for p in hs], [p["price"] for p in hs])
-    ml, bl = _fit_line([p["idx"] for p in ls], [p["price"] for p in ls])
+    mh, _ = _fit_line([p["idx"] for p in hs], hp)
+    ml, _ = _fit_line([p["idx"] for p in ls], lp)
+    # ENVELOPE lines: keep the fitted slope but anchor the intercept so the upper line sits on/above
+    # EVERY high and the lower line on/below every low — a true boundary, not a line drawn through the
+    # middle of the candles.
+    bh = max(p["price"] - mh * p["idx"] for p in hs)
+    bl = min(p["price"] - ml * p["idx"] for p in ls)
     span0 = _at(mh, bh, first) - _at(ml, bl, first)
     span1 = _at(mh, bh, x_now) - _at(ml, bl, x_now)
     if span1 <= 0 or span1 >= span0 * 0.85:            # must be converging
@@ -585,76 +606,112 @@ def _wedge(z, df, close, atr):
         return [_line(df, hs[0]["idx"], _at(mh, bh, hs[0]["idx"]), x_now, res, "Upper line", "trendline"),
                 _line(df, ls[0]["idx"], _at(ml, bl, ls[0]["idx"]), x_now, sup, "Lower line", "trendline")]
 
-    if mh > flat and ml > flat:                        # rising wedge → bearish
+    if rising and mh > flat and ml > flat:             # rising wedge → bearish
         broke = close < sup
+        stop = round(res + 0.4 * atr, 2)
         return _pattern(
             "rising_wedge", "Rising Wedge", "continuation", "bearish",
             "broken_out" if broke else "forming", 0.55 + (0.15 if broke else 0.0),
-            points=[_P(df, p, "Rising high") for p in hs] + [_P(df, p, "Rising low") for p in ls],
+            points=[_P(df, p, "Higher high") for p in hs] + [_P(df, p, "Higher low") for p in ls],
             lines=lines(), breakout={"level": round(sup, 2), "side": "down"},
-            target=_tgt(sup - span0, close, "lower line − wedge mouth"), stop=res + 0.4 * atr, as_of_idx=x_now,
+            target=_tgt(sup - span0, close, "lower line − wedge mouth"), stop=stop, as_of_idx=x_now,
             education={
                 "what": "Both lines slope UP but the lows rise faster than the highs — momentum fading into a narrowing rise. Usually resolves DOWN (bearish).",
                 "where": f"Upper line ~${round(res,2)}, lower line ~${round(sup,2)}, converging as price grinds higher.",
-                "how_to_spot": "An up-tilted wedge that gets thinner — rallies shrink even as price ticks up.",
+                "how_to_spot": "An up-tilted wedge that gets thinner — each rally shrinks even as price ticks up (higher highs AND higher lows).",
                 "confirms": f"A close below the rising support (~${round(sup,2)}) triggers the drop.",
-                "invalidates": f"A strong close above the upper line (~${round(res,2)}) flips it.",
+                "invalidates": f"A close above the upper line at ${stop} — that's the protective stop.",
             })
-    if mh < -flat and ml < -flat:                      # falling wedge → bullish
+    if falling and mh < -flat and ml < -flat:          # falling wedge → bullish
         broke = close > res
+        stop = round(sup - 0.4 * atr, 2)
         return _pattern(
             "falling_wedge", "Falling Wedge", "continuation", "bullish",
             "broken_out" if broke else "forming", 0.55 + (0.15 if broke else 0.0),
-            points=[_P(df, p, "Falling high") for p in hs] + [_P(df, p, "Falling low") for p in ls],
+            points=[_P(df, p, "Lower high") for p in hs] + [_P(df, p, "Lower low") for p in ls],
             lines=lines(), breakout={"level": round(res, 2), "side": "up"},
-            target=_tgt(res + span0, close, "upper line + wedge mouth"), stop=sup - 0.4 * atr, as_of_idx=x_now,
+            target=_tgt(res + span0, close, "upper line + wedge mouth"), stop=stop, as_of_idx=x_now,
             education={
                 "what": "Both lines slope DOWN but the highs fall faster than the lows — selling exhausting into a narrowing drop. Usually resolves UP (bullish).",
                 "where": f"Upper line ~${round(res,2)}, lower line ~${round(sup,2)}, converging as price grinds lower.",
-                "how_to_spot": "A down-tilted wedge that gets thinner — down-legs shrink even as price ticks lower.",
+                "how_to_spot": "A down-tilted wedge that gets thinner — each push down shrinks (lower highs AND lower lows), price staying inside the lines.",
                 "confirms": f"A close above the falling resistance (~${round(res,2)}) triggers the rally.",
-                "invalidates": f"A decisive close below the lower line (~${round(sup,2)}) flips it.",
+                "invalidates": f"A close below the lower line at ${stop} — that's the protective stop.",
             })
     return None
 
 
-def _fibonacci(z, df, close):
-    """Retracement grid of the dominant recent swing (the largest single H↔L leg in the zigzag)."""
-    if len(z) < 2:
+def _fibonacci(z, df, close, window: int = 63):
+    """Fibonacci grid of the dominant RECENT swing (the extreme low↔high of the last ~3 months,
+    ordered by time), NOT some ancient completed leg — anchoring to a low price already ran far past
+    is useless (OKTA at $170 anchored to a $73 base). Returns:
+      • ``levels``      — retracements (0–100%): pullback / support zones INSIDE the swing.
+      • ``extensions``  — 127.2 / 141.4 / 161.8 / 200 / 261.8%: the price-projection TARGETS *beyond*
+                          the swing — i.e. where price is headed after a breakout.
+    ``position`` says whether price is mid-swing (use retracements) or has broken out past the
+    extreme (use the extensions as targets)."""
+    n = len(df)
+    if n < 20:
         return None
-    best = None
-    for i in range(1, len(z)):
-        a, b = z[i - 1], z[i]
-        move = abs(b["price"] - a["price"])
-        if best is None or move > best[0]:
-            best = (move, a, b)
-    if not best:
-        return None
-    _, a, b = best
-    up = b["price"] > a["price"]
-    hi, lo = (b["price"], a["price"]) if up else (a["price"], b["price"])
-    rng = hi - lo
+
+    def swing(w):
+        seg = max(0, n - w)
+        hi_i = seg + int(np.argmax(df["High"].values[seg:]))
+        lo_i = seg + int(np.argmin(df["Low"].values[seg:]))
+        return hi_i, float(df["High"].values[hi_i]), lo_i, float(df["Low"].values[lo_i])
+
+    hi_i, hi_p, lo_i, lo_p = swing(window)
+    if (hi_p - lo_p) < 0.05 * close:                      # too flat lately → widen to find a real swing
+        hi_i, hi_p, lo_i, lo_p = swing(min(n, 130))
+    rng = hi_p - lo_p
     if rng <= 0:
         return None
-    ratios = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
-    levels = [{"ratio": rr, "price": round(hi - rr * rng, 2) if up else round(lo + rr * rng, 2)} for rr in ratios]
-    # which two levels bracket spot
+    up = hi_i > lo_i                                       # the high came AFTER the low → up-swing
+    a_i, a_p = (lo_i, lo_p) if up else (hi_i, hi_p)        # swing start
+    b_i, b_p = (hi_i, hi_p) if up else (lo_i, lo_p)        # swing end (the extreme)
+
+    def at(r):                                             # r=0 → swing END, r=1 → swing START (standard retr)
+        return round((hi_p - r * rng) if up else (lo_p + r * rng), 2)
+
+    def ext(e):                                            # e>1 projects BEYOND the swing end
+        return round((lo_p + e * rng) if up else (hi_p - e * rng), 2)
+
+    levels = [{"ratio": r, "price": at(r)} for r in (0.236, 0.382, 0.5, 0.618, 0.786)]
+    extensions = [{"ratio": e, "price": ext(e)} for e in (1.272, 1.414, 1.618, 2.0, 2.618)]
+    # where is price now: inside the swing (retracement play) or broken out past the extreme (targets)?
+    broke_out = (close >= hi_p) if up else (close <= lo_p)
+    nxt = next((x for x in extensions if (x["price"] > close if up else x["price"] < close)), None)
     zone = None
-    ordered = sorted(levels, key=lambda x: x["price"])
-    for k in range(len(ordered) - 1):
-        if ordered[k]["price"] <= close <= ordered[k + 1]["price"]:
-            zone = (ordered[k], ordered[k + 1]); break
+    if not broke_out:
+        band = sorted([{"ratio": 0.0, "price": at(0.0)}, *levels, {"ratio": 1.0, "price": at(1.0)}],
+                      key=lambda x: x["price"])
+        for k in range(len(band) - 1):
+            if band[k]["price"] <= close <= band[k + 1]["price"]:
+                zone = {"low": band[k], "high": band[k + 1]}; break
+
     return {
         "direction": "up" if up else "down",
-        "swing": {"from": _P(df, a, "Swing start"), "to": _P(df, b, "Swing end")},
+        "swing": {"from": _pt(df, a_i, a_p, "Swing low" if up else "Swing high"),
+                  "to": _pt(df, b_i, b_p, "Swing high" if up else "Swing low")},
         "levels": levels,
-        "in_zone": {"low": zone[0], "high": zone[1]} if zone else None,
+        "extensions": extensions,
+        "position": "broken_out" if broke_out else "in_retracement",
+        "in_zone": zone,
+        "next_target": nxt,
         "education": {
-            "what": f"Fibonacci retracement of the dominant {'up' if up else 'down'} swing ${a['price']}→${b['price']}. Pullbacks often stall at 38.2 / 50 / 61.8% before the trend resumes.",
-            "where": "The dashed levels are the retracement grid; the 61.8% level is the classic 'golden pocket' where trend pullbacks tend to hold.",
-            "how_to_spot": "Anchor 0% at the swing end and 100% at the swing start; the in-between levels are the standard ratios.",
-            "confirms": "A bounce (up-swing) or rejection (down-swing) at a level, ideally with a candle signal, is the actionable tell.",
-            "invalidates": "A clean break of the 78.6% level warns the whole swing may fully reverse.",
+            "what": (f"Fibonacci on the recent {'up' if up else 'down'} swing ${round(a_p,2)}→${round(b_p,2)}. "
+                     f"The 23.6–78.6% levels are RETRACEMENTS (where a pullback tends to find support); the "
+                     f"127–262% EXTENSIONS are price TARGETS once the swing extreme is broken."),
+            "where": ("Price has broken out past the swing extreme — the retracements are behind it; the live "
+                      f"targets are the extensions ({', '.join('$'+str(e['price']) for e in extensions[:3])}…)."
+                      if broke_out else
+                      "Price is still inside the swing — the 61.8% level (the 'golden pocket') is the classic "
+                      "spot a trend pullback holds before resuming."),
+            "how_to_spot": "Anchor 0% at the swing end and 100% at the start; extensions project the same ratios BEYOND the end.",
+            "confirms": (f"After a breakout, the first extension {'above' if up else 'below'} price "
+                         f"(${nxt['price']} = {nxt['ratio']}×) is the nearest measured target."
+                         if nxt else "A hold at a retracement level, then continuation, is the tell."),
+            "invalidates": f"Losing the 78.6% retracement (${at(0.786)}) warns the whole swing may fully reverse.",
         },
     }
 

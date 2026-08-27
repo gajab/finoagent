@@ -30,6 +30,7 @@ from ..services.portfolio_enrichment_service import (
 )
 from ..services.cache_service import get_cached, set_cached, invalidate
 from ..services.exit_strategy_service import analyze_exit_strategy
+from ..services.exit_analysis_service import run_exit_analysis
 from ..services.portfolio_optimization_service import optimize_portfolio
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,29 @@ class HighlightFundamentalSignal(BaseModel):
     dividend_yield: float | None = None
 
 
+class HighlightCatalyst(BaseModel):
+    """One grounded, dated catalyst worth watching. Assembled deterministically from the
+    exit-analysis pillars + live quote (no LLM) so every number and date is exact."""
+    kind: str                       # earnings | analyst | valuation | technical | sector | macro | quality
+    title: str                      # short label, e.g. "Next Earnings"
+    detail: str                     # one-line description
+    date: str | None = None         # ISO date if known
+    days_until: int | None = None   # calendar days from today if known
+    sentiment: str = "neutral"      # bullish | bearish | neutral | event
+    importance: str = "medium"      # high | medium | low
+
+
+class HighlightVerdict(BaseModel):
+    """The Dashboard exit-analysis conclusion (10 pillars + technical + risk) distilled to a
+    badge. HEALTH convention: higher score = stronger hold (matches the Exit tab gauge)."""
+    label: str                      # Strong Hold | Hold | Caution | Consider Exit | Strong Exit
+    score: int                      # 0-100 (higher = healthier / stronger hold)
+    pillars_score: int | None = None
+    technical_score: int | None = None
+    risk_score: int | None = None
+    summary: str | None = None      # one-line overall narrative
+
+
 class HighlightHolding(BaseModel):
     ticker: str
     company_name: str | None = None
@@ -211,6 +235,8 @@ class HighlightHolding(BaseModel):
     fundamentals: HighlightFundamentalSignal
     news: list[HighlightNewsItem] = []
     hypothesis: str
+    verdict: HighlightVerdict | None = None
+    catalysts: list[HighlightCatalyst] = []
 
 
 class HighlightResponse(BaseModel):
@@ -2383,6 +2409,188 @@ async def fetch_5d_history(ticker: str) -> list[dict]:
     return await asyncio.to_thread(_fetch_5d_history_sync, ticker)
 
 
+def _hl_num(v) -> float | None:
+    """Coerce a value to float, tolerating None / strings / NaN."""
+    try:
+        if v is None:
+            return None
+        f = float(v)
+        if f != f:  # NaN
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+# Priority order used to rank catalysts when there are more than the card can show.
+_CATALYST_IMPORTANCE_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+async def _fetch_exit_analyses(db: AsyncSession, tickers: list[str]) -> dict[str, dict]:
+    """Fetch the full exit analysis (10 pillars + technical + risk) for each ticker, reusing
+    the SAME cache the Exit tab uses (``exit_analysis:{ticker}:v4``, 15-min TTL). Cache reads
+    and writes stay serial on the shared DB session; only the heavy yfinance work fans out.
+
+    Never raises — a ticker that fails simply maps to ``{}`` so its card still renders."""
+    result: dict[str, dict] = {}
+    misses: list[str] = []
+    for t in tickers:
+        try:
+            cached = await get_cached(db, f"exit_analysis:{t}:v4")
+        except Exception:
+            cached = None
+        if cached is not None:
+            result[t] = cached
+        else:
+            misses.append(t)
+
+    if misses:
+        async def _run(tk: str):
+            try:
+                return tk, await run_exit_analysis(ticker=tk)
+            except Exception as exc:
+                logger.warning(f"Highlight exit analysis failed for {tk}: {exc}")
+                return tk, {}
+        computed = await asyncio.gather(*[_run(t) for t in misses])
+        for tk, payload in computed:
+            result[tk] = payload or {}
+            if payload and payload.get("success") and not payload.get("error"):
+                try:
+                    await set_cached(db, f"exit_analysis:{tk}:v4", payload, ttl_seconds=900)
+                except Exception:
+                    pass
+    return result
+
+
+def _build_highlight_verdict(exit_analysis: dict) -> HighlightVerdict | None:
+    """Distil a cached exit-analysis payload into the compact Hold/Exit verdict badge.
+    The score is already health-flipped inside run_exit_analysis (higher = stronger hold)."""
+    if not exit_analysis or not exit_analysis.get("success"):
+        return None
+    score = exit_analysis.get("overall_score")
+    label = exit_analysis.get("overall_label")
+    if score is None or not label:
+        return None
+    dims = exit_analysis.get("dimension_scores", {}) or {}
+
+    def _dim(name: str) -> int | None:
+        s = (dims.get(name) or {}).get("score")
+        return int(round(s)) if s is not None else None
+
+    summary = (exit_analysis.get("signal_summary", {}) or {}).get("overall_narrative")
+    return HighlightVerdict(
+        label=label,
+        score=int(round(score)),
+        pillars_score=_dim("pillars"),
+        technical_score=_dim("technical"),
+        risk_score=_dim("risk"),
+        summary=summary,
+    )
+
+
+def _build_highlight_catalysts(
+    exit_analysis: dict,
+    stock_details: dict,
+) -> list[HighlightCatalyst]:
+    """Assemble a grounded, forward-looking 'Catalysts to Watch' list — company earnings,
+    analyst revisions & targets, sector rotation and macro sensitivity — from the exit-analysis
+    pillars. Deterministic so dates/numbers stay exact. Current technical STATE is deliberately
+    excluded; it already has its own Technical Indicators card."""
+    out: list[HighlightCatalyst] = []
+    pillars = (exit_analysis or {}).get("pillars", {}) or {}
+    cat = (pillars.get("catalyst_revisions") or {}).get("data", {}) or {}
+
+    # 1) Earnings — the binary event every holder tracks.
+    guidance = (stock_details.get("earnings", {}) or {}).get("guidance", {}) or {}
+    ed_iso = guidance.get("nextEarningsDate")
+    ed_est = bool(guidance.get("nextEarningsDateIsEstimated"))
+    days = cat.get("days_to_earnings")
+    if days is not None:
+        d = int(days)
+        imp = "high" if d <= 14 else ("medium" if d <= 35 else "low")
+        detail = (
+            f"Report expected in {d} day{'s' if d != 1 else ''}"
+            + (" (estimated)" if ed_est else "")
+            + " — binary event risk; size/hedge accordingly."
+        )
+        out.append(HighlightCatalyst(kind="earnings", title="Next Earnings", detail=detail,
+                                     date=ed_iso, days_until=d, sentiment="event", importance=imp))
+    elif ed_iso:
+        out.append(HighlightCatalyst(
+            kind="earnings", title="Next Earnings",
+            detail="Upcoming earnings report" + (" (estimated date)" if ed_est else "") + ".",
+            date=ed_iso, sentiment="event", importance="low"))
+
+    # 2) Analyst estimate-revision momentum.
+    trend = (cat.get("eps_revision_trend") or "").lower()
+    net = cat.get("eps_revision_net")
+    net_str = f"{net:+d}" if isinstance(net, int) else "net"
+    if "rais" in trend:
+        out.append(HighlightCatalyst(
+            kind="analyst", title="Estimates Rising",
+            detail=f"Analysts raising EPS estimates ({net_str}, last 30d) — upgrade momentum building.",
+            sentiment="bullish", importance="medium" if trend == "raising" else "low"))
+    elif "cut" in trend:
+        out.append(HighlightCatalyst(
+            kind="analyst", title="Estimates Being Cut",
+            detail=f"Analysts cutting EPS estimates ({net_str}, last 30d) — watch for downgrades.",
+            sentiment="bearish", importance="high" if trend == "cutting" else "medium"))
+
+    # 3) Price-target headroom vs. the consensus.
+    upside = cat.get("target_upside_pct")
+    if upside is not None:
+        if upside >= 12:
+            out.append(HighlightCatalyst(
+                kind="valuation", title="Target Upside",
+                detail=f"Mean analyst target implies {upside:+.0f}% upside from here.",
+                sentiment="bullish", importance="medium"))
+        elif upside <= -5:
+            out.append(HighlightCatalyst(
+                kind="valuation", title="Above Target",
+                detail=f"Trading {abs(upside):.0f}% above the mean analyst target — limited headroom.",
+                sentiment="bearish", importance="medium"))
+
+    # NOTE: current technical STATE (RSI, support/resistance, MACD) already has its own card
+    # in the Technical Indicators section — deliberately NOT duplicated here. Catalysts stay
+    # forward-looking: events and flows the technical panel doesn't already show.
+
+    # 4) Sector rotation — is money flowing into or out of the group?
+    sec = (pillars.get("sector_rotation") or {}).get("data", {}) or {}
+    sector = sec.get("sector")
+    rs_sig = sec.get("relative_strength_signal")
+    if sector and rs_sig and rs_sig != "Neutral":
+        low = rs_sig.lower()
+        sent = "bullish" if "inflow" in low else ("bearish" if "outflow" in low else "neutral")
+        out.append(HighlightCatalyst(
+            kind="sector", title=f"{sector} Rotation",
+            detail=f"Sector flow vs. S&P 500: {rs_sig}.",
+            sentiment=sent, importance="low"))
+
+    # 5) Macro sensitivity — flag names that whip around on rates / risk sentiment.
+    mac = (pillars.get("macro") or {}).get("data", {}) or {}
+    beta_interp = mac.get("beta_interp")
+    vol_regime = mac.get("vol_regime")
+    if beta_interp in ("High Beta", "Very High Beta", "Aggressive"):
+        beta_val = _hl_num(mac.get("beta"))
+        beta_txt = f" (β {beta_val:.2f})" if beta_val is not None else ""
+        out.append(HighlightCatalyst(
+            kind="macro", title="Macro-Sensitive",
+            detail=f"{beta_interp}{beta_txt} — Fed/CPI and risk-sentiment swings move this more than the market.",
+            sentiment="event", importance="low"))
+    elif vol_regime in ("High", "Elevated"):
+        out.append(HighlightCatalyst(
+            kind="macro", title="Elevated Volatility",
+            detail=f"{vol_regime} volatility regime — expect wider swings around macro prints.",
+            sentiment="event", importance="low"))
+
+    # Rank by importance, then soonest dated event first; cap at 6 for the card.
+    out.sort(key=lambda c: (
+        _CATALYST_IMPORTANCE_RANK.get(c.importance, 1),
+        c.days_until if c.days_until is not None else 9999,
+    ))
+    return out[:6]
+
+
 @router.get("/highlights", response_model=HighlightResponse)
 async def get_highlights(
     user: User = Depends(get_current_user),
@@ -2470,6 +2678,12 @@ async def get_highlights(
     # Sort candidates by score descending and take the top 5
     top_candidates = sorted(scored_candidates, key=lambda x: x["score"], reverse=True)[:5]
 
+    # Dashboard exit-analysis (10 pillars + technical + risk) for each card — drives the
+    # Hold/Exit verdict badge and the grounded Catalysts-to-Watch list. Cache is shared with
+    # the Exit tab, so a name the user already reviewed resolves instantly. Done up-front
+    # (serial cache I/O, parallel compute) so the DB session isn't touched inside the gather.
+    exit_analyses = await _fetch_exit_analyses(db, [c["ticker"] for c in top_candidates])
+
     openai_key = await get_user_api_key(db, user.id, "openai_api_key")
     model_pref = await get_user_api_key(db, user.id, "openai_model")
     model = model_pref or "gpt-4o-mini"
@@ -2534,6 +2748,33 @@ async def get_highlights(
                 summary=n.get("summary", "")
             ))
 
+        # Dashboard verdict (Hold/Exit) + grounded Catalysts-to-Watch from the exit analysis.
+        exit_payload = exit_analyses.get(ticker) or {}
+        verdict = _build_highlight_verdict(exit_payload)
+        catalysts = _build_highlight_catalysts(exit_payload, stock_details)
+
+        # Compact, factual context so the AI thesis reasons over the real verdict & catalysts
+        # instead of defaulting to "watch next earnings".
+        if verdict:
+            verdict_line = f"{verdict.label} (health {verdict.score}/100"
+            _parts = []
+            if verdict.pillars_score is not None:
+                _parts.append(f"pillars {verdict.pillars_score}")
+            if verdict.technical_score is not None:
+                _parts.append(f"technical {verdict.technical_score}")
+            if verdict.risk_score is not None:
+                _parts.append(f"risk {verdict.risk_score}")
+            verdict_line += (" — " + ", ".join(_parts) if _parts else "") + ")"
+        else:
+            verdict_line = "N/A"
+        if catalysts:
+            catalyst_lines = "\n".join(
+                f"- [{cat.title}] {cat.detail}" + (f" (in {cat.days_until}d)" if cat.days_until is not None else "")
+                for cat in catalysts
+            )
+        else:
+            catalyst_lines = "- No structured catalysts detected; fall back to next earnings and macro."
+
         # Generate LLM hypothesis
         if not openai_key:
             hypothesis = (
@@ -2572,15 +2813,20 @@ Technicals:
 - Support Level: ${tech.get('supportLevel') or 'N/A'} | Resistance Level: ${tech.get('resistanceLevel') or 'N/A'}
 - Trend: {tech.get('volumeAnalysis', {}).get('phase', '').replace('_', ' ').title()}
 
+Dashboard Verdict (10 pillars + technical + risk, higher = stronger hold): {verdict_line}
+{f"Verdict rationale: {verdict.summary}" if verdict and verdict.summary else ""}
+
+Catalysts already surfaced to the user in a separate 'Catalysts to Watch' section (do NOT list or restate them — the user already sees them; only let them inform your read):
+{catalyst_lines}
+
 Recent News:
 {news_summary}
 
-Write a concise investment hypothesis and catalyst watch for this holding. Include:
-1. **Developments & Drivers**: Briefly explain any major news or factors driving the stock recently. Ensure your context matches the provided news publication dates relative to today.
-2. **AI Hypothesis**: What is the most plausible path forward for the stock price in the near-term?
-3. **Catalysts to Watch**: What specific events or data releases should the user monitor? (Explicitly mention if earnings has already passed recently or when next earnings is expected, based on the provided dates).
+Write a tight investment thesis for this holding. Only two brief paragraphs:
+1. **Developments & Drivers**: The major news or factors driving the stock recently. Ensure your context matches the provided news publication dates relative to today.
+2. **AI Hypothesis**: The most plausible near-term path for the price, reconciled with the Dashboard Verdict above (if you disagree with the verdict, say why in a phrase). Let the catalysts inform this — but do NOT enumerate them; they have their own section.
 
-Keep your response highly engaging, compact, and formatted as brief paragraphs with **bold headers**. Maximum 180 words. Do not use markdown headers (like # or ##) or bullet points (like * or -) to save vertical space. Speak directly to the investor."""
+Keep it crisp and high-signal, formatted as two short paragraphs with **bold headers**. Maximum 110 words total. Do not use markdown headers (like # or ##), bullet points, or a 'Catalysts to Watch' section. Speak directly to the investor."""
 
             try:
                 hypothesis = await call_llm(
@@ -2618,7 +2864,9 @@ Keep your response highly engaging, compact, and formatted as brief paragraphs w
             technicals=technicals,
             fundamentals=fundamentals,
             news=news_items,
-            hypothesis=hypothesis
+            hypothesis=hypothesis,
+            verdict=verdict,
+            catalysts=catalysts,
         )
 
     tasks = [process_candidate(c) for c in top_candidates]

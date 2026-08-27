@@ -27,7 +27,7 @@ import {
   TrendingUp, TrendingDown, Clock, BarChart3, Activity,
   Brain, Send, Bot, History, PlusCircle, X, Target,
   DollarSign, Percent, Calendar, Shield, Zap, List, ExternalLink, Trash2, Pencil, Check,
-  Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp, Cpu,
+  Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp, Cpu, Wrench,
 } from 'lucide-react';
 import {
   fetchActiveTrades, fetchTradeLivePnl, fetchTradeAdvisor,
@@ -41,6 +41,7 @@ import TransactionHistoryPanel from './TransactionHistoryPanel';
 import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
 import InstitutionalDesk from './InstitutionalDesk';
+import RepairMenu from './RepairMenu';
 import { QuantAnalysisLoader } from './QuantExitCard';
 import CloseTradeModal from './CloseTradeModal';
 import BookTailRisk from './BookTailRisk';
@@ -337,6 +338,8 @@ function trimPnl(p: LivePnlResponse): Record<string, any> {
   const a: any = (p as any).analysis || {};
   return {
     unrealized_pnl: p.unrealized_pnl, pnl_pct: (p as any).pnl_pct, underlying_price: (p as any).underlying_price,
+    options_pnl: (p as any).options_pnl, stock_pnl: (p as any).stock_pnl,   // derivative-only toggle
+    options_premium: (p as any).options_breakdown?.cost_basis,             // option-only max gain (premium)
     current_value: (p as any).current_value, cost_basis: (p as any).cost_basis, margin_required: (p as any).margin_required,
     expiration_date: (p as any).expiration_date, max_profit: (p as any).max_profit, max_loss: (p as any).max_loss,
     analysis: {
@@ -377,6 +380,34 @@ function Chip({ label, value, color = '', hint }: { label: string; value: string
 // Reg-T naked formula max(20%·U − OTM, 10%·base)·100 for naked shorts and spread widths for
 // verticals, honoring the account's margin mode). A naked call's max_loss is UNBOUNDED, so the
 // old |max_loss| path fell through to the PREMIUM — the "$2,178 for 21 naked calls" bug.
+// Does this trade hold underlying stock (covered call / collar / combo)? Keyed on
+// `parameters.shares` — the SAME field the backend uses to compute the stock/option P&L split,
+// so the toggle only appears when a real split can actually be produced.
+function tradeHasStock(t: SavedStrategyItem): boolean {
+  return (Number(t.parameters?.shares) || 0) > 0;
+}
+
+// P&L to show: total by default, or DERIVATIVE-ONLY (strip the stock leg's P&L) when the user
+// unchecks "include stock". A stock-less income trade's unrealized_pnl is already options-only.
+// Prefer the backend's options_pnl; else derive it as total − stock_pnl (both persisted in the
+// snapshot). If NEITHER split field is present (a pre-feature cached snapshot) we can't strip —
+// a refresh repopulates them.
+function effectivePnl(p: LivePnlResponse | null | undefined, excludeStock: boolean): number | null {
+  if (!p) return null;
+  const total = p.unrealized_pnl ?? null;
+  if (!excludeStock) return total;
+  const op = (p as any).options_pnl;
+  if (op != null) return Number(op);
+  const sp = (p as any).stock_pnl;
+  if (sp != null && total != null) return total - Number(sp);
+  return total;
+}
+
+// Does the snapshot carry the stock/option P&L split needed for the "derivatives only" toggle?
+function hasPnlSplit(p: LivePnlResponse | null | undefined): boolean {
+  return !!p && ((p as any).options_pnl != null || (p as any).stock_pnl != null);
+}
+
 function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): number {
   const shares = Number(t.parameters?.shares) || 0;
   const avgCost = Number(t.parameters?.avg_cost ?? t.entry_prices?.[0]?.price) || 0;
@@ -394,14 +425,15 @@ function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): numb
   return Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));     // last resort (understates naked shorts)
 }
 
-function GroupSummary({ trades, pnlMap, isIncome = false }: {
+function GroupSummary({ trades, pnlMap, isIncome = false, excludeStock = false }: {
   trades: SavedStrategyItem[];              // the FILTERED/visible trades — so the summary tracks filters
   pnlMap: Record<number, LivePnlResponse>;
   isIncome?: boolean;
+  excludeStock?: boolean;                   // when true, totals use DERIVATIVE-only P&L (strip the stock leg)
 }) {
   const anyFutures = trades.some(t => t.strategy_type === 'futures');
   const totalCapital = trades.reduce((s, t) => s + deployedCapital(t, pnlMap[t.id]), 0);
-  const totalPnl = trades.reduce((s, t) => s + (pnlMap[t.id]?.unrealized_pnl ?? 0), 0);
+  const totalPnl = trades.reduce((s, t) => s + (effectivePnl(pnlMap[t.id], excludeStock) ?? 0), 0);
   const anyPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
 
   // Capital-WEIGHTED annualized yield — an arithmetic mean over-weights a tiny high-yield CSP
@@ -414,10 +446,18 @@ function GroupSummary({ trades, pnlMap, isIncome = false }: {
   }
   const avgAnn = wden > 0 ? wnum / wden : null;
 
-  // Income: the max possible gain (all premium kept) and how much is LEFT to capture from here.
-  const maxGain = isIncome
-    ? trades.reduce((s, t) => { const mp = Number((pnlMap[t.id] as any)?.max_profit); return s + (mp > 0 ? mp : 0); }, 0)
-    : 0;
+  // Income: max possible gain (all premium kept) + how much is LEFT to capture. Honors the
+  // toggle — when stock is excluded, a covered call's max gain is the OPTION premium only
+  // (options_breakdown.cost_basis), not the buy-write max (which bakes in stock appreciation).
+  const maxGainOf = (p: any): number => {
+    if (excludeStock) {
+      const prem = Number(p?.options_premium ?? p?.options_breakdown?.cost_basis);
+      if (Number.isFinite(prem) && prem > 0) return prem;
+    }
+    const mp = Number(p?.max_profit);
+    return mp > 0 ? mp : 0;
+  };
+  const maxGain = isIncome ? trades.reduce((s, t) => s + maxGainOf(pnlMap[t.id]), 0) : 0;
   const leftToCapture = isIncome && maxGain > 0 ? Math.max(0, maxGain - totalPnl) : null;
   const money = (n: number) => `${n < 0 ? '−' : ''}${fmtMoney(Math.abs(n))}`;
 
@@ -426,7 +466,9 @@ function GroupSummary({ trades, pnlMap, isIncome = false }: {
       <Chip label="Positions" value={`${trades.length}`} />
       <Chip label={anyFutures ? 'Margin' : 'Deployed'} value={fmtMoney(totalCapital)}
         hint="Buying power on hold — Reg-T / portfolio margin (naked shorts ≈ 20% of notional, spreads = width, stock = notional). Not the premium collected." />
-      {anyPnl && <Chip label="Unrealized" value={`${totalPnl >= 0 ? '+' : ''}${money(totalPnl)}`} color={totalPnl >= 0 ? 'text-success' : 'text-error'} />}
+      {anyPnl && <Chip label={excludeStock ? 'Unrealized · deriv' : 'Unrealized'} value={`${totalPnl >= 0 ? '+' : ''}${money(totalPnl)}`}
+        color={totalPnl >= 0 ? 'text-success' : 'text-error'}
+        hint={excludeStock ? 'Derivative (option) legs only — the underlying stock holding P&L is excluded.' : undefined} />}
       {avgAnn != null && <Chip label="Avg yield" value={fmtAnnualized(avgAnn)} color={avgAnn >= 0 ? 'text-success' : 'text-error'} />}
       {isIncome && maxGain > 0 && <Chip label="Max gain" value={fmtMoney(maxGain)} color="text-success/70" />}
       {leftToCapture != null && <Chip label="Left to capture" value={fmtMoney(leftToCapture)} color="text-warning/80" />}
@@ -440,6 +482,7 @@ interface CardProps {
   trade: SavedStrategyItem;
   group: TradeGroup;
   pnl?: LivePnlResponse | null;
+  excludeStock?: boolean;        // show DERIVATIVE-only P&L in the collapsed headline
   isExpanded: boolean;
   onToggle: () => void;
   onRefreshPnl: () => void;
@@ -472,7 +515,7 @@ interface RollState {
 }
 
 function TradeCard({
-  trade, group, pnl, isExpanded, onToggle,
+  trade, group, pnl, excludeStock = false, isExpanded, onToggle,
   onRefreshPnl, pnlLoading, quoteSource, onQuoteSourceChange,
   onUpdatePosition, onShowHistory, onCreateAgent,
   advisorState, onAskAdvisor, onAdvisorQuestion,
@@ -706,10 +749,12 @@ function TradeCard({
     }
   };
 
-  // Headline metrics for collapsed row
+  // Headline metrics for collapsed row. When "Derivatives only" is on, the P&L shows the
+  // OPTION legs only (stock holding's gain/loss stripped) — so the card sums to the summary.
   const annReturn = pnl?.analysis?.annualized_return_to_expiry ?? null;
-  const pnlAmt = pnl?.unrealized_pnl ?? null;
-  const pnlPct = pnl?.pnl_pct ?? null;
+  const stockStripped = excludeStock && (pnl as any)?.options_pnl != null && (pnl as any)?.options_pnl !== pnl?.unrealized_pnl;
+  const pnlAmt = effectivePnl(pnl, excludeStock);
+  const pnlPct = stockStripped ? null : (pnl?.pnl_pct ?? null);   // % is total-basis; hide it when we've stripped the stock
 
   const entryNet = trade.entry_net_debit ?? 0;
   const shares = trade.parameters?.shares ?? null;
@@ -804,13 +849,17 @@ function TradeCard({
               </div>
               <div className={`text-[10px] ${statusColor} opacity-70`}>
                 {pnlPct != null && <>{pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</>}
+                {stockStripped && <span className="text-base-content/40" title="Derivative (option) legs only — stock holding P&L excluded">derivatives only</span>}
               </div>
-              {/* Income: max possible gain → shows how much premium is left to capture */}
-              {isIncome && (pnl as any)?.max_profit > 0 && (
+              {/* Income: max possible gain → shows how much premium is left to capture. Honors the
+                  toggle — derivatives-only uses the OPTION premium, not the buy-write max. */}
+              {(() => {
+                const dMax = stockStripped ? Number((pnl as any)?.options_premium ?? (pnl as any)?.options_breakdown?.cost_basis) : Number((pnl as any)?.max_profit);
+                return isIncome && dMax > 0 ? (
                 <div className="text-[9px] text-base-content/40" title="Maximum possible gain (all premium kept) — the gap to your current P&L is what's left to capture">
-                  of {fmtMoney((pnl as any).max_profit)} max
+                  of {fmtMoney(dMax)} max
                 </div>
-              )}
+                ) : null; })()}
             </>
           ) : (
             <div className="text-xs text-base-content/30">
@@ -1861,6 +1910,14 @@ function TradeCard({
             );
           })()}
 
+          {/* Repair / adjust — institutional alternatives for a tested short-premium trade */}
+          {(trade.legs_data || []).some((l: any) => /sell|short/i.test(l.action || '') && /call|put/i.test(l.type || '')) && (
+            <CollapsibleSection title="Repair / adjust · manage a tested trade" accent="warning"
+              icon={<Wrench className="w-3 h-3" />} subtitle="roll · cap into spread · hedge · wheel · close — payoffs & risk">
+              <RepairMenu tradeId={trade.id} quoteSource={quoteSource} />
+            </CollapsibleSection>
+          )}
+
           {/* Payoff diagram — P&L vs underlying (all trade types), collapsed by default */}
           {pnl && pnl.scenarios && pnl.scenarios.length > 1 && (
             <CollapsibleSection title="Payoff diagram" accent="base-content"
@@ -2167,6 +2224,7 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
   const [collapsed, setCollapsed] = useState(false);
   const [structFilter, setStructFilter] = useState<string>('all');
   const [sortBy, setSortBy] = useState<string>('added');
+  const [excludeStock, setExcludeStock] = useState(false);   // derivatives-only P&L toggle
   const meta = PURPOSE_META[purpose];
 
   // Structures present in this group (for the filter chips) + counts.
@@ -2226,7 +2284,32 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
       {!collapsed && (
         <div className={`border-x border-b border-${meta.color}/10 rounded-b-2xl overflow-hidden`}>
           {/* Summary reflects the ACTIVE filter (shown), not the whole group */}
-          <GroupSummary trades={shown} pnlMap={pnlMap} isIncome={purpose === 'income'} />
+          <GroupSummary trades={shown} pnlMap={pnlMap} isIncome={purpose === 'income'} excludeStock={excludeStock} />
+
+          {/* Include/exclude the stock holding's P&L — only when some shown trade actually holds
+              stock (covered calls / collars / combos). Lets the user isolate the OPTION P&L. */}
+          {shown.some(tradeHasStock) && (() => {
+            const splitMissing = excludeStock && shown.some(t => tradeHasStock(t) && !hasPnlSplit(pnlMap[t.id]));
+            return (
+            <div className="flex items-center gap-2 px-4 pb-1.5 -mt-1 flex-wrap">
+              <label className="flex items-center gap-1.5 text-[10px] text-base-content/50 cursor-pointer"
+                title="Uncheck to see P&L from the derivative (option) legs ONLY — excluding the underlying stock holding's gain/loss. Affects the summary totals and each trade's headline P&L.">
+                <input type="checkbox" className="checkbox checkbox-xs" checked={!excludeStock}
+                  onChange={e => setExcludeStock(!e.target.checked)} />
+                Include the underlying stock holding’s P&amp;L {excludeStock && <span className="text-warning/70">— off (derivatives only)</span>}
+              </label>
+              {splitMissing && (
+                <span className="text-[10px] text-warning/70 flex items-center gap-1">
+                  <AlertCircle className="w-3 h-3" />
+                  <button className="underline hover:text-warning"
+                    onClick={() => shown.filter(tradeHasStock).forEach(t => props.onRefreshPnl(t.id))}>
+                    Refresh
+                  </button>
+                  to load the stock/option split
+                </span>
+              )}
+            </div>
+          ); })()}
 
           {/* Filter by structure + sort — shown when the group holds a mix of types */}
           {showFilters && (
@@ -2263,6 +2346,7 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
                 trade={trade}
                 group={classifyTrade(trade)}
                 pnl={pnlMap[trade.id]}
+                excludeStock={excludeStock}
                 {...props}
                 isExpanded={props.expandedIds.has(trade.id)}
                 onToggle={() => props.onToggle(trade.id)}

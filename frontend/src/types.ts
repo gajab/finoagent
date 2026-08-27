@@ -421,7 +421,11 @@ export interface FibLevel { ratio: number; price: number }
 export interface FibonacciData {
   direction: 'up' | 'down' | string;
   swing: { from: PatternPoint; to: PatternPoint };
-  levels: FibLevel[]; in_zone: { low: FibLevel; high: FibLevel } | null; education: PatternEducation;
+  levels: FibLevel[];                       // retracements (support / pullback zones)
+  extensions?: FibLevel[];                  // 127–262% price-projection targets (after a breakout)
+  position?: 'broken_out' | 'in_retracement' | string;
+  next_target?: FibLevel | null;
+  in_zone: { low: FibLevel; high: FibLevel } | null; education: PatternEducation;
 }
 export interface PatternSeries {
   timestamps: string[]; open: (number | null)[]; high: (number | null)[];
@@ -2556,12 +2560,12 @@ export interface ExitValuationData {
 }
 
 export interface ExitSentimentData {
-  short_pct_of_float: number | null;
-  short_ratio: number | null;
-  insider_ownership_pct: number | null;
-  institutional_ownership_pct: number | null;
-  analyst_consensus: string | null;
-  target_upside_pct: number | null;
+  range_position_pct: number | null;
+  pct_from_52w_high: number | null;
+  above_50dma: boolean | null;
+  above_200dma: boolean | null;
+  one_year_return_pct: number | null;
+  relative_to_sp_pct: number | null;
   sentiment_label: string;
 }
 
@@ -2692,12 +2696,98 @@ export interface ExitDimensionScore {
   weight: number;
 }
 
+export interface ExitOwnershipFlowData {
+  institution_pct: number | null;
+  insider_pct: number | null;
+  short_pct_float: number | null;
+  days_to_cover: number | null;
+  short_change_pct: number | null;
+  insider_net_pct: number | null;
+  insider_signal: string;
+}
+
+export interface ExitCatalystData {
+  recommendation_mean: number | null;
+  recommendation_key: string | null;
+  num_analysts: number | null;
+  target_upside_pct: number | null;
+  earnings_qtr_growth_pct: number | null;
+  days_to_earnings: number | null;
+  eps_revision_trend: string | null;
+  eps_revision_net: number | null;
+}
+
+export interface ExitQualityData {
+  roe: number | null;
+  roa: number | null;
+  roic: number | null;
+  fcf_conversion: number | null;
+  gross_margin: number | null;
+  shares_trend: string | null;   // 'buyback' | 'dilution' | 'stable'
+  buyback_yield_pct: number | null;
+}
+
+export interface ExitSetupLevel {
+  low?: number;
+  high?: number;
+  level?: number | null;
+  label?: string;
+}
+export interface ExitSetupTarget {
+  level?: number | null;
+  label?: string;
+  rr?: number | null;
+}
+export interface ExitModernSetup {
+  rank?: number;
+  type?: string;
+  direction?: string;   // 'long' | 'short' | 'neutral'
+  regime_fit?: string;
+  confidence?: number | string;
+  score?: number;
+  entry?: ExitSetupLevel | number | null;
+  stop?: ExitSetupLevel | number | null;
+  targets?: ExitSetupTarget[];
+  risk_reward?: number | null;
+  thesis?: string;
+  horizon?: { label?: string; style?: string; est_days?: number; note?: string } | string;
+  entry_style?: { type?: string; label?: string; note?: string; distance_pct?: number } | string;
+}
+export interface ExitModernTechnical {
+  available: boolean;
+  bias?: { direction: string; strength: string; score: number; rationale?: string };
+  regime?: string;
+  best_long_rr?: number | null;
+  best_short_rr?: number | null;
+  entry_timing_score?: number;
+  exit_pressure_score?: number;
+  setups?: ExitModernSetup[];
+  confluence_zones?: any[];
+  price?: number;
+  context?: any;
+}
+
+export interface ExitEntryRating {
+  score: number;
+  label: string;
+  narrative?: string;
+  components: {
+    hold_anchor: number;
+    technical_timing: number;
+    valuation_attractiveness: number;
+    catalyst: number;
+  };
+  supports: { factor: string; score: number }[];
+  headwinds: { factor: string; score: number }[];
+}
+
 export interface ExitAnalysisData {
   success: boolean;
   ticker: string;
   position: ExitPosition;
   overall_score: number;
   overall_label: string;
+  entry?: ExitEntryRating;
   dimension_scores?: {
     pillars: ExitDimensionScore;
     technical: ExitDimensionScore;
@@ -2712,11 +2802,15 @@ export interface ExitAnalysisData {
     valuation: { score: number; data: ExitValuationData };
     sentiment: { score: number; data: ExitSentimentData };
     sector_rotation: { score: number; data: ExitSectorRotationData };
+    ownership_flow: { score: number; data: ExitOwnershipFlowData };
+    catalyst_revisions: { score: number; data: ExitCatalystData };
+    quality_capital: { score: number; data: ExitQualityData };
   };
   technical_signals: {
     swing: ExitSwingSignals;
     longterm: ExitLongtermSignals;
   };
+  technical_modern?: ExitModernTechnical;
   price_chart: ExitPriceChart;
   options_protection: ExitOptionsProtection;
   risk: ExitRiskData;
@@ -3724,6 +3818,9 @@ export interface DerivativeIncomeVolStats {
 
 export interface DerivativeIncomeContext {
   spot: number;
+  prev_close?: number | null;   // reference close for the recent-change badge
+  change_abs?: number | null;   // spot − prev_close ($)
+  change_pct?: number | null;   // spot vs prev close (%), green/red
   shares_per_contract: number;
   notional_per_contract: number;
   week52: { high: number; low: number; position_pct: number } | null;
@@ -3829,13 +3926,14 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   desk_score: number;
   ta_note?: string;
   algo_grade?: string;          // A–F after the full deterministic pre-vet
-  approval_odds?: string;       // high | medium | low | auto_reject
+  approval_odds?: string;       // high | medium | low | auto_reject | wait (timing hold)
   grade_demerits?: string[];    // deterministic marks against the trade
   grade_merits?: string[];
-  grade_blocking?: string[];    // hard fails (structurally broken, etc.)
+  grade_blocking?: string[];    // STRUCTURAL hard fails (crushed vol, etc.) → grade F
+  grade_timing_hold?: string[]; // TIMING holds (momentum against a REACHABLE strike) → WAIT, keeps its quality letter
   base_quality?: number;        // the algorithmic_quant base score BEFORE regime/factor adjustments
   grade_adjustments?: { label: string; points: number; detail?: string }[];  // signed option-math contributions → desk_score
-  ta_factors?: { label: string; points: number; detail?: string }[];         // signed technical/regime contributions → desk_score (detail = price-point evidence)
+  ta_factors?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean }[]; // signed technical/regime contributions → desk_score (baseline_points = the value WITHOUT the earnings-aware adjustment, for the with/without comparison)
   qp?: {                        // Q-vs-P: implied (risk-neutral) vs physical (realized) read
     implied_vol_pct?: number | null; realized_vol_pct?: number | null; weight_vol_pct?: number | null;
     iv_hv_ratio?: number | null;                     // < 1 = negative VRP (implied under-prices risk)
@@ -3928,6 +4026,10 @@ export interface DeskReviewResult {
   ranked: DeskRankedTrade[];
   algo_top_pick: DeskRankedTrade | null;
   n_trades: number;
+  /** Earnings-aware ranking was requested (user opt-in). */
+  earnings_aware?: boolean;
+  /** An expiry in the scan straddles a print, so the earnings-aware toggle actually bit. */
+  earnings_in_window?: boolean;
   note?: string;
   error?: string;
   // Chrome passthrough (single-ticker one-call render): the same context / expiries / event flags
