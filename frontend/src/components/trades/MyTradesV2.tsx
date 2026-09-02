@@ -45,6 +45,7 @@ import RepairMenu from './RepairMenu';
 import { QuantAnalysisLoader } from './QuantExitCard';
 import CloseTradeModal from './CloseTradeModal';
 import BookTailRisk from './BookTailRisk';
+import PaperTraderPanel from './PaperTraderPanel';
 import CollapsibleSection from './CollapsibleSection';
 import { DeskDebate } from '../DeskDebate';
 import { TickerChrome } from '../DerivativeIncome';
@@ -423,6 +424,203 @@ function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): numb
   const coll = Number(t.parameters?.collateral) || 0;
   if (coll > 0) return coll;
   return Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));     // last resort (understates naked shorts)
+}
+
+// ── Closed-trade ledger (simple realized-P&L accounting — no live metrics) ─────
+//
+// A closed trade is done: no Greeks, no risk desk, just the books — what it cost to
+// get in, what it sold for, the realized gain, and the annualized return on the
+// capital (BPR) it tied up. Everything is derived from `parameters.closed_legs` (the
+// authoritative per-leg records banked by /close-position), NOT a live snapshot —
+// closed trades are never re-priced. Mirrors trade_math conventions:
+//   • Schedule-D framing — a SHORT leg's open is a sell (proceeds) and its close a buy
+//     (cost); a LONG leg is the reverse. Realized = proceeds − cost, which equals the
+//     backend's Σ realized_close_pnl by construction (see [[trade-pnl-math]]).
+//   • Annualized return here is SIMPLE interest (gain% × 365/days) — a deliberate
+//     exception to the app's geometric convention. This is a REALIZED, one-off,
+//     historical result, not a repeatable forward yield, so compounding a single
+//     trade's return is misleading (a 35% gain in 21 days is ~620% simple, but a
+//     nonsensical ~20,000% compounded). Standard for a per-trade realized journal.
+
+interface ClosedLeg {
+  leg_index?: number | null; action?: string; type?: string; strike?: number;
+  qty?: number; entry_price?: number; exit_price?: number; realized?: number; closed_at?: string;
+}
+
+interface ClosedLedgerRow {
+  costBasis: number | null;    // Σ buys (what it cost to acquire — open debits + close-to-cover)
+  proceeds: number | null;     // Σ sells (what it sold for — open credits + close-to-close)
+  realized: number | null;     // proceeds − cost (falls back to realized_pnl / exit_net)
+  capitalBase: number | null;  // BPR — the capital the trade tied up (annualization base)
+  capitalBasis: string;        // how capitalBase was derived (surfaced in the tooltip)
+  structureLabel: string;      // reconstructed from the closed legs (legs_data is emptied at close)
+  legsSummary: string;         // compact leg brief, e.g. "−1 P120 · +1 P115"
+}
+
+const round2 = (x: number) => Math.round(x * 100) / 100;
+const isShortAction = (a?: string) => /sell|short/i.test(a || '');
+
+/** Simple-interest annualization for a realized trade: gain% × 365/days, as a percent.
+ *  Deliberately NOT the app's geometric formula — see the ledger header note. Linear, so
+ *  there's no negative-base blow-up; a loss annualizes proportionally (not floored at −100%). */
+function annualizedSimple(profit: number, base: number | null, days: number): number | null {
+  if (!base || base <= 0 || !days || days <= 0) return null;
+  return (profit / base) * (365 / Math.max(1, days)) * 100;
+}
+
+/** Reconstruct the structure name from the closed legs (legs_data is emptied at close,
+ *  and parameters.shares is zeroed, so tradeStructure() can't be trusted here). */
+function closedStructure(legs: ClosedLeg[]): { key: string; label: string } {
+  const opts = legs.filter(l => /call|put/i.test(l.type || ''));
+  const hasStock = legs.some(l => l.type === 'stock');
+  if (opts.length === 0) return hasStock ? { key: 'stock', label: 'Stock' } : { key: 'other', label: 'Trade' };
+  const short = (l: ClosedLeg) => isShortAction(l.action);
+  const call = (l: ClosedLeg) => /call/i.test(l.type || '');
+  const put = (l: ClosedLeg) => /put/i.test(l.type || '');
+  const sc = opts.filter(l => short(l) && call(l)).length;
+  const sp = opts.filter(l => short(l) && put(l)).length;
+  const lc = opts.filter(l => !short(l) && call(l)).length;
+  const lp = opts.filter(l => !short(l) && put(l)).length;
+  const one = opts.length === 1;
+  if (hasStock && sc === 1 && lp === 0) return { key: 'covered_call', label: 'Covered Call' };
+  if (hasStock && sc === 1 && lp === 1) return { key: 'collar', label: 'Collar' };
+  if (!hasStock && sp === 1 && one) return { key: 'cash_secured_put', label: 'Cash-Secured Put' };
+  if (!hasStock && sc === 1 && one) return { key: 'naked_call', label: 'Naked Call' };
+  if (!hasStock && lp === 1 && one) return { key: 'long_put', label: 'Long Put' };
+  if (!hasStock && lc === 1 && one) return { key: 'long_call', label: 'Long Call' };
+  if (sp === 1 && lp === 1 && sc === 0 && lc === 0) return { key: 'put_credit_spread', label: 'Put Spread' };
+  if (sc === 1 && lc === 1 && sp === 0 && lp === 0) return { key: 'call_credit_spread', label: 'Call Spread' };
+  if (sp === 1 && lp === 1 && sc === 1 && lc === 1) return { key: 'iron_condor', label: 'Iron Condor' };
+  if (sp === 1 && sc === 1 && lc === 1 && lp === 0) return { key: 'jade_lizard', label: 'Jade Lizard' };
+  if (sp === 1 && sc === 1 && lc === 0 && lp === 0) return { key: 'short_strangle', label: 'Short Strangle' };
+  return { key: 'custom', label: 'Custom' };
+}
+
+/** Defined-risk width (× 100 × qty) for verticals / iron condors — the larger wing sets
+ *  the margin on an IC. Returns 0 when the legs don't form a closed-risk spread. */
+function definedRiskWidth(opts: ClosedLeg[]): number {
+  const strike = (l?: ClosedLeg) => Number(l?.strike) || 0;
+  const put = (short: boolean) => opts.find(l => /put/i.test(l.type || '') && isShortAction(l.action) === short);
+  const call = (short: boolean) => opts.find(l => /call/i.test(l.type || '') && isShortAction(l.action) === short);
+  const sp = put(true), lp = put(false), sc = call(true), lc = call(false);
+  const putW = sp && lp ? Math.abs(strike(sp) - strike(lp)) : 0;
+  const callW = sc && lc ? Math.abs(strike(sc) - strike(lc)) : 0;
+  const width = Math.max(putW, callW);
+  const qty = Math.abs(Number((sp || sc)?.qty) || 1);
+  return width * 100 * qty;
+}
+
+/** BPR — the capital the closed trade tied up, used as the annualization base. Structural
+ *  first (the intuitive "capital at risk"), because a closed trade has no live margin and
+ *  its shares were zeroed at close; falls back to the pre-close snapshot's margin, then to
+ *  deployedCapital()'s chain. Returns a label so the tooltip can explain the basis. */
+function closedCapitalBase(
+  trade: SavedStrategyItem, legs: ClosedLeg[], structKey: string,
+  pnl: LivePnlResponse | null | undefined, costBasis: number | null,
+): { value: number | null; basis: string } {
+  const opts = legs.filter(l => /call|put/i.test(l.type || ''));
+  const stockLegs = legs.filter(l => l.type === 'stock');
+
+  // 1) Stock-collateralized (covered call / collar / stock): the share notional.
+  if (stockLegs.length) {
+    const notional = stockLegs.reduce((s, l) => s + Math.abs(Number(l.entry_price) || 0) * Math.abs(Number(l.qty) || 0), 0);
+    if (notional > 0) return { value: round2(notional), basis: 'stock notional' };
+  }
+  // 2) Cash-secured put: the strike cash collateral (strike × 100 × qty).
+  if (structKey === 'cash_secured_put') {
+    const p = opts.find(l => /put/i.test(l.type || '') && isShortAction(l.action));
+    if (p?.strike) return { value: round2(Number(p.strike) * 100 * Math.abs(Number(p.qty) || 1)), basis: 'cash collateral' };
+  }
+  // 3) Defined-risk verticals & iron condors: the max loss the pre-close snapshot
+  //    preserved (width − credit, matching the active tab's "deployed"), else full width.
+  if (['put_credit_spread', 'call_credit_spread', 'iron_condor'].includes(structKey)) {
+    const ml = (pnl as any)?.max_loss;
+    if (ml != null && ml < 0) return { value: round2(Math.abs(ml)), basis: 'defined risk (max loss)' };
+    const w = definedRiskWidth(opts);
+    if (w > 0) return { value: round2(w), basis: 'defined risk (width)' };
+  }
+  // 4) Any UNPROTECTED short leg (naked call/put, strangle, jade lizard's naked put): a closed
+  //    trade has no live spot, so mirror the backend _naked no-spot rule — 0.20 × strike × 100 × qty
+  //    on the greatest naked side. This is the fix for naked shorts whose BPR was collapsing to the
+  //    premium (deployedCapital's last resort) and inflating the annualized return 10–100×. A short
+  //    leg is "covered" (skipped) when a long of the same right caps it: long call at/above the short
+  //    call, or long put at/below the short put.
+  const longCalls = opts.filter(l => /call/i.test(l.type || '') && !isShortAction(l.action));
+  const longPuts = opts.filter(l => /put/i.test(l.type || '') && !isShortAction(l.action));
+  const covered = (l: ClosedLeg) => {
+    const k = Number(l.strike) || 0;
+    return /call/i.test(l.type || '')
+      ? longCalls.some(lc => (Number(lc.strike) || 0) >= k)
+      : longPuts.some(lp => (Number(lp.strike) || 0) <= k);
+  };
+  const nakedProxy = opts
+    .filter(l => isShortAction(l.action) && !covered(l))
+    .reduce((mx, l) => Math.max(mx, 0.20 * (Number(l.strike) || 0) * 100 * Math.abs(Number(l.qty) || 1)), 0);
+  if (nakedProxy > 0) return { value: round2(nakedProxy), basis: 'Reg-T margin (≈20% of strike)' };
+  // 5) Everything else (longs → premium) via the shared chain.
+  const dep = deployedCapital(trade, pnl);
+  if (dep > 0) return { value: round2(dep), basis: 'capital deployed' };
+  // 6) Last resort: the net cost magnitude.
+  if (costBasis != null && Math.abs(costBasis) > 0) return { value: round2(Math.abs(costBasis)), basis: 'net cost' };
+  return { value: null, basis: '—' };
+}
+
+/** Compact one-line leg brief for the ledger row. */
+function summarizeClosedLegs(legs: ClosedLeg[]): string {
+  return legs.map(l => {
+    const qty = Math.abs(Number(l.qty) || 1);
+    if (l.type === 'stock') return `${qty} sh`;
+    const sign = isShortAction(l.action) ? '−' : '+';                 // U+2212 minus
+    const t = /call/i.test(l.type || '') ? 'C' : 'P';
+    const k = Number(l.strike);
+    return `${sign}${qty} ${t}${Number.isFinite(k) ? (Number.isInteger(k) ? k : k.toFixed(1)) : ''}`;
+  }).join(' · ');
+}
+
+/** Build the full ledger row for one closed trade. Pure — reads only persisted data. */
+function buildClosedLedger(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): ClosedLedgerRow {
+  const legs: ClosedLeg[] = Array.isArray(trade.parameters?.closed_legs) ? trade.parameters.closed_legs : [];
+  const struct = legs.length ? closedStructure(legs) : { key: 'other', label: tradeStructure(trade).label };
+
+  // Schedule-D gross legs: a short leg sells to open / buys to close; a long leg the reverse.
+  let cost = 0, proceeds = 0, sawPrices = false;
+  for (const l of legs) {
+    const qty = Math.abs(Number(l.qty) || 0);
+    if (qty <= 0) continue;
+    const mult = l.type === 'stock' ? 1 : 100;
+    const entry = Number(l.entry_price) || 0;
+    const exit = Number(l.exit_price) || 0;
+    sawPrices = true;
+    if (isShortAction(l.action)) { proceeds += entry * mult * qty; cost += exit * mult * qty; }
+    else { cost += entry * mult * qty; proceeds += exit * mult * qty; }
+  }
+
+  // Realized: leg-derived (proceeds − cost) keeps the three columns reconciling on screen;
+  // fall back to the stored cumulative realized_pnl / legacy exit_net when legs lack prices.
+  const storedReal = trade.parameters?.realized_pnl != null ? Number(trade.parameters.realized_pnl)
+    : (trade.exit_net != null ? Number(trade.exit_net) : null);
+  const costBasis = sawPrices ? round2(cost) : null;
+  const proceedsV = sawPrices ? round2(proceeds) : null;
+  const realized = sawPrices ? round2(proceeds - cost) : storedReal;
+
+  // BPR is authoritative from the BACKEND (Reg-T margin via calc_reg_t_margin — CSP reads
+  // ~20% margin, not full collateral). Only reconstruct locally if the backend didn't send one
+  // (e.g. a pure long-premium trade, where the debit paid is the capital).
+  const backendBpr = typeof trade.bpr === 'number' && trade.bpr > 0 ? trade.bpr : null;
+  const cap = backendBpr != null
+    ? { value: round2(backendBpr), basis: 'Reg-T margin' }
+    : closedCapitalBase(trade, legs, struct.key, pnl, costBasis);
+  return {
+    costBasis, proceeds: proceedsV, realized,
+    capitalBase: cap.value, capitalBasis: cap.basis,
+    structureLabel: struct.label, legsSummary: summarizeClosedLegs(legs),
+  };
+}
+
+/** Stored cumulative realized P&L for a closed trade (for the header total) — authoritative. */
+function closedRealized(trade: SavedStrategyItem): number | null {
+  if (trade.parameters?.realized_pnl != null) return Number(trade.parameters.realized_pnl);
+  return trade.exit_net != null ? Number(trade.exit_net) : null;
 }
 
 function GroupSummary({ trades, pnlMap, isIncome = false, excludeStock = false }: {
@@ -2216,6 +2414,249 @@ interface SharedCardProps {
   onDeleteTrade: (id: number) => void;
 }
 
+// ── Closed-trade ledger table ─────────────────────────────────────────────────
+//
+// The Closed tab is a plain accounting ledger, not a management surface. One sortable
+// row per closed trade: what it was, when it opened & closed, cost basis, proceeds,
+// realized gain, and the geometric annualized return on the capital (BPR) it tied up.
+// No Greeks / risk / quant — those are meaningless on a settled position.
+
+type ClosedSortKey = 'ticker' | 'opened' | 'closed' | 'held' | 'cost' | 'proceeds' | 'realized' | 'bpr' | 'ann';
+
+interface ClosedRow extends ClosedLedgerRow {
+  trade: SavedStrategyItem;
+  opened: number | null;   // entry epoch ms
+  closed: number | null;   // exit epoch ms
+  held: number | null;     // calendar days held
+  ann: number | null;      // annualized % on BPR
+}
+
+function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
+  trades: SavedStrategyItem[];
+  pnlMap: Record<number, LivePnlResponse>;
+  onDeleteTrade: (id: number) => void;
+}) {
+  const [sortKey, setSortKey] = useState<ClosedSortKey>('closed');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [collapsedMonths, setCollapsedMonths] = useState<Set<string>>(new Set());
+  const toggleMonth = (k: string) => setCollapsedMonths(prev => {
+    const n = new Set(prev); n.has(k) ? n.delete(k) : n.add(k); return n;
+  });
+
+  // Backend delete THEN local cleanup (onDeleteTrade only prunes local state — mirrors TradeCard).
+  const handleDelete = async (t: SavedStrategyItem, label: string) => {
+    if (!window.confirm(`Delete ${t.ticker} ${label} from your closed journal? This cannot be undone.`)) return;
+    setDeletingId(t.id);
+    try { await deleteTrade(t.id); onDeleteTrade(t.id); }
+    catch { setDeletingId(null); }
+  };
+
+  const rows: ClosedRow[] = useMemo(() => trades.map(t => {
+    const led = buildClosedLedger(t, pnlMap[t.id]);
+    const opened = t.entry_date ? new Date(t.entry_date).getTime() : null;
+    const closed = t.exit_date ? new Date(t.exit_date).getTime() : null;
+    const held = opened != null && closed != null
+      ? Math.max(1, Math.round((closed - opened) / 86400000))
+      : (opened != null ? Math.max(1, daysHeld(t.entry_date)) : null);
+    const ann = led.realized != null && led.capitalBase && held != null ? annualizedSimple(led.realized, led.capitalBase, held) : null;
+    return { trade: t, ...led, opened, closed, held, ann };
+  }), [trades, pnlMap]);
+
+  // Active-column comparator (applied WITHIN each month group).
+  const cmp = useMemo(() => {
+    const dir = sortDir === 'asc' ? 1 : -1;
+    const val = (r: ClosedRow): number | string => {
+      switch (sortKey) {
+        case 'ticker': return r.trade.ticker || '';
+        case 'opened': return r.opened ?? -Infinity;
+        case 'closed': return r.closed ?? -Infinity;
+        case 'held': return r.held ?? -Infinity;
+        case 'cost': return r.costBasis ?? -Infinity;
+        case 'proceeds': return r.proceeds ?? -Infinity;
+        case 'realized': return r.realized ?? -Infinity;
+        case 'bpr': return r.capitalBase ?? -Infinity;
+        case 'ann': return r.ann ?? -Infinity;
+      }
+    };
+    return (a: ClosedRow, b: ClosedRow) => {
+      const av = val(a), bv = val(b);
+      if (typeof av === 'string' || typeof bv === 'string') return String(av).localeCompare(String(bv)) * dir;
+      return (av - bv) * dir;
+    };
+  }, [sortKey, sortDir]);
+
+  // Group by CLOSE month; each month carries its own subtotals ("top metrics"). Months run
+  // newest-first, except when the user sorts by Closed ascending (then oldest-first); undated last.
+  const months = useMemo(() => {
+    const m = new Map<string, ClosedRow[]>();
+    for (const r of rows) {
+      const d = r.closed != null ? new Date(r.closed) : null;
+      const key = d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` : 'undated';
+      const arr = m.get(key);
+      if (arr) arr.push(r); else m.set(key, [r]);
+    }
+    const groups = Array.from(m.entries()).map(([key, rs]) => ({
+      key,
+      label: key === 'undated' ? 'Undated' : new Date(rs[0].closed!).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+      rows: [...rs].sort(cmp),
+      count: rs.length,
+      cost: rs.reduce((s, r) => s + (r.costBasis ?? 0), 0),
+      proceeds: rs.reduce((s, r) => s + (r.proceeds ?? 0), 0),
+      realized: rs.reduce((s, r) => s + (r.realized ?? 0), 0),
+      bpr: rs.reduce((s, r) => s + (r.capitalBase ?? 0), 0),
+      wins: rs.filter(r => (r.realized ?? 0) > 0).length,
+      scored: rs.filter(r => r.realized != null).length,
+    }));
+    const chronoAsc = sortKey === 'closed' && sortDir === 'asc';
+    groups.sort((a, b) => {
+      if (a.key === 'undated') return 1;
+      if (b.key === 'undated') return -1;
+      return chronoAsc ? a.key.localeCompare(b.key) : b.key.localeCompare(a.key);
+    });
+    return groups;
+  }, [rows, cmp, sortKey, sortDir]);
+
+  const toggleSort = (k: ClosedSortKey) => {
+    if (k === sortKey) setSortDir(d => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortKey(k); setSortDir(k === 'ticker' ? 'asc' : 'desc'); }
+  };
+
+  // Totals (from the raw rows — filter-agnostic, whole closed book in view).
+  const tCost = rows.reduce((s, r) => s + (r.costBasis ?? 0), 0);
+  const tProceeds = rows.reduce((s, r) => s + (r.proceeds ?? 0), 0);
+  const tRealized = rows.reduce((s, r) => s + (r.realized ?? 0), 0);
+  const tBpr = rows.reduce((s, r) => s + (r.capitalBase ?? 0), 0);
+  const wins = rows.filter(r => (r.realized ?? 0) > 0).length;
+  const scored = rows.filter(r => r.realized != null).length;
+
+  const SortTh = ({ k, label, align = 'right', hint }: { k: ClosedSortKey; label: string; align?: 'left' | 'right'; hint?: string }) => (
+    <th className={align === 'left' ? 'text-left' : 'text-right'}>
+      <button
+        onClick={() => toggleSort(k)}
+        title={hint || `Sort by ${label.toLowerCase()}`}
+        className={`inline-flex items-center gap-0.5 hover:text-base-content transition-colors ${align === 'left' ? '' : 'flex-row-reverse'} ${sortKey === k ? 'text-base-content font-semibold' : 'text-base-content/50'}`}
+      >
+        <span>{label}</span>
+        {sortKey === k
+          ? (sortDir === 'asc' ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />)
+          : <ArrowDownUp className="w-2.5 h-2.5 opacity-30" />}
+      </button>
+    </th>
+  );
+
+  const money = (v: number | null, opts?: { signed?: boolean }) => (v == null ? <span className="text-base-content/25">—</span> : fmtMoney(v, opts));
+
+  const renderRow = (r: ClosedRow) => {
+    const rz = r.realized;
+    const rzCls = rz == null ? '' : rz >= 0 ? 'text-success' : 'text-error';
+    return (
+      <tr key={r.trade.id} className="hover:bg-base-200/30 border-base-300/30 group">
+        {/* Brief: ticker · structure, with the leg summary underneath */}
+        <td className="text-left align-top">
+          <div className="flex items-center gap-1.5">
+            <span className="font-semibold text-sm">{r.trade.ticker}</span>
+            <span className="text-[11px] text-base-content/50">{r.structureLabel}</span>
+          </div>
+          {r.legsSummary && <div className="text-[10px] text-base-content/35 tabular-nums mt-0.5">{r.legsSummary}</div>}
+        </td>
+        <td className="text-right whitespace-nowrap text-base-content/70">{r.trade.entry_date ? fmtDate(r.trade.entry_date) : '—'}</td>
+        <td className="text-right whitespace-nowrap text-base-content/70">{r.trade.exit_date ? fmtDate(r.trade.exit_date) : '—'}</td>
+        <td className="text-right whitespace-nowrap text-base-content/60">{r.held != null ? `${r.held}d` : '—'}</td>
+        <td className="text-right whitespace-nowrap tabular-nums">{money(r.costBasis)}</td>
+        <td className="text-right whitespace-nowrap tabular-nums">{money(r.proceeds)}</td>
+        <td className={`text-right whitespace-nowrap tabular-nums font-semibold ${rzCls}`}>{money(rz, { signed: true })}</td>
+        <td className="text-right whitespace-nowrap tabular-nums text-base-content/70" title={r.capitalBasis !== '—' ? `BPR basis: ${r.capitalBasis}` : undefined}>{money(r.capitalBase)}</td>
+        <td className={`text-right whitespace-nowrap tabular-nums font-medium ${r.ann == null ? '' : r.ann >= 0 ? 'text-success' : 'text-error'}`}>
+          {r.ann == null ? <span className="text-base-content/25">—</span> : fmtAnnualized(r.ann)}
+        </td>
+        <td className="text-right">
+          <button
+            className="btn btn-ghost btn-xs px-1 text-base-content/20 hover:text-error opacity-0 group-hover:opacity-100 transition-opacity"
+            title="Delete this closed trade from the journal"
+            disabled={deletingId === r.trade.id}
+            onClick={() => handleDelete(r.trade, r.structureLabel)}
+          >
+            {deletingId === r.trade.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+          </button>
+        </td>
+      </tr>
+    );
+  };
+
+  return (
+    <div className="overflow-x-auto rounded-2xl border border-base-300/40 bg-base-100/40">
+      <table className="table table-xs">
+        <thead>
+          <tr className="text-[10px] uppercase tracking-wider text-base-content/40 border-base-300/40">
+            <SortTh k="ticker" label="Trade" align="left" hint="Sort by ticker A–Z" />
+            <SortTh k="opened" label="Opened" />
+            <SortTh k="closed" label="Closed" />
+            <SortTh k="held" label="Held" hint="Sort by days held" />
+            <SortTh k="cost" label="Cost basis" hint="What it cost to acquire (Σ buys)" />
+            <SortTh k="proceeds" label="Proceeds" hint="What it sold for (Σ sells)" />
+            <SortTh k="realized" label="Realized" hint="Realized gain — proceeds minus cost basis" />
+            <SortTh k="bpr" label="BPR" hint="Buying-power reduction — the capital the trade tied up" />
+            <SortTh k="ann" label="Ann." hint="Annualized return on BPR — simple interest (gain% × 365 / days held)" />
+            <th></th>
+          </tr>
+        </thead>
+        {/* One tbody per close-month: a summary band (subtotals) + that month's trades. */}
+        {months.map(g => {
+          const collapsed = collapsedMonths.has(g.key);
+          const roc = g.bpr > 0 ? (g.realized / g.bpr) * 100 : null;   // month return on capital (not annualized)
+          return (
+            <tbody key={g.key}>
+              <tr
+                className="bg-base-200/50 hover:bg-base-200/70 cursor-pointer border-t-2 border-base-300/50 text-xs font-medium"
+                onClick={() => toggleMonth(g.key)}
+                title={collapsed ? 'Expand this month' : 'Collapse this month'}
+              >
+                <td colSpan={4} className="text-left">
+                  <div className="flex items-center gap-1.5">
+                    {collapsed ? <ChevronDown className="w-3.5 h-3.5 text-base-content/40" /> : <ChevronUp className="w-3.5 h-3.5 text-base-content/40" />}
+                    <span className="font-semibold text-sm text-base-content/90">{g.label}</span>
+                    <span className="text-[11px] text-base-content/45">
+                      · {g.count} closed{g.scored > 0 && ` · ${g.wins}/${g.scored} win (${Math.round((g.wins / g.scored) * 100)}%)`}
+                    </span>
+                  </div>
+                </td>
+                <td className="text-right tabular-nums text-base-content/55">{fmtMoney(g.cost)}</td>
+                <td className="text-right tabular-nums text-base-content/55">{fmtMoney(g.proceeds)}</td>
+                <td className={`text-right tabular-nums font-bold ${g.realized >= 0 ? 'text-success' : 'text-error'}`}>{fmtMoney(g.realized, { signed: true })}</td>
+                <td className="text-right tabular-nums text-base-content/55">{fmtMoney(g.bpr)}</td>
+                <td className={`text-right tabular-nums font-medium ${roc == null ? 'text-base-content/40' : roc >= 0 ? 'text-success/80' : 'text-error/80'}`}
+                  title="Month realized return on deployed BPR (blended, not annualized — holding periods differ)">
+                  {roc == null ? '—' : fmtPct(roc, { signed: true })}
+                </td>
+                <td></td>
+              </tr>
+              {!collapsed && g.rows.map(renderRow)}
+            </tbody>
+          );
+        })}
+        {rows.length > 0 && (
+          <tfoot>
+            <tr className="border-t-2 border-primary/30 text-xs font-semibold bg-base-300/30">
+              <td colSpan={4} className="text-left text-base-content/70">
+                All {months.length > 1 ? `${months.length} months` : 'time'} · {rows.length} closed{scored > 0 && <span className="text-base-content/40 font-medium"> · {wins}/{scored} winners ({Math.round((wins / scored) * 100)}%)</span>}
+              </td>
+              <td className="text-right tabular-nums text-base-content/60">{fmtMoney(tCost)}</td>
+              <td className="text-right tabular-nums text-base-content/60">{fmtMoney(tProceeds)}</td>
+              <td className={`text-right tabular-nums font-bold ${tRealized >= 0 ? 'text-success' : 'text-error'}`}>{fmtMoney(tRealized, { signed: true })}</td>
+              <td className="text-right tabular-nums text-base-content/50">{fmtMoney(tBpr)}</td>
+              <td className="text-right tabular-nums text-base-content/50" title="Aggregate realized on total BPR (not annualized — holding periods differ)">
+                {tBpr > 0 ? fmtPct((tRealized / tBpr) * 100, { signed: true }) : '—'}
+              </td>
+              <td></td>
+            </tr>
+          </tfoot>
+        )}
+      </table>
+    </div>
+  );
+}
+
 function GroupSection({ purpose, trades, pnlMap, ...props }: {
   purpose: TradePurpose;
   trades: SavedStrategyItem[];
@@ -2380,7 +2821,7 @@ interface AdvisorState {
 }
 
 export default function MyTradesV2() {
-  const [activeStatus, setActiveStatus] = useState<'active' | 'closed'>('active');
+  const [activeStatus, setActiveStatus] = useState<'active' | 'closed' | 'paper'>('active');
   const [trades, setTrades] = useState<SavedStrategyItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -2400,6 +2841,9 @@ export default function MyTradesV2() {
   const [agentTrade, setAgentTrade] = useState<SavedStrategyItem | null>(null);
 
   const loadTrades = useCallback(async () => {
+    // Paper Trader is a self-contained panel with its OWN (lazy) data source — don't fetch the
+    // real SavedStrategy trade book for it.
+    if (activeStatus === 'paper') { setTrades([]); setLoading(false); return; }
     setLoading(true);
     setErr(null);
     try {
@@ -2560,6 +3004,8 @@ export default function MyTradesV2() {
   // Only sum P&L for trades still in view (pnlMap can hold stale/closed entries).
   const totalPnl = trades.reduce((s, t) => s + (pnlMap[t.id]?.unrealized_pnl ?? 0), 0);
   const hasPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
+  // Closed tab: banked realized P&L (authoritative stored total), not live unrealized.
+  const totalRealized = trades.reduce((s, t) => s + (closedRealized(t) ?? 0), 0);
 
   const groupOrder: TradePurpose[] = PURPOSE_ORDER;
 
@@ -2613,20 +3059,39 @@ export default function MyTradesV2() {
           >
             Closed
           </button>
+          <button
+            className={`tab tab-sm gap-1 ${activeStatus === 'paper' ? 'tab-active' : ''}`}
+            onClick={() => setActiveStatus('paper')}
+            title="Paper trades placed from the Income Desk — track placed-vs-now quant analysis"
+          >
+            Paper Trader
+          </button>
         </div>
 
         {/* Portfolio summary strip + Refresh all */}
         {trades.length > 0 && (
           <div className="flex items-center gap-3 text-xs text-base-content/50 flex-wrap">
-            <span>{trades.length} position{trades.length !== 1 ? 's' : ''}</span>
-            <span className="opacity-30">·</span>
-            <span>{fmtMoney(totalCapital)} total deployed</span>
-            {hasPnl && totalPnl !== 0 && (
+            <span>{trades.length} {activeStatus === 'closed' ? 'closed' : 'position' + (trades.length !== 1 ? 's' : '')}</span>
+            {activeStatus === 'closed' ? (
+              /* Closed: banked realized P&L — no live "deployed / unrealized" (those are settled). */
               <>
                 <span className="opacity-30">·</span>
-                <span className={totalPnl >= 0 ? 'text-success' : 'text-error'}>
-                  {totalPnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalPnl))} unrealized
+                <span className={totalRealized >= 0 ? 'text-success' : 'text-error'}>
+                  {totalRealized >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalRealized))} realized
                 </span>
+              </>
+            ) : (
+              <>
+                <span className="opacity-30">·</span>
+                <span>{fmtMoney(totalCapital)} total deployed</span>
+                {hasPnl && totalPnl !== 0 && (
+                  <>
+                    <span className="opacity-30">·</span>
+                    <span className={totalPnl >= 0 ? 'text-success' : 'text-error'}>
+                      {totalPnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalPnl))} unrealized
+                    </span>
+                  </>
+                )}
               </>
             )}
             {activeStatus === 'active' && (
@@ -2655,15 +3120,18 @@ export default function MyTradesV2() {
         </div>
       )}
 
+      {/* Paper Trader — its own lazy panel (placed-vs-now quant), not the SavedStrategy book */}
+      {activeStatus === 'paper' && <PaperTraderPanel quoteSource={quoteSource} />}
+
       {/* Loading */}
-      {loading && (
+      {activeStatus !== 'paper' && loading && (
         <div className="flex justify-center py-12">
           <Loader2 className="w-7 h-7 animate-spin text-base-content/20" />
         </div>
       )}
 
       {/* Empty state */}
-      {!loading && trades.length === 0 && (
+      {activeStatus !== 'paper' && !loading && trades.length === 0 && (
         <div className="text-center py-16 text-base-content/30">
           <BarChart3 className="w-12 h-12 mx-auto mb-3 opacity-20" />
           <p className="font-medium">No {activeStatus} trades</p>
@@ -2680,8 +3148,13 @@ export default function MyTradesV2() {
         <BookTailRisk quoteSource={quoteSource} />
       )}
 
-      {/* Groups */}
-      {!loading && (
+      {/* Closed — a plain realized-P&L ledger (sortable), not the management cards */}
+      {activeStatus === 'closed' && !loading && trades.length > 0 && (
+        <ClosedLedger trades={trades} pnlMap={pnlMap} onDeleteTrade={handleDeleteTrade} />
+      )}
+
+      {/* Active — grouped management cards */}
+      {activeStatus === 'active' && !loading && (
         <div className="space-y-4">
           {groupOrder.map(g => (
             <GroupSection

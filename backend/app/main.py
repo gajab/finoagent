@@ -16,7 +16,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from .config import settings
 from .database import init_db
 from .middleware import SessionMiddleware
-from .routers import auth_router, portfolio_router, settings_router, stock_router, proxy_router, agent_router, stock_notes_router, channel_router, tlh_portfolio_router, broker_router, saved_strategy_router, metrics_router, market_router
+from .routers import auth_router, portfolio_router, settings_router, stock_router, proxy_router, agent_router, stock_notes_router, channel_router, tlh_portfolio_router, broker_router, saved_strategy_router, metrics_router, market_router, paper_trade_router
 from .routers import tracking_router
 from .routers import trade_tracking_router
 from .routers import pick_shovel_v2_router
@@ -160,6 +160,7 @@ app.include_router(channel_router.router)
 app.include_router(tlh_portfolio_router.router)
 app.include_router(broker_router.router)
 app.include_router(saved_strategy_router.router)
+app.include_router(paper_trade_router.router)
 app.include_router(metrics_router.router)
 app.include_router(market_router.router)
 app.include_router(tracking_router.router)

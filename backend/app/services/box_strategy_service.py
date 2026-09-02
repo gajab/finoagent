@@ -1012,6 +1012,7 @@ async def scan_box_opportunities(
     cached briefly to shield the quote provider from repeat scans.
     """
     from .cache_service import get_cached, set_cached
+    from ..database import async_session
 
     universe = [t.strip().upper() for t in (tickers or BOX_SCAN_UNIVERSE) if t and t.strip()]
     per_ticker = max(1, min(per_ticker, 2))
@@ -1027,13 +1028,19 @@ async def scan_box_opportunities(
         nr = s.get("net_achievable_rate", 0.0) or 0.0
         return (s.get("fill_probability", 0), nr if intent == "lend" else -nr)
 
-    async def _scan_one(tk: str):
+    # An AsyncSession is NOT safe for concurrent use, so the gathered scans must NOT share the
+    # caller's `db` (sharing collides their flush/commit → "this transaction is closed", and every
+    # miss then fails to cache). Give each task its OWN short-lived session and cap how many run at
+    # once so the single instance's connection pool isn't exhausted. db=None (standalone/MCP) → no DB.
+    _scan_sem = asyncio.Semaphore(4)
+
+    async def _scan_compute(tk: str, sess):
         cache_key = (
             f"box-scan:{tk}:{intent}:{duration_days}:{target_annual_return}:"
             f"{int(amount)}:{max_contracts}:{per_ticker}:{quote_source}"
         )
-        if db is not None:
-            cached = await get_cached(db, cache_key)
+        if sess is not None:
+            cached = await get_cached(sess, cache_key)
             if cached is not None:
                 return tk, cached, None
 
@@ -1046,7 +1053,7 @@ async def scan_box_opportunities(
                 intent=intent,
                 quote_source=quote_source,
                 user=user,
-                db=db,
+                db=sess,
                 max_contracts=max_contracts,
             )
         except Exception as exc:  # noqa: BLE001 — one bad ticker must not kill the scan
@@ -1071,9 +1078,16 @@ async def scan_box_opportunities(
             for s in chosen
         ]
         payload = {"opportunities": opps}
-        if db is not None:
-            await set_cached(db, cache_key, payload, ttl_seconds=180)
+        if sess is not None:
+            await set_cached(sess, cache_key, payload, ttl_seconds=180)
         return tk, payload, None
+
+    async def _scan_one(tk: str):
+        async with _scan_sem:
+            if db is None:
+                return await _scan_compute(tk, None)
+            async with async_session() as sess:
+                return await _scan_compute(tk, sess)
 
     results = await asyncio.gather(*[_scan_one(tk) for tk in universe], return_exceptions=False)
 

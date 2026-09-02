@@ -100,12 +100,28 @@ export default function ChartPatternsPanel({ ticker }: { ticker: string }) {
         label: { formatter: `${(l.ratio * 100).toFixed(1)}% tgt ${money(l.price)}`, position: 'insideEndTop', color: '#22c55e', fontSize: 9 },
       }));
     }
+    // Keep every drawn line on-screen: markLines don't expand the axis, so the Fibonacci extension
+    // TARGETS (which sit beyond the candle range) would be clipped. When Fib is on, widen y to fit
+    // the candles + all fib levels/extensions.
+    let yMin: number | undefined, yMax: number | undefined;
+    if (showFib && data.fibonacci) {
+      const fibP = [...data.fibonacci.levels.map(l => l.price), ...(data.fibonacci.extensions || []).map(l => l.price)];
+      // frame on the recent window (≈ the fib swing) so candles + targets both fill the view,
+      // rather than the full history dragging the axis down to old lows.
+      const his = s.high.slice(-70).filter((v): v is number => v != null);
+      const los = s.low.slice(-70).filter((v): v is number => v != null);
+      if (his.length && los.length) {
+        const hi = Math.max(...his, ...fibP), lo = Math.min(...los, ...fibP);
+        const pad = (hi - lo) * 0.03;
+        yMin = Math.floor(lo - pad); yMax = Math.ceil(hi + pad);
+      }
+    }
     return {
       animation: false,
       grid: { left: 8, right: 62, top: 12, bottom: 24 },
       tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
       xAxis: { type: 'category', data: ts, boundaryGap: true, axisLabel: { color: '#94a3b8', fontSize: 10 }, axisLine: { lineStyle: { color: '#475569' } } },
-      yAxis: { scale: true, position: 'right', axisLabel: { color: '#94a3b8', fontSize: 10, formatter: '${value}' }, splitLine: { lineStyle: { color: 'rgba(100,116,139,0.15)' } } },
+      yAxis: { scale: true, min: yMin, max: yMax, position: 'right', axisLabel: { color: '#94a3b8', fontSize: 10, formatter: '${value}' }, splitLine: { lineStyle: { color: 'rgba(100,116,139,0.15)' } } },
       dataZoom: [{ type: 'inside', start: 55, end: 100 }, { type: 'slider', height: 14, bottom: 4, start: 55, end: 100 }],
       series: [{
         type: 'candlestick', data: candles,

@@ -24,7 +24,9 @@ import re
 from datetime import date, timedelta
 from typing import Optional, TYPE_CHECKING
 
-from .lifecycle_service import compute_pretrade_metrics, terminal_payoff_curve, horizon_payoff_curve
+from .lifecycle_service import (
+    compute_pretrade_metrics, terminal_payoff_curve, horizon_payoff_curve, management_desk_score,
+)
 from .llm_service import call_llm
 from .derivative_income_service import (
     run_derivative_income, _norm_ticker, _macro_events_in_window, _reports_earnings,
@@ -280,6 +282,10 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     _eg_pct = opp.get("earnings_gap_pct")
     earnings_on = bool(earnings_aware and _eg_pct and spot)
     _eg_frac = (_eg_pct / 100.0) if _eg_pct else None
+    # How much a continuous-tape CREDIT (gamma-calm / range / calm-tape) is VOIDED by the gap: a bigger event
+    # move voids more (a discontinuity those "smooth tape" signals can't survive). 0 when the flag is off.
+    _evoid = _clampf(_eg_frac / _EARN_VOID_SCALE, 0.0, 1.0) if (earnings_on and _eg_frac) else 0.0
+    _defined_risk = opp.get("max_loss") is not None      # bounded loss (spread/condor/CSP/covered) → gap consequence CAPPED
 
     def add(label: str, pts: float, note: str, baseline: Optional[float] = None):
         # ``detail`` = the concrete price-point evidence, surfaced per-factor in the UI so the user sees
@@ -333,7 +339,11 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     if mode == "range" and s in _NEUTRAL_INCOME:
         _va = f", value area ${round(vp['val'], 1)}–${round(vp['vah'], 1)}" if vp.get("val") and vp.get("vah") else ""
         _poc = f"POC ${round(vp['poc'], 1)}" if vp.get("poc") else "range-bound tape"
-        add("Range fit", 5, f"{_poc}{_va} — neutral premium suits the range")
+        # An earnings gap can JUMP the stock clean out of the range → the flag voids the range-fit credit.
+        _rf = round(5 * (1.0 - _evoid)) if earnings_on else 5
+        add("Range fit", _rf, f"{_poc}{_va} — neutral premium suits the range"
+            + (f" — but an earnings gap can JUMP out of the range, voiding {round(_evoid * 100)}% of this credit" if earnings_on and _evoid > 0 else ""),
+            baseline=5 if (earnings_on and _evoid > 0) else None)
     # STRUCTURE — is the short strike behind a WALL (defended) or in OPEN AIR (undefended)? Walls = classical
     # S/R + value-area edges + dealer gamma walls/flip/HVL. DEFENDED (a wall between the strike and spot, with a
     # σ-sized cushion beyond it) → +; UNDEFENDED (no wall to spot) → naked premium, PENALISED unless the strike
@@ -419,11 +429,16 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
                     _pens.append((min((_band - _cush) / _band * _EARN_GAP_MAX, _EARN_GAP_MAX), _sk, _cush))
         if _pens:
             _pen, _wk, _wc = max(_pens, key=lambda t: t[0])   # worst (most gap-exposed) leg
-            add("Earnings gap", -round(_pen, 1),
+            # #3 CONSEQUENCE — a DEFINED-RISK structure caps the gap loss (the long wing), so the same breach
+            # hurts far less than on a naked short → soften the penalty (and say why).
+            _soft = _EARN_DEFINED_SOFTEN if _defined_risk else 1.0
+            _cap_note = (" — but the loss is CAPPED (defined-risk wing), so the breach is survivable: penalty softened"
+                         if _defined_risk else " — and the loss is UNBOUNDED (naked short), so a breach is the worst case")
+            add("Earnings gap", -round(_pen * _soft, 1),
                 f"strike ${round(_wk, 1)} is only ${round(_wc, 1)} ({round(_wc / _gap_abs, 2)}× the ~{round(_eg_pct, 1)}% "
                 f"event move) from spot — inside the {_EARN_GAP_MULT}× earnings-gap band (±${round(_band, 1)}); an "
-                f"earnings JUMP the diffusion touch can't see can breach it. Prefer a strike ≥ {_EARN_GAP_MULT}× the gap "
-                f"or an expiry that doesn't straddle the print", baseline=0.0)
+                f"earnings JUMP the diffusion touch can't see can breach it{_cap_note}. Prefer a strike ≥ {_EARN_GAP_MULT}× "
+                f"the gap or an expiry that doesn't straddle the print", baseline=0.0)
 
     # BREACH RISK — the honest "does the short EVER go ITM" probability (drift-aware first-passage / touch),
     # NOT just P(finish OTM at expiry). Touch ≈ 2× the expiry-ITM odds and RISES when the stock drifts TOWARD
@@ -432,19 +447,42 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     _mu = (ta or {}).get("_drift_mu") or 0.0
     _vol = max((opp.get("atm_iv_pct") or 0.0) / 100.0, hv or 0.0)          # dual vol — conservative (wider cone)
     _dte_t = int(opp.get("dte") or 0)
-    touches = [t for t in (_prob_touch(k, spot, _dte_t, _vol, _mu)
-                           for k in (put_short, call_short) if k) if t is not None]
-    if touches and spot:
-        pt = max(touches)                                                 # worst (most breach-prone) leg
-        opp["prob_touch_pct"] = round(pt * 100, 1)                        # surface it on the trade
-        pen = 0.0 if pt <= _TOUCH_OK else -round(min((pt - _TOUCH_OK) / _BREACH_RAMP * _BREACH_MAX, _BREACH_MAX), 1)
-        add("Breach risk", pen,
-            f"P(touch) {round(pt * 100)}% — the chance the short is breached (goes ITM) at ANY point before "
-            f"expiry, drift-aware (trend {round(_mu * 100)}%/yr) & ~2× the expiry-ITM odds; "
-            + (f"within the ≤{round(_TOUCH_OK * 100)}% comfort zone" if pt <= _TOUCH_OK
-               else f"above ≤{round(_TOUCH_OK * 100)}% → penalised to steer toward deeper, harder-to-reach strikes"))
+    _legs_ip = [(k, ip) for k, ip in ((put_short, True), (call_short, False)) if k]
+    # BASELINE (without earnings-aware) = the current pure-DIFFUSION first-passage on the dual vol.
+    _diff = [(_prob_touch(k, spot, _dte_t, _vol, _mu), k, ip) for k, ip in _legs_ip]
+    _diff = [(t, k, ip) for t, k, ip in _diff if t is not None]
+    if _diff and spot:
+        touches_base = [t for t, k, ip in _diff]
+        # #2 JUMP-AWARE (with earnings-aware): the diffusion touch can't see the overnight gap — add the jump.
+        # The BASELINE diffusion here strips the event (HV, else the dual vol) so the jump isn't double-counted.
+        if earnings_on:
+            _bd = hv or _vol
+            # The overnight JUMP can only ADD breach risk — take the max of the diffusion touch and the
+            # jump-diffusion touch so the earnings-aware number is never LOWER than the plain one.
+            touches_used = [max(t, _prob_touch_jump(k, spot, _dte_t, _bd, _mu, _eg_frac, ip) or 0.0) for t, k, ip in _diff]
+        else:
+            touches_used = touches_base
+        pt = max(touches_used)                                            # worst (most breach-prone) leg
+        pt_base = max(touches_base)
+        opp["prob_touch_pct"] = round(pt * 100, 1)                        # surface the APPLIED (earnings-aware) touch
+        _pen_of = lambda p: (0.0 if p <= _TOUCH_OK
+                             else -round(min((p - _TOUCH_OK) / _BREACH_RAMP * _BREACH_MAX, _BREACH_MAX), 1))
+        pen, pen_base = _pen_of(pt), _pen_of(pt_base)
+        _within = (f"within the ≤{round(_TOUCH_OK * 100)}% comfort zone" if pt <= _TOUCH_OK
+                   else f"above ≤{round(_TOUCH_OK * 100)}% → penalised to steer toward deeper, harder-to-reach strikes")
+        if earnings_on:
+            add("Breach risk", pen,
+                f"P(touch) {round(pt * 100)}% JUMP-AWARE — diffusion alone reads {round(pt_base * 100)}%, but the "
+                f"~{round(_eg_pct, 1)}% earnings JUMP the GBM path can't leap lifts it to {round(pt * 100)}%; {_within}",
+                baseline=pen_base)
+        else:
+            add("Breach risk", pen,
+                f"P(touch) {round(pt * 100)}% — the chance the short is breached (goes ITM) at ANY point before "
+                f"expiry, drift-aware (trend {round(_mu * 100)}%/yr) & ~2× the expiry-ITM odds; {_within}")
+    else:
+        touches_used = []
 
-    _touch_min = min(touches) if touches else None
+    _touch_min = min(touches_used) if touches_used else None
     # #4 FORTIFIED — the two touch-reducers TOGETHER: a deep cushion (low touch) AND behind a wall. The
     #    combination is the lowest-breach placement — structure AND distance both have to fail — worth more
     #    than either alone.
@@ -456,13 +494,19 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     #    REVERT rather than persist into assignment (the GBM touch model can't see mean-reversion). Complements
     #    'Range fit' (which already rewards neutral structures in a range) by covering directional income too.
     if mode == "range" and s not in _NEUTRAL_INCOME:
-        add("Calm tape", 2.0, "range-bound / mean-reverting tape — probes of the strike tend to revert, so a "
-            "touch is less likely to persist into assignment than in a trending tape")
+        # A range/mean-reversion CREDIT assumes continuous tape — an earnings gap is a discontinuity that jumps
+        # OUT of the range, so the flag VOIDS the credit in proportion to the gap.
+        _ct_base = 2.0
+        _ct = round(_ct_base * (1.0 - _evoid), 1) if earnings_on else _ct_base
+        add("Calm tape", _ct, "range-bound / mean-reverting tape — probes of the strike tend to revert, so a "
+            "touch is less likely to persist into assignment than in a trending tape"
+            + (f" — but the earnings gap can JUMP out of the range, voiding {round(_evoid * 100)}% of this calm credit" if earnings_on and _evoid > 0 else ""),
+            baseline=_ct_base if (earnings_on and _evoid > 0) else None)
 
     # #5 VOL-EXPANSION proximity — the touch prob is sized off TODAY'S vol; a SHORT-gamma tape (dealers chase
     #    moves → vol EXPANDS) widens the real breach cone beyond that estimate, so dock a little extra when the
     #    strike is already non-trivially breach-prone.
-    if gex and gex.get("regime") == "short" and _touch_min is not None and max(touches) > _TOUCH_OK * 0.6:
+    if gex and gex.get("regime") == "short" and _touch_min is not None and touches_used and max(touches_used) > _TOUCH_OK * 0.6:
         add("Vol-expansion", -2.0, "short-gamma tape can EXPAND vol → the real breach cone is wider than the "
             "current-vol touch estimate; extra breach caution")
 
@@ -524,10 +568,17 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
             _bits.append(f"put-wall ${round(gex['put_support'], 1)}")
         if gex.get("call_resistance"):
             _bits.append(f"call-wall ${round(gex['call_resistance'], 1)}")
-        _ev = f" ({', '.join(_bits)})" if _bits else ""
-        add("Gamma regime", 4 if _lg else -6,
-            f"dealers {'LONG' if _lg else 'SHORT'} gamma{_ev} — "
-            f"{'vol-suppressed / mean-reverting (good backdrop for selling premium)' if _lg else 'vol-EXPANSION / trending (dealers chase moves — dangerous)'}")
+        _gb = f" ({', '.join(_bits)})" if _bits else ""
+        # LONG-gamma is a CREDIT (dealers hedge into moves → vol suppressed) — but dealers CAN'T hedge a binary
+        # overnight JUMP, so an earnings gap VOIDS the long-gamma calm in proportion to the gap. The SHORT-gamma
+        # penalty is left intact (the gap only makes an already-dangerous, dealers-chase tape worse).
+        _g_base = 4 if _lg else -6
+        _g = round(_g_base * (1.0 - _evoid)) if (earnings_on and _lg) else _g_base
+        add("Gamma regime", _g,
+            f"dealers {'LONG' if _lg else 'SHORT'} gamma{_gb} — "
+            f"{'vol-suppressed / mean-reverting (good backdrop for selling premium)' if _lg else 'vol-EXPANSION / trending (dealers chase moves — dangerous)'}"
+            + (f" — but dealers can't hedge a binary earnings JUMP, voiding {round(_evoid * 100)}% of this long-gamma calm" if (earnings_on and _lg and _evoid > 0) else ""),
+            baseline=_g_base if (earnings_on and _lg and _evoid > 0) else None)
     bonus = sum(f["points"] for f in factors)
     return bonus, ", ".join(notes), factors
 
@@ -874,6 +925,23 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def _prob_touch_jump(K: float, spot: float, dte_days: int, diff_vol: Optional[float], mu: float,
+                     m_event: Optional[float], is_put: bool) -> Optional[float]:
+    """EARNINGS-AWARE breach — a JUMP-DIFFUSION touch. The GBM first-passage sees only the continuous path; a
+    print is a discrete overnight JUMP it can't leap. The strike is breached if the continuous path touches OR
+    the earnings gap alone lands past it: P = 1 − (1−P_diffusion)(1−P_jump). P_diffusion uses the BASELINE
+    (non-event) diffusion vol so the event is NOT double-counted; P_jump treats the gap as ~Normal in log-space
+    with std = the isolated event move. Returns None only when the diffusion touch itself is unavailable."""
+    p_diff = _prob_touch(K, spot, dte_days, diff_vol, mu)
+    if p_diff is None:
+        return None
+    p_jump = 0.0
+    if m_event and m_event > 0 and spot and K and K > 0:
+        z = math.log(K / spot) / m_event                    # log-distance to the strike in event-move units
+        p_jump = _norm_cdf(z) if is_put else (1.0 - _norm_cdf(z))   # put = down-jump ≤ K · call = up-jump ≥ K
+    return 1.0 - (1.0 - float(p_diff)) * (1.0 - float(p_jump))
+
+
 def _macd_accel(ta: dict, spot: Optional[float]) -> Optional[dict]:
     """MACD-histogram ACCELERATION (2nd-derivative of momentum) — is the trend's speed increasing?
     accel = Δhistogram over ~3 sessions; accel_norm = accel ÷ spot (scale-free for the veto threshold)."""
@@ -1018,6 +1086,13 @@ _EARN_CLEAN_BONUS = 3.0     # the window ENDS before earnings → clean theta/VR
 _EARN_CRUSH_BONUS = 4.0     # earnings imminent + short strike OUTSIDE the implied move → a real IV-crush harvest
 _EARN_GAP_MULT = 1.5        # earnings-aware #2: require the strike beyond 1.5× the isolated event move (surprises run 2-3×)
 _EARN_GAP_MAX = 10.0        # max "Earnings gap" breach penalty when the strike sits well inside the gap band
+# #3 CONSEQUENCE + smooth-tape re-validation (all gated on the earnings-aware flag):
+_EARN_VOID_SCALE = 0.10     # a ~10% event gap fully VOIDS a continuous-tape credit (gamma-calm / range / calm-tape);
+                            #   a gap is a discontinuity those "the tape is calm" signals can't survive
+_EARN_UNDEF_MULT = 1.6      # AMPLIFY the undefined-risk (naked/unbounded) demerit across a print — the unbounded tail
+                            #   bites exactly on the gap; a defined-risk structure caps it and is preferred
+_EARN_DEFINED_SOFTEN = 0.5  # SOFTEN the Earnings-gap breach penalty for a DEFINED-RISK structure — the gap can breach
+                            #   the short but the long wing CAPS the loss (the consequence is bounded)
 
 
 def _earnings_timing_factor(opp: dict, next_earnings: Optional[str], today) -> tuple:
@@ -1097,7 +1172,7 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
                 hv: Optional[float] = None, gex: Optional[dict] = None,
                 macd: Optional[dict] = None, overwrite: bool = False,
                 next_earnings: Optional[str] = None, today=None,
-                har_rv_pct: Optional[float] = None) -> dict:
+                har_rv_pct: Optional[float] = None, earnings_aware: bool = False) -> dict:
     pm = (dm or {}).get("pm") or {}
     # blocking = STRUCTURAL/quality hard-fails → grade F (avoid). timing_hold = a good trade held on TIMING
     # (momentum against a REACHABLE strike) → WAIT, distinct from F. Kept separate so a fortified trade is
@@ -1111,6 +1186,7 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     comp: dict[str, float] = {"expectation": 0.0, "vrp": 0.0, "moneyness": 0.0,
                               "skew": 0.0, "liquidity": 0.0, "beta": 0.0, "event": 0.0,
                               "undefined_risk": 0.0}
+    comp_baseline: dict[str, float] = {}   # per-key value WITHOUT the earnings-aware adjustment (for the with/without UI)
     if today is None:
         today = date.today()
     is_cal = opp.get("structure") == "calendar"   # LONG-vega, ATM-by-design → the short-vol penalties invert
@@ -1216,7 +1292,9 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     spreads = [l.get("bid_ask_spread_pct") for l in (opp.get("legs") or []) if l.get("bid_ask_spread_pct") is not None]
     worst = max(spreads) if spreads else None
     if worst is not None and worst > 15:
-        demerits.append(f"wide spread ({worst}%)"); comp["liquidity"] -= 8
+        # SCALE with width — a flat −8 let a 100%-spread (untradeable near mid) grade the same as a 16% one.
+        _liq_pen = min(int((worst - 15) / 8.0 * 4) + 4, 20)
+        demerits.append(f"wide spread ({worst}%)" + (" — untradeable near mid" if worst > 40 else "")); comp["liquidity"] -= _liq_pen
     elif worst is not None and worst > 10:
         demerits.append(f"wide-ish spread ({worst}%)"); comp["liquidity"] -= 5
     elif worst is not None and worst < 5:
@@ -1244,25 +1322,35 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     #     fat the 1% tail is (CVaR99 ÷ capital — naked structures run 2-4×) AND by reachability (a deep,
     #     low-touch strike's unbounded tail is remote; a near-money one is live). Overwrite (income overlay on
     #     held shares) is EXEMPT — that short call is covered, its loss is bounded.
+    _earn_on = bool(earnings_aware and opp.get("earnings_gap_pct"))    # flag AND a print straddles the window
     if opp.get("max_loss") is None and not overwrite:      # max_loss None = unbounded (naked call / short strangle)
         _cap = opp.get("collateral") or opp.get("notional_capital")
         _cvar99 = (dm.get("risk") or {}).get("cvar_99")
         _tail_mult = _clampf((_cvar99 / _cap) / 3.0, 0.5, 1.5) if (_cvar99 and _cap and _cap > 0) else 1.0
-        _pt = opp.get("prob_touch_pct")                    # set by _ta_alignment (runs first)
+        _pt = opp.get("prob_touch_pct")                    # set by _ta_alignment (runs first) — earnings-aware when the flag is on
         if _pt is not None:
             _reach = _clampf(_pt / _UNDEFINED_TOUCH_FULL, _UNDEFINED_REACH_FLOOR, 1.0)
         elif nss is not None:
             _reach = _clampf((2.0 - nss) / 1.5, _UNDEFINED_REACH_FLOOR, 1.0)   # deep (high σ) → floor · near-money → full
         else:
             _reach = 0.5
-        _ur = -round(min(_UNDEFINED_RISK_BASE * _tail_mult * _reach, _UNDEFINED_DEMERIT_CAP), 1)
+        _ur_raw = _UNDEFINED_RISK_BASE * _tail_mult * _reach
+        _ur_base = -round(min(_ur_raw, _UNDEFINED_DEMERIT_CAP), 1)             # WITHOUT the earnings amplification
+        # #3 CONSEQUENCE — the unbounded tail bites EXACTLY on an earnings gap → amplify the naked demerit across
+        # a print (the cap rises with it), steering capital toward defined-risk structures. Baseline shown.
+        _mult = _EARN_UNDEF_MULT if _earn_on else 1.0
+        _ur = -round(min(_ur_raw * _mult, _UNDEFINED_DEMERIT_CAP * _mult), 1)
         if _ur < 0:
             comp["undefined_risk"] += _ur
+            if _earn_on and round(_ur, 1) != round(_ur_base, 1):
+                comp_baseline["undefined_risk"] = _ur_base                    # with/without for the UI
             _pctxt = (f"P(touch) {round(_pt)}%" if _pt is not None
                       else (f"{round(nss, 2)}σ to the strike" if nss is not None else "unknown reach"))
             _c99txt = f"CVaR99 {round(_cvar99 / _cap * 100)}% of capital" if (_cvar99 and _cap) else "unbounded loss"
             demerits.append(f"undefined-risk (unbounded loss): {_c99txt} — a deep tail the CVaR95 base term omits; "
-                            f"{_pctxt} → {'remote' if _reach <= 0.45 else 'live'} exposure")
+                            f"{_pctxt} → {'remote' if _reach <= 0.45 else 'live'} exposure"
+                            + (f"; AMPLIFIED ×{_EARN_UNDEF_MULT} across the earnings print — an unbounded structure is worst here, "
+                               f"a defined-risk (spread/condor) caps the gap loss" if (_earn_on and round(_ur, 1) != round(_ur_base, 1)) else ""))
 
     # 8) Dealer gamma HARD FILTER — a SHORT-gamma tape (dealers chase moves → vol expansion) runs
     #    DELTA-NEUTRAL premium over both ways: veto iron condors. Directional income is only penalised
@@ -1303,7 +1391,7 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
 
     adj = sum(comp.values())
     return {"adj": adj, "merits": merits, "demerits": demerits, "blocking": blocking,
-            "timing_hold": timing_hold, "components": comp,
+            "timing_hold": timing_hold, "components": comp, "components_baseline": comp_baseline,
             "iv_edge_vp": iv_edge_vp,   # short-strike IV vs ATM (vol-pts) — the per-strike skew premium / edge
             # Q-vs-P boundary read (for the number-line viz): implied vs physical 1σ moves + strike distance.
             "qp": {"implied_move_pct": imp_em, "physical_move_pct": phys_em, "dual_move_pct": dual_em,
@@ -1544,12 +1632,23 @@ def _candidate_json(i: int, r: dict, meta: dict) -> dict:
         "pricing": {"net_premium": r.get("premium"), "premium_annualized_pct": r.get("premium_annualized_pct"),
                     "sofr_hurdle_pct": r.get("sofr_pct"), "max_profit": r.get("max_profit"),
                     "max_loss": r.get("max_loss"), "collateral": r.get("collateral")},
-        "probability": {"keep_prob_pct": r.get("prob_keep_pct")},
+        "probability": {"keep_prob_pct": r.get("prob_keep_pct"),
+                        # BREACH (does it EVER go ITM) — jump-aware & earnings-aware when the flag is on; ~2× expiry-ITM.
+                        "prob_touch_pct": r.get("prob_touch_pct"),
+                        "keep_prob_source": r.get("prob_method")},   # RND · BS · BS_fallback (RND degenerate → IV-estimate; treat Win% as approx)
         "volatility": {"atm_iv_pct": r.get("atm_iv_pct"), "iv_hv_ratio": r.get("iv_hv_ratio"),
                        "expected_move_pct_1sigma": _expected_move_pct(r)},   # 1σ implied move to expiry
+        # EARNINGS — the isolated single-day event move (%) when a print falls before expiry; a discontinuous
+        # gap the diffusion σ can't see (walls it can leap, jump breach, unbounded-tail amplification).
+        "earnings": {"gap_pct": r.get("earnings_gap_pct"), "print_before_expiry": bool(r.get("earnings_gap_pct"))},
         "pm_ratios": dm.get("pm") or {},                # Omega/Sortino/Calmar/EV/Kelly/expected_return
         "risk": dm.get("risk") or {},                   # VaR95/CVaR95/max_loss/capital
         "net_greeks": dm.get("trader") or {},           # Δ/Γ/Θ/ν + Vanna/Charm/Volga + avg_iv
+        # ITEMIZED auditable factors (each with points + evidence; earnings-impacted ones carry baseline_points =
+        # value WITHOUT the earnings adjustment). grade_adjustments = option-math (VRP/Moneyness/Skew/Liquidity/
+        # Beta/Undefined-risk); ta_factors = Trend/Structure/Breach/Fortified/Gamma-regime/Earnings-gap/LVN.
+        "factors": {"grade_adjustments": r.get("grade_adjustments") or [], "ta_factors": r.get("ta_factors") or []},
+        "execution": r.get("confidence") or {},         # fill/liquidity read (label/score/reasons — a wide bid-ask caps it)
         "institutional": _candidate_extra(r, meta, max_oi_strike),
         "flags": [f.get("text") for f in (r.get("flags") or [])],
         # WATCH→DEFEND→EXIT price ladder from the TA levels + trade geometry — the pre-committed management
@@ -1674,7 +1773,17 @@ def _desk_payload(desk: dict, focus_index: Optional[int] = None) -> dict:
                           "(the override), else pass; structurally_broken (bps < -75) → HARD reject (toxic "
                           "liquidity/skew), NO override; positive_alpha → clears on its own. Do NOT treat a small "
                           "negative bps as capital destruction, and do NOT use a VRP override to buy a "
-                          "structurally_broken trade."),
+                          "structurally_broken trade.\n"
+                          "NEWEST METRICS (weigh these): probability.prob_touch_pct = the BREACH (ever-ITM) odds, "
+                          "jump-aware — for an income seller the worst outcome is going ITM, so a high touch is a "
+                          "bigger red flag than a slightly lower Win%. probability.keep_prob_source='BS_fallback' "
+                          "means the chain IV was inconsistent so treat Win% as an ESTIMATE. earnings.gap_pct (when "
+                          "a print is before expiry) is a DISCONTINUOUS overnight move that jumps THROUGH walls and "
+                          "voids 'calm tape' credits — an UNDEFINED-RISK (naked, max_loss null) structure is worst "
+                          "across a print; a defined-risk one caps the gap. factors.grade_adjustments / ta_factors "
+                          "are the itemized reasons (a factor's baseline_points = its value WITHOUT the earnings "
+                          "adjustment — the delta IS what earnings did). execution.label: a wide bid-ask can't fill "
+                          "near mid, so 'Low' means the quoted credit/yield is optimistic — discount it."),
         "events_before_expiry": desk.get("events") or [],
         "technical_analysis": _ta_json(desk.get("ta") or {}),
         "algo_top_pick_id": 1 if ranked else None,
@@ -1734,6 +1843,35 @@ async def _term_structure_probe(ticker: str, spot: float, front_dte: Optional[in
 # Deterministic ranking (no LLM)
 # ---------------------------------------------------------------------------
 
+# A desk review transiently balloons RSS (up to MAX_EXPIRIES option chains + a fine-grid lifecycle
+# reprice for EVERY candidate). On a single 512 MiB Cloud Run instance shared by many users, two
+# concurrent reviews stack their peaks and OOM. Serialise the heavy SCAN so LIGHT endpoints stay fully
+# concurrent while at most _DESK_SCAN_CONCURRENCY reviews compute at once (raise only with more memory).
+_DESK_SCAN_CONCURRENCY = 1
+_SCAN_SEMAPHORE = asyncio.Semaphore(_DESK_SCAN_CONCURRENCY)
+
+
+def _release_memory() -> None:
+    """Return the scan's freed heap back to the OS after a desk review.
+
+    ``rank_desk`` transiently holds several option-chain DataFrames (up to
+    ``MAX_EXPIRIES``) plus per-candidate RND / payoff grids. Python frees those
+    the moment the scan returns, but glibc keeps the emptied malloc arenas
+    resident — so on a 512 MiB Cloud Run instance the RSS stays pinned near the
+    ceiling and the NEXT desk review stacks on top of it and OOMs (the observed
+    "526 MiB used" 503). ``malloc_trim`` hands the arenas back to the kernel so
+    each request starts from a low floor. Best-effort: a no-op off glibc / on any
+    failure (e.g. local macOS dev), so it is always safe to call.
+    """
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — non-glibc platform or missing symbol
+        pass
+
+
 async def rank_desk(
     ticker: str,
     target_dte: Optional[int] = None,
@@ -1757,23 +1895,28 @@ async def rank_desk(
     # Fetch the TECHNICAL read FIRST so the scan can bias multi-leg SHORT strikes toward real structural
     # levels (S/R, value area, dealer gamma walls/flip). The SAME ta/gex/portfolio_fit are handed to
     # _finalize_desk so the read happens ONCE — no double fetch, same total latency (already sequential).
-    ta, portfolio_fit, gex = await asyncio.gather(
-        asyncio.to_thread(_ta_sync, ticker),
-        asyncio.to_thread(_portfolio_fit_sync, ticker),
-        asyncio.to_thread(_gex_sync, ticker),
-    )
-    scan = await run_derivative_income(
-        ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
-        structures=structures, quote_source=quote_source, user=user, db=db,
-        target_expiration=target_expiration, focus=focus, owns_underlying=owns_underlying,
-        ta_levels=_structural_levels(ta, gex),
-    )
-    if scan.get("error"):
-        return {"error": scan["error"]}
-    return await _finalize_desk(scan, scan.get("opportunities", []), ticker,
-                                quote_source, owns_underlying, user, db, target_dte,
-                                collapse_strikes=True, ta=ta, portfolio_fit=portfolio_fit, gex=gex,
-                                earnings_aware=earnings_aware)
+    # The whole memory-heavy scan runs under _SCAN_SEMAPHORE so concurrent reviews on the single shared
+    # instance queue instead of stacking their peaks and OOMing; light endpoints are unaffected.
+    async with _SCAN_SEMAPHORE:
+        ta, portfolio_fit, gex = await asyncio.gather(
+            asyncio.to_thread(_ta_sync, ticker),
+            asyncio.to_thread(_portfolio_fit_sync, ticker),
+            asyncio.to_thread(_gex_sync, ticker),
+        )
+        scan = await run_derivative_income(
+            ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
+            structures=structures, quote_source=quote_source, user=user, db=db,
+            target_expiration=target_expiration, focus=focus, owns_underlying=owns_underlying,
+            ta_levels=_structural_levels(ta, gex),
+        )
+        if scan.get("error"):
+            return {"error": scan["error"]}
+        result = await _finalize_desk(scan, scan.get("opportunities", []), ticker,
+                                      quote_source, owns_underlying, user, db, target_dte,
+                                      collapse_strikes=True, ta=ta, portfolio_fit=portfolio_fit, gex=gex,
+                                      earnings_aware=earnings_aware)
+        _release_memory()   # return freed chains/RND arenas to the OS BEFORE the next queued review starts
+    return result
 
 
 # ── Risk triggers — the price-level management plan ──────────────────────
@@ -2342,16 +2485,23 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
                         iv_percentile=vsx.get("iv_percentile"),
                         hv=phys_vol, gex=gex, macd=macd_accel, overwrite=overwrite,
                         next_earnings=(ctx or {}).get("next_earnings"), today=date.today(),
-                        har_rv_pct=vsx.get("har_rv_pct"))
+                        har_rv_pct=vsx.get("har_rv_pct"), earnings_aware=earnings_aware)
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
         grade, approval = _grade_letter(desk_score, g["blocking"], g.get("timing_hold"))
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
         # factors are their OWN group (ta_factors), kept separate from the option-math adjustments:
         #   desk_score = base_quality + Σ(grade_adjustments) + Σ(ta_factors).
         c = g["components"]
+        cb = g.get("components_baseline") or {}
         _notes = (g["merits"] or []) + (g["demerits"] or [])   # attach each bar's own evidence line (symmetry w/ TA)
+        def _adj(lbl, key):
+            a = {"label": lbl, "points": round(c[key], 1), "detail": _adj_detail(lbl, _notes)}
+            if key in cb and round(cb[key], 1) != round(c[key], 1):   # earnings-aware with/without (same shape as ta_factors)
+                a["baseline_points"] = round(cb[key], 1)
+                a["earnings_impacted"] = True
+            return a
         grade_adjustments = [
-            {"label": lbl, "points": round(c[key], 1), "detail": _adj_detail(lbl, _notes)}
+            _adj(lbl, key)
             for lbl, key in (("Expectation", "expectation"), ("VRP", "vrp"), ("Moneyness", "moneyness"),
                              ("Skew / IV-edge", "skew"), ("Liquidity", "liquidity"), ("Beta", "beta"),
                              ("Earnings timing", "event"), ("Undefined risk", "undefined_risk"))
@@ -3028,6 +3178,149 @@ def _find_focus_index(ranked: list[dict], structure: Optional[str], expiration: 
     return None
 
 
+# Structures the fresh-chain desk score is well-defined for (priced at EXACT legs off the chain).
+# Anything else (collar, calendars, ratios, custom multi-leg, plain stock) has no meaningful
+# re-scored read — callers should fall back to the always-present entry Quant Algorithmic card.
+DESK_SCORABLE_STRUCTURES = {
+    "covered_call", "naked_call", "cash_secured_put", "put_credit_spread",
+    "call_credit_spread", "short_strangle", "iron_condor", "jade_lizard",
+}
+
+
+def focus_legs_from_legs(legs: list[dict]) -> list[dict]:
+    """Map a trade's stored legs → the FOCUS leg descriptors ``rank_desk`` prices exactly
+    (``{strike, right: C|P, action: BUY|SELL}``). Shared by the placed-trade desk score and the
+    paper-trade refresh so both re-price the same way."""
+    out = []
+    for l in legs or []:
+        if not l.get("strike"):
+            continue
+        typ = str(l.get("type", "")).upper()
+        right = "C" if ("CALL" in typ or typ == "C") else "P"
+        action = "SELL" if "SELL" in str(l.get("action", "")).upper() else "BUY"
+        out.append({"strike": float(l["strike"]), "right": right, "action": action})
+    return out
+
+
+async def reprice_desk_focus(
+    *, ticker: str, structure: str, expiration: Optional[str], short_strike: Optional[float],
+    legs: list[dict], target_dte: Optional[int], user, db, quote_source: str = "yfinance",
+) -> tuple[Optional[dict], dict]:
+    """Re-price THIS exact income trade off a FRESH chain via an injected FOCUS built from its
+    legs (ONE ``rank_desk`` call — price/bid-ask/greeks/IV/OI/vol at the exact strikes, even
+    off-grid). Returns ``(row, desk)`` on success; ``(None, error_dict)`` when the structure
+    isn't fresh-chain-scorable or the exact legs can't be priced.
+
+    The single heavy step behind both the placed-trade desk score and the paper-trade refresh —
+    isolated so callers do it exactly once, then score the returned row cheaply/purely."""
+    if structure not in DESK_SCORABLE_STRUCTURES:
+        return None, {"matched": False,
+                      "error": "A fresh-chain desk score isn't defined for this structure — "
+                               "the scored Quant Algorithmic card above is the read for this trade."}
+    focus = {"structure": structure, "expiration": expiration,
+             "legs": focus_legs_from_legs(legs)}
+    desk = await rank_desk(
+        ticker, target_dte=target_dte, min_prob=0.0, min_income=0.0,
+        structures=[structure], quote_source=quote_source,
+        user=user, db=db, target_expiration=expiration, focus=focus,
+    )
+    if desk.get("error"):
+        return None, {"matched": False, "error": desk["error"]}
+    ranked = desk.get("ranked", []) or []
+    # Prefer the injected focus candidate; fall back to the strike/expiry matcher.
+    idx = next((i for i, rr in enumerate(ranked) if rr.get("_is_focus")), None)
+    if idx is None:
+        idx = _find_focus_index(ranked, structure, expiration, short_strike)
+    if idx is None:
+        return None, {"matched": False,
+                      "error": "Couldn't price this trade's exact legs from the current chain "
+                               "(illiquid/unlisted strike or expiry). The scored Quant Algorithmic "
+                               "card above still applies."}
+    return ranked[idx], desk
+
+
+def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structure: str) -> dict:
+    """PURE assembly (no I/O): given a repriced focus ``row`` + the ``desk`` payload + a live
+    ``pnl_snapshot`` (dte_remaining / captured_pct / unrealized_pnl / max_profit / max_loss),
+    build the full desk-score result the UI renders — base quality + option-math + TA + Q-vs-P,
+    then the holder-re-signed ``management_desk_score`` overlay → the 4-level hold/close signal."""
+    pnl = pnl_snapshot or {}
+    a = pnl.get("analysis", {}) or {}
+    dte = a.get("dte_remaining")
+    _dm = row.get("desk_metrics") or {}
+    subscores = ((_dm.get("quant") or {}).get("subscores")) or {}
+    _pm = _dm.get("pm") or {}          # Omega / Sortino / Calmar (risk-adjusted quality)
+    _risk = _dm.get("risk") or {}      # VaR / CVaR / capital (the manageable-tail check)
+    _trader = _dm.get("trader") or {}  # live greeks incl. the dynamic (vanna/charm/volga)
+    qp = row.get("qp") or {}
+    mgmt = management_desk_score(
+        keep_drift_pct=qp.get("keep_drift_pct"),
+        keep_standard_pct=qp.get("keep_standard_pct") or row.get("prob_keep_pct"),
+        subscores=subscores, grade_adjustments=row.get("grade_adjustments"),
+        ta_factors=row.get("ta_factors"), captured_pct=a.get("captured_pct"), dte_days=dte,
+        unrealized_pnl=pnl.get("unrealized_pnl"),
+        max_profit=pnl.get("max_profit"), max_loss=pnl.get("max_loss"),
+        cushion_pct=row.get("cushion_pct"), structure=structure,
+        omega=_pm.get("omega"), sortino=_pm.get("sortino"),
+        cvar95=_risk.get("cvar_95"), capital=_risk.get("capital"),
+        net_gamma=_trader.get("net_gamma"), net_vega=_trader.get("net_vega"),
+        net_theta=_trader.get("net_theta"),
+    )
+    return {
+        "matched": True,
+        "desk_score": row.get("desk_score"),
+        "base_quality": row.get("base_quality"),
+        "subscores": subscores,
+        "grade_adjustments": row.get("grade_adjustments", []),   # OPTION MATH
+        "ta_factors": row.get("ta_factors", []),                 # TECHNICALS
+        "qp": row.get("qp", {}),                                 # Q vs P (VRP boundary)
+        "algo_grade": row.get("algo_grade"),
+        "merits": row.get("grade_merits", []),
+        "demerits": row.get("grade_demerits", []),
+        "blocking": row.get("grade_blocking", []),
+        # The full opportunity → render the SAME OpportunityCard as the scan.
+        "opp": json.loads(json.dumps(row, default=_json_default)),
+        "spot": desk.get("spot") or (desk.get("context") or {}).get("spot"),
+        "signal": mgmt["signal"],
+        "lifecycle_score": mgmt["score"],
+        "overrides": mgmt["overrides"],
+        "management_analysis": {
+            "anchor": mgmt["anchor"],
+            "anchor_label": mgmt["anchor_label"],
+            "contributions": mgmt["contributions"],   # re-signed scan factors (holder view)
+            "factors_net": mgmt["factors_net"],
+            "overlay": mgmt["overlay"],               # take-profit / time-gamma
+            "score": mgmt["score"],
+            "signal": mgmt["signal"],
+            "overrides": mgmt["overrides"],
+            "advisories": mgmt["advisories"],         # covered / naked call advice
+        },
+        # keep for back-compat with the light card's buildup line:
+        "lifecycle_adjustments": mgmt["overlay"],
+        "hold_base": mgmt["anchor"],
+        "base_source": "neutral",
+    }
+
+
+async def compute_placed_desk_score(
+    *, ticker: str, structure: str, expiration: Optional[str], short_strike: Optional[float],
+    legs: list[dict], pnl_snapshot: dict, user, db, quote_source: str = "yfinance",
+) -> dict:
+    """The FULL institutional desk score for an ALREADY-PLACED income trade — reprice the exact
+    legs (``reprice_desk_focus``) then score the holder overlay (``score_desk_management``).
+    Returns ``{matched: False, error}`` when it can't be priced. Shared by
+    ``POST /saved-strategies/{id}/desk-score`` and the paper-trade ``/refresh`` path so the two
+    compute identically (one engine, one code path)."""
+    dte = (pnl_snapshot or {}).get("analysis", {}).get("dte_remaining")
+    row, desk = await reprice_desk_focus(
+        ticker=ticker, structure=structure, expiration=expiration, short_strike=short_strike,
+        legs=legs, target_dte=dte, user=user, db=db, quote_source=quote_source,
+    )
+    if row is None:
+        return desk  # error dict
+    return score_desk_management(row, desk, pnl_snapshot=pnl_snapshot, structure=structure)
+
+
 async def _run_agent(role: str, persona: dict, context: str, api_key: str, model: str) -> dict:
     messages = [
         {"role": "system", "content": persona["system"]},
@@ -3055,7 +3348,12 @@ _BLIND_SYS = (
     "CVaR, keep-prob, an event date). If you can't cite a number, don't assert it.\n"
     "• The quant math (greeks, CVaR, keep-prob, expected move) is GIVEN and correct — USE it, never recompute.\n"
     "• Judge what a mechanical screen can't: does the vol / cushion / event / regime picture actually FIT "
-    "together, and what is the real risk. Be willing to DISAGREE with what a rule model would conclude."
+    "together, and what is the real risk. Be willing to DISAGREE with what a rule model would conclude.\n"
+    "• KEY FACTS to weigh: probability.breach_touch_pct = the chance it EVER goes ITM (not just at expiry) — "
+    "for a premium seller a high touch is the real danger. volatility.earnings_implied_gap_pct (if set) is a "
+    "DISCONTINUOUS overnight jump before expiry that can leap the cushion in one move — size against it, not the "
+    "smooth 1σ. liquidity.worst_leg_bid_ask_spread_pct: if wide, the mid isn't fillable so the credit/yield is "
+    "OPTIMISTIC. keep_prob_source='BS_fallback' → the chain IV was inconsistent, so treat keep-prob as an estimate."
 )
 _BLIND_GUIDE = (
     "\n\nFill this template EXACTLY — nothing before or after it:\n"
@@ -3085,8 +3383,16 @@ def _blind_facts(r: dict, desk: dict) -> dict:
                        "forward_rv_har_pct": vs.get("har_rv_pct"), "iv_over_hv": r.get("iv_hv_ratio"),
                        "iv_minus_har_vp": vs.get("iv_vs_har_pts"), "iv_rank": vs.get("iv_rank"),
                        "iv_percentile": vs.get("iv_percentile"), "skew_pts": vs.get("skew_pts"),
-                       "expected_move_pct_1sigma": _expected_move_pct(r)},
-        "probability_from_option_market_RND": {"keep_prob_pct": r.get("prob_keep_pct")},
+                       "expected_move_pct_1sigma": _expected_move_pct(r),
+                       # RAW market-implied EARNINGS gap (isolated event move) when a print falls before expiry —
+                       # a discontinuous jump the 1σ diffusion move can't capture. None = no print in the window.
+                       "earnings_implied_gap_pct": r.get("earnings_gap_pct")},
+        "probability_from_option_market_RND": {"keep_prob_pct": r.get("prob_keep_pct"),
+                       "breach_touch_pct": r.get("prob_touch_pct"),   # chance it EVER goes ITM (barrier hit; ~2× expiry-ITM)
+                       "keep_prob_source": r.get("prob_method")},      # RND · BS · BS_fallback (RND was degenerate → treat keep% as an estimate)
+        "liquidity": {"worst_leg_bid_ask_spread_pct": max([l.get("bid_ask_spread_pct") for l in (r.get("legs") or [])
+                                                           if l.get("bid_ask_spread_pct") is not None] or [None]),
+                      "note": "a wide bid-ask means the mid isn't a fillable price — the yield/credit is optimistic"},
         "quant_facts": {"pm_ratios": dm.get("pm") or {}, "risk": dm.get("risk") or {},   # from the RND payoff — not our score
                         "greeks": dm.get("trader") or {}},
         "yield": {"premium_annualized_pct": r.get("premium_annualized_pct")},

@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import {
   Gauge, Loader2, AlertTriangle, Cpu, Shield, Briefcase, ChevronDown, ChevronUp,
-  Play, Terminal, Maximize2, X, MessageSquare, Activity, LineChart, Layers, Zap, Sparkles,
+  Play, Terminal, Maximize2, X, MessageSquare, MessageCircle, Newspaper, Activity, LineChart, Layers, Zap, Sparkles, Check, Network, GitCompare,
+  Info, ShieldCheck, Lightbulb, TrendingDown, TrendingUp,
 } from 'lucide-react';
-import { runDeskReview, runDeskReviewAgents, runDeskMonitor, runDeskMonitorAnalyze, runDeskBlind } from '../api';
+import { runDeskReview, runDeskReviewAgents, runDeskMonitor, runDeskMonitorAnalyze, runDeskBlind, createPaperTrade, fetchMarketSentiment, fetchBookExposure } from '../api';
+import type { MarketSentimentResult, BookExposureResult } from '../api';
 import { RatingsHelpButton } from './RatingsHelp';
 import DeskDebateModal from './DeskDebateModal';
 import { OpportunitySummary, LegsTable } from './DerivativeIncome';
@@ -259,7 +261,11 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
       {/* 2) Option-math factor adjustments — bars, then the net at the end */}
       {adjs.length > 0 && (
         <div className="mb-2.5">
-          <div className={GROUP_LABEL}>Regime &amp; factor adjustments — option math (± on base)</div>
+          <div className={GROUP_LABEL}>Regime &amp; factor adjustments — option math (± on base)
+            {adjs.some(a => a.earnings_impacted) && (
+              <span className="ml-2 badge badge-xs badge-warning badge-outline align-middle normal-case">earnings-aware · with/without below</span>
+            )}
+          </div>
           <div className="flex flex-wrap gap-2">
             {adjs.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
           </div>
@@ -270,7 +276,15 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
               {adjs.filter(a => a.detail).map((a, i) => (
                 <li key={i} className="flex gap-2 text-[11px] leading-snug">
                   <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
-                  <span className="text-base-content/65"><b className="text-base-content/85">{a.label}</b> · {a.detail}</span>
+                  <span className="text-base-content/65">
+                    <b className="text-base-content/85">{a.label}</b>
+                    {a.earnings_impacted && a.baseline_points != null && (
+                      <span className="ml-1 inline-flex items-baseline gap-1 rounded bg-warning/15 border border-warning/30 px-1 text-[9px] text-warning/90 align-middle whitespace-nowrap">
+                        earnings: <span className="line-through opacity-60">{a.baseline_points > 0 ? '+' : ''}{a.baseline_points}</span>→<b>{a.points > 0 ? '+' : ''}{a.points}</b>
+                      </span>
+                    )}
+                    {' · '}{a.detail}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -545,9 +559,308 @@ function BlindReadCard({ data }: { data: BlindRead }) {
   );
 }
 
-function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams; evaluate?: DeskEvaluateParams }) {
+// Market-sentiment panel — the crowd + news read for this trade, framed around the short leg. Additional
+// colour, never part of the grade.
+function SentimentCard({ data }: { data: MarketSentimentResult }) {
+  const r = data.read || {};
+  const sent = (r.sentiment || '').toLowerCase();
+  const tone = sent.includes('bull') ? 'text-success border-success/40 bg-success/[0.08]'
+    : sent.includes('bear') ? 'text-error border-error/40 bg-error/[0.08]'
+    : sent.includes('mix') ? 'text-warning border-warning/40 bg-warning/[0.08]'
+    : 'text-base-content/60 border-white/[0.12] bg-base-200/40';
+  const st = data.sources?.stocktwits;
+  const news = data.sources?.news || [];
+  return (
+    <div className="rounded-lg border border-accent/25 bg-accent/[0.03] p-3 space-y-2 text-[12px]">
+      <div className="flex items-center gap-2 flex-wrap">
+        <MessageCircle className="w-4 h-4 text-accent" />
+        <span className="text-[10px] uppercase tracking-wider font-semibold text-accent/80">Market Sentiment</span>
+        <span className="text-[9px] text-base-content/40">news + StockTwits · for this trade</span>
+        {r.sentiment && <span className={`ml-auto text-sm font-bold uppercase rounded px-2 py-0.5 border ${tone}`}>{r.sentiment}{r.strength ? ` · ${r.strength}` : ''}</span>}
+      </div>
+      {r.summary && <p className="text-base-content/80 leading-snug">{r.summary}</p>}
+      {r.earnings && (
+        <div className="rounded border border-warning/25 bg-warning/[0.06] px-2 py-1.5 leading-snug">
+          <span className="text-[9px] uppercase tracking-wider text-warning/70">Earnings setup</span>
+          <p className="text-base-content/80">{r.earnings}</p>
+        </div>
+      )}
+      {r.trade_implication && (
+        <div className="rounded border border-accent/30 bg-accent/[0.07] px-2 py-1.5 leading-snug">
+          <span className="text-[9px] uppercase tracking-wider text-accent/70">What it means for your short leg</span>
+          <p className="text-base-content/85 font-medium">{r.trade_implication}</p>
+        </div>
+      )}
+      {r.price_levels && <p className="text-[11px] text-base-content/70"><span className="text-[9px] uppercase text-base-content/40">Levels watched · </span>{r.price_levels}</p>}
+      {r.catalysts && r.catalysts.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {r.catalysts.map((c, i) => <span key={i} className="badge badge-xs badge-outline text-[9px]">{c}</span>)}
+        </div>
+      )}
+      <div className="flex items-center gap-3 flex-wrap text-[10px] text-base-content/50 border-t border-white/[0.06] pt-1.5">
+        {st?.url && <a href={st.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-accent"><MessageCircle className="w-3 h-3" />{st.count ?? 0} StockTwits</a>}
+        {news.length > 0 && <span className="inline-flex items-center gap-1"><Newspaper className="w-3 h-3" />{news.length} headlines</span>}
+        {r.confidence && <span>signal: {r.confidence}</span>}
+      </div>
+      {news.length > 0 && (
+        <ul className="space-y-0.5">
+          {news.slice(0, 5).map((n, i) => (
+            <li key={i} className="text-[10.5px] leading-snug truncate">
+              {n.link ? <a href={n.link} target="_blank" rel="noreferrer" className="text-base-content/60 hover:text-accent">· {n.title}</a> : <span className="text-base-content/60">· {n.title}</span>}
+              {n.publisher && <span className="text-base-content/35"> — {n.publisher}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-[9px] text-base-content/35 border-t border-white/[0.06] pt-1">
+        {r.caveat || 'Qualitative colour from news + crowd chatter — NOT part of the grade. Social is noisy; treat it as context, not truth.'}
+      </p>
+    </div>
+  );
+}
+
+// Book-Exposure panel — DETERMINISTIC (no LLM). Verdict-led: a one-glance read on whether this trade
+// concentrates or diversifies the user's OPEN book, in plain language, with the concrete numbers
+// (computed by the Manage-Book engine) tucked into a details drawer.
+const _expMoney = (n?: number | null) => {
+  if (n == null || Number.isNaN(n)) return '—';
+  const s = Math.abs(Math.round(n)).toLocaleString('en-US');
+  return n < 0 ? `−$${s}` : `$${s}`;
+};
+const _pnlTone = (n?: number | null) => (n == null ? 'text-base-content/60' : n > 0 ? 'text-success' : n < 0 ? 'text-error' : 'text-base-content/60');
+const _dotTone = (t: string) => (t === 'bad' ? 'bg-error' : t === 'warn' ? 'bg-warning' : t === 'good' ? 'bg-success' : 'bg-info');
+
+function ExposureCard({ data }: { data: BookExposureResult }) {
+  const verdict = data.verdict || 'neutral';
+  const vCfg = verdict === 'concentrates'
+    ? { tone: 'text-error border-error/40 bg-error/[0.08]', Icon: AlertTriangle, word: 'Concentrates risk' }
+    : verdict === 'diversifies'
+    ? { tone: 'text-success border-success/40 bg-success/[0.08]', Icon: ShieldCheck, word: 'Diversifies' }
+    : { tone: 'text-info border-info/40 bg-info/[0.08]', Icon: Info, word: 'Neutral' };
+  const VIcon = vCfg.Icon;
+  const kp = data.key_points || [];
+  const mm = data.market_move || {};
+  const down = mm.down20; const up = mm.up20;
+  const rows = mm.rows || [];
+  const corrs = data.correlations || [];
+  const macro = data.macro || [];
+  const sn = data.same_name;
+  const dir = data.direction;
+  const themes = data.theme_overlap || [];
+  const earnings = data.related_earnings || [];
+  const sector = data.sector_overlap;
+  const prof = data.candidate_profile;
+
+  return (
+    <div className="rounded-lg border border-secondary/25 bg-secondary/[0.03] p-3 space-y-3 text-[12px]">
+      <div className="flex items-center gap-2 flex-wrap">
+        <Network className="w-4 h-4 text-secondary" />
+        <span className="text-[10px] uppercase tracking-wider font-semibold text-secondary/80">Book Exposure</span>
+        <span className="text-[9px] text-base-content/40">vs your open book · computed, not a grade</span>
+        <span className="ml-auto text-[10px] text-base-content/50">
+          {data.book?.position_count ?? 0} position{(data.book?.position_count ?? 0) === 1 ? '' : 's'} · {data.book?.names?.length ?? 0} names
+        </span>
+      </div>
+
+      {/* VERDICT HERO — the one-glance answer. */}
+      <div className={`rounded-lg border px-3 py-2.5 flex items-start gap-2.5 ${vCfg.tone}`}>
+        <VIcon className="w-5 h-5 mt-0.5 shrink-0" />
+        <div>
+          <div className="text-[13px] font-bold uppercase tracking-wide leading-none">{vCfg.word}</div>
+          {data.headline && <div className="text-[12.5px] text-base-content/85 mt-1 leading-snug font-medium">{data.headline}</div>}
+        </div>
+      </div>
+
+      {data.empty_book ? null : (
+        <>
+          {/* KEY POINTS — the plain-language reasons. */}
+          {kp.length > 0 && (
+            <ul className="space-y-1.5">
+              {kp.map((k, i) => (
+                <li key={i} className="flex items-start gap-2 leading-snug">
+                  <span className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${_dotTone(k.tone)}`} />
+                  <span className="text-[12px] text-base-content/85">{k.text}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {/* THEME overlap — the shared underlying themes (crypto / gold / AI data-center …). */}
+          {themes.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {themes.map((t, i) => (
+                <span key={i} className="inline-flex items-baseline gap-1 rounded border border-secondary/30 bg-secondary/[0.06] px-2 py-0.5 text-[10.5px]">
+                  <span className="font-semibold text-secondary">{t.theme}</span>
+                  <span className="text-base-content/55">with {t.book_tickers.slice(0, 4).join(', ')}{t.book_tickers.length > 4 ? '…' : ''}</span>
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* RELATED EARNINGS in the window — a shared catalyst that can gap several positions. */}
+          {earnings.length > 0 && (
+            <div className="rounded border border-warning/30 bg-warning/[0.07] px-2.5 py-1.5 flex items-start gap-2">
+              <Zap className="w-4 h-4 text-warning mt-0.5 shrink-0" />
+              <div className="text-[11px] leading-snug text-base-content/85">
+                {earnings.slice(0, 2).map((e, i) => (
+                  <div key={i}><b>{e.bellwether}</b> reports in {e.days_out}d ({e.date}) — moves the whole <span className="text-warning">{e.theme}</span> group your book holds.</div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* MARKET-MOVE IMPACT — the concrete money, framed simply. */}
+          {(down || up) && (
+            <div>
+              <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1">If the market makes a big move (your whole book, with this trade)</div>
+              <div className="grid grid-cols-2 gap-2">
+                {down && (
+                  <div className="rounded border border-error/20 bg-error/[0.04] px-2.5 py-2">
+                    <div className="flex items-center gap-1 text-[9.5px] uppercase tracking-wider text-error/70"><TrendingDown className="w-3 h-3" /> Market −20%</div>
+                    <div className={`text-[15px] font-bold mt-0.5 ${_pnlTone(down.with_pnl)}`}>{_expMoney(down.with_pnl)}</div>
+                    <div className="text-[9.5px] text-base-content/45">book alone {_expMoney(down.book_pnl)} · this trade {down.delta_pnl >= 0 ? '+' : ''}{_expMoney(down.delta_pnl)}</div>
+                  </div>
+                )}
+                {up && (
+                  <div className="rounded border border-success/20 bg-success/[0.04] px-2.5 py-2">
+                    <div className="flex items-center gap-1 text-[9.5px] uppercase tracking-wider text-success/70"><TrendingUp className="w-3 h-3" /> Market +20%</div>
+                    <div className={`text-[15px] font-bold mt-0.5 ${_pnlTone(up.with_pnl)}`}>{_expMoney(up.with_pnl)}</div>
+                    <div className="text-[9.5px] text-base-content/45">book alone {_expMoney(up.book_pnl)} · this trade {up.delta_pnl >= 0 ? '+' : ''}{_expMoney(up.delta_pnl)}</div>
+                  </div>
+                )}
+              </div>
+              {mm.direction_plain && mm.direction_plain !== '—' && (
+                <p className="text-[11px] text-base-content/70 mt-1.5 leading-snug">{mm.direction_plain}</p>
+              )}
+            </div>
+          )}
+
+          {/* RECOMMENDATION. */}
+          {data.recommendation && (
+            <div className="rounded border border-info/25 bg-info/[0.06] px-2.5 py-2 flex items-start gap-2">
+              <Lightbulb className="w-4 h-4 text-info mt-0.5 shrink-0" />
+              <div>
+                <span className="text-[9px] uppercase tracking-wider text-info/70 block">What to do</span>
+                <span className="text-[12px] text-base-content/85">{data.recommendation}</span>
+              </div>
+            </div>
+          )}
+
+          {/* DETAILS — the full numbers, collapsed by default. */}
+          <CollapsibleSection title="The numbers" accent="base-content" icon={<LineChart className="w-3 h-3" />} subtitle="scenarios · correlations · positions">
+            <div className="space-y-3 pt-1">
+              {rows.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px] tabular-nums">
+                    <thead><tr className="text-base-content/45 text-[9.5px] uppercase">
+                      <th className="text-left font-medium py-0.5">Market move</th>
+                      <th className="text-right font-medium">Book now</th>
+                      <th className="text-right font-medium">With trade</th>
+                      <th className="text-right font-medium">This trade</th>
+                    </tr></thead>
+                    <tbody>
+                      {rows.map((s, i) => (
+                        <tr key={i} className="border-t border-white/[0.05]">
+                          <td className={`text-left py-0.5 font-semibold ${s.move_pct < 0 ? 'text-error/80' : 'text-success/80'}`}>{s.move_pct > 0 ? '+' : ''}{s.move_pct}%</td>
+                          <td className={`text-right ${_pnlTone(s.book_pnl)}`}>{_expMoney(s.book_pnl)}</td>
+                          <td className={`text-right font-semibold ${_pnlTone(s.with_pnl)}`}>{_expMoney(s.with_pnl)}</td>
+                          <td className={`text-right ${_pnlTone(s.delta_pnl)}`}>{s.delta_pnl > 0 ? '+' : ''}{_expMoney(s.delta_pnl)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <p className="text-[9px] text-base-content/35 mt-1">Full reprice of every leg; each name moved by its β. Stock in covered positions is excluded (same as Manage Book).</p>
+                </div>
+              )}
+
+              {sn && (
+                <div className="rounded border border-white/[0.08] bg-base-200/40 px-2 py-1.5 text-[10.5px]">
+                  <div className="text-[9px] uppercase tracking-wider text-base-content/40">Same name · {sn.ticker}</div>
+                  <div className="text-base-content/75 mt-0.5">
+                    You hold: {sn.existing.map((e, i) => <span key={i} className="mr-2">{(e.structure || 'position').replace(/_/g, ' ')}{e.capital ? ` (${_expMoney(e.capital)})` : ''}</span>)}
+                  </div>
+                  {sn.downside_outlay != null && <div className="text-base-content/60">Downside: assigned below ${sn.highest_put} → buy shares for {_expMoney(sn.downside_outlay)}.</div>}
+                  {sn.upside_unbounded && <div className="text-base-content/60">Upside: naked call above ${sn.lowest_naked_call} → loss is unlimited.</div>}
+                </div>
+              )}
+
+              {corrs.length > 0 && (
+                <div>
+                  <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><GitCompare className="w-3 h-3" /> Correlated with your book (1-yr ρ)</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {corrs.map((c, i) => (
+                      <span key={i} className={`inline-flex items-baseline gap-1 rounded border px-1.5 py-0.5 text-[10.5px] ${Math.abs(c.rho) >= 0.75 ? 'border-error/30 bg-error/[0.06]' : 'border-white/[0.08] bg-base-100/40'}`}>
+                        <span className="font-mono font-semibold">{c.ticker}</span>
+                        <span className="text-base-content/55">{c.rho >= 0 ? '+' : ''}{c.rho.toFixed(2)}</span>
+                        {c.cluster && <span className="text-base-content/40">· {c.cluster}</span>}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {macro.length > 0 && (
+                <div className="space-y-0.5">
+                  <div className="text-[9px] uppercase tracking-wider text-base-content/40">Shared macro drivers</div>
+                  {macro.map((m, i) => <div key={i} className="text-[10.5px] text-base-content/65 leading-snug">· {m.plain}</div>)}
+                </div>
+              )}
+
+              {sector && sector.book_tickers.length > 0 && (
+                <div className="text-[10.5px] text-base-content/65 leading-snug">
+                  <span className="text-[9px] uppercase tracking-wider text-base-content/40">Sector · </span>
+                  {sector.sector} — you also hold <b>{sector.book_tickers.join(', ')}</b> here.
+                </div>
+              )}
+
+              {prof && (prof.sector || (prof.themes && prof.themes.length) || (prof.macro_factors && prof.macro_factors.length)) && (
+                <div className="text-[10px] text-base-content/50 leading-snug">
+                  <span className="text-[9px] uppercase tracking-wider text-base-content/40">This trade · </span>
+                  {prof.sector || '—'}{prof.industry ? ` (${prof.industry})` : ''}
+                  {prof.themes && prof.themes.length > 0 && <> · themes: {prof.themes.join(', ')}</>}
+                  {prof.macro_factors && prof.macro_factors.length > 0 && <> · loads on: {prof.macro_factors.join(', ')}</>}
+                </div>
+              )}
+
+              {dir && (
+                <div className="text-[10px] text-base-content/50">
+                  <span className="text-[9px] uppercase tracking-wider text-base-content/40">Net direction ($ per 1% market move) · </span>
+                  book {_expMoney(dir.book_per_pct)} → with trade <b className={_pnlTone(dir.with_per_pct)}>{_expMoney(dir.with_per_pct)}</b> (this trade {(dir.trade_per_pct ?? 0) >= 0 ? '+' : ''}{_expMoney(dir.trade_per_pct)})
+                </div>
+              )}
+
+              {data.capital && (
+                <div className="text-[10px] text-base-content/50">
+                  <span className="text-[9px] uppercase tracking-wider text-base-content/40">Capital · </span>
+                  book BPR {_expMoney(data.capital.book_bpr)} · this trade {_expMoney(data.capital.candidate_bpr)}
+                </div>
+              )}
+            </div>
+          </CollapsibleSection>
+        </>
+      )}
+
+      <p className="text-[9px] text-base-content/35 border-t border-white/[0.06] pt-1">
+        Deterministic — computed from your open book via the Manage-Book engine. Not part of the grade.
+      </p>
+    </div>
+  );
+}
+
+function TradeExplorer({ t, ticker, params, evaluate, spot, nextEarnings }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams; evaluate?: DeskEvaluateParams; spot?: number | null; nextEarnings?: string | null }) {
   const dm = t.desk_metrics;
   const q = dm.quant || {};
+  // Paper trade — one click "places" THIS opportunity (snapshotting its Quant Analysis) so the
+  // user can track placed-vs-now in My Trades ▸ Paper Trader. No pricing here; refresh is lazy.
+  const [paperState, setPaperState] = useState<'idle' | 'creating' | 'created' | 'error'>('idle');
+  const [paperErr, setPaperErr] = useState<string | null>(null);
+  const runTrade = async () => {
+    setPaperErr(null); setPaperState('creating');
+    try {
+      await createPaperTrade(ticker, t, spot ?? null, params.quote_source);
+      setPaperState('created');
+    } catch (e: any) { setPaperErr(e?.message || 'Could not create paper trade'); setPaperState('error'); }
+  };
   // Per-trade "Run Institutional Desk" — the Quant→Risk→PM debate focused on THIS trade,
   // presented in the dramatized boardroom modal.
   const [debateOpen, setDebateOpen] = useState(false);
@@ -569,6 +882,47 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
       if (b.error) setBlindErr(b.error); else setBlind(b);
     } catch (e: any) { setBlindErr(e?.message || 'Blind read failed'); }
     finally { setBlindLoading(false); }
+  };
+
+  // Market sentiment — news + StockTwits crowd chatter for THIS trade (earnings-focused). Not a grade.
+  const [sentiment, setSentiment] = useState<MarketSentimentResult | null>(null);
+  const [sentLoading, setSentLoading] = useState(false);
+  const [sentErr, setSentErr] = useState<string | null>(null);
+  const runSentiment = async () => {
+    setSentErr(null); setSentiment(null); setSentLoading(true);
+    try {
+      // Independent read — send the TRADE definition + public facts only (no desk metrics like the gap %).
+      const s = await fetchMarketSentiment(ticker, {
+        structure: t.structure, label: t.label,
+        short_strike: t.short_strike ?? t.put_short ?? t.call_short ?? null,
+        expiration: t.expiration ?? null, spot: spot ?? null, dte: t.dte ?? null,
+        next_earnings: nextEarnings ?? null,
+      });
+      if (s.error) setSentErr(s.error); else setSentiment(s);
+    } catch (e: any) { setSentErr(e?.message || 'Sentiment read failed'); }
+    finally { setSentLoading(false); }
+  };
+
+  // Book exposure — how THIS trade interacts with the user's existing active book. Not a grade.
+  const [exposure, setExposure] = useState<BookExposureResult | null>(null);
+  const [expLoading, setExpLoading] = useState(false);
+  const [expErr, setExpErr] = useState<string | null>(null);
+  const runExposure = async () => {
+    setExpErr(null); setExposure(null); setExpLoading(true);
+    try {
+      // Send the candidate's ACTUAL legs so the backend reprices it in the same engine as Manage-Book.
+      const e = await fetchBookExposure(ticker, {
+        structure: t.structure, label: t.label,
+        short_strike: t.short_strike ?? t.put_short ?? t.call_short ?? null,
+        long_strike: t.long_strike ?? null,
+        expiration: t.expiration ?? null, spot: spot ?? null, dte: t.dte ?? null,
+        contracts: t.contracts ?? null,
+        legs: (t.legs ?? []).map(l => ({ action: l.action, type: l.type, strike: l.strike,
+          expiration: l.expiration, iv: l.iv })),
+      }, params.quote_source);
+      if (e.error) setExpErr(e.error); else setExposure(e);
+    } catch (er: any) { setExpErr(er?.message || 'Exposure read failed'); }
+    finally { setExpLoading(false); }
   };
 
   const runDesk = async () => {
@@ -659,7 +1013,27 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
 
       {/* Run Institutional Desk — the LLM debate on THIS trade, in the boardroom modal. Right-aligned,
           directly after the Quant Analysis section. */}
-      <div className="flex justify-end gap-2 pt-1">
+      <div className="flex flex-wrap justify-end gap-2 pt-1">
+        {/* Trade — one click places THIS opportunity as a paper trade (snapshots the Quant
+            Analysis) to track placed-vs-now in My Trades ▸ Paper Trader. */}
+        <button
+          className={`btn btn-sm gap-1.5 ${paperState === 'created' ? 'btn-success btn-outline' : 'btn-primary'}`}
+          onClick={runTrade} disabled={paperState === 'creating' || paperState === 'created'}
+          title="Place this as a PAPER trade — snapshots its Quant Analysis now, then track how it plays out in My Trades ▸ Paper Trader.">
+          {paperState === 'creating' ? <Loader2 className="w-4 h-4 animate-spin" />
+            : paperState === 'created' ? <Check className="w-4 h-4" /> : <Briefcase className="w-4 h-4" />}
+          {paperState === 'creating' ? 'Placing…' : paperState === 'created' ? 'Paper trade placed' : 'Trade'}
+        </button>
+        <button className="btn btn-outline btn-accent btn-sm gap-1.5" onClick={runSentiment} disabled={sentLoading}
+          title="Recent news + StockTwits crowd chatter distilled for THIS trade — the mood, catalysts and (near a print) the earnings setup. Qualitative context to build conviction, NOT part of the grade.">
+          {sentLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <MessageCircle className="w-4 h-4" />}
+          Market Sentiment
+        </button>
+        <button className="btn btn-outline btn-secondary btn-sm gap-1.5" onClick={runExposure} disabled={expLoading}
+          title="How THIS trade changes your EXISTING open book (My Trades): same-name concentration, $ P&L across market moves (book vs book+trade), BPR/assignment, net directional delta, and measured 1-year correlations. Computed by the Manage-Book engine — no LLM, NOT part of the grade.">
+          {expLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Network className="w-4 h-4" />}
+          Exposure
+        </button>
         {!evaluate && (
           <button className="btn btn-outline btn-info btn-sm gap-1.5" onClick={runBlind} disabled={blindLoading}
             title="An independent LLM read that is NOT shown our score/grade — an un-anchored second opinion. Divergence from the desk is the signal.">
@@ -672,9 +1046,21 @@ function TradeExplorer({ t, ticker, params, evaluate }: { t: DeskRankedTrade; ti
           Run Institutional Desk
         </button>
       </div>
+      {paperState === 'created' && (
+        <div className="text-[11px] text-success text-right flex items-center justify-end gap-1.5">
+          <Check className="w-3.5 h-3.5" /> Placed — track it in <b>My Trades ▸ Paper Trader</b>.
+        </div>
+      )}
+      {paperErr && <div className="text-[11px] text-warning text-right">{paperErr}</div>}
       {blindLoading && <div className="text-[11px] text-base-content/50 text-right flex items-center justify-end gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Forming an independent read from the raw facts…</div>}
       {blindErr && <div className="text-[11px] text-warning text-right">{blindErr}</div>}
       {blind && <BlindReadCard data={blind} />}
+      {sentLoading && <div className="text-[11px] text-base-content/50 text-right flex items-center justify-end gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Reading the news &amp; StockTwits crowd for this trade…</div>}
+      {sentErr && <div className="text-[11px] text-warning text-right">{sentErr}</div>}
+      {sentiment && <SentimentCard data={sentiment} />}
+      {expLoading && <div className="text-[11px] text-base-content/50 text-right flex items-center justify-end gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Cross-checking this trade against your open book…</div>}
+      {expErr && <div className="text-[11px] text-warning text-right">{expErr}</div>}
+      {exposure && <ExposureCard data={exposure} />}
 
       <DeskDebateModal
         open={debateOpen}
@@ -1020,7 +1406,12 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                             )}
                           </td>
                           <td className="text-success whitespace-nowrap">{money(t.premium)}</td>
-                          <td>{winPct(t.prob_keep_pct)}</td>
+                          <td className="whitespace-nowrap">{winPct(t.prob_keep_pct)}
+                            {t.prob_method === 'BS_fallback' && (
+                              <span className="ml-0.5 text-[10px] text-warning cursor-help align-super font-semibold"
+                                title="IV-ESTIMATE — the option chain's implied-vol surface was inconsistent, so the market-implied (RND) probability was unreliable and this Win% is a flat-vol Black-Scholes estimate instead. Treat it as approximate.">≈</span>
+                            )}
+                          </td>
                           <td className={confTextTone(t.confidence?.label)}>{t.confidence?.label ?? '—'}</td>
                           <td title="annualized">
                             {annShort(t.premium_annualized_pct)}
@@ -1036,7 +1427,7 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                           <tr className="bg-secondary/[0.05]">
                             <td colSpan={10} className="!p-0">
                               <div className="m-2 rounded-lg border border-secondary/30 bg-base-100/40 overflow-hidden">
-                                <TradeExplorer t={t} ticker={ticker} params={params} evaluate={evaluate} />
+                                <TradeExplorer t={t} ticker={ticker} params={params} evaluate={evaluate} spot={rev.spot} nextEarnings={rev.context?.next_earnings ?? null} />
                               </div>
                             </td>
                           </tr>

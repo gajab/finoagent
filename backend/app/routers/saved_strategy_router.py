@@ -66,6 +66,7 @@ class SavedStrategyOut(BaseModel):
     exit_date: Optional[str] = None
     exit_prices: Optional[list] = None
     exit_net: Optional[float] = None
+    bpr: Optional[float] = None          # buying-power reduction (Reg-T margin); annualization base
     created_at: str
     updated_at: str
 
@@ -186,7 +187,169 @@ def _to_out(s: SavedStrategy) -> SavedStrategyOut:
         exit_net=s.exit_net,
         created_at=s.created_at.isoformat(),
         updated_at=s.updated_at.isoformat(),
+        bpr=_closed_trade_bpr(s),
     )
+
+
+def calc_reg_t_margin(leg_list, U: float = 0.0, mode: str = "reg_t") -> float:
+    """Margin requirement for a set of option legs — the SINGLE source of the app's
+    Reg-T / portfolio margin math (get_live_pnl and the closed-trade BPR both call this).
+
+    Defined-risk spreads = width (both regimes). Naked shorts depend on the regime:
+      • Reg T (default): max(20%·underlying − out-of-the-money, 10%·strike[put]/
+        underlying[call]) — the standard broker rule.
+      • Portfolio Margin: risk-based ≈ a 15% adverse move on the underlying.
+    With no spot (U=0), naked falls back to 20%-of-strike (a spot-free Reg-T proxy).
+    """
+    def _naked(strike: float, qty: float, right: str) -> float:
+        if mode == "portfolio" and U > 0:
+            return 0.15 * U * qty * 100
+        if U > 0:
+            otm = max(0.0, U - strike) if right == "P" else max(0.0, strike - U)
+            floor_base = strike if right == "P" else U
+            return max(0.20 * U - otm, 0.10 * floor_base) * qty * 100
+        return 0.20 * strike * qty * 100   # no spot → legacy 20%-of-strike fallback
+
+    puts = [l for l in leg_list if l.get("right") == "P" or "PUT" in (l.get("type") or "").upper()]
+    calls = [l for l in leg_list if l.get("right") == "C" or "CALL" in (l.get("type") or "").upper()]
+    margin = 0.0
+
+    # Process put spreads
+    sell_puts = sorted(
+        [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
+         for l in puts if "SELL" in (l.get("action") or "").upper()],
+        key=lambda x: -x["strike"],
+    )
+    buy_puts = [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
+                for l in puts if "BUY" in (l.get("action") or "").upper()]
+    for sp in sell_puts:
+        # Pair with higher-strike buys first (protective)
+        for bp in buy_puts:
+            if sp["rem"] <= 0:
+                break
+            if bp["rem"] <= 0 or bp["strike"] <= sp["strike"]:
+                continue
+            paired = min(sp["rem"], bp["rem"])
+            sp["rem"] -= paired
+            bp["rem"] -= paired
+        # Pair with lower-strike buys (spread margin)
+        for bp in buy_puts:
+            if sp["rem"] <= 0:
+                break
+            if bp["rem"] <= 0 or bp["strike"] >= sp["strike"]:
+                continue
+            paired = min(sp["rem"], bp["rem"])
+            margin += (sp["strike"] - bp["strike"]) * paired * 100
+            sp["rem"] -= paired
+            bp["rem"] -= paired
+        if sp["rem"] > 0:
+            margin += _naked(sp["strike"], sp["rem"], "P")
+
+    # Process call spreads
+    sell_calls = sorted(
+        [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
+         for l in calls if "SELL" in (l.get("action") or "").upper()],
+        key=lambda x: x["strike"],
+    )
+    buy_calls = [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
+                 for l in calls if "BUY" in (l.get("action") or "").upper()]
+    for sc in sell_calls:
+        for bc in buy_calls:
+            if sc["rem"] <= 0:
+                break
+            if bc["rem"] <= 0 or bc["strike"] > sc["strike"]:
+                continue
+            paired = min(sc["rem"], bc["rem"])
+            sc["rem"] -= paired
+            bc["rem"] -= paired
+        for bc in buy_calls:
+            if sc["rem"] <= 0:
+                break
+            if bc["rem"] <= 0 or bc["strike"] <= sc["strike"]:
+                continue
+            paired = min(sc["rem"], bc["rem"])
+            margin += (bc["strike"] - sc["strike"]) * paired * 100
+            sc["rem"] -= paired
+            bc["rem"] -= paired
+        if sc["rem"] > 0:
+            margin += _naked(sc["strike"], sc["rem"], "C")
+
+    return round(margin, 2)
+
+
+def _leg_for_margin(rec: dict) -> dict:
+    """Map a closed_legs record (or a live legs_data leg) to calc_reg_t_margin's shape."""
+    return {
+        "strike": rec.get("strike"),
+        "qty": abs(float(rec.get("qty") or rec.get("contracts") or 1)),
+        "action": rec.get("action"),
+        "type": rec.get("type"),
+        "right": rec.get("right"),
+    }
+
+
+def _closed_trade_bpr(s: SavedStrategy) -> Optional[float]:
+    """Backend BPR (buying-power reduction) for a trade — the annualization base for the
+    Closed ledger, computed HERE (not the frontend) via the single Reg-T source so a CSP
+    reads its ~20% Reg-T margin, not the full strike collateral. Priority:
+      1. margin_required captured on an active refresh (exact, computed with the live spot).
+      2. Stock notional for stock / covered call / collar (the stock IS the capital on hold).
+      3. calc_reg_t_margin on the option legs, using the last cached spot when we have one,
+         else the no-spot 20%-of-strike Reg-T proxy (a closed trade has no live underlying).
+    Returns None for a pure long-premium trade (no short margin, no stock) — the frontend
+    then falls back to the debit paid. Never raises: a bad row just yields None."""
+    try:
+        params = json.loads(s.parameters or "{}")
+    except (ValueError, TypeError):
+        return None
+
+    last = params.get("last_pnl") or {}
+    mr = last.get("margin_required")
+    try:
+        if mr not in (None, "") and float(mr) > 0:
+            return round(float(mr), 2)
+    except (ValueError, TypeError):
+        pass
+
+    mode = params.get("margin_mode") or "reg_t"
+    closed = params.get("closed_legs") or []
+    try:
+        live_legs = json.loads(s.legs_data or "[]")
+    except (ValueError, TypeError):
+        live_legs = []
+
+    # Stock notional (covered call / collar / stock): the stock is the buying power used.
+    stock_notional = 0.0
+    for r in closed:
+        if r.get("type") == "stock":
+            try:
+                stock_notional += abs(float(r.get("entry_price") or 0)) * abs(float(r.get("qty") or 0))
+            except (ValueError, TypeError):
+                pass
+    if stock_notional <= 0:
+        try:
+            shares = float(params.get("shares") or 0)
+            avg = float(params.get("avg_cost") or 0)
+            if shares > 0 and avg > 0:
+                stock_notional = shares * avg
+        except (ValueError, TypeError):
+            pass
+    if stock_notional > 0:
+        return round(stock_notional, 2)
+
+    # Option legs → the single Reg-T margin source. Prefer live legs; a fully-closed trade
+    # has emptied legs_data, so reconstruct from the closed_legs records.
+    opt_source = live_legs if live_legs else closed
+    opt_legs = [_leg_for_margin(l) for l in opt_source
+                if (l.get("type") or "").lower() in ("call", "put") or l.get("right") in ("C", "P")]
+    if not opt_legs:
+        return None
+    try:
+        U = float(last.get("underlying_price") or 0)
+    except (ValueError, TypeError):
+        U = 0.0
+    m = calc_reg_t_margin(opt_legs, U, mode)
+    return round(m, 2) if m and m > 0 else None
 
 
 async def _sync_stock_ledger(db: AsyncSession, strategy: SavedStrategy) -> None:
@@ -2171,6 +2334,7 @@ async def get_live_pnl(
         opt_current_net = 0.0
         opt_quotes = []
         opt_greeks = []
+        combo_leg_meta = []   # always defined — a covered call whose option leg was closed has NO opt_legs
         if opt_legs:
             snapshot = json.loads(strategy.result_snapshot) if strategy.result_snapshot else {}
             strategy_expiration = snapshot.get("expirationDate") or params.get("expiration") or None
@@ -2797,88 +2961,10 @@ async def get_live_pnl(
         })
 
     # --- Margin calculation (IBKR-style spread margin) ---
+    # Margin math lives in the module-level calc_reg_t_margin (single source, also used by
+    # the closed-trade BPR). Kept as a local alias so the call sites below read unchanged.
     def _calc_margin(leg_list, U: float = 0.0, mode: str = "reg_t"):
-        """Margin requirement for the position. Defined-risk spreads = width (both
-        regimes). Naked shorts depend on the regime:
-          • Reg T (default): max(20%·underlying − out-of-the-money, 10%·strike[put]/
-            underlying[call]) — the standard broker rule.
-          • Portfolio Margin: risk-based ≈ a 15% adverse move on the underlying
-            (lower than Reg T for naked shorts; requires broker approval).
-        """
-        def _naked(strike: float, qty: float, right: str) -> float:
-            if mode == "portfolio" and U > 0:
-                return 0.15 * U * qty * 100
-            if U > 0:
-                otm = max(0.0, U - strike) if right == "P" else max(0.0, strike - U)
-                floor_base = strike if right == "P" else U
-                return max(0.20 * U - otm, 0.10 * floor_base) * qty * 100
-            return 0.20 * strike * qty * 100   # no spot → legacy 20%-of-strike fallback
-
-        puts = [l for l in leg_list if l.get("right") == "P" or "PUT" in (l.get("type") or "").upper()]
-        calls = [l for l in leg_list if l.get("right") == "C" or "CALL" in (l.get("type") or "").upper()]
-        margin = 0.0
-
-        # Process put spreads
-        sell_puts = sorted(
-            [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
-             for l in puts if "SELL" in (l.get("action") or "").upper()],
-            key=lambda x: -x["strike"],
-        )
-        buy_puts = [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
-                    for l in puts if "BUY" in (l.get("action") or "").upper()]
-        for sp in sell_puts:
-            # Pair with higher-strike buys first (protective)
-            for bp in buy_puts:
-                if sp["rem"] <= 0:
-                    break
-                if bp["rem"] <= 0 or bp["strike"] <= sp["strike"]:
-                    continue
-                paired = min(sp["rem"], bp["rem"])
-                sp["rem"] -= paired
-                bp["rem"] -= paired
-            # Pair with lower-strike buys (spread margin)
-            for bp in buy_puts:
-                if sp["rem"] <= 0:
-                    break
-                if bp["rem"] <= 0 or bp["strike"] >= sp["strike"]:
-                    continue
-                paired = min(sp["rem"], bp["rem"])
-                margin += (sp["strike"] - bp["strike"]) * paired * 100
-                sp["rem"] -= paired
-                bp["rem"] -= paired
-            if sp["rem"] > 0:
-                margin += _naked(sp["strike"], sp["rem"], "P")
-
-        # Process call spreads
-        sell_calls = sorted(
-            [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
-             for l in calls if "SELL" in (l.get("action") or "").upper()],
-            key=lambda x: x["strike"],
-        )
-        buy_calls = [{"strike": float(l["strike"]), "qty": l["qty"], "rem": l["qty"]}
-                     for l in calls if "BUY" in (l.get("action") or "").upper()]
-        for sc in sell_calls:
-            for bc in buy_calls:
-                if sc["rem"] <= 0:
-                    break
-                if bc["rem"] <= 0 or bc["strike"] > sc["strike"]:
-                    continue
-                paired = min(sc["rem"], bc["rem"])
-                sc["rem"] -= paired
-                bc["rem"] -= paired
-            for bc in buy_calls:
-                if sc["rem"] <= 0:
-                    break
-                if bc["rem"] <= 0 or bc["strike"] <= sc["strike"]:
-                    continue
-                paired = min(sc["rem"], bc["rem"])
-                margin += (bc["strike"] - sc["strike"]) * paired * 100
-                sc["rem"] -= paired
-                bc["rem"] -= paired
-            if sc["rem"] > 0:
-                margin += _naked(sc["strike"], sc["rem"], "C")
-
-        return round(margin, 2)
+        return calc_reg_t_margin(leg_list, U, mode)
 
     margin_required = _calc_margin(legs, underlying_price, margin_mode)
     # For debit spreads: capital = entry cost + margin
@@ -4259,8 +4345,7 @@ async def compute_lifecycle_desk_score(
     VRP/Moneyness/Skew/Liquidity/Beta + TA factors + Q-vs-P), then the lifecycle
     overlay (profit banked, time/gamma) → the 4-level exit signal. On-demand
     (heavy: runs the scan + TA), so it never touches the live-pnl refresh path."""
-    from ..services.desk_review_service import rank_desk, _find_focus_index, _json_default
-    from ..services.lifecycle_service import management_desk_score
+    from ..services.desk_review_service import compute_placed_desk_score
 
     result = await db.execute(
         select(SavedStrategy).where(
@@ -4271,113 +4356,16 @@ async def compute_lifecycle_desk_score(
     if not strategy:
         raise HTTPException(status_code=404, detail="Trade not found")
 
-    pnl = body.pnl_snapshot or {}
-    a = pnl.get("analysis", {}) or {}
-    dte = a.get("dte_remaining")
-
-    # A fresh-chain full desk score is only well-defined for the income structures
-    # the scan can price at exact legs. For anything else (collar, calendars, ratios,
-    # custom multi-leg, plain stock) the always-present Quant Algorithmic card above is
-    # the read — say so plainly instead of pricing something we can't stand behind.
-    _SCORABLE = {"covered_call", "naked_call", "cash_secured_put", "put_credit_spread",
-                 "call_credit_spread", "short_strangle", "iron_condor", "jade_lizard"}
-    if body.structure not in _SCORABLE:
-        return {"matched": False,
-                "error": "A fresh-chain desk score isn't defined for this structure — "
-                         "the scored Quant Algorithmic card above is the read for this trade."}
-
-    # Build the FOCUS from the trade's ACTUAL legs so the scan prices THIS exact
-    # trade (fresh chain: price/bid-ask/greeks/IV/OI/vol) even when its strike/expiry
-    # is off the normal grid — no more "not among candidates".
+    # Delegate the fresh-chain re-score + management overlay to the shared helper so a PLACED
+    # trade here and a PAPER trade refresh compute identically (one engine, one code path).
     _legs = json.loads(strategy.legs_data) if strategy.legs_data else []
-    focus_legs = [
-        {"strike": float(l["strike"]),
-         "right": "C" if "CALL" in str(l.get("type", "")).upper() or str(l.get("type", "")).upper() == "C" else "P",
-         "action": "SELL" if "SELL" in str(l.get("action", "")).upper() else "BUY"}
-        for l in _legs if l.get("strike")
-    ]
-    focus = {"structure": body.structure, "expiration": body.expiration, "legs": focus_legs}
-
     try:
-        desk = await rank_desk(
-            strategy.ticker, target_dte=dte, min_prob=0.0, min_income=0.0,
-            structures=[body.structure], quote_source=body.quote_source,
-            user=user, db=db, target_expiration=body.expiration, focus=focus,
+        return await compute_placed_desk_score(
+            ticker=strategy.ticker, structure=body.structure, expiration=body.expiration,
+            short_strike=body.short_strike, legs=_legs, pnl_snapshot=body.pnl_snapshot or {},
+            user=user, db=db, quote_source=body.quote_source,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Desk scan failed: {exc}")
-    if desk.get("error"):
-        return {"matched": False, "error": desk["error"]}
-
-    ranked = desk.get("ranked", []) or []
-    # Prefer the injected focus candidate; fall back to the strike/expiry matcher.
-    idx = next((i for i, rr in enumerate(ranked) if rr.get("_is_focus")), None)
-    if idx is None:
-        idx = _find_focus_index(ranked, body.structure, body.expiration, body.short_strike)
-    if idx is None:
-        return {"matched": False,
-                "error": "Couldn't price this trade's exact legs from the current chain "
-                         "(illiquid/unlisted strike or expiry). The scored Quant Algorithmic "
-                         "card above still applies."}
-
-    row = ranked[idx]
-    _dm = row.get("desk_metrics") or {}
-    subscores = ((_dm.get("quant") or {}).get("subscores")) or {}
-    _pm = _dm.get("pm") or {}          # Omega / Sortino / Calmar (risk-adjusted quality)
-    _risk = _dm.get("risk") or {}      # VaR / CVaR / capital (the manageable-tail check)
-    _trader = _dm.get("trader") or {}  # live greeks incl. the dynamic (vanna/charm/volga)
-    qp = row.get("qp") or {}
-    # DEEP MANAGEMENT read — "given I'm already in, is what's LEFT worth the risk?". The
-    # base is COMPUTED from the live position state (keep-prob, premium-left×keep,
-    # Omega/Sortino, CVaR tail, cushion) — not a fixed 50 — then the re-signed scan
-    # factors + a dynamic-greek convexity term + a slim time/gamma overlay decide
-    # hold-vs-close. The raw ENTRY desk_score / grade are still returned for reference.
-    mgmt = management_desk_score(
-        keep_drift_pct=qp.get("keep_drift_pct"),
-        keep_standard_pct=qp.get("keep_standard_pct") or row.get("prob_keep_pct"),
-        subscores=subscores, grade_adjustments=row.get("grade_adjustments"),
-        ta_factors=row.get("ta_factors"), captured_pct=a.get("captured_pct"), dte_days=dte,
-        unrealized_pnl=pnl.get("unrealized_pnl"),
-        max_profit=pnl.get("max_profit"), max_loss=pnl.get("max_loss"),
-        cushion_pct=row.get("cushion_pct"), structure=body.structure,
-        omega=_pm.get("omega"), sortino=_pm.get("sortino"),
-        cvar95=_risk.get("cvar_95"), capital=_risk.get("capital"),
-        net_gamma=_trader.get("net_gamma"), net_vega=_trader.get("net_vega"),
-        net_theta=_trader.get("net_theta"),
-    )
-    return {
-        "matched": True,
-        "desk_score": row.get("desk_score"),
-        "base_quality": row.get("base_quality"),
-        "subscores": subscores,
-        "grade_adjustments": row.get("grade_adjustments", []),   # OPTION MATH
-        "ta_factors": row.get("ta_factors", []),                 # TECHNICALS
-        "qp": row.get("qp", {}),                                 # Q vs P (VRP boundary)
-        "algo_grade": row.get("algo_grade"),
-        "merits": row.get("grade_merits", []),
-        "demerits": row.get("grade_demerits", []),
-        "blocking": row.get("grade_blocking", []),
-        # The full opportunity → render the SAME OpportunityCard as the scan.
-        "opp": json.loads(json.dumps(row, default=_json_default)),
-        "spot": desk.get("spot") or (desk.get("context") or {}).get("spot"),
-        # DEEP MANAGEMENT read → the hold-vs-close call (scan factors re-signed for the
-        # holder + take-profit/time overlay). This is the recommendation the UI leads on.
-        "signal": mgmt["signal"],
-        "lifecycle_score": mgmt["score"],
-        "overrides": mgmt["overrides"],
-        "management_analysis": {
-            "anchor": mgmt["anchor"],
-            "anchor_label": mgmt["anchor_label"],
-            "contributions": mgmt["contributions"],   # re-signed scan factors (holder view)
-            "factors_net": mgmt["factors_net"],
-            "overlay": mgmt["overlay"],               # take-profit / time-gamma
-            "score": mgmt["score"],
-            "signal": mgmt["signal"],
-            "overrides": mgmt["overrides"],
-            "advisories": mgmt["advisories"],         # covered / naked call advice
-        },
-        # keep for back-compat with the light card's buildup line:
-        "lifecycle_adjustments": mgmt["overlay"],
-        "hold_base": mgmt["anchor"],
-        "base_source": "neutral",
-    }

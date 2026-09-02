@@ -37,6 +37,7 @@ class User(Base):
     saved_strategies: Mapped[list["SavedStrategy"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     tracked_companies: Mapped[list["TrackedCompany"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     tracked_trades: Mapped[list["TrackedTrade"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    paper_trades: Mapped[list["PaperTrade"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     highlight_dismissals: Mapped[list["PortfolioHighlightDismissal"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
@@ -599,6 +600,77 @@ class TrackedTrade(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="tracked_trades")
+
+
+class PaperTrade(Base):
+    """A one-click *paper* option-income trade placed from the Income Desk.
+
+    Purpose: let the user "place" any scanned/evaluated opportunity and then track — across
+    many such trades — how its quant read at placement compares to the SAME engine's read now.
+    The full opportunity (a ``DeskRankedTrade``) is snapshotted at placement in
+    ``placed_snapshot`` so the "when placed" Quant Analysis stays stable; every Refresh reprices
+    the exact legs via the desk engine (``rank_desk`` + ``management_desk_score``) and caches the
+    current read in ``last_eval`` plus the denormalized ``last_*`` columns.
+
+    Laziness contract: the list view reads ONLY stored/cached columns (no yfinance, no
+    ``rank_desk``); all repricing happens on the ``/refresh`` path, per trade, on user action.
+
+    Lifecycle: ``open`` (tracked live) → ``closed`` (P&L banked into ``close_pnl``, kept as a
+    placed-vs-final record). Always 1 contract.
+    """
+    __tablename__ = "paper_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ticker: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+
+    # Structure descriptor — enough to re-price the exact trade off a fresh chain.
+    structure: Mapped[str] = mapped_column(String(40), nullable=False)   # covered_call / cash_secured_put / ...
+    expiration: Mapped[str | None] = mapped_column(String(20), nullable=True)  # YYYY-MM-DD
+    label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    short_strike: Mapped[float | None] = mapped_column(Float, nullable=True)   # for the focus-index fallback matcher
+    contracts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    legs: Mapped[str] = mapped_column(Text, nullable=False, default="[]")      # JSON — the opportunity legs
+    focus: Mapped[str | None] = mapped_column(Text, nullable=True)             # JSON — {structure,expiration,legs[]}
+
+    # Entry basis captured at placement (cost basis = net credit received).
+    entry_spot: Mapped[float | None] = mapped_column(Float, nullable=True)               # backfilled on first refresh if null
+    entry_premium_per_share: Mapped[float | None] = mapped_column(Float, nullable=True)  # net credit / share
+    entry_credit: Mapped[float | None] = mapped_column(Float, nullable=True)             # premium/share ×100× contracts (+ = credit)
+
+    # The full DeskRankedTrade shown when the user placed it → renders the "when placed" Quant Analysis.
+    placed_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default="{}")     # JSON
+    placed_desk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    placed_algo_grade: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", index=True)  # open | closed
+
+    # Cached CURRENT read (from the last /refresh) — the list renders these with zero compute.
+    last_eval: Mapped[str | None] = mapped_column(Text, nullable=True)                   # JSON — DeskScoreResult + pnl
+    last_eval_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_spot: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_value_per_share: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_desk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_algo_grade: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
+    # Close (P&L banked at close time; the row stays as a placed-vs-final record).
+    closed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship(back_populates="paper_trades")
 
 
 class DataCache(Base):

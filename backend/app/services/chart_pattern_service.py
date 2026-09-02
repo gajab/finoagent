@@ -663,23 +663,37 @@ def _fibonacci(z, df, close, window: int = 63):
     hi_i, hi_p, lo_i, lo_p = swing(window)
     if (hi_p - lo_p) < 0.05 * close:                      # too flat lately → widen to find a real swing
         hi_i, hi_p, lo_i, lo_p = swing(min(n, 130))
-    rng = hi_p - lo_p
+    full_rng = hi_p - lo_p
+    if full_rng <= 0:
+        return None
+    # Orient the swing by what price is ACTUALLY doing — not merely which absolute extreme is newer.
+    # A pullback-then-recovery (window high OLDER than its low, but price has since bounced well off
+    # that low) is an UP move; labelling it a down-swing projects targets DOWN toward $0/negative
+    # (the CRDO bug: $308→$177 "down", 262% target −$36). So:
+    if hi_i >= lo_i:                                       # the high is the most recent extreme → up-swing
+        a_i, a_p, b_i, b_p, up = lo_i, lo_p, hi_i, hi_p, True
+    elif close > lo_p + 0.30 * full_rng:                  # low is newer but price recovered → up-swing off it
+        seg2 = df["High"].values[lo_i:]
+        b_i = lo_i + int(np.argmax(seg2)); b_p = float(df["High"].values[b_i])
+        a_i, a_p, up = lo_i, lo_p, True
+    else:                                                  # low is newer and price stayed down → down-swing
+        a_i, a_p, b_i, b_p, up = hi_i, hi_p, lo_i, lo_p, False
+    lo_lvl, hi_lvl = (a_p, b_p) if up else (b_p, a_p)
+    rng = hi_lvl - lo_lvl
     if rng <= 0:
         return None
-    up = hi_i > lo_i                                       # the high came AFTER the low → up-swing
-    a_i, a_p = (lo_i, lo_p) if up else (hi_i, hi_p)        # swing start
-    b_i, b_p = (hi_i, hi_p) if up else (lo_i, lo_p)        # swing end (the extreme)
 
-    def at(r):                                             # r=0 → swing END, r=1 → swing START (standard retr)
-        return round((hi_p - r * rng) if up else (lo_p + r * rng), 2)
+    def at(r):                                             # retracement level (inside the swing)
+        return round((hi_lvl - r * rng) if up else (lo_lvl + r * rng), 2)
 
-    def ext(e):                                            # e>1 projects BEYOND the swing end
-        return round((lo_p + e * rng) if up else (hi_p - e * rng), 2)
+    def ext(e):                                            # extension level (projected beyond the swing end)
+        return round((lo_lvl + e * rng) if up else (hi_lvl - e * rng), 2)
 
     levels = [{"ratio": r, "price": at(r)} for r in (0.236, 0.382, 0.5, 0.618, 0.786)]
-    extensions = [{"ratio": e, "price": ext(e)} for e in (1.272, 1.414, 1.618, 2.0, 2.618)]
+    # never surface a non-positive target (a deep down-swing 262% extension can go negative)
+    extensions = [{"ratio": e, "price": ext(e)} for e in (1.272, 1.414, 1.618, 2.0, 2.618) if ext(e) > 0]
     # where is price now: inside the swing (retracement play) or broken out past the extreme (targets)?
-    broke_out = (close >= hi_p) if up else (close <= lo_p)
+    broke_out = (close >= hi_lvl) if up else (close <= lo_lvl)
     nxt = next((x for x in extensions if (x["price"] > close if up else x["price"] < close)), None)
     zone = None
     if not broke_out:

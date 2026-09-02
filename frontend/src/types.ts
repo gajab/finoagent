@@ -3746,7 +3746,7 @@ export interface DerivativeIncomeOpportunity {
   prob_keep_pct: number;
   prob_assign_pct: number;
   prob_in_band_pct?: number | null;
-  prob_method: 'RND' | 'BS' | string;
+  prob_method: 'RND' | 'BS' | 'BS_fallback' | string;   // BS_fallback = the RND was degenerate (inconsistent chain IV) → flat-vol estimate
   premium: number;
   premium_per_share: number;
   collateral: number;
@@ -3932,7 +3932,7 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   grade_blocking?: string[];    // STRUCTURAL hard fails (crushed vol, etc.) → grade F
   grade_timing_hold?: string[]; // TIMING holds (momentum against a REACHABLE strike) → WAIT, keeps its quality letter
   base_quality?: number;        // the algorithmic_quant base score BEFORE regime/factor adjustments
-  grade_adjustments?: { label: string; points: number; detail?: string }[];  // signed option-math contributions → desk_score
+  grade_adjustments?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean }[];  // signed option-math contributions → desk_score (baseline_points = value WITHOUT the earnings-aware adjustment)
   ta_factors?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean }[]; // signed technical/regime contributions → desk_score (baseline_points = the value WITHOUT the earnings-aware adjustment, for the with/without comparison)
   qp?: {                        // Q-vs-P: implied (risk-neutral) vs physical (realized) read
     implied_vol_pct?: number | null; realized_vol_pct?: number | null; weight_vol_pct?: number | null;
@@ -3961,6 +3961,7 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   event_premium_share?: number | null;               // fraction of the premium that is event (not harvestable) premium
   iv_edge_vp?: number | null;                         // short-strike IV vs ATM (vol-pts) — the per-strike skew premium / edge
   prob_touch_pct?: number | null;                     // P(short EVER goes ITM before expiry) — drift-aware touch, ~2× expiry-ITM
+  earnings_gap_pct?: number | null;                   // isolated earnings-implied event move (%) when a print is before expiry
 }
 
 // One rung of the tail-risk management plan — a price level + the corrective action to take there.

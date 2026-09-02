@@ -884,6 +884,82 @@ export async function runDeskBlind(
   });
 }
 
+// Market sentiment — recent news + StockTwits crowd chatter distilled (earnings-focused) into an actionable
+// read for the user's specific trade. NOT part of the grade — qualitative colour to build conviction.
+export type SentimentTrade = {
+  structure?: string; label?: string; short_strike?: number | null; expiration?: string | null;
+  spot?: number | null; next_earnings?: string | null; earnings_gap_pct?: number | null; dte?: number | null;
+};
+export type MarketSentimentResult = {
+  ticker: string;
+  read?: {
+    sentiment?: string; strength?: string; summary?: string; earnings?: string | null;
+    price_levels?: string | null; trade_implication?: string; catalysts?: string[];
+    confidence?: string; caveat?: string;
+  };
+  sources?: {
+    stocktwits?: { count?: number; url?: string };
+    news?: { title: string; publisher?: string; link?: string }[];
+  };
+  model?: string;
+  error?: string;
+};
+export async function fetchMarketSentiment(ticker: string, trade: SentimentTrade, model?: string): Promise<MarketSentimentResult> {
+  return apiFetch<MarketSentimentResult>(`/api/stock/${encodeURIComponent(ticker)}/desk-review/sentiment`, {
+    method: 'POST',
+    body: JSON.stringify({ trade, model }),
+  });
+}
+
+// Book Exposure — DETERMINISTIC portfolio-risk read (NO LLM) on how a NEW trade changes the user's
+// EXISTING active book (My Trades, first tab): same-name concentration, $ exposure across market moves
+// (book vs book+trade), BPR/assignment, β-weighted directional delta, measured 1y correlations, macro
+// sensitivity. Reuses the Manage-Book engine. Additional risk context, NOT part of the grade.
+export type BookExposureTrade = {
+  structure?: string; label?: string; short_strike?: number | null; long_strike?: number | null;
+  expiration?: string | null; spot?: number | null; dte?: number | null; contracts?: number | null;
+  legs?: { action?: string; type?: string; strike?: number; expiration?: string | null; iv?: number | null; qty?: number }[];
+};
+type ExpScenarioRow = { move_pct: number; book_pnl: number; with_pnl: number; delta_pnl: number };
+export type BookExposureResult = {
+  ticker: string;
+  empty_book?: boolean;
+  error?: string;
+  verdict?: 'concentrates' | 'diversifies' | 'neutral';
+  headline?: string;
+  key_points?: { tone: 'bad' | 'warn' | 'good' | 'info'; text: string }[];
+  recommendation?: string;
+  market_move?: {
+    rows?: ExpScenarioRow[];
+    down20?: ExpScenarioRow | null;
+    up20?: ExpScenarioRow | null;
+    direction_plain?: string;
+  };
+  same_name?: {
+    ticker: string; count: number;
+    existing: { structure?: string; n_short?: number; capital?: number }[];
+    posture?: string; downside_outlay?: number | null; upside_unbounded?: boolean;
+    highest_put?: number | null; lowest_naked_call?: number | null; same_expiry?: boolean;
+    n_short_puts?: number; n_short_calls?: number;
+  } | null;
+  theme_overlap?: { key: string; theme: string; driver: string; bellwether?: string; note?: string | null; book_tickers: string[] }[];
+  sector_overlap?: { sector: string; book_tickers: string[]; capital: number } | null;
+  related_earnings?: { bellwether: string; theme: string; date: string; days_out: number; driver: string }[];
+  candidate_profile?: { sector?: string; industry?: string; themes?: string[]; macro_factors?: string[] };
+  correlations?: { ticker: string; rho: number; cluster?: string | null }[];
+  macro?: { factor: string; candidate_rho?: number; book_rho?: number; plain?: string }[];
+  direction?: { book_per_pct?: number; with_per_pct?: number; trade_per_pct?: number; lean?: string };
+  capital?: { book_bpr?: number; candidate_bpr?: number };
+  book?: { position_count?: number; names?: string[] };
+  candidate?: { ticker?: string; structure?: string; bpr?: number };
+};
+export async function fetchBookExposure(ticker: string, trade: BookExposureTrade, quoteSource?: string): Promise<BookExposureResult> {
+  return apiFetch<BookExposureResult>(`/api/stock/${encodeURIComponent(ticker)}/desk-review/exposure`, {
+    method: 'POST',
+    body: JSON.stringify({ trade, quote_source: quoteSource }),
+  });
+}
+
 // Evaluate a user-entered multi-leg trade — returns the same DeskReviewResult shape as the
 // single-ticker scan (chrome + ranked=[the one trade]) so the UI renders it identically.
 export async function evaluateDeskTrade(ticker: string, params: DeskEvaluateParams): Promise<DeskReviewResult> {
@@ -1197,6 +1273,7 @@ export interface SavedStrategyItem {
   exit_date?: string | null;
   exit_prices?: any[] | null;
   exit_net?: number | null;
+  bpr?: number | null;                 // buying-power reduction (backend Reg-T margin); BPR base for the closed ledger
   created_at: string;
   updated_at: string;
 }
@@ -1689,6 +1766,108 @@ export async function runDeskScore(
     method: 'POST',
     body: JSON.stringify({ pnl_snapshot: pnlSnapshot, ...focus, quote_source: quoteSource }),
   });
+}
+
+// ===== Paper Trader — place an Income-Desk opportunity, track placed-vs-now =====
+
+// Short-premium mark-to-market: cost basis = net credit received; current_value = what it'd
+// cost to buy the structure back now; unrealized = cost_basis − current_value (+ = decayed for you).
+export interface PaperTradePnl {
+  cost_basis: number | null;
+  current_value: number | null;
+  unrealized_pnl: number | null;
+  unrealized_pct: number | null;
+  captured_pct: number | null;          // % of max profit banked (negative = moved against you)
+  current_spot: number | null;
+  entry_spot: number | null;
+  spot_change_pct: number | null;
+  dte_remaining: number | null;
+  contracts: number;
+  entry_premium_per_share: number | null;
+  current_premium_per_share: number | null;
+}
+
+// The CURRENT desk read for a paper trade — the SAME shape as a placed trade's desk score
+// (opp + management_analysis + signal), plus the paper P&L block.
+export type PaperTradeCurrent = DeskScoreResult & { id?: number; pnl?: PaperTradePnl | null };
+
+// LIGHTWEIGHT list row — cached/denormalized columns only (the list never triggers compute).
+export interface PaperTradeListItem {
+  id: number;
+  ticker: string;
+  structure: string;
+  label: string | null;
+  expiration: string | null;
+  dte: number | null;
+  contracts: number;
+  status: 'open' | 'closed';
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  cost_basis: number | null;
+  entry_premium_per_share: number | null;
+  entry_spot: number | null;
+  placed_desk_score: number | null;
+  placed_algo_grade: string | null;
+  last_eval_at: string | null;          // when the cached current read was last refreshed
+  last_spot: number | null;
+  current_value: number | null;
+  last_pnl: number | null;
+  last_desk_score: number | null;
+  last_algo_grade: string | null;
+  closed_at: string | null;
+  close_pnl: number | null;
+  close_note: string | null;
+}
+
+export interface PaperTradeDetail extends PaperTradeListItem {
+  legs: import('./types').DerivativeIncomeLeg[];
+  placed_snapshot: import('./types').DeskRankedTrade;   // → the "when placed" Quant Analysis
+  last_eval: PaperTradeCurrent | null;                  // → the cached "now" read
+}
+
+export interface PaperTradesResponse {
+  items: PaperTradeListItem[];
+  counts: { open: number; closed: number; total: number };
+}
+
+/** All paper trades (newest first). LIGHTWEIGHT — no yfinance/scan. status = open | closed | all. */
+export async function fetchPaperTrades(status: string = 'all'): Promise<PaperTradesResponse> {
+  return apiFetch<PaperTradesResponse>(`/api/paper-trades?status=${encodeURIComponent(status)}`);
+}
+
+/** One paper trade with the placed snapshot + cached current read (no compute). */
+export async function fetchPaperTrade(id: number): Promise<PaperTradeDetail> {
+  return apiFetch<PaperTradeDetail>(`/api/paper-trades/${id}`);
+}
+
+/** Place a paper trade from an Income-Desk opportunity (always 1 contract; no compute). */
+export async function createPaperTrade(
+  ticker: string, opp: import('./types').DeskRankedTrade,
+  spot?: number | null, quoteSource = 'yfinance', note?: string | null,
+): Promise<PaperTradeListItem> {
+  return apiFetch<PaperTradeListItem>('/api/paper-trades', {
+    method: 'POST',
+    body: JSON.stringify({ ticker, opp, spot: spot ?? null, quote_source: quoteSource, note: note ?? null }),
+  });
+}
+
+/** THE heavy path — re-price the exact legs + recompute the current quant/management read. */
+export async function refreshPaperTrade(id: number, quoteSource = 'yfinance'): Promise<PaperTradeCurrent> {
+  return apiFetch<PaperTradeCurrent>(
+    `/api/paper-trades/${id}/refresh?quote_source=${encodeURIComponent(quoteSource)}`, { method: 'POST' });
+}
+
+/** Bank the current P&L and archive to Closed. */
+export async function closePaperTrade(id: number, quoteSource = 'yfinance', note?: string | null): Promise<PaperTradeDetail> {
+  return apiFetch<PaperTradeDetail>(`/api/paper-trades/${id}/close`, {
+    method: 'POST',
+    body: JSON.stringify({ quote_source: quoteSource, note: note ?? null }),
+  });
+}
+
+export async function deletePaperTrade(id: number): Promise<void> {
+  return apiFetch<void>(`/api/paper-trades/${id}`, { method: 'DELETE' });
 }
 
 export interface LifecycleManagerResult {

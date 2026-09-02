@@ -28,6 +28,23 @@ RUN mkdir -p /app/data
 ENV DATABASE_URL=sqlite+aiosqlite:///./data/stock_research.db
 ENV PYTHONUNBUFFERED=1
 
+# ---- Memory-footprint tuning for the 512 MiB Cloud Run free tier ----
+# numpy/scipy/pandas link OpenBLAS, which spins up a per-core thread pool with
+# scratch buffers. Cloud Run free tier is 1 vCPU, so those extra threads only
+# waste RSS (and thrash the single core). Pin every math backend to one thread.
+ENV OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
+# glibc opens up to 8×CPU malloc arenas that hold onto freed memory (fragmentation
+# never returned to the OS). Cap the arenas and trim freed blocks back sooner —
+# the single biggest RSS win for a numpy-heavy process. See the memory-limit docs.
+ENV MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=65536
+# matplotlib/mplfinance are lazy-imported for PNG export; force the headless
+# backend so they never try to load a GUI toolkit when they do come in.
+ENV MPLBACKEND=Agg
+
 EXPOSE 8000
 
 # Remove __pycache__ and other unnecessary files to save those last few MBs

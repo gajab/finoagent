@@ -60,10 +60,18 @@ DEFAULT_MIN_INCOME = 20.0         # minimum premium ($/contract) to surface
 MIN_DTE = 7
 MAX_DEFAULT_DTE = 45              # default-mode horizon (monthlies only)
 TARGET_DTE_BAND = 10             # ± window around a user-supplied target DTE
-MAX_EXPIRIES = 3                 # hard cap on chain fetches per ticker
+MAX_EXPIRIES = 3                 # hard ceiling on chain fetches per ticker (a calendar needs a back leg)
+DEFAULT_SCAN_EXPIRIES = 1        # scan ONE expiry by default (next monthly / the user's pick) — a ~3× peak
+                                 # cut on the 512 MiB instance; a calendar (premium) bumps this to 2 to pair
 PER_STRUCTURE_CAP = 15           # CC/CSP strikes kept per expiry — effectively the WHOLE ladder above
                                  # min_prob (cheap: the chain is fetched once; a display cap, not a scan cost),
                                  # SAFEST-first (highest keep-prob) so the safe rungs are never truncated
+# Delta band for the CC/CSP short-strike ladder. The scan sorts SAFEST-first, so WITHOUT a floor the
+# ladder fills with the deepest-OTM strikes — |Δ|≈0, ~zero volume, no fill — which also balloon
+# _finalize_desk (every survivor gets a fine-grid lifecycle reprice → the 512 MiB OOM). Drop them: a
+# tradable safe-income short lives near ~0.16Δ. min_prob still gates the NEAR side on top of this.
+MIN_ABS_DELTA = 0.015           # hard floor — below this the strike is illiquid junk, never a candidate
+MAX_ABS_DELTA = 0.16            # near cap = ~84% win floor: drop near-money strikes; min_prob tightens further
 TTL_ANALYSIS = 900              # 15 min — matches _TTL_PRICE
 TTL_PORTFOLIO = 300
 EVENTS_HORIZON_DAYS = 90         # always surface events for the next 90 days …
@@ -128,16 +136,19 @@ def _is_monthly_expiry(d: date) -> bool:
 
 
 def _select_expirations(all_exps: list[str], target_dte: Optional[int],
-                        today: date, target_expiration: Optional[str] = None) -> list[tuple[str, int]]:
+                        today: date, target_expiration: Optional[str] = None,
+                        limit: Optional[int] = None) -> list[tuple[str, int]]:
     """Pick the expirations to actually fetch — the API-budget gate.
 
     Exact (``target_expiration`` set): scan ONLY that expiry — the user picked a
     specific date, so honour it and fetch nothing else.
     Default (``target_dte`` is None): monthlies only, ``MIN_DTE ≤ DTE ≤ 45``.
     Target mode: any listing type within ``±TARGET_DTE_BAND`` of the target,
-    nearest first. Both capped at ``MAX_EXPIRIES``; resilient fallbacks keep a
-    weekly-only name from returning nothing.
+    nearest first. Capped at ``limit`` (default ``DEFAULT_SCAN_EXPIRIES`` = one expiry; the
+    calendar caller passes 2 to pair a back leg), never above ``MAX_EXPIRIES``; resilient
+    fallbacks keep a weekly-only name from returning nothing.
     """
+    limit = min(limit or DEFAULT_SCAN_EXPIRIES, MAX_EXPIRIES)
     parsed: list[tuple[str, int, date]] = []
     for s in all_exps:
         try:
@@ -161,19 +172,19 @@ def _select_expirations(all_exps: list[str], target_dte: Optional[int],
                    if _is_monthly_expiry(d) and MIN_DTE <= dte <= MAX_DEFAULT_DTE]
         if monthly:
             monthly.sort(key=lambda x: x[1])
-            return monthly[:MAX_EXPIRIES]
+            return monthly[:limit]
         # Fallback: nearest few expiries inside the horizon (e.g. weekly-only ETFs).
         near = sorted([(s, dte) for (s, dte, d) in parsed if dte <= MAX_DEFAULT_DTE],
                       key=lambda x: x[1])
         if near:
-            return near[:MAX_EXPIRIES]
+            return near[:limit]
         nearest = min(parsed, key=lambda x: x[1])
         return [(nearest[0], nearest[1])]
 
     band = [(s, dte) for (s, dte, d) in parsed if abs(dte - target_dte) <= TARGET_DTE_BAND]
     band.sort(key=lambda x: abs(x[1] - target_dte))
     if band:
-        return band[:MAX_EXPIRIES]
+        return band[:limit]
     nearest = min(parsed, key=lambda x: abs(x[1] - target_dte))
     return [(nearest[0], nearest[1])]
 
@@ -327,36 +338,78 @@ def _context_sync(ticker: str) -> dict:
     return out
 
 
+_SOFR_DB_KEY = "rates:sofr:v1"
+_SOFR_DB_TTL = 12 * 3600   # persists across restarts / Cloud Run cold-starts; SOFR moves ≤once per business day
+
+
 async def _get_sofr() -> tuple[float, str]:
-    """(rate_fraction, label) for SOFR from keyless FRED; falls back to ^IRX-ish default."""
+    """(rate_fraction, label) for SOFR from keyless FRED.
+
+    Cached in the external-Postgres DB (survives restarts / cold-starts) so we don't hit FRED on
+    every scan — SOFR only changes once per business day. rates_service's in-process memo is the
+    fast L1; this DB row is the durable L2. Uses its OWN short-lived session (never share a session
+    across concurrent scans). Falls back to DEFAULT_RISK_FREE and never caches a fallback."""
+    from .cache_service import get_cached, set_cached
+    from ..database import async_session
+    default = (DEFAULT_RISK_FREE, f"Default ({DEFAULT_RISK_FREE * 100:.1f}%)")
+
+    # L2 — durable DB cache first, so a fresh process skips FRED entirely.
+    try:
+        async with async_session() as s:
+            cached = await get_cached(s, _SOFR_DB_KEY)
+        if isinstance(cached, dict) and cached.get("rate") is not None:
+            return float(cached["rate"]), str(cached.get("label") or "SOFR (cached)")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("SOFR DB-cache read failed: %s", exc)
+
+    rate, label, got_real = default[0], default[1], False
     try:
         from . import rates_service
         series = await rates_service.fred_series(rates_service.SERIES["sofr"])
         val = rates_service.latest(series)
         if val is not None and val > 0:
-            return float(val) / 100.0, "SOFR (FRED)"
+            rate, label, got_real = float(val) / 100.0, "SOFR (FRED)", True
     except Exception as exc:  # noqa: BLE001
         logger.debug("SOFR fetch failed: %s", exc)
-    return DEFAULT_RISK_FREE, f"Default ({DEFAULT_RISK_FREE * 100:.1f}%)"
+
+    if got_real:                                 # only persist a REAL reading, never the fallback
+        try:
+            async with async_session() as s:
+                await set_cached(s, _SOFR_DB_KEY, {"rate": rate, "label": label}, ttl_seconds=_SOFR_DB_TTL)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SOFR DB-cache write failed: %s", exc)
+    return rate, label
 
 
 # ---------------------------------------------------------------------------
 # Probability + expected value off the RND (with flat-vol fallback)
 # ---------------------------------------------------------------------------
 
+_KEEP_RND_TOL = 0.15   # if the RND keep-prob disagrees with the flat-vol BS keep by more than this, the RND is
+                       # degenerate (an inconsistent chain IV surface collapses it — e.g. an identical keep-prob
+                       # across strikes) → fall back to BS and flag it, so the displayed Win% is never garbage.
+
+
 def _prob_keep(rnd, strike: float, right: str, spot: float, dte: int,
                r: float, iv: Optional[float]) -> tuple[Optional[float], str]:
     """Probability the short option expires OTM (we keep the premium, unassigned).
 
-    Market-implied off the RND when available; otherwise flat-vol Black-Scholes.
-    """
-    if rnd is not None:
-        p = rnd.prob_below(strike) if right == "C" else rnd.prob_above(strike)
-        return float(p), "RND"
+    Market-implied off the RND when available; otherwise flat-vol Black-Scholes. The RND is SANITY-CHECKED
+    against the BS keep: a garbage/inconsistent chain IV surface can collapse the RND to a nonsensical keep-
+    prob (the "grade A but Win% 30%" bug — the grade uses the robust payoff law, the displayed Win% used the
+    broken RND). When they disagree beyond tolerance the RND is rejected → BS, method ``BS_fallback`` (the UI
+    marks it as an IV-estimate)."""
+    bs = None
     if iv and iv > 0:
         T = max(dte, 1) / 365.0
-        p = bs_prob_otm(spot, strike, T, r, iv, "call" if right == "C" else "put")
-        return float(p), "BS"
+        bs = float(bs_prob_otm(spot, strike, T, r, iv, "call" if right == "C" else "put"))
+    if rnd is not None:
+        p = float(rnd.prob_below(strike) if right == "C" else rnd.prob_above(strike))
+        if bs is not None and abs(p - bs) > _KEEP_RND_TOL:
+            return bs, "BS_fallback"          # RND degenerate — the flat-vol estimate is the honest number
+        return p, "RND"
+    if bs is not None:
+        return bs, "BS"
     return None, ""
 
 
@@ -533,6 +586,10 @@ def _quant_block(rnd, calls: dict, puts: dict, strikes_all: list[float],
     return q
 
 
+_SPREAD_WIDE = 20.0          # bid-ask % above which execution is capped BELOW "High" (you won't fill near mid)
+_SPREAD_UNTRADEABLE = 40.0   # bid-ask % above which the market is untradeable near mid → execution capped at "Low"
+
+
 def _confidence(opp: dict, quant: dict) -> dict:
     """A 5–99 confidence score for actually filling *and* trusting this trade,
     from the probability model, smile fit, QuantLib read and live liquidity."""
@@ -559,7 +616,10 @@ def _confidence(opp: dict, quant: dict) -> dict:
         if sp <= 6:
             score += 10; reasons.append("tight bid-ask")
         elif sp > 15:
-            score -= 10; reasons.append("wide bid-ask")
+            # SCALE the penalty with how wide — a flat dock let a 100%-spread strike (untradeable near mid)
+            # still read "High" once deep OI added back. The wider the market, the less the mid is real.
+            score -= min(int((sp - 15) / 8.0 * 6) + 4, 48)
+            reasons.append(f"wide bid-ask ({round(sp)}%)")
     if depth >= 500:
         score += 8; reasons.append("deep liquidity")
     elif depth < 25:
@@ -567,6 +627,12 @@ def _confidence(opp: dict, quant: dict) -> dict:
     h = quant.get("heston")
     if h and h.get("feller_ok"):
         score += 4; reasons.append("Heston Feller-stable")
+    # HARD CEILINGS — a wide market can't be filled near mid, so it DOMINATES execution regardless of OI /
+    # model quality: > _SPREAD_WIDE caps below "High" (Medium at best), > _SPREAD_UNTRADEABLE caps at "Low".
+    if sp is not None and sp > _SPREAD_UNTRADEABLE:
+        score = min(score, 44)
+    elif sp is not None and sp > _SPREAD_WIDE:
+        score = min(score, 62)
     score = int(max(5, min(99, score)))
     label = "High" if score >= 75 else "Medium" if score >= 55 else "Low"
     return {"score": score, "label": label, "reasons": reasons[:4]}
@@ -1768,27 +1834,42 @@ def _build_evaluate_opp(legs: list[dict], stock: Optional[dict], chains_by_exp: 
     return opp
 
 
+_EARN_GAP_MIN_FRAC = 0.4   # a print in the window ALWAYS carries a gap → the isolated event is ≥ 40% of the
+                           # straddle move; the decomposition must never collapse it to nothing (a high trailing
+                           # HV or a thin decomposition would otherwise zero it out and silently disable the feature)
+
+
 def _earnings_implied_move_pct(calls: dict, puts: dict, spot: float, dte: int,
                                hv: Optional[float]) -> Optional[float]:
     """The isolated EARNINGS gap as a FRACTION of spot. The ATM straddle prices the market's TOTAL expected
-    move to expiry (event-inflated); the baseline DIFFUSION move (from HV, which carries no event) is stripped
-    out — variance is additive, so M_event = √(M_total² − M_diffusion²). This is the single-day jump the
-    diffusion σ (IV·√T) smears across the whole horizon and therefore understates. Returns None when the ATM
-    straddle can't be priced or the straddle is fully explained by diffusion (no isolable event excess)."""
+    move to expiry (event-inflated); the baseline DIFFUSION move is stripped out — variance is additive, so
+    M_event = √(M_total² − M_diffusion²) — leaving the single-day jump the diffusion σ (IV·√T) smears across the
+    horizon. ROBUSTNESS (a print in the window must never silently disable the feature): (a) the ATM straddle is
+    taken from the nearest strike with BOTH legs priceable (a single dead leg no longer returns None); (b) the
+    diffusion vol is CAPPED at the straddle's own implied vol, so a high trailing HV can't drive the event
+    negative; (c) the event is FLOORED at _EARN_GAP_MIN_FRAC of the straddle move. Returns None only when NO
+    near-ATM straddle can be priced at all."""
     if not spot or spot <= 0:
         return None
-    common_ks = [k for k in calls if k in puts]                 # strikes quoted on BOTH sides
-    if not common_ks:
+    common_ks = sorted((k for k in calls if k in puts), key=lambda k: abs(k - spot))   # nearest-to-spot first
+    straddle = None
+    for k in common_ks[:5]:                                     # first near-ATM strike with BOTH legs priceable
+        cq, pq = calls[k], puts[k]
+        if cq.mid and pq.mid and cq.mid > 0 and pq.mid > 0:
+            straddle = cq.mid + pq.mid
+            break
+    if not straddle:
         return None
-    atm_k = min(common_ks, key=lambda k: abs(k - spot))         # nearest-to-spot straddle
-    cq, pq = calls[atm_k], puts[atm_k]
-    if not (cq.mid and pq.mid and cq.mid > 0 and pq.mid > 0):
-        return None
-    m_total = (cq.mid + pq.mid) / spot                          # straddle-implied TOTAL move to expiry (fraction)
-    m_diff = (hv * math.sqrt(max(dte, 1) / 365.0)) if hv else 0.0   # baseline diffusion (no event)
+    hz = math.sqrt(max(dte, 1) / 365.0)
+    m_total = straddle / spot                                   # straddle-implied TOTAL move to expiry (fraction)
+    straddle_vol = m_total / hz if hz else None                 # the straddle's own implied annualized vol
+    # Diffusion baseline CAPPED at the straddle's implied vol — a high trailing HV (a recently-volatile name)
+    # must not swamp the total and force the event negative.
+    diff_vol = min(hv, straddle_vol) if (hv and straddle_vol) else 0.0
+    m_diff = diff_vol * hz
     m_event = math.sqrt(max(m_total ** 2 - m_diff ** 2, 0.0))
-    m_event = min(m_event, 0.60)                                # sanity clamp against a mispriced/illiquid straddle
-    return m_event or None
+    m_event = max(m_event, _EARN_GAP_MIN_FRAC * m_total)        # floor — a print always carries a gap
+    return min(m_event, 0.60)                                   # sanity clamp against a mispriced/illiquid straddle
 
 
 def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: date,
@@ -1835,10 +1916,13 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
         for k in call_strikes:
             o = _single_leg_income(_struct, _cc_label, calls[k],
                                    sofr_pct=sofr_pct, covered=owns_underlying, **common)
-            if o:
-                if not owns_underlying:
-                    o["unbounded_loss"] = True     # naked call — upside risk is unbounded (matches the evaluate build)
-                cc.append(o)
+            if not o:
+                continue
+            if not (MIN_ABS_DELTA <= abs(o.get("short_delta") or 0.0) <= MAX_ABS_DELTA):
+                continue                           # outside the tradable delta band — skip (liquidity + memory)
+            if not owns_underlying:
+                o["unbounded_loss"] = True     # naked call — upside risk is unbounded (matches the evaluate build)
+            cc.append(o)
         # Prioritize SAFER strikes (higher keep-prob) — surface the ladder above min_prob, not just the
         # nearest-money / highest-yield strikes; yield breaks ties.
         opps += sorted(cc, key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0),
@@ -1848,7 +1932,8 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     if "cash_secured_put" in structures:
         cp = [o for k in put_strikes
               if (o := _single_leg_income("cash_secured_put", "Cash-Secured Put", puts[k],
-                                          sofr_pct=sofr_pct, **common))]
+                                          sofr_pct=sofr_pct, **common))
+              and MIN_ABS_DELTA <= abs(o.get("short_delta") or 0.0) <= MAX_ABS_DELTA]
         # Prioritize SAFER strikes (higher keep-prob) — the full ladder above min_prob; yield breaks ties.
         opps += sorted(cp, key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0),
                        reverse=True)[:PER_STRUCTURE_CAP]
@@ -2084,7 +2169,7 @@ async def run_derivative_income(
     plain single-scan / portfolio callers pass None → unchanged RND-probability strikes."""
     ticker = _norm_ticker(ticker)
     structures = structures or ["covered_call", "cash_secured_put", "short_strangle",
-                                "credit_spread", "iron_condor", "jade_lizard", "calendar"]
+                                "credit_spread", "iron_condor"]
     min_prob = min(max(min_prob, 0.5), 0.99)
     today = date.today()
 
@@ -2092,10 +2177,11 @@ async def run_derivative_income(
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
                  f"{'own' if owns_underlying else 'naked'}:"
-                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v5")   # owns → covered call · else naked-call BPR;
+                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v6")   # owns → covered call · else naked-call BPR;
                  # v4: not-owned short calls now build as structure=naked_call (correct payoff/grade), untradeable-leg
                  #     filter, + context.change_pct/prev_close — all change the cached shape.
                  # v5: opp.earnings_gap_pct (isolated event move) attached when earnings is before expiry.
+                 # v6: earnings gap made ROBUST (multi-strike straddle + HV cap + floor) — no longer collapses to None.
                  #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:
@@ -2120,7 +2206,10 @@ async def run_derivative_income(
         all_exps = await provider.get_option_expirations(ticker)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"No options chain for {ticker}: {exc}"}
-    chosen = _select_expirations(all_exps, target_dte, today, target_expiration)
+    # ONE expiry by default — the 512 MiB peak scales with expiries × candidates; a calendar
+    # (premium) needs a later expiry to pair against, so bump to 2 only then.
+    chosen = _select_expirations(all_exps, target_dte, today, target_expiration,
+                                 limit=2 if "calendar" in structures else DEFAULT_SCAN_EXPIRIES)
     if not chosen:
         return {"error": f"No expirations in range for {ticker}"}
 

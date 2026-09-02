@@ -133,6 +133,16 @@ class TestFibonacci:
         by = {round(l["ratio"], 3): l["price"] for l in fib["levels"]}
         assert abs(by[0.618] - (150 - 0.618 * 50)) < 1.0      # 61.8% retracement ≈ 119.1
 
+    def test_pullback_recovery_is_up_swing_not_down(self):
+        # high early ($300), low middle ($150), price recovered to $230 → an UP move. The old logic
+        # (window high older than low → "down-swing") projected targets toward $0/negative (CRDO bug).
+        df = _df(_path([100, 300, 150, 230]))
+        z = _zigzag(df, order=5)
+        fib = _fibonacci(z, df, float(df["Close"].values[-1]))
+        assert fib and fib["direction"] == "up"
+        assert all(e["price"] > 0 for e in fib["extensions"])                          # no negative targets
+        assert all(e["price"] > fib["swing"]["to"]["price"] for e in fib["extensions"])  # targets above the swing
+
     def test_extensions_project_targets_above_the_swing(self):
         # the "price after breakout" targets: 127–262% extensions sit ABOVE the up-swing high
         df = _df(_path([130, 100, 150, 120]))

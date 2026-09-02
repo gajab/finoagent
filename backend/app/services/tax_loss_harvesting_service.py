@@ -465,6 +465,14 @@ def _get_sector_peers(ticker: str, max_peers: int = 40) -> list[str]:
     # Sector ETFs (always add — very wash-sale safe, low TE)
     sector_etfs = _SECTOR_PEER_ETFS.get(sector, [])
     combined = list(dict.fromkeys(peers + sector_etfs))  # dedup, preserve order
+
+    # Shared theme peers (crypto / gold complex / AI data-center / …) from the correlated-assets
+    # registry — the same curated knowledge Book Exposure uses, so both surfaces agree on what's related.
+    try:
+        from .correlated_assets_service import theme_peers as _theme_peers
+        combined = list(dict.fromkeys(combined + [p for p in _theme_peers(ticker) if p != ticker]))
+    except Exception:  # noqa: BLE001 — best-effort enrichment
+        pass
     return combined[:max_peers]
 
 

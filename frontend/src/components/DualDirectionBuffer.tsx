@@ -1176,6 +1176,15 @@ export function DualDirectionBuffer() {
                         const lossOnsetPct = payoffBounds?.lossOnsetPct ?? maxLossScenario.underlyingChangePct;
                         const upsideCapped = payoffBounds?.upsideCapped ?? false;
                         const downsideFloored = payoffBounds?.downsideFloored ?? false;
+                        // Guard against nonsensical "Max Loss" labels when the payoff is flat
+                        // (a conversion/box locks one number at every price) or one-sided (the
+                        // worst case is still a gain, or the best case is still a loss).
+                        const pnlSpan = Math.abs(maxProfitScenario.pnl - maxLossScenario.pnl);
+                        const flatTol = Math.max(2, Math.abs(customTotalDeployed || maxProfitScenario.pnl) * 0.0005);
+                        const isFlatPayoff = pnlSpan < flatTol;
+                        const worstIsProfit = maxLossScenario.pnl >= 0;   // no scenario loses money
+                        const bestIsLoss = maxProfitScenario.pnl <= 0;    // no scenario makes money
+                        const money0 = (v: number) => `${v >= 0 ? '+' : '−'}$${Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
                         const crossoverScenarios = evaluatedScenarios.filter(s => s.isCrossover);
                         // Chart: all points (smooth curve) minus crossover-inserted rows
                         const chartScenarios = evaluatedScenarios.filter(s => !s.isCrossover);
@@ -1197,26 +1206,31 @@ export function DualDirectionBuffer() {
 
                                 {/* ── Summary Cards ── */}
                                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
-                                    <div className="rounded-xl bg-success/10 border border-success/20 p-3 text-center">
-                                        <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">Max Profit</div>
-                                        <div className="text-lg font-bold text-success">+{maxProfitScenario.roi.toFixed(1)}%</div>
+                                    {isFlatPayoff ? (
+                                        <div className={`col-span-2 rounded-xl p-3 text-center border ${maxProfitScenario.pnl >= 0 ? 'bg-info/10 border-info/20' : 'bg-error/10 border-error/20'}`}>
+                                            <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">Locked P&amp;L — flat payoff</div>
+                                            <div className={`text-lg font-bold ${maxProfitScenario.pnl >= 0 ? 'text-info' : 'text-error'}`}>{money0(maxProfitScenario.pnl)}</div>
+                                            <div className="text-[10px] opacity-50">{maxProfitScenario.roi >= 0 ? '+' : ''}{maxProfitScenario.roi.toFixed(1)}% · same at every price</div>
+                                            <div className="text-[10px] text-info/80 mt-0.5">No directional risk — a conversion/box. Verify the legs aren&apos;t mispriced.</div>
+                                        </div>
+                                    ) : (<>
+                                    <div className={`rounded-xl p-3 text-center border ${bestIsLoss ? 'bg-error/10 border-error/20' : 'bg-success/10 border-success/20'}`}>
+                                        <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">{bestIsLoss ? 'Best Case (still a loss)' : 'Max Profit'}</div>
+                                        <div className={`text-lg font-bold ${bestIsLoss ? 'text-error' : 'text-success'}`}>{maxProfitScenario.roi >= 0 ? '+' : ''}{maxProfitScenario.roi.toFixed(1)}%</div>
                                         <div className="text-[10px] opacity-50">
                                             at {gainOnsetPct > 0 ? '+' : ''}{gainOnsetPct}%{upsideCapped ? ' & above' : ''}
                                         </div>
-                                        <div className="text-xs text-success mt-0.5">
-                                            +${maxProfitScenario.pnl.toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                                        </div>
+                                        <div className={`text-xs mt-0.5 ${bestIsLoss ? 'text-error' : 'text-success'}`}>{money0(maxProfitScenario.pnl)}</div>
                                     </div>
-                                    <div className="rounded-xl bg-error/10 border border-error/20 p-3 text-center">
-                                        <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">Max Loss</div>
-                                        <div className="text-lg font-bold text-error">{maxLossScenario.roi.toFixed(1)}%</div>
+                                    <div className={`rounded-xl p-3 text-center border ${worstIsProfit ? 'bg-success/10 border-success/20' : 'bg-error/10 border-error/20'}`}>
+                                        <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">{worstIsProfit ? 'Worst Case (still a gain)' : 'Max Loss'}</div>
+                                        <div className={`text-lg font-bold ${worstIsProfit ? 'text-success' : 'text-error'}`}>{maxLossScenario.roi >= 0 ? '+' : ''}{maxLossScenario.roi.toFixed(1)}%</div>
                                         <div className="text-[10px] opacity-50">
                                             at {lossOnsetPct > 0 ? '+' : ''}{lossOnsetPct}%{downsideFloored ? ' & below' : ''}
                                         </div>
-                                        <div className="text-xs text-error mt-0.5">
-                                            ${maxLossScenario.pnl.toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                                        </div>
+                                        <div className={`text-xs mt-0.5 ${worstIsProfit ? 'text-success' : 'text-error'}`}>{money0(maxLossScenario.pnl)}</div>
                                     </div>
+                                    </>)}
                                     <div className="rounded-xl bg-base-200/30 border border-base-content/10 p-3 text-center">
                                         <div className="text-[10px] uppercase tracking-wider opacity-60 mb-1">Breakeven</div>
                                         {crossoverScenarios.length > 0 ? crossoverScenarios.map((c, i) => (

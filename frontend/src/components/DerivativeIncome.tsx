@@ -4,8 +4,9 @@ import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
   AlertCircle, ChevronDown, ChevronUp, Activity, Landmark,
-  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw
+  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw, Crown
 } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations, fetchDerivativeIncomeWatchlist, addDerivativeIncomeWatchlist, deleteDerivativeIncomeWatchlist } from '../api';
 import type { DerivativeIncomeWatchlistItem } from '../api';
 import type { DeskEvaluateParams, EvaluateLeg } from '../api';
@@ -37,14 +38,16 @@ function buildQuantSignals(quant?: DerivativeIncomeQuant | null): QuantSignal[] 
   return sig;
 }
 
-const STRUCTURE_OPTIONS = [
+const STRUCTURE_OPTIONS: { id: string; label: string; icon: React.ReactNode; premiumOnly?: boolean }[] = [
   { id: 'covered_call', label: 'Covered Call', icon: <TrendingUp className="w-3.5 h-3.5" /> },
   { id: 'cash_secured_put', label: 'Cash-Secured Put', icon: <DollarSign className="w-3.5 h-3.5" /> },
   { id: 'short_strangle', label: 'Short Strangle', icon: <Activity className="w-3.5 h-3.5" /> },
   { id: 'credit_spread', label: 'Credit Spreads', icon: <ShieldCheck className="w-3.5 h-3.5" /> },
   { id: 'iron_condor', label: 'Iron Condor', icon: <Layers className="w-3.5 h-3.5" /> },
-  { id: 'jade_lizard', label: 'Jade Lizard', icon: <Feather className="w-3.5 h-3.5" /> },
-  { id: 'calendar', label: 'Calendar', icon: <Calendar className="w-3.5 h-3.5" /> },
+  // Premium-only — placed LAST and gated on isPremium. Off by default for everyone; the backend also
+  // strips these for non-premium (_gate_premium_structures), so this is UX, not the enforcement boundary.
+  { id: 'jade_lizard', label: 'Jade Lizard', icon: <Feather className="w-3.5 h-3.5" />, premiumOnly: true },
+  { id: 'calendar', label: 'Calendar', icon: <Calendar className="w-3.5 h-3.5" />, premiumOnly: true },
 ];
 
 const money = (n: number | null | undefined, d = 0) =>
@@ -378,8 +381,16 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
           </p>
         </div>
         <div className="text-right shrink-0">
-          <p className={`text-2xl font-bold ${probTone(opp.prob_keep_pct)}`}>{winPct(opp.prob_keep_pct)}</p>
-          <p className="text-[10px] uppercase tracking-wider text-base-content/50">keep · {opp.prob_method}</p>
+          <p className={`text-2xl font-bold ${probTone(opp.prob_keep_pct)}`}>{winPct(opp.prob_keep_pct)}
+            {opp.prob_method === 'BS_fallback' && <span className="ml-0.5 text-sm text-warning cursor-help align-super"
+              title="IV-estimate">≈</span>}
+          </p>
+          {opp.prob_method === 'BS_fallback' ? (
+            <p className="text-[10px] uppercase tracking-wider text-warning/80 cursor-help"
+              title="IV-ESTIMATE — the option chain's implied-vol surface was inconsistent, so the market-implied (RND) probability was unreliable; this Win% is a flat-vol Black-Scholes estimate. Treat it as approximate.">keep · IV-est ≈</p>
+          ) : (
+            <p className="text-[10px] uppercase tracking-wider text-base-content/50">keep · {opp.prob_method}</p>
+          )}
         </div>
       </div>
 
@@ -1049,6 +1060,7 @@ function WatchList({ onSelect }: { onSelect: (ticker: string) => void }) {
 }
 
 export function DerivativeIncome() {
+  const { isPremium } = useAuth();
   const [mode, setMode] = useState<Mode>('single');
   const [ticker, setTicker] = useState('AAPL');
   const [searchParams] = useSearchParams();
@@ -1062,7 +1074,7 @@ export function DerivativeIncome() {
   const [minProb, setMinProb] = useState(90);
   const [minIncome, setMinIncome] = useState(20);
   const [structures, setStructures] = useState<string[]>(
-    ['covered_call', 'cash_secured_put', 'credit_spread', 'iron_condor', 'jade_lizard', 'short_strangle', 'calendar']);
+    ['covered_call', 'cash_secured_put', 'credit_spread', 'iron_condor', 'short_strangle']);
   // Data source is chosen once in Settings (functionality-level), not per-scan. Default Yahoo Finance.
   const [quoteSource] = useState<'yfinance' | 'ibkr'>(
     () => (localStorage.getItem('incomeDesk.quoteSource') === 'ibkr' ? 'ibkr' : 'yfinance'));
@@ -1111,8 +1123,13 @@ export function DerivativeIncome() {
     return () => { alive = false; clearTimeout(id); };
   }, [ticker, mode]);
 
-  const toggleStructure = (id: string) =>
+  const toggleStructure = (id: string) => {
+    // Premium-only structures (jade lizard / calendar) can't be enabled without premium — the backend
+    // strips them anyway, so block the toggle here to avoid a checkbox that silently does nothing.
+    const opt = STRUCTURE_OPTIONS.find(o => o.id === id);
+    if (opt?.premiumOnly && !isPremium) return;
     setStructures(s => (s.includes(id) ? s.filter(x => x !== id) : [...s, id]));
+  };
 
   const commonParams = (): DiParams => {
     // Single ticker: scan the EXACT picked expiry. Portfolio: that exact date won't be listed for every
@@ -1245,11 +1262,15 @@ export function DerivativeIncome() {
         <div className="form-control lg:col-span-4">
           <label className="label py-1"><span className="label-text text-xs font-medium">Structures to evaluate</span></label>
           <div className="flex flex-wrap gap-2">
-            {STRUCTURE_OPTIONS.map((s) => (
-              <button type="button" key={s.id}
-                className={`btn btn-xs gap-1 ${structures.includes(s.id) ? 'btn-secondary' : 'btn-outline'}`}
-                onClick={() => toggleStructure(s.id)}>{s.icon}{s.label}</button>
-            ))}
+            {STRUCTURE_OPTIONS.map((s) => {
+              const locked = s.premiumOnly && !isPremium;
+              return (
+                <button type="button" key={s.id} disabled={locked}
+                  title={locked ? 'Premium feature' : undefined}
+                  className={`btn btn-xs gap-1 ${structures.includes(s.id) ? 'btn-secondary' : 'btn-outline'} ${locked ? 'opacity-50' : ''}`}
+                  onClick={() => toggleStructure(s.id)}>{s.icon}{s.label}{locked && <Crown className="w-3 h-3 text-yellow-400" />}</button>
+              );
+            })}
           </div>
           {mode === 'single' && structures.includes('covered_call') && (
             <label className="flex items-start gap-2 mt-2 cursor-pointer text-[11px] text-base-content/70">

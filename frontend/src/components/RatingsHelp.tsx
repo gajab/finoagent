@@ -89,12 +89,19 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                     title="Win %" q="How likely to work out?">
                     The chance the option you sold <b>expires worthless</b> — you keep the full premium and are not
                     assigned. Your <i>min-probability</i> setting is the floor. Shown to one decimal and capped at
-                    <b> 99.9%</b> — it is never a certainty.
+                    <b> 99.9%</b> — it is never a certainty. A <b className="text-warning">≈</b> next to it means
+                    <b> IV-estimate</b>: the chain's implied-vol surface was inconsistent, so the market-implied (RND)
+                    probability was unreliable and this is a flat-vol Black-Scholes estimate instead — treat it as
+                    approximate.
                   </HeadNum>
                   <HeadNum icon={<Gauge className="w-4 h-4 text-warning" />} tone="border-warning/25 bg-warning/[0.06]"
                     title="Execution" q="Can I trust & fill it?">
                     Pricing reliability (arbitrage-free vol model) and liquidity (bid-ask, open interest).
                     <b> High ≠ a good trade</b> — it means the numbers are trustworthy and the fill is realistic.
+                    A <b>wide bid-ask dominates</b> this read: above ~20% it can't reach <b>High</b>, and above ~40%
+                    (untradeable near the mid) it's capped at <b>Low</b> no matter how deep the open interest — because
+                    the quoted mid isn't a price you can actually get. When you <i>evaluate</i> a strike that the scan
+                    dropped, a <b>Low here is usually why</b> (the scan only lists fillable strikes).
                   </HeadNum>
                 </div>
               </div>
@@ -115,7 +122,8 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                     bit of alpha — not risk-neutral profit (fairly-priced income has ~0 of that; the seller's vol edge is
                     the <b>VRP</b> factor below).</span></li>
                   <li>➋ <b>Option-math adjustments</b> (± on the base): <b>VRP</b>, <b>Moneyness</b> (how close the short
-                    strike sits), <b>Skew / IV-edge</b>, <b>Liquidity</b>, <b>Beta</b>, and <b>Undefined risk</b> — an
+                    strike sits), <b>Skew / IV-edge</b>, <b>Liquidity</b> (scales with the bid-ask — a very wide,
+                    hard-to-fill market is a heavy demerit, not a token dock), <b>Beta</b>, and <b>Undefined risk</b> — an
                     explicit demerit for <b>unbounded-loss</b> structures (naked calls, short strangles): the base
                     score's tail term uses CVaR<sub>95</sub> and deliberately omits the deep worst case, so this prices
                     the <b>CVaR<sub>99</sub></b> tail, scaled by how <i>reachable</i> the strike is — a deep, low-touch
@@ -167,13 +175,21 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                   creep closer into open air.
                 </p>
                 <div className="mt-2 rounded-lg border border-warning/25 bg-warning/[0.05] p-2 text-[11px] text-base-content/70 leading-snug">
-                  <b className="text-warning/90">Earnings-aware ranking</b> (opt-in checkbox before you scan) — walls are a
-                  <b> continuous-tape</b> defense; an earnings <b>gap jumps through them</b>. When a print falls before expiry it:
-                  <b> ➊</b> discounts the <b>Structure</b> credit for walls the isolated event move can leap, and
-                  <b> ➋</b> adds an <b>Earnings gap</b> penalty when the strike sits inside <b>~1.5×</b> that move (a real
-                  surprise runs 2–3× the implied). The event move is <b>isolated</b> from the straddle (total move minus the
-                  baseline diffusion), so it's the single-day jump the diffusion σ smears away. Every impacted metric shows
-                  its value <b>with / without</b> the adjustment so you can see exactly what earnings did.
+                  <b className="text-warning/90">Earnings-aware ranking</b> (opt-in checkbox before you scan) — an earnings print
+                  is a <b>discontinuous overnight jump</b> that continuous-tape signals can't survive. The <b>event move</b> is
+                  isolated from the straddle (total move minus the baseline diffusion). When a print falls before expiry it:
+                  <ul className="mt-1 ml-3 space-y-0.5 list-disc">
+                    <li><b>Structure</b> — discounts the wall credit for walls the gap can leap.</li>
+                    <li><b>Earnings gap</b> — penalises a strike inside <b>~1.5×</b> the move (surprises run 2–3× implied); the
+                      hit is <b>softened for defined-risk</b> structures whose long wing caps the loss.</li>
+                    <li><b>Breach risk</b> — becomes <b>jump-aware</b>: the touch probability adds the overnight gap the diffusion
+                      path can't leap, so it never understates the real breach odds.</li>
+                    <li><b>Undefined risk</b> — the naked/unbounded demerit is <b>amplified</b> across a print (the unbounded tail
+                      bites exactly on the gap), steering toward capped-loss structures.</li>
+                    <li><b>Gamma regime · Range fit · Calm tape</b> — these "the tape is calm" credits are <b>voided</b> in
+                      proportion to the gap (dealers can't hedge a binary jump; price can jump out of the range).</li>
+                  </ul>
+                  Every impacted metric shows its value <b>with / without</b> so you see exactly what earnings did.
                 </div>
               </div>
 

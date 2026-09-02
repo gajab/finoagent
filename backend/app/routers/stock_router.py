@@ -38,6 +38,8 @@ from ..services.pmcc_service import run_pmcc_pmcp
 from ..services.zebra_service import run_zebra
 from ..services.derivative_income_service import run_derivative_income, run_portfolio_derivative_income
 from ..services.desk_review_service import rank_desk, run_desk_agents, evaluate_desk_trade, monitor_trade, monitor_analyze, blind_read
+from ..services.market_sentiment_service import market_sentiment
+from ..services.book_exposure_service import compute_book_exposure
 from ..services.cppi_service import run_cppi_simulation
 from ..services.tax_loss_harvesting_service import run_portfolio_tax_loss_harvesting
 from ..services.market_impact_service import analyze_market_impact
@@ -140,7 +142,21 @@ async def get_box_market_timing(user: User = Depends(get_current_user)):
 # =========================================================================
 
 _DI_DEFAULT_STRUCTURES = ["covered_call", "cash_secured_put", "collar", "credit_spread",
-                          "iron_condor", "jade_lizard", "calendar"]
+                          "iron_condor"]
+
+# Structures only PREMIUM users may scan — OFF by default for everyone; a premium user opts in
+# by passing the name explicitly (the frontend shows the checkbox only to them). Kept out of the
+# free-tier scan both as product tiering AND to hold the 512 MiB instance's peak down: every extra
+# structure is more candidates for _finalize_desk to fine-grid.
+_PREMIUM_STRUCTURES = {"jade_lizard", "calendar"}
+
+
+def _gate_premium_structures(structures: list[str], user: User) -> list[str]:
+    """Drop premium-only structures unless the user is premium. Enforced server-side so a
+    hand-crafted request can't bypass the frontend's premium-gated checkbox."""
+    if getattr(user, "is_premium", False):
+        return structures
+    return [s for s in structures if s not in _PREMIUM_STRUCTURES]
 
 
 class WatchlistItem(BaseModel):
@@ -2356,6 +2372,7 @@ async def compute_derivative_income(
     income with ≥min_prob probability of not being exercised, ranked vs SOFR."""
     if ticker.startswith("."):
         ticker = "^" + ticker[1:]
+    body.structures = _gate_premium_structures(body.structures, user)
     try:
         result = await run_derivative_income(
             ticker=ticker,
@@ -2433,6 +2450,7 @@ async def compute_desk_review(
     No LLM — instant."""
     if ticker.startswith("."):
         ticker = "^" + ticker[1:]
+    body.structures = _gate_premium_structures(body.structures, user)
     try:
         result = await rank_desk(
             ticker, target_dte=body.target_dte, min_prob=body.min_prob,
@@ -2596,6 +2614,116 @@ async def compute_desk_blind(
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Blind read failed: {exc}")
+
+
+class SentimentTradeIn(BaseModel):
+    """The trade the sentiment read is framed around (so the crowd/news is judged against the short leg)."""
+    structure: str | None = None
+    label: str | None = None
+    short_strike: float | None = None
+    expiration: str | None = None
+    spot: float | None = None
+    next_earnings: str | None = None
+    earnings_gap_pct: float | None = None
+    dte: int | None = None
+
+
+class SentimentIn(BaseModel):
+    trade: SentimentTradeIn = Field(default_factory=SentimentTradeIn)
+    model: str | None = None
+
+
+@router.post("/{ticker}/desk-review/sentiment")
+async def compute_market_sentiment(
+    ticker: str,
+    body: SentimentIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """MARKET SENTIMENT — recent news + StockTwits crowd chatter distilled into an actionable, earnings-focused
+    read for the user's specific trade. NOT part of the grade — qualitative colour to build conviction. Needs
+    the user's OpenAI key."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured. Please add it in Settings.")
+    model = body.model or (await get_user_api_key(db, user.id, "openai_model")) or "gpt-4o-mini"
+    try:
+        result = await market_sentiment(ticker, body.trade.model_dump(), api_key=api_key, model=model, db=db)
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Sentiment read failed: {exc}")
+
+
+class ExposureLegIn(BaseModel):
+    action: str | None = None       # BUY | SELL
+    type: str | None = None         # CALL | PUT
+    strike: float | None = None
+    expiration: str | None = None
+    iv: float | None = None
+    qty: float | None = None
+
+
+class ExposureTradeIn(BaseModel):
+    """The candidate trade whose interaction with the existing book we analyze."""
+    structure: str | None = None
+    label: str | None = None
+    short_strike: float | None = None
+    long_strike: float | None = None
+    expiration: str | None = None
+    spot: float | None = None
+    dte: int | None = None
+    contracts: float | None = None
+    legs: list[ExposureLegIn] = Field(default_factory=list)
+
+
+class ExposureIn(BaseModel):
+    trade: ExposureTradeIn = Field(default_factory=ExposureTradeIn)
+    quote_source: str | None = None
+
+
+@router.post("/{ticker}/desk-review/exposure")
+async def desk_book_exposure(
+    ticker: str,
+    body: ExposureIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """BOOK EXPOSURE — DETERMINISTIC portfolio-risk read on how a NEW income trade changes the user's
+    EXISTING active book (My Trades, first tab): same-name concentration, $ exposure across market moves
+    (book vs book+trade), BPR / assignment, β-weighted directional delta, measured 1y correlations, and
+    macro sensitivity. Reuses the Manage-Book engine. NO LLM, no invented facts — NOT part of the grade."""
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    # The existing book = the user's ACTIVE saved strategies (My Trades first tab, NOT paper trades).
+    strategies = []
+    try:
+        strategies = (await db.execute(select(SavedStrategy).where(
+            SavedStrategy.user_id == user.id,
+            SavedStrategy.trade_status == "active",
+        ))).scalars().all()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Exposure: failed to load book for user {user.id}: {exc}")
+
+    candidate = body.trade.model_dump()
+    candidate["ticker"] = ticker
+    quote_source = body.quote_source or "yfinance"
+    try:
+        result = await compute_book_exposure(candidate, strategies, quote_source, user, db)
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Exposure read failed: {exc}")
 
 
 # =========================================================================
