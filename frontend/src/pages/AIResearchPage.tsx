@@ -23,6 +23,7 @@ import WhatIfScenarios from '../components/WhatIfScenarios';
 import { PickAndShovel } from '../components/PickAndShovel';
 import { PickAndShovelV2 } from '../components/PickAndShovelV2';
 import { useAuth } from '../contexts/AuthContext';
+import { CollapsibleSidebar } from '../components/CollapsibleSidebar';
 
 type ModuleId = 'event' | 'whatif' | 'pickshv' | 'pickshv2';
 
@@ -129,7 +130,7 @@ export default function AIResearchPage() {
 
       <div className="flex flex-col lg:flex-row gap-6">
         {/* Sidebar */}
-        <div className="w-full lg:w-1/4">
+        <CollapsibleSidebar storageKey="aiResearch:navCollapsed" label="Research" accent="primary">
           <div className="flex flex-col gap-2">
             {MODULES.map(m => (
               <button
@@ -155,10 +156,10 @@ export default function AIResearchPage() {
               </button>
             ))}
           </div>
-        </div>
+        </CollapsibleSidebar>
 
         {/* Content */}
-        <div className="w-full lg:w-3/4">
+        <div className="w-full lg:flex-1 min-w-0">
           <div className="glass-card h-full">
             <div className="card-body">
               {/* Module title strip for clarity on narrow screens */}

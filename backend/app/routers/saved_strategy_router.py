@@ -1,5 +1,6 @@
 """Saved strategy routes: save, load, update, delete named strategy configurations."""
 
+import datetime as _dt
 import json
 import logging
 import math
@@ -549,9 +550,290 @@ async def delete_saved_strategy(
 # Trade Tracking Routes
 # --------------------------------------------------------------------------
 
+def _has_banked_realized(s: SavedStrategy) -> bool:
+    """True if the trade has realized P&L banked from a (partial or full) close —
+    i.e. it carries closed_legs or a non-zero realized_pnl. Used so the Closed tab can
+    surface the realized chunk of a still-active PARTIAL close."""
+    try:
+        p = json.loads(s.parameters or "{}")
+    except (ValueError, TypeError):
+        return False
+    if p.get("closed_legs"):
+        return True
+    try:
+        return abs(float(p.get("realized_pnl") or 0)) > 0.005
+    except (ValueError, TypeError):
+        return False
+
+
+# ── Closed-tab monthly rollups ────────────────────────────────────────────────
+# A closed trade never re-prices, so a PRIOR month's realized numbers are immutable.
+# We compute each prior month ONCE, store the small rollup in the DB cache, and stop
+# shipping those trades' full records to the browser. The client then downloads only the
+# CURRENT month's trades (expandable) plus a handful of tiny summaries, instead of the
+# entire closed history on every landing.
+#
+# "Frozen" (rollup-only) month  ⇔  strictly before the current month AND untouched by any
+# still-open PARTIAL close (a partial can bank more realized later, so its month stays live).
+# Everything else — the current month, undated closes, any prior month a partial touched —
+# ships as full rows ("loose") so the user can still expand it.
+
+_CLOSED_LEDGER_TTL = 180 * 86400   # rollups are immutable; the signature below guards staleness
+
+
+def _closed_ledger_key(user_id: int) -> str:
+    return f"closed_ledger:{user_id}:v1"
+
+
+def _now_month() -> str:
+    n = _dt.datetime.now(_dt.timezone.utc)
+    return f"{n.year:04d}-{n.month:02d}"
+
+
+def _month_label(month: str) -> str:
+    if month == "undated":
+        return "Undated"
+    try:
+        y, m = month.split("-")
+        return _dt.date(int(y), int(m), 1).strftime("%B %Y")
+    except (ValueError, TypeError):
+        return month
+
+
+def _is_short_action(action: Optional[str]) -> bool:
+    a = (action or "").lower()
+    return "sell" in a or "short" in a
+
+
+def _safe_params(s: SavedStrategy) -> dict:
+    try:
+        return json.loads(s.parameters or "{}")
+    except (ValueError, TypeError):
+        return {}
+
+
+def _close_month_of(s: SavedStrategy, params: dict) -> Optional[str]:
+    """The 'YYYY-MM' bucket a trade's realized P&L belongs to. Full close → exit_date;
+    partial (still-active, banked) → the latest closed-leg date; else updated_at. Sliced from
+    the ISO string so the frontend can group the returned rows by this exact tag (no local-vs-
+    UTC month drift between the frozen summaries and the live current-month rows)."""
+    iso = None
+    if s.trade_status == "closed" and s.exit_date:
+        iso = s.exit_date.isoformat()
+    else:
+        for l in (params.get("closed_legs") or []):
+            ca = l.get("closed_at")
+            if ca and (iso is None or ca > iso):
+                iso = ca
+    if not iso and s.updated_at:
+        iso = s.updated_at.isoformat()
+    return iso[:7] if iso and len(iso) >= 7 else None
+
+
+def _closed_realized(s: SavedStrategy, params: dict) -> Optional[float]:
+    """Authoritative banked realized P&L — mirrors the frontend's closedRealized():
+    parameters.realized_pnl, else the legacy exit_net."""
+    rp = params.get("realized_pnl")
+    if rp is not None:
+        try:
+            return float(rp)
+        except (ValueError, TypeError):
+            pass
+    if s.exit_net is not None:
+        try:
+            return float(s.exit_net)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _closed_cost_proceeds(params: dict) -> tuple[Optional[float], Optional[float]]:
+    """Σ buys (cost) and Σ sells (proceeds) from closed_legs — mirrors buildClosedLedger:
+    a short leg sells-to-open / buys-to-close; a long leg the reverse. (None, None) when the
+    legs carry no prices (then realized falls back to the stored cumulative value)."""
+    cost = proceeds = 0.0
+    saw = False
+    for l in (params.get("closed_legs") or []):
+        try:
+            qty = abs(float(l.get("qty") or 0))
+        except (ValueError, TypeError):
+            qty = 0.0
+        if qty <= 0:
+            continue
+        mult = 1 if l.get("type") == "stock" else 100
+        try:
+            entry = float(l.get("entry_price") or 0)
+            exit_ = float(l.get("exit_price") or 0)
+        except (ValueError, TypeError):
+            continue
+        saw = True
+        if _is_short_action(l.get("action")):
+            proceeds += entry * mult * qty
+            cost += exit_ * mult * qty
+        else:
+            cost += entry * mult * qty
+            proceeds += exit_ * mult * qty
+    if not saw:
+        return None, None
+    return round(cost, 2), round(proceeds, 2)
+
+
+def _closed_row_out(s: SavedStrategy) -> dict:
+    """Full trade record for the Closed tab, tagged with its canonical close-month so the
+    frontend groups it consistently with the frozen summaries."""
+    d = _to_out(s).model_dump()
+    d["close_month"] = _close_month_of(s, _safe_params(s)) or "undated"
+    return d
+
+
+def _compute_closed_ledger(rows: list[SavedStrategy], now_m: str) -> dict:
+    """Partition closed/partial trades into frozen prior-month rollups, loose ids, and the
+    current-month + loose full rows. Pure arithmetic over persisted fields — no pricing."""
+    contribs = []
+    partial_months: set[str] = set()
+    for s in rows:
+        params = _safe_params(s)
+        m = _close_month_of(s, params) or "undated"
+        is_partial = s.trade_status != "closed"
+        cost, proceeds = _closed_cost_proceeds(params)
+        contribs.append({
+            "s": s, "month": m, "is_partial": is_partial,
+            "realized": _closed_realized(s, params),
+            "cost": cost, "proceeds": proceeds, "bpr": _closed_trade_bpr(s),
+        })
+        if is_partial and m != "undated":
+            partial_months.add(m)
+
+    impure = partial_months | {now_m}
+    frozen: dict[str, dict] = {}
+    loose_ids: list[int] = []
+    current_rows: list[SavedStrategy] = []
+
+    for c in contribs:
+        m = c["month"]
+        if m != "undated" and m < now_m and m not in impure:
+            g = frozen.get(m)
+            if g is None:
+                g = frozen[m] = {"month": m, "label": _month_label(m), "count": 0,
+                                 "wins": 0, "scored": 0, "cost": 0.0, "proceeds": 0.0,
+                                 "realized": 0.0, "bpr": 0.0}
+            g["count"] += 1
+            r = c["realized"]
+            if r is not None:
+                g["scored"] += 1
+                g["realized"] += r
+                if r > 0:
+                    g["wins"] += 1
+            if c["cost"] is not None:
+                g["cost"] += c["cost"]
+            if c["proceeds"] is not None:
+                g["proceeds"] += c["proceeds"]
+            if c["bpr"]:
+                g["bpr"] += c["bpr"]
+        else:
+            current_rows.append(c["s"])
+            if m == "undated" or m < now_m:   # a prior/undated loose row (not caught by the month query)
+                loose_ids.append(c["s"].id)
+
+    for g in frozen.values():
+        for k in ("cost", "proceeds", "realized", "bpr"):
+            g[k] = round(g[k], 2)
+
+    frozen_list = sorted(frozen.values(), key=lambda g: g["month"], reverse=True)
+    return {"frozen": frozen_list, "loose_ids": loose_ids, "current_rows": current_rows}
+
+
+def _closed_ledger_response(now_m: str, frozen: list[dict], current_rows: list[SavedStrategy],
+                            stored: bool) -> dict:
+    total = sum((g.get("realized") or 0) for g in frozen)
+    total += sum((_closed_realized(s, _safe_params(s)) or 0) for s in current_rows)
+    return {
+        "current_month": now_m,
+        "current_month_label": _month_label(now_m),
+        "frozen_months": frozen,
+        "trades": [_closed_row_out(s) for s in current_rows],
+        "total_realized": round(total, 2),
+        "stored": stored,
+    }
+
+
+async def _closed_ledger_sig(db: AsyncSession, user_id: int) -> str:
+    """Cheap staleness signature over ALL of the user's trades (count + latest touch) plus the
+    current month. Any close / partial / edit / delete changes count or max(updated_at), and a
+    month rollover changes the suffix — so a matching signature means the stored rollups are
+    still valid, with no manual cache invalidation to get wrong."""
+    row = (await db.execute(
+        select(sql_func.count(SavedStrategy.id), sql_func.max(SavedStrategy.updated_at))
+        .where(SavedStrategy.user_id == user_id, SavedStrategy.trade_status.isnot(None))
+    )).one()
+    cnt, mx = row[0], row[1]
+    return f"{cnt}:{mx.isoformat() if mx else '-'}:{_now_month()}"
+
+
+@router.get("/trades/closed-ledger")
+async def closed_ledger(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Closed-tab data with prior months pre-summarized.
+
+    Returns the CURRENT month's closed trades (plus partial-close realized and any loose prior
+    rows) as FULL records so they stay expandable, and every strictly-prior immutable month as a
+    compact stored rollup {month, count, wins, scored, cost, proceeds, realized, bpr}. The heavy
+    full closed history is no longer shipped to the browser on every landing.
+
+    Storage: the prior-month rollups live in the DB cache, guarded by a self-validating
+    signature (see _closed_ledger_sig). On a signature hit we reuse the stored summaries and
+    fetch only the current slice (current-month closes + active partials + loose ids), so the
+    older closed rows are never even loaded."""
+    from ..services.cache_service import get_cached, set_cached
+    from sqlalchemy import or_
+
+    now_m = _now_month()
+    sig = await _closed_ledger_sig(db, user.id)
+    cached = await get_cached(db, _closed_ledger_key(user.id))
+
+    if cached and cached.get("sig") == sig:
+        frozen = cached.get("frozen") or []
+        loose_ids = cached.get("loose_ids") or []
+        month_start = _dt.datetime(int(now_m[:4]), int(now_m[5:7]), 1, tzinfo=_dt.timezone.utc)
+        conds = [
+            (SavedStrategy.trade_status == "closed") & (SavedStrategy.exit_date >= month_start),
+            SavedStrategy.trade_status == "active",   # partials filtered below
+        ]
+        if loose_ids:
+            conds.append(SavedStrategy.id.in_(loose_ids))
+        rows = list((await db.execute(select(SavedStrategy).where(
+            SavedStrategy.user_id == user.id,
+            SavedStrategy.trade_status.isnot(None),
+            or_(*conds),
+        ))).scalars().all())
+        current = [s for s in rows if s.trade_status == "closed" or _has_banked_realized(s)]
+        return _closed_ledger_response(now_m, frozen, current, stored=True)
+
+    # Cold or stale → recompute everything and refreeze the prior months.
+    all_rows = list((await db.execute(select(SavedStrategy).where(
+        SavedStrategy.user_id == user.id, SavedStrategy.trade_status.isnot(None),
+    ))).scalars().all())
+    closed_or_banked = [s for s in all_rows if s.trade_status == "closed" or _has_banked_realized(s)]
+    comp = _compute_closed_ledger(closed_or_banked, now_m)
+    try:
+        await set_cached(db, _closed_ledger_key(user.id), {
+            "sig": sig, "now_month": now_m,
+            "frozen": comp["frozen"], "loose_ids": comp["loose_ids"],
+        }, ttl_seconds=_CLOSED_LEDGER_TTL)
+    except Exception:  # noqa: BLE001 — caching must never break the response
+        pass
+    return _closed_ledger_response(now_m, comp["frozen"], comp["current_rows"], stored=False)
+
+
 @router.get("/trades", response_model=list[SavedStrategyOut])
 async def list_trades(
     status: Optional[str] = Query(None, description="Filter: 'active' or 'closed'"),
+    include_partial: bool = Query(
+        False,
+        description="With status='closed', also return still-ACTIVE trades that banked realized "
+                    "P&L from a partial close, so their realized portion shows in the Closed ledger."),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -560,11 +842,17 @@ async def list_trades(
         SavedStrategy.user_id == user.id,
         SavedStrategy.trade_status.isnot(None),
     )
-    if status:
+    if status == "closed" and include_partial:
+        # Pull closed + active, then keep active ones only when they carry realized P&L.
+        q = q.where(SavedStrategy.trade_status.in_(["closed", "active"]))
+    elif status:
         q = q.where(SavedStrategy.trade_status == status)
     q = q.order_by(SavedStrategy.updated_at.desc())
     result = await db.execute(q)
-    return [_to_out(s) for s in result.scalars().all()]
+    rows = result.scalars().all()
+    if status == "closed" and include_partial:
+        rows = [s for s in rows if s.trade_status == "closed" or _has_banked_realized(s)]
+    return [_to_out(s) for s in rows]
 
 
 @router.post("/{strategy_id}/mark-traded", response_model=SavedStrategyOut)
@@ -1014,6 +1302,24 @@ async def book_hedge_advice(
             _pick(s, ("label", "move_pct", "pnl", "pct_of_capital")) for s in (d.get("crash_scenarios") or [])],
         "concentration_by_underlying": [
             _pick(c, ("ticker", "beta", "trades", "short_legs", "gamma_share_pct", "laddered")) for c in (d.get("concentration") or [])],
+        "stock_notional_usd": d.get("stock_notional"),
+        # WHO actually loses in a −20% month (whole position, shares split) — target hedges here.
+        "loss_by_name_at_minus20pct": [
+            _pick(x, ("ticker", "pnl", "option_pnl", "stock_pnl", "beta")) for x in (d.get("loss_by_name") or [])][:10],
+        # DETERMINISTIC factor read (measured ρ / GICS sectors — NOT your opinion, do not override it):
+        #   sectors = where capital & net direction sit; clusters = names that move together (hidden
+        #   concentration); macro = which factors (rates/oil/gold/USD/…) the whole book loads on.
+        "factor_exposure": (lambda fe: {
+            "sectors": [_pick(s, ("sector", "tickers", "capital", "net_directional", "n")) for s in (fe.get("sectors") or [])][:8],
+            "correlated_clusters": [_pick(c, ("tickers", "capital", "net_directional", "avg_rho")) for c in (fe.get("clusters") or [])],
+            "macro_loadings": fe.get("macro") or [],
+        } if fe else None)(d.get("factor_exposure") or {}),
+        # STANDARDIZED institutional guardrails — each breach already carries the cheapest computed fix.
+        "risk_scorecard": (lambda s: {
+            "grade": s.get("grade"), "n_breach": s.get("n_breach"), "n_warn": s.get("n_warn"),
+            "flagged_checks": [_pick(c, ("key", "label", "status", "value_str", "limit_str", "fix"))
+                               for c in (s.get("checks") or []) if c.get("status") != "pass"],
+        } if s else None)(d.get("risk_scorecard") or {}),
         "naked_assignment_capital": d.get("naked_assignment"),
         "hedge_menu": [
             _pick(h, ("label", "instrument", "kind", "long_strike", "short_strike", "contracts",
@@ -1023,15 +1329,35 @@ async def book_hedge_advice(
     }
 
     system = (
-        "You are an institutional derivatives risk manager advising a retail client on hedging a "
-        "premium-selling (short-vol) option book. You are given a JSON where EVERY number is ALREADY "
-        "COMPUTED. Do NOT perform ANY arithmetic, do NOT recompute, do NOT invent numbers — reason "
-        "ONLY over the values provided and cite them. Recommend the single best hedge (or a small "
-        "combination) for the WHOLE book to cut its tail risk cost-effectively. Ground your pick in the "
-        "hedge_menu candidates using their cvar_reduction, annual_bleed (cost), efficiency, and "
-        "cagr_lift_pct; note the net beta-weighted delta direction, that short-vol loses on a big move "
-        "EITHER way (see stress_scenarios both signs), and any concentration. Be concrete and concise: "
-        "a 2-3 sentence rationale then up to 4 bullet actions naming specific hedge_menu rows. No preamble."
+        "You are an institutional derivatives risk manager advising a retail client on a premium-selling "
+        "(short-vol) option book. You are given a JSON where EVERY number is ALREADY COMPUTED — greeks, "
+        "stress P&Ls, a per-name loss waterfall, a DETERMINISTIC factor read (GICS sectors, MEASURED-ρ "
+        "correlated clusters, macro loadings), and a ranked hedge_menu. Do NOT perform ANY arithmetic, do "
+        "NOT recompute, and — critically — do NOT invent or assert any correlation, sector, theme, or "
+        "macro link that is not present in factor_exposure (those ρ/sector values are measured from real "
+        "data; treat them as ground truth and never override them with your own market intuition).\n\n"
+        "START from risk_scorecard: the book is graded and each BREACHED guardrail already carries the "
+        "cheapest computed fix (a specific trade + its cost + before→after). Your job is to PRIORITIZE and "
+        "SEQUENCE these — find the one or two trades that clear the MOST breaches per dollar (e.g. a single "
+        "SPX put spread that fixes both extreme-tail AND CVaR; buying SPY that fixes both net-direction AND "
+        "up/down symmetry), and note when de-risking a concentrated cluster is cheaper than a blanket hedge. "
+        "Keep every fix's own numbers; do not invent new ones.\n\n"
+        "Then add the deeper read, NOT a restatement of the table. In order:\n"
+        "1) Name the book's REAL concentration: the correlated_clusters and the top sectors — these are "
+        "the names that move together, so a hit to one hits the whole cluster (cite the tickers + avg_rho).\n"
+        "2) Name the macro_loadings that matter (e.g. rates/oil/gold/USD) and what event would light them up.\n"
+        "3) Point to loss_by_name_at_minus20pct — which specific NAMES drive the crash, and whether it's "
+        "the option overlay or the shares (stock_pnl) doing the damage.\n"
+        "3b) Check stress_scenarios BOTH signs: if a melt-up / squeeze (positive move_pct) loses MORE than "
+        "the −20% downside, the UPSIDE is the under-hedged tail — say so and recommend call spreads / "
+        "trimming the biggest short calls / a small long-call hedge, NOT a downside index put (which does "
+        "nothing for a squeeze).\n"
+        "4) THEN recommend what to manage: which single-name shorts to trim/roll/spread to cut the cluster "
+        "or sector concentration, AND the single best book-level tail hedge from hedge_menu (cite its "
+        "cvar_reduction, annual_bleed, cagr_lift_pct). Prefer de-risking a concentrated cluster over a "
+        "blanket index hedge when the concentration is the dominant risk.\n"
+        "Be concrete and concise: 2-3 sentence rationale, then up to 5 bullet actions naming specific "
+        "tickers/clusters and hedge_menu rows. No preamble."
     )
     messages = [
         {"role": "system", "content": system},

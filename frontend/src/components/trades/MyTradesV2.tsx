@@ -30,11 +30,11 @@ import {
   Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp, Cpu, Wrench,
 } from 'lucide-react';
 import {
-  fetchActiveTrades, fetchTradeLivePnl, fetchTradeAdvisor,
+  fetchActiveTrades, fetchClosedLedger, fetchTradeLivePnl, fetchTradeAdvisor,
   appendTradeTransaction, fetchTradeTransactions, createAgent,
   deleteTrade, updateSavedStrategy, saveTradePnlSnapshot,
 } from '../../api';
-import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind } from '../../api';
+import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind, ClosedMonthSummary } from '../../api';
 import { fmtMoney, fmtPct, fmtAnnualized, fmtDTE, fmtDate, fmtQty, pnlSummary } from '../../lib/tradeFormat';
 import UpdatePositionModal from './UpdatePositionModal';
 import TransactionHistoryPanel from './TransactionHistoryPanel';
@@ -455,6 +455,8 @@ interface ClosedLedgerRow {
   capitalBasis: string;        // how capitalBase was derived (surfaced in the tooltip)
   structureLabel: string;      // reconstructed from the closed legs (legs_data is emptied at close)
   legsSummary: string;         // compact leg brief, e.g. "−1 P120 · +1 P115"
+  isPartial: boolean;          // realized from a partial close of a still-active trade (legs remain open)
+  closedAt: string | null;     // when the close happened (exit_date, or latest closed_leg for a partial)
 }
 
 const round2 = (x: number) => Math.round(x * 100) / 100;
@@ -603,10 +605,18 @@ function buildClosedLedger(trade: SavedStrategyItem, pnl?: LivePnlResponse | nul
   const proceedsV = sawPrices ? round2(proceeds) : null;
   const realized = sawPrices ? round2(proceeds - cost) : storedReal;
 
+  // A still-active trade that carries closed_legs is a PARTIAL close: the realized chunk shows in
+  // this ledger, while the open remainder stays in the Active tab.
+  const isPartial = trade.trade_status !== 'closed';
+  const closedAt = isPartial
+    ? legs.reduce<string | null>((mx, l) => (l.closed_at && (!mx || l.closed_at > mx) ? l.closed_at : mx), null)
+    : (trade.exit_date ?? null);
+
   // BPR is authoritative from the BACKEND (Reg-T margin via calc_reg_t_margin — CSP reads
-  // ~20% margin, not full collateral). Only reconstruct locally if the backend didn't send one
-  // (e.g. a pure long-premium trade, where the debit paid is the capital).
-  const backendBpr = typeof trade.bpr === 'number' && trade.bpr > 0 ? trade.bpr : null;
+  // ~20% margin, not full collateral) — but the backend field is the WHOLE trade's margin, which
+  // for a partial close reflects the still-open remainder, not what was closed. So use it only for
+  // a full close; for a partial, base the annualization on the CLOSED chunk's own capital.
+  const backendBpr = !isPartial && typeof trade.bpr === 'number' && trade.bpr > 0 ? trade.bpr : null;
   const cap = backendBpr != null
     ? { value: round2(backendBpr), basis: 'Reg-T margin' }
     : closedCapitalBase(trade, legs, struct.key, pnl, costBasis);
@@ -614,6 +624,7 @@ function buildClosedLedger(trade: SavedStrategyItem, pnl?: LivePnlResponse | nul
     costBasis, proceeds: proceedsV, realized,
     capitalBase: cap.value, capitalBasis: cap.basis,
     structureLabel: struct.label, legsSummary: summarizeClosedLegs(legs),
+    isPartial, closedAt,
   };
 }
 
@@ -2431,9 +2442,19 @@ interface ClosedRow extends ClosedLedgerRow {
   ann: number | null;      // annualized % on BPR
 }
 
-function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
+// One month band in the Closed ledger. A CURRENT/loose month carries its per-trade `rows`
+// (expandable); a FROZEN prior month is a stored summary with `rows: null` (not expandable).
+interface DisplayMonth {
+  key: string; frozen: boolean; label: string;
+  rows: ClosedRow[] | null;
+  count: number; cost: number; proceeds: number; realized: number; bpr: number; wins: number; scored: number;
+}
+
+function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, onDeleteTrade }: {
   trades: SavedStrategyItem[];
   pnlMap: Record<number, LivePnlResponse>;
+  frozenMonths?: ClosedMonthSummary[];   // prior immutable months, stored server-side — summary only
+  currentMonth?: string | null;          // 'YYYY-MM' of the one expandable (live) month
   onDeleteTrade: (id: number) => void;
 }) {
   const [sortKey, setSortKey] = useState<ClosedSortKey>('closed');
@@ -2455,7 +2476,8 @@ function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
   const rows: ClosedRow[] = useMemo(() => trades.map(t => {
     const led = buildClosedLedger(t, pnlMap[t.id]);
     const opened = t.entry_date ? new Date(t.entry_date).getTime() : null;
-    const closed = t.exit_date ? new Date(t.exit_date).getTime() : null;
+    // Close date = exit_date for a full close, or the partial-close date (led.closedAt).
+    const closed = led.closedAt ? new Date(led.closedAt).getTime() : null;
     const held = opened != null && closed != null
       ? Math.max(1, Math.round((closed - opened) / 86400000))
       : (opened != null ? Math.max(1, daysHeld(t.entry_date)) : null);
@@ -2486,19 +2508,24 @@ function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
     };
   }, [sortKey, sortDir]);
 
-  // Group by CLOSE month; each month carries its own subtotals ("top metrics"). Months run
-  // newest-first, except when the user sorts by Closed ascending (then oldest-first); undated last.
-  const months = useMemo(() => {
+  // Group the current-month (+ loose) rows by their canonical close-month tag, then MERGE the
+  // stored prior-month summaries (rows: null — immutable, never re-fetched, not expandable).
+  // Months run newest-first, except when sorting by Closed ascending (oldest-first); undated last.
+  const months = useMemo<DisplayMonth[]>(() => {
     const m = new Map<string, ClosedRow[]>();
     for (const r of rows) {
       const d = r.closed != null ? new Date(r.closed) : null;
-      const key = d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` : 'undated';
+      const key = r.trade.close_month
+        || (d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` : 'undated');
       const arr = m.get(key);
       if (arr) arr.push(r); else m.set(key, [r]);
     }
-    const groups = Array.from(m.entries()).map(([key, rs]) => ({
-      key,
-      label: key === 'undated' ? 'Undated' : new Date(rs[0].closed!).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+    const labelOf = (key: string, sample?: number | null) =>
+      key === 'undated' ? 'Undated'
+        : sample != null ? new Date(sample).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+          : new Date(`${key}-01T00:00:00`).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    const computed: DisplayMonth[] = Array.from(m.entries()).map(([key, rs]) => ({
+      key, frozen: false, label: labelOf(key, rs[0].closed),
       rows: [...rs].sort(cmp),
       count: rs.length,
       cost: rs.reduce((s, r) => s + (r.costBasis ?? 0), 0),
@@ -2508,6 +2535,14 @@ function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
       wins: rs.filter(r => (r.realized ?? 0) > 0).length,
       scored: rs.filter(r => r.realized != null).length,
     }));
+    const frozen: DisplayMonth[] = frozenMonths
+      .filter(f => !m.has(f.month))   // disjoint by construction; guard against a rare overlap
+      .map(f => ({
+        key: f.month, frozen: true, label: f.label, rows: null,
+        count: f.count, cost: f.cost, proceeds: f.proceeds, realized: f.realized,
+        bpr: f.bpr, wins: f.wins, scored: f.scored,
+      }));
+    const groups = [...computed, ...frozen];
     const chronoAsc = sortKey === 'closed' && sortDir === 'asc';
     groups.sort((a, b) => {
       if (a.key === 'undated') return 1;
@@ -2515,20 +2550,22 @@ function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
       return chronoAsc ? a.key.localeCompare(b.key) : b.key.localeCompare(a.key);
     });
     return groups;
-  }, [rows, cmp, sortKey, sortDir]);
+  }, [rows, cmp, sortKey, sortDir, frozenMonths]);
 
   const toggleSort = (k: ClosedSortKey) => {
     if (k === sortKey) setSortDir(d => (d === 'asc' ? 'desc' : 'asc'));
     else { setSortKey(k); setSortDir(k === 'ticker' ? 'asc' : 'desc'); }
   };
 
-  // Totals (from the raw rows — filter-agnostic, whole closed book in view).
-  const tCost = rows.reduce((s, r) => s + (r.costBasis ?? 0), 0);
-  const tProceeds = rows.reduce((s, r) => s + (r.proceeds ?? 0), 0);
-  const tRealized = rows.reduce((s, r) => s + (r.realized ?? 0), 0);
-  const tBpr = rows.reduce((s, r) => s + (r.capitalBase ?? 0), 0);
-  const wins = rows.filter(r => (r.realized ?? 0) > 0).length;
-  const scored = rows.filter(r => r.realized != null).length;
+  // Grand totals — current-month rows PLUS every stored prior-month summary (the whole book).
+  const fr = frozenMonths;
+  const tCost = rows.reduce((s, r) => s + (r.costBasis ?? 0), 0) + fr.reduce((s, f) => s + f.cost, 0);
+  const tProceeds = rows.reduce((s, r) => s + (r.proceeds ?? 0), 0) + fr.reduce((s, f) => s + f.proceeds, 0);
+  const tRealized = rows.reduce((s, r) => s + (r.realized ?? 0), 0) + fr.reduce((s, f) => s + f.realized, 0);
+  const tBpr = rows.reduce((s, r) => s + (r.capitalBase ?? 0), 0) + fr.reduce((s, f) => s + f.bpr, 0);
+  const wins = rows.filter(r => (r.realized ?? 0) > 0).length + fr.reduce((s, f) => s + f.wins, 0);
+  const scored = rows.filter(r => r.realized != null).length + fr.reduce((s, f) => s + f.scored, 0);
+  const totalClosed = rows.length + fr.reduce((s, f) => s + f.count, 0);
 
   const SortTh = ({ k, label, align = 'right', hint }: { k: ClosedSortKey; label: string; align?: 'left' | 'right'; hint?: string }) => (
     <th className={align === 'left' ? 'text-left' : 'text-right'}>
@@ -2557,11 +2594,17 @@ function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
           <div className="flex items-center gap-1.5">
             <span className="font-semibold text-sm">{r.trade.ticker}</span>
             <span className="text-[11px] text-base-content/50">{r.structureLabel}</span>
+            {r.isPartial && (
+              <span className="badge badge-xs badge-warning badge-outline text-[9px] font-semibold"
+                title="Realized from a PARTIAL close — the rest of this trade is still open in the Active tab.">
+                partial
+              </span>
+            )}
           </div>
-          {r.legsSummary && <div className="text-[10px] text-base-content/35 tabular-nums mt-0.5">{r.legsSummary}</div>}
+          {r.legsSummary && <div className="text-[10px] text-base-content/35 tabular-nums mt-0.5">{r.legsSummary}{r.isPartial && <span className="text-warning/60"> · closed leg{(r.trade.parameters?.closed_legs?.length ?? 0) !== 1 ? 's' : ''}</span>}</div>}
         </td>
         <td className="text-right whitespace-nowrap text-base-content/70">{r.trade.entry_date ? fmtDate(r.trade.entry_date) : '—'}</td>
-        <td className="text-right whitespace-nowrap text-base-content/70">{r.trade.exit_date ? fmtDate(r.trade.exit_date) : '—'}</td>
+        <td className="text-right whitespace-nowrap text-base-content/70">{r.closedAt ? fmtDate(r.closedAt) : '—'}</td>
         <td className="text-right whitespace-nowrap text-base-content/60">{r.held != null ? `${r.held}d` : '—'}</td>
         <td className="text-right whitespace-nowrap tabular-nums">{money(r.costBasis)}</td>
         <td className="text-right whitespace-nowrap tabular-nums">{money(r.proceeds)}</td>
@@ -2603,19 +2646,26 @@ function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
         </thead>
         {/* One tbody per close-month: a summary band (subtotals) + that month's trades. */}
         {months.map(g => {
-          const collapsed = collapsedMonths.has(g.key);
+          // A frozen prior month is a stored summary (no rows shipped) — never expandable.
+          const collapsed = g.frozen || collapsedMonths.has(g.key);
+          const isCurrent = !g.frozen && g.key === currentMonth;
           const roc = g.bpr > 0 ? (g.realized / g.bpr) * 100 : null;   // month return on capital (not annualized)
           return (
             <tbody key={g.key}>
               <tr
-                className="bg-base-200/50 hover:bg-base-200/70 cursor-pointer border-t-2 border-base-300/50 text-xs font-medium"
-                onClick={() => toggleMonth(g.key)}
-                title={collapsed ? 'Expand this month' : 'Collapse this month'}
+                className={`bg-base-200/50 border-t-2 border-base-300/50 text-xs font-medium ${g.frozen ? '' : 'hover:bg-base-200/70 cursor-pointer'}`}
+                onClick={g.frozen ? undefined : () => toggleMonth(g.key)}
+                title={g.frozen ? 'Prior month — stored summary, not re-priced' : (collapsed ? 'Expand this month' : 'Collapse this month')}
               >
                 <td colSpan={4} className="text-left">
                   <div className="flex items-center gap-1.5">
-                    {collapsed ? <ChevronDown className="w-3.5 h-3.5 text-base-content/40" /> : <ChevronUp className="w-3.5 h-3.5 text-base-content/40" />}
+                    {g.frozen
+                      ? <History className="w-3 h-3 text-base-content/30 shrink-0" />
+                      : (collapsed ? <ChevronDown className="w-3.5 h-3.5 text-base-content/40" /> : <ChevronUp className="w-3.5 h-3.5 text-base-content/40" />)}
                     <span className="font-semibold text-sm text-base-content/90">{g.label}</span>
+                    {isCurrent && <span className="badge badge-xs badge-success badge-outline text-[8px] uppercase tracking-wider">this month</span>}
+                    {g.frozen && <span className="text-[9px] uppercase tracking-wider text-base-content/30"
+                      title="Immutable — summarized once and stored in the DB, not re-fetched on every visit">stored</span>}
                     <span className="text-[11px] text-base-content/45">
                       · {g.count} closed{g.scored > 0 && ` · ${g.wins}/${g.scored} win (${Math.round((g.wins / g.scored) * 100)}%)`}
                     </span>
@@ -2631,15 +2681,15 @@ function ClosedLedger({ trades, pnlMap, onDeleteTrade }: {
                 </td>
                 <td></td>
               </tr>
-              {!collapsed && g.rows.map(renderRow)}
+              {!collapsed && g.rows && g.rows.map(renderRow)}
             </tbody>
           );
         })}
-        {rows.length > 0 && (
+        {(rows.length > 0 || frozenMonths.length > 0) && (
           <tfoot>
             <tr className="border-t-2 border-primary/30 text-xs font-semibold bg-base-300/30">
               <td colSpan={4} className="text-left text-base-content/70">
-                All {months.length > 1 ? `${months.length} months` : 'time'} · {rows.length} closed{scored > 0 && <span className="text-base-content/40 font-medium"> · {wins}/{scored} winners ({Math.round((wins / scored) * 100)}%)</span>}
+                All {months.length > 1 ? `${months.length} months` : 'time'} · {totalClosed} closed{scored > 0 && <span className="text-base-content/40 font-medium"> · {wins}/{scored} winners ({Math.round((wins / scored) * 100)}%)</span>}
               </td>
               <td className="text-right tabular-nums text-base-content/60">{fmtMoney(tCost)}</td>
               <td className="text-right tabular-nums text-base-content/60">{fmtMoney(tProceeds)}</td>
@@ -2835,6 +2885,10 @@ export default function MyTradesV2() {
   const [advisorMap, setAdvisorMap] = useState<Record<number, AdvisorState>>({});
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [lastRefreshAt, setLastRefreshAt] = useState<string | null>(null);   // most recent snapshot time
+  // Closed tab: prior months arrive pre-summarized (immutable, stored server-side) so only the
+  // current month's trades come down in full. See fetchClosedLedger / the backend closed-ledger.
+  const [frozenMonths, setFrozenMonths] = useState<ClosedMonthSummary[]>([]);
+  const [closedMonth, setClosedMonth] = useState<string | null>(null);
 
   // Modals
   const [updateTrade, setUpdateTrade] = useState<SavedStrategyItem | null>(null);
@@ -2847,7 +2901,19 @@ export default function MyTradesV2() {
     setLoading(true);
     setErr(null);
     try {
-      const data = await fetchActiveTrades(activeStatus);
+      // Closed tab: prior months come as compact stored summaries; only the current month (+ any
+      // still-open partial-close realized) ships as full rows. Active tab: the open book.
+      let data: SavedStrategyItem[];
+      if (activeStatus === 'closed') {
+        const led = await fetchClosedLedger();
+        data = led.trades;
+        setFrozenMonths(led.frozen_months);
+        setClosedMonth(led.current_month);
+      } else {
+        data = await fetchActiveTrades(activeStatus, false);
+        setFrozenMonths([]);
+        setClosedMonth(null);
+      }
       setTrades(data);
       // Seed the P&L map from each trade's LAST persisted snapshot → collapsed rows show
       // last-known numbers immediately; a full live refresh happens on expand / Refresh all.
@@ -3004,8 +3070,11 @@ export default function MyTradesV2() {
   // Only sum P&L for trades still in view (pnlMap can hold stale/closed entries).
   const totalPnl = trades.reduce((s, t) => s + (pnlMap[t.id]?.unrealized_pnl ?? 0), 0);
   const hasPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
-  // Closed tab: banked realized P&L (authoritative stored total), not live unrealized.
-  const totalRealized = trades.reduce((s, t) => s + (closedRealized(t) ?? 0), 0);
+  // Closed tab: banked realized P&L (authoritative stored total), not live unrealized —
+  // the current-month rows PLUS every frozen prior month's stored realized.
+  const totalRealized = trades.reduce((s, t) => s + (closedRealized(t) ?? 0), 0)
+    + frozenMonths.reduce((s, m) => s + (m.realized || 0), 0);
+  const closedCount = trades.length + frozenMonths.reduce((s, m) => s + m.count, 0);
 
   const groupOrder: TradePurpose[] = PURPOSE_ORDER;
 
@@ -3069,9 +3138,9 @@ export default function MyTradesV2() {
         </div>
 
         {/* Portfolio summary strip + Refresh all */}
-        {trades.length > 0 && (
+        {(trades.length > 0 || (activeStatus === 'closed' && frozenMonths.length > 0)) && (
           <div className="flex items-center gap-3 text-xs text-base-content/50 flex-wrap">
-            <span>{trades.length} {activeStatus === 'closed' ? 'closed' : 'position' + (trades.length !== 1 ? 's' : '')}</span>
+            <span>{activeStatus === 'closed' ? `${closedCount} closed` : `${trades.length} position${trades.length !== 1 ? 's' : ''}`}</span>
             {activeStatus === 'closed' ? (
               /* Closed: banked realized P&L — no live "deployed / unrealized" (those are settled). */
               <>
@@ -3131,7 +3200,7 @@ export default function MyTradesV2() {
       )}
 
       {/* Empty state */}
-      {activeStatus !== 'paper' && !loading && trades.length === 0 && (
+      {activeStatus !== 'paper' && !loading && trades.length === 0 && !(activeStatus === 'closed' && frozenMonths.length > 0) && (
         <div className="text-center py-16 text-base-content/30">
           <BarChart3 className="w-12 h-12 mx-auto mb-3 opacity-20" />
           <p className="font-medium">No {activeStatus} trades</p>
@@ -3148,9 +3217,11 @@ export default function MyTradesV2() {
         <BookTailRisk quoteSource={quoteSource} />
       )}
 
-      {/* Closed — a plain realized-P&L ledger (sortable), not the management cards */}
-      {activeStatus === 'closed' && !loading && trades.length > 0 && (
-        <ClosedLedger trades={trades} pnlMap={pnlMap} onDeleteTrade={handleDeleteTrade} />
+      {/* Closed — a plain realized-P&L ledger (sortable), not the management cards.
+          Current month expands to per-trade rows; prior months show stored summary bands only. */}
+      {activeStatus === 'closed' && !loading && (trades.length > 0 || frozenMonths.length > 0) && (
+        <ClosedLedger trades={trades} pnlMap={pnlMap} frozenMonths={frozenMonths}
+          currentMonth={closedMonth} onDeleteTrade={handleDeleteTrade} />
       )}
 
       {/* Active — grouped management cards */}

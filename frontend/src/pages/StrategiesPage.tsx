@@ -4,6 +4,7 @@ import {
   Layers, Box, ArrowLeftRight, Building, Shield, Target, ArrowDownRight, Crown, Lock, Briefcase, ClipboardList, ShieldCheck, Coins
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { CollapsibleSidebar } from '../components/CollapsibleSidebar';
 
 // Each strategy is a heavy component (charts, quant panels); load only the selected one so the
 // Strategies chunk isn't one giant bundle. Named exports → unwrap to default for React.lazy.
@@ -143,7 +144,7 @@ export default function StrategiesPage() {
 
       <div className="flex flex-col lg:flex-row gap-6">
         {/* Sidebar Nav */}
-        <div className="w-full lg:w-1/4">
+        <CollapsibleSidebar storageKey="strategies:navCollapsed" label="Strategies" accent="secondary">
           <div className="flex flex-col gap-2">
             {STRATEGIES.map((s) => (
               <button
@@ -166,10 +167,10 @@ export default function StrategiesPage() {
               </button>
             ))}
           </div>
-        </div>
+        </CollapsibleSidebar>
 
         {/* Main Strategy Content */}
-        <div className="w-full lg:w-3/4">
+        <div className="w-full lg:flex-1 min-w-0">
           <div className="glass-card h-full">
             <div className="card-body">
               <Suspense fallback={<div className="flex items-center justify-center py-24 text-base-content/50"><span className="loading loading-spinner loading-md" /></div>}>

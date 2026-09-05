@@ -5,6 +5,7 @@ import { MoneyLastCalculator } from '../components/calculators/MoneyLastCalculat
 import { RetirementLongevity } from '../components/calculators/retirement/RetirementLongevity';
 import { CollegeSavings529 } from '../components/calculators/CollegeSavings529';
 import { useDocumentMetadata } from '../hooks/useDocumentMetadata';
+import { CollapsibleSidebar } from '../components/CollapsibleSidebar';
 
 // ---------------------------------------------------------------------------
 // Calculator registry — add a new entry here to expose another calculator.
@@ -85,7 +86,7 @@ export default function CalculatorsPage() {
 
       <div className="flex flex-col lg:flex-row gap-6">
         {/* Sidebar: calculator picker */}
-        <div className="w-full lg:w-1/4">
+        <CollapsibleSidebar storageKey="calculators:navCollapsed" label="Calculators" accent="secondary">
           <div className="flex flex-col gap-2">
             {CALCULATORS.map((c) => (
               <button
@@ -112,10 +113,10 @@ export default function CalculatorsPage() {
               More calculators coming soon
             </div>
           </div>
-        </div>
+        </CollapsibleSidebar>
 
         {/* Main: selected calculator */}
-        <div className="w-full lg:w-3/4">
+        <div className="w-full lg:flex-1 min-w-0">
           <div className="glass-card h-full">
             <div className="card-body">{current.render()}</div>
           </div>

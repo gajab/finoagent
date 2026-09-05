@@ -1274,8 +1274,38 @@ export interface SavedStrategyItem {
   exit_prices?: any[] | null;
   exit_net?: number | null;
   bpr?: number | null;                 // buying-power reduction (backend Reg-T margin); BPR base for the closed ledger
+  close_month?: string;                // 'YYYY-MM' bucket tag (only set by the closed-ledger endpoint)
   created_at: string;
   updated_at: string;
+}
+
+// One immutable prior month on the Closed tab, pre-summarized server-side (no per-trade rows
+// shipped). Mirrors the on-screen month band's subtotals. See fetchClosedLedger.
+export interface ClosedMonthSummary {
+  month: string;        // 'YYYY-MM'
+  label: string;        // e.g. "August 2026"
+  count: number;
+  wins: number;
+  scored: number;       // trades with a known realized figure (win-rate denominator)
+  cost: number;
+  proceeds: number;
+  realized: number;
+  bpr: number;
+}
+
+export interface ClosedLedgerResult {
+  current_month: string;                 // 'YYYY-MM' — the one expandable month
+  current_month_label: string;
+  frozen_months: ClosedMonthSummary[];   // strictly-prior immutable months, summary-only
+  trades: SavedStrategyItem[];           // full records for the current month + any loose prior rows
+  total_realized: number;                // frozen + current, the whole-book banked total
+  stored: boolean;                       // true = prior months served from the DB cache
+}
+
+// Closed tab: current-month trades in full (expandable) + prior months as compact stored
+// summaries. The full closed history is no longer downloaded on every landing.
+export async function fetchClosedLedger(): Promise<ClosedLedgerResult> {
+  return apiFetch<ClosedLedgerResult>('/api/saved-strategies/trades/closed-ledger');
 }
 
 export async function fetchSavedStrategies(strategyType: string): Promise<SavedStrategyItem[]> {
@@ -1325,8 +1355,11 @@ export async function deleteTrade(strategyId: number): Promise<void> {
   return apiFetch<void>(`/api/saved-strategies/${strategyId}`, { method: 'DELETE' });
 }
 
-export async function fetchActiveTrades(status?: string): Promise<SavedStrategyItem[]> {
-  const params = status ? `?status=${encodeURIComponent(status)}` : '';
+export async function fetchActiveTrades(status?: string, includePartial = false): Promise<SavedStrategyItem[]> {
+  const qs = new URLSearchParams();
+  if (status) qs.set('status', status);
+  if (includePartial) qs.set('include_partial', 'true');
+  const params = qs.toString() ? `?${qs.toString()}` : '';
   return apiFetch<SavedStrategyItem[]>(`/api/saved-strategies/trades${params}`);
 }
 
@@ -1610,6 +1643,18 @@ export interface BookHedgeCandidate {
   vix_at_minus20?: number;                                // VIX future level a −20% month implies
   sleeve_capital?: number; signal?: string; capture_pct?: number;   // VIXY dynamic sleeve
 }
+// One concrete remediation leg-set (close, or a real-strike spread), priced from live data.
+export interface RemediationLeg {
+  action: string;          // 'cap' | 'close'
+  legs: string;            // human-readable real legs, e.g. "BUY 5× 2026-10-17 130C (vs your short 120C)"
+  cost: number;            // $ to execute
+  tail_after: number;      // position P&L at the stress move AFTER the fix
+  premium_kept: number;    // $ premium still collected after the fix
+  detail?: string;
+  // Structured legs for the Evaluate deep-dive (exact live-chain pricing). Present on 'cap'.
+  prefill?: { ticker: string; legs: { action: 'BUY' | 'SELL'; type: 'CALL' | 'PUT'; strike: number; expiration: string | null; qty: number }[] };
+}
+
 export interface BookTailRiskResult {
   positions: number;
   error?: string;
@@ -1620,10 +1665,39 @@ export interface BookTailRiskResult {
   book_capital?: number; annual_income?: number; capital_basis?: string;
   theta_net_liq_pct?: number | null; carry_yield_pct?: number | null; cvar_capital_pct?: number | null;
   short_vol?: boolean; avg_beta?: number;
+  stock_notional?: number;   // $ of shares behind the overlay (covered calls / collars / holdings)
   var_95?: number | null; cvar_95?: number | null; var_99?: number | null; cvar_99?: number | null;
   horizon?: string;
   concentration?: { ticker: string; trades: number; short_legs: number; net_gamma: number; net_vega: number; net_delta: number; beta?: number; gamma_share_pct: number; laddered: boolean; flags: string[] }[];
-  crash_scenarios?: { label: string; move_pct: number; pnl: number; pct_of_capital: number | null }[];
+  // Per-underlying P&L at a −20% month (whole position; option overlay vs shares split out).
+  loss_by_name?: { ticker: string; pnl: number; option_pnl: number; stock_pnl: number; beta: number }[];
+  // 2-D risk array: book P&L for each (spot move × vol-point shock).
+  scenario_grid?: { spot_moves: number[]; vol_shocks: number[]; rows: { move_pct: number; cells: { pnl: number; pct: number | null }[] }[] };
+  // Institutional risk scorecard: standardized guardrails, book value vs limit, cheapest fix per breach.
+  risk_scorecard?: {
+    grade: string; n_breach: number; n_warn: number; n_checks: number;
+    checks: {
+      key: string; label: string; status: 'pass' | 'warn' | 'breach';
+      value_pct?: number; value_str: string; limit_str: string; note?: string;
+      fix?: {
+        headline: string; cost?: string; effect?: string; alt?: string;
+        // Position-specific remediation with REAL legs, ranked by risk vs remaining premium.
+        targets?: {
+          ticker: string; name: string; structure?: string | null;
+          risk: number; premium_left: number; why: string; tail_before: number;
+          recommended: RemediationLeg; alt?: RemediationLeg | null;
+        }[];
+      };
+    }[];
+  } | null;
+  // Deterministic factor read: GICS sector buckets, measured-ρ correlated clusters, macro loadings.
+  factor_exposure?: {
+    sectors?: { sector: string; tickers: string[]; capital: number; net_directional: number; n: number }[];
+    clusters?: { tickers: string[]; capital: number; net_directional: number; avg_rho: number | null }[];
+    macro?: { factor: string; label: string; rho: number }[];
+    by_name?: { ticker: string; sector: string | null; capital: number; net_directional: number }[];
+  } | null;
+  crash_scenarios?: { label: string; move_pct: number; pnl: number; pct_of_capital: number | null; overlay_pnl?: number; stock_pnl?: number }[];
   assignment_ladder?: { move_pct: number; pnl: number; put_assignment_capital: number; call_cover_cost: number; puts_itm: number; calls_itm: number }[];
   naked_assignment?: { put_capital: number; call_capital: number; total: number; n_naked_puts: number; n_naked_calls: number };
   hedge_menu?: BookHedgeCandidate[];

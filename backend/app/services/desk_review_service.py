@@ -67,6 +67,9 @@ _BREACH_RAMP = 0.35              # …reached at _TOUCH_OK + 0.35 (i.e. P(touch)
 _VRP_BLOCK_RATIO = 0.70          # implied < 70% of realized → VETO the trade
 _VRP_PENALTY_K = 22              # points per 1.0 of (1 − IV/HV): 0.9→−2, 0.5→−11, 0.2→−18
 _VRP_PENALTY_CAP = 25
+# A print in the last ≤5 trading days = a FRESH IV crush → judge the VRP on the ex-earnings diffusion HV
+# (trailing HV is still inflated by the event) so a fairly-priced post-crush premium isn't falsely vetoed.
+_POST_EARN_CRUSH_DAYS = 5
 
 # Trend drift (P-measure DRIFT half) — the annualized EMA-slope μ becomes the SINGLE continuous
 # "Trend drift" factor (retiring the old ±6/±5 yes/no regime-fit). Points scale with the trend's
@@ -1172,7 +1175,8 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
                 hv: Optional[float] = None, gex: Optional[dict] = None,
                 macd: Optional[dict] = None, overwrite: bool = False,
                 next_earnings: Optional[str] = None, today=None,
-                har_rv_pct: Optional[float] = None, earnings_aware: bool = False) -> dict:
+                har_rv_pct: Optional[float] = None, earnings_aware: bool = False,
+                diffusion_hv: Optional[float] = None, days_since_earnings: Optional[int] = None) -> dict:
     pm = (dm or {}).get("pm") or {}
     # blocking = STRUCTURAL/quality hard-fails → grade F (avoid). timing_hold = a good trade held on TIMING
     # (momentum against a REACHABLE strike) → WAIT, distinct from F. Kept separate so a fortified trade is
@@ -1231,7 +1235,24 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
             # normalising, so downgrade softly and keep the opportunity.
             iv_har = ((atm_iv_pct / 100.0) / (har_rv_pct / 100.0)) if (atm_iv_pct and har_rv_pct and har_rv_pct > 0) else None
             reasonable_crush = iv_har is not None and iv_har >= _VRP_BLOCK_RATIO   # OK vs the forward RV forecast
-            if reasonable_crush:
+            # POST-EARNINGS crush: a JUST-passed print inflates BOTH trailing HV and HAR-RV with the event
+            # vol run-up + gap, so "IV < HV" here is the crush NORMALISING, not a no-edge trap. Judge the
+            # crushed IV against the EX-EARNINGS diffusion HV (the print window removed); a healthy clean
+            # ratio = a fairly/richly priced post-crush premium → relieve the penalty and NEVER veto.
+            post_earn = (days_since_earnings is not None and 0 <= days_since_earnings <= _POST_EARN_CRUSH_DAYS)
+            iv_diff = (round((atm_iv_pct / 100.0) / diffusion_hv, 2)
+                       if (atm_iv_pct and diffusion_hv and diffusion_hv > 0) else None)
+            if post_earn and iv_diff is not None and iv_diff >= _VRP_BLOCK_RATIO:
+                if iv_diff >= 1.0:
+                    merits.append(f"post-earnings vol crush ({days_since_earnings}d ago) — IV reads {round(iv_hv*100)}% "
+                                  f"of trailing HV but {round(iv_diff*100)}% of the EX-EARNINGS diffusion HV "
+                                  f"(fair/rich vs normal vol; the trailing HV is inflated by the print)")
+                else:
+                    comp["vrp"] -= 2
+                    demerits.append(f"post-earnings crush ({days_since_earnings}d ago) — IV {round(iv_diff*100)}% of the "
+                                    f"ex-earnings diffusion HV (mildly cheap vs normal vol, but trailing HV is "
+                                    f"print-inflated — sellable, not a veto)")
+            elif reasonable_crush:
                 comp["vrp"] -= 3
                 demerits.append(f"cheap vs trailing HV (IV/HV {iv_hv}) but FAIR vs the forward RV forecast "
                                 f"(IV/HAR {round(iv_har, 2)}) — trailing realized is spike-inflated & reverting down; "
@@ -1872,6 +1893,33 @@ def _release_memory() -> None:
         pass
 
 
+_CTX_TTL = 300.0                                     # 5 min — TA / dealer-GEX / portfolio-fit drift slowly intraday
+_CTX_MEMO: dict[str, tuple[float, tuple]] = {}
+
+
+async def _desk_context(ticker: str) -> tuple[dict, dict, dict]:
+    """(ta, portfolio_fit, gex) — the changing TA + dealer-positioning context the hold/close
+    recommendation is built on. Run SEQUENTIALLY (not a 3-way gather) so the per-read memory peaks
+    don't STACK on the 512 MiB instance — that stacking was the desk-score spike — and memoised ~5 min
+    per ticker so re-scoring a trade or a My-Trades refresh-all doesn't recompute them. Objects are
+    cached in-process (no JSON round-trip, so numpy-typed fields survive), bounded so it can't leak."""
+    import time
+    tk = _norm_ticker(ticker)
+    now = time.monotonic()
+    hit = _CTX_MEMO.get(tk)
+    if hit and hit[0] > now:
+        return hit[1]
+    ta = await asyncio.to_thread(_ta_sync, ticker)
+    portfolio_fit = await asyncio.to_thread(_portfolio_fit_sync, ticker)
+    gex = await asyncio.to_thread(_gex_sync, ticker)
+    ctx = (ta, portfolio_fit, gex)
+    if len(_CTX_MEMO) > 48:                          # prune expired entries so the memo stays bounded
+        for k in [k for k, (exp, _v) in _CTX_MEMO.items() if exp <= now]:
+            _CTX_MEMO.pop(k, None)
+    _CTX_MEMO[tk] = (now + _CTX_TTL, ctx)
+    return ctx
+
+
 async def rank_desk(
     ticker: str,
     target_dte: Optional[int] = None,
@@ -1885,6 +1933,7 @@ async def rank_desk(
     focus: Optional[dict] = None,
     owns_underlying: bool = False,
     earnings_aware: bool = False,
+    focus_only: bool = False,
 ) -> dict:
     """Rank ALL candidate income trades (best → worst) by a blended desk score:
     the algorithmic Quant 0–100 score adjusted for technical/regime alignment.
@@ -1898,16 +1947,18 @@ async def rank_desk(
     # The whole memory-heavy scan runs under _SCAN_SEMAPHORE so concurrent reviews on the single shared
     # instance queue instead of stacking their peaks and OOMing; light endpoints are unaffected.
     async with _SCAN_SEMAPHORE:
-        ta, portfolio_fit, gex = await asyncio.gather(
-            asyncio.to_thread(_ta_sync, ticker),
-            asyncio.to_thread(_portfolio_fit_sync, ticker),
-            asyncio.to_thread(_gex_sync, ticker),
-        )
+        # TA + dealer-GEX + portfolio-fit — the CHANGING context the hold/close call is built on, so the
+        # placed-trade score gets them too (that's the whole point of re-scoring an open trade). Run them
+        # SEQUENTIALLY (was a 3-way asyncio.gather) so their per-read memory peaks don't STACK — that
+        # stacking was the desk-score spike — and memoised ~5 min per ticker so re-scoring a trade / a
+        # My-Trades refresh-all doesn't recompute them.
+        ta, portfolio_fit, gex = await _desk_context(ticker)
         scan = await run_derivative_income(
             ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
             structures=structures, quote_source=quote_source, user=user, db=db,
             target_expiration=target_expiration, focus=focus, owns_underlying=owns_underlying,
-            ta_levels=_structural_levels(ta, gex),
+            focus_only=focus_only,
+            ta_levels=(None if focus_only else _structural_levels(ta, gex)),
         )
         if scan.get("error"):
             return {"error": scan["error"]}
@@ -2485,7 +2536,9 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
                         iv_percentile=vsx.get("iv_percentile"),
                         hv=phys_vol, gex=gex, macd=macd_accel, overwrite=overwrite,
                         next_earnings=(ctx or {}).get("next_earnings"), today=date.today(),
-                        har_rv_pct=vsx.get("har_rv_pct"), earnings_aware=earnings_aware)
+                        har_rv_pct=vsx.get("har_rv_pct"), earnings_aware=earnings_aware,
+                        diffusion_hv=((vsx.get("hv_diffusion_pct") or 0) / 100.0) or None,
+                        days_since_earnings=vsx.get("days_since_earnings"))
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
         grade, approval = _grade_letter(desk_score, g["blocking"], g.get("timing_hold"))
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
@@ -3222,7 +3275,7 @@ async def reprice_desk_focus(
     desk = await rank_desk(
         ticker, target_dte=target_dte, min_prob=0.0, min_income=0.0,
         structures=[structure], quote_source=quote_source,
-        user=user, db=db, target_expiration=expiration, focus=focus,
+        user=user, db=db, target_expiration=expiration, focus=focus, focus_only=True,
     )
     if desk.get("error"):
         return None, {"matched": False, "error": desk["error"]}
@@ -3381,6 +3434,10 @@ def _blind_facts(r: dict, desk: dict) -> dict:
         "spot": desk.get("spot"), "sofr_pct": desk.get("sofr_pct"),
         "volatility": {"atm_iv_pct": r.get("atm_iv_pct"), "hv30_pct": vs.get("hv30_pct"),
                        "forward_rv_har_pct": vs.get("har_rv_pct"), "iv_over_hv": r.get("iv_hv_ratio"),
+                       # ex-earnings diffusion HV + trading days since the last print: post-crush, judge IV
+                       # against the diffusion HV (trailing HV is print-inflated), NOT the raw hv30.
+                       "ex_earnings_diffusion_hv_pct": vs.get("hv_diffusion_pct"),
+                       "trading_days_since_earnings": vs.get("days_since_earnings"),
                        "iv_minus_har_vp": vs.get("iv_vs_har_pts"), "iv_rank": vs.get("iv_rank"),
                        "iv_percentile": vs.get("iv_percentile"), "skew_pts": vs.get("skew_pts"),
                        "expected_move_pct_1sigma": _expected_move_pct(r),

@@ -15,6 +15,7 @@ import { fetchMarketOverview, fetchMarketNarrative, fetchSectorDashboard, fetchS
 import SectorCalendarHeatmap from '../components/SectorCalendarHeatmap';
 import StyleCalendarHeatmap, { clearStyleCalendarCache } from '../components/StyleCalendarHeatmap';
 import LiquidityPanel from '../components/LiquidityPanel';
+import { CollapsibleSidebar } from '../components/CollapsibleSidebar';
 import EconomicCycles from '../components/EconomicCycles';
 import DebtRadarPage from './DebtRadarPage';
 import type {
@@ -1058,8 +1059,8 @@ export default function MarketPage() {
 
       <div className="flex flex-col lg:flex-row gap-6">
         {/* Left navigation */}
-        <div className="w-full lg:w-52 shrink-0">
-          <nav className="lg:sticky lg:top-6 rounded-2xl border border-white/[0.06] bg-base-100/40 p-2 backdrop-blur-sm">
+        <CollapsibleSidebar storageKey="market:navCollapsed" label="Sections" widthClass="lg:w-52" accent="primary" sticky>
+          <nav className="rounded-2xl border border-white/[0.06] bg-base-100/40 p-2 backdrop-blur-sm">
             {/* Markets group */}
             <div className="px-3 pt-2 pb-1">
               <span className="text-[9px] font-bold uppercase tracking-widest text-base-content/30">Markets</span>
@@ -1084,7 +1085,7 @@ export default function MarketPage() {
               })}
             </div>
           </nav>
-        </div>
+        </CollapsibleSidebar>
 
         {/* Content pane */}
         <div className="w-full lg:flex-1 min-w-0 space-y-8">

@@ -151,6 +151,184 @@ class TestTwoSidedStress:
         assert _vol_shock_for(0.20) < 0       # melt-up → vol crushes
 
 
+class TestWholePositionStock:
+    """The shares behind a covered call / collar are part of the crash — excluding them made a
+    −50% look milder than a −34% (short call decays = paper gain, huge stock loss invisible)."""
+    def _covered(self):   # long 100 sh + short 1 OTM call, spot 100
+        return [{"ticker": "AAA", "spot": 100.0, "beta": 1.0, "iv": 0.30, "shares": 100,
+                 "legs": [{"strike": 110, "right": "C", "sign": -1, "qty": 1, "iv": 0.30, "dte_years": 45 / 365}]}]
+
+    def test_stock_included_makes_the_crash_monotonic_and_worse(self):
+        b = self._covered()
+        overlay = [reprice_scenario(b, mv, vs, 0.045, include_stock=False) for mv, vs in [(-0.10, 8), (-0.34, 30), (-0.50, 45)]]
+        whole = [reprice_scenario(b, mv, vs, 0.045) for mv, vs in [(-0.10, 8), (-0.34, 30), (-0.50, 45)]]
+        # whole-position loss must grow monotonically with the crash size…
+        assert whole[2] < whole[1] < whole[0] < 0
+        # …and each whole loss is materially worse than the option-overlay-only number.
+        assert all(w < o for w, o in zip(whole, overlay))
+
+    def test_overlay_excludes_shares(self):
+        b = self._covered()
+        assert reprice_scenario(b, -0.30, 20, 0.045, include_stock=False) != reprice_scenario(b, -0.30, 20, 0.045)
+
+    def test_short_shares_flip_the_sign(self):
+        long_b = self._covered()
+        short_b = [{**long_b[0], "shares": -100}]
+        assert reprice_scenario(short_b, -0.30, 20, 0.045) > reprice_scenario(long_b, -0.30, 20, 0.045)
+
+
+class TestLossByNameAndGrid:
+    def _book(self):
+        return [
+            {"ticker": "AAA", "spot": 100.0, "beta": 1.1, "iv": 0.30, "shares": 100,
+             "legs": [{"strike": 110, "right": "C", "sign": -1, "qty": 1, "iv": 0.30, "dte_years": 45 / 365}]},
+            {"ticker": "CCC", "spot": 80.0, "beta": 0.9, "iv": 0.28, "shares": 0,
+             "legs": [{"strike": 72, "right": "P", "sign": -1, "qty": 3, "iv": 0.28, "dte_years": 45 / 365}]},
+        ]
+
+    def test_loss_by_name_splits_stock_and_sorts_worst_first(self):
+        from app.services.book_tail_risk import _loss_by_name
+        rows = _loss_by_name(self._book(), 0.045, -0.20, 15.0)
+        assert [r["ticker"] for r in rows] == sorted([r["ticker"] for r in rows], key=lambda t: {x["ticker"]: x["pnl"] for x in rows}[t])
+        aaa = next(r for r in rows if r["ticker"] == "AAA")
+        ccc = next(r for r in rows if r["ticker"] == "CCC")
+        assert aaa["stock_pnl"] < 0 and ccc["stock_pnl"] == 0          # only the covered name has a stock loss
+        assert all(abs(r["pnl"] - (r["option_pnl"] + r["stock_pnl"])) < 1 for r in rows)  # parts reconcile
+
+    def test_scenario_grid_shape_and_short_gamma_valley(self):
+        from app.services.book_tail_risk import _scenario_grid, _GRID_SPOT, _GRID_VOL
+        g = _scenario_grid(self._book(), 0.045, 100000.0)
+        assert len(g["rows"]) == len(_GRID_SPOT) and all(len(row["cells"]) == len(_GRID_VOL) for row in g["rows"])
+        vi0, vhi = _GRID_VOL.index(0.0), _GRID_VOL.index(30.0)
+        flat = {row["move_pct"]: row["cells"] for row in g["rows"]}
+        # a −20% month loses at flat vol; and rising vol adds loss (short vega) at that spot.
+        assert flat[-20.0][vi0]["pnl"] < 0
+        assert flat[-20.0][vhi]["pnl"] < flat[-20.0][vi0]["pnl"]
+
+
+class TestPositionRemediation:
+    """Fixes must be POSITION-SPECIFIC with REAL legs, ranked by risk-vs-remaining-premium."""
+    EXP = "2026-10-17"
+    CS = [100, 105, 110, 115, 120, 125, 130, 140, 150, 160, 175, 200]
+    PS = [60, 70, 80, 85, 90, 95, 100, 105, 110]
+
+    def _naked_call(self):
+        return {"ticker": "NVDA", "name": "NVDA", "spot": 115.0, "beta": 1.4, "shares": 0, "capital": 240000,
+                "structure": "naked_call", "strikes_by_exp": {self.EXP: {"C": self.CS, "P": self.PS}},
+                "legs": [{"strike": 120, "right": "C", "sign": -1, "qty": 5, "iv": 0.45, "dte_years": 45/365, "exp": self.EXP, "dte_days": 45}]}
+
+    def test_targets_use_real_listed_strikes(self):
+        from app.services.book_tail_risk import _offender_targets
+        t = _offender_targets([self._naked_call()], "up", 0.045, top=1)[0]
+        cap = t["recommended"] if t["recommended"]["action"] == "cap" else t["alt"]
+        assert cap and "130C" in cap["legs"]            # 130 is a REAL listed strike beyond the short 120
+        assert cap["cost"] > 0 and cap["tail_after"] > t["tail_before"]   # caps the loss
+
+    def test_cap_preferred_over_close_when_it_keeps_premium_cheaper(self):
+        from app.services.book_tail_risk import _offender_targets
+        t = _offender_targets([self._naked_call()], "up", 0.045, top=1)[0]
+        assert t["recommended"]["action"] == "cap"      # more loss-cut per $ AND keeps premium
+        assert t["recommended"]["premium_kept"] > 0
+
+    def test_why_cites_risk_and_remaining_premium(self):
+        from app.services.book_tail_risk import _offender_targets
+        t = _offender_targets([self._naked_call()], "up", 0.045, top=1)[0]
+        assert "squeeze loss" in t["why"] and "premium" in t["why"]
+        assert t["risk"] < 0
+
+    def test_no_offenders_on_the_safe_side(self):
+        from app.services.book_tail_risk import _offender_targets
+        # a naked short CALL has no DOWNSIDE tail worth flagging
+        assert _offender_targets([self._naked_call()], "down", 0.045) == []
+
+
+class TestRiskScorecard:
+    """Standardized institutional guardrails: value vs limit, status, and a quantified fix per breach."""
+    def _sc(self, **over):
+        from app.services.book_tail_risk import _risk_scorecard
+        base = dict(
+            positions=[], r=0.045,
+            book_capital=800000, annual_income=180000,
+            scenarios=[{"label": "GFC −50%", "move_pct": -0.50, "pnl": -120000},
+                       {"label": "−20%", "move_pct": -0.20, "pnl": -40000},
+                       {"label": "Squeeze +35%", "move_pct": 0.35, "pnl": -30000}],
+            cvar_95=40000, var_95=24000, beta_delta_notional=-40000, beta_delta_spy=-70, spy_price=560,
+            concentration=[], factor_exposure={"by_name": [{"ticker": "NVDA", "capital": 240000}],
+                                               "clusters": [], "sectors": []},
+            naked_assignment={"total": 700000},
+            hedge_menu=[{"label": "SPX ps", "instrument": "SPX", "long_strike": 5400, "short_strike": 4800,
+                         "contracts": 3, "annual_bleed": 9000, "cvar_reduction": 30000, "crash_payoff_20": 25000}])
+        base.update(over)
+        return _risk_scorecard(**base)
+
+    def test_extreme_tail_breach_gets_a_hedge_fix(self):
+        sc = self._sc()   # GFC −120k = 15% of 800k > 10% breach
+        et = next(c for c in sc["checks"] if c["key"] == "extreme_tail")
+        assert et["status"] == "breach" and et.get("fix") and "SPX" in et["fix"]["headline"]
+
+    def test_cvar_guardrail(self):
+        et = next(c for c in self._sc()["checks"] if c["key"] == "cvar")
+        assert et["status"] == "breach"          # 40k/800k = 5% > 3%
+        assert et["fix"]["headline"].startswith("Add")
+
+    def test_single_name_concentration_targets_the_name(self):
+        c = next(x for x in self._sc()["checks"] if x["key"] == "name_conc")
+        assert c["status"] == "breach"           # NVDA 240k/800k = 30% > 25%
+        assert "NVDA" in c["fix"]["headline"]
+        assert "targets" in c["fix"]             # position-specific fixes attached (empty when positions=[])
+
+    def test_symmetry_pass_when_balanced(self):
+        sc = self._sc(scenarios=[{"label": "−20%", "move_pct": -0.20, "pnl": -40000},
+                                 {"label": "+20%", "move_pct": 0.20, "pnl": -38000}])
+        sym = next(c for c in sc["checks"] if c["key"] == "symmetry")
+        assert sym["status"] == "pass"
+
+    def test_grade_and_sort_breaches_first(self):
+        sc = self._sc()
+        assert sc["grade"] == "At risk" and sc["n_breach"] >= 1
+        statuses = [c["status"] for c in sc["checks"]]
+        assert statuses == sorted(statuses, key=lambda s: {"breach": 0, "warn": 1, "pass": 2}[s])
+
+    def test_clean_book_is_sound(self):
+        sc = self._sc(scenarios=[{"label": "−20%", "move_pct": -0.20, "pnl": -20000},
+                                 {"label": "+20%", "move_pct": 0.20, "pnl": -18000}],
+                      cvar_95=12000, var_95=9000, beta_delta_notional=-20000,
+                      factor_exposure={"by_name": [{"ticker": "A", "capital": 100000}, {"ticker": "B", "capital": 100000}],
+                                       "clusters": [], "sectors": []})
+        assert sc["grade"] == "Sound" and sc["n_breach"] == 0
+
+
+class TestTwoSidedVerdict:
+    """The verdict must be set by the WORSE tail (down OR up) — a melt-up-dominant short-call book
+    was wrongly called 'Contained' because only the −20% downside was scored."""
+    def _v(self, scen, **kw):
+        from app.services.book_tail_risk import _verdict_and_actions
+        base = dict(short_vol=True, concentration=[], hedge_menu=[], cvar_pct=None, beta_delta_spy=0)
+        base.update(kw)
+        return _verdict_and_actions(scenarios=scen, **base)
+
+    def test_meltup_dominant_raises_level_and_names_upside(self):
+        scen = [{"label": "−20%", "move_pct": -0.20, "pct_of_capital": -4.0},
+                {"label": "Squeeze +35%", "move_pct": 0.35, "pct_of_capital": -13.6}]
+        v = self._v(scen)
+        assert v["level"] == "Moderate"                       # 13.6% up-tail, NOT Contained off the 4% down
+        assert "upside" in v["summary"].lower() or "melt-up" in v["summary"].lower()
+        assert any("MELT-UP" in a or "call SPREAD" in a for a in v["actions"])
+
+    def test_downside_dominant_unchanged(self):
+        scen = [{"label": "−20%", "move_pct": -0.20, "pct_of_capital": -25.0},
+                {"label": "GFC −50%", "move_pct": -0.50, "pct_of_capital": -48.0},
+                {"label": "Squeeze +35%", "move_pct": 0.35, "pct_of_capital": -3.0}]
+        v = self._v(scen)
+        assert v["level"] == "Dangerous"
+        assert "−20%" in v["summary"]
+
+    def test_well_sized_both_sides_is_contained(self):
+        scen = [{"label": "−20%", "move_pct": -0.20, "pct_of_capital": -3.0},
+                {"label": "Squeeze +35%", "move_pct": 0.35, "pct_of_capital": -2.0}]
+        assert self._v(scen)["level"] == "Contained"
+
+
 class TestAssignmentLadder:
     def _pos(self):
         return [{"spot": 100.0, "beta": 1.0, "iv": 0.31,

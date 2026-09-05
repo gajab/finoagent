@@ -272,16 +272,120 @@ def _har_rv_forecast(r: np.ndarray) -> Optional[float]:
     return round(vol_pct, 1) if 3.0 <= vol_pct <= 300.0 else None
 
 
+# Earnings elevates vol for a FEW DAYS around the print, not just the gap day: implied builds into the
+# event and realized ranges widen approaching it, then IV crushes after. So the "clean" diffusion vol
+# (what a crushed post-earnings IV should be judged against) excludes a WINDOW around each earnings date,
+# not a single day. Windows are trading-day counts on the returns series.
+_EARN_VOL_WIN_BEFORE = 3    # elevated run-up days before the print
+_EARN_VOL_WIN_AFTER = 1     # the gap prints the day of (BMO) or the day after (AMC) → cover +1
+_DIFFUSION_LOOKBACK = 45    # base window (~2 months) the diffusion HV is measured over
+_POST_EARN_CRUSH_DAYS = 5   # ≤5 trading days after a print = a FRESH crush → judge VRP on the clean HV
+
+
+def _diffusion_hv(log_ret, earnings_dates, lookback: int = _DIFFUSION_LOOKBACK,
+                  win_before: int = _EARN_VOL_WIN_BEFORE, win_after: int = _EARN_VOL_WIN_AFTER):
+    """Annualized realized vol with the earnings EVENT WINDOW removed — the diffusion (non-event) vol the
+    crushed post-earnings IV should be compared against for a fair VRP read. Excludes returns within
+    [ed − win_before, ed + win_after] trading days of each earnings date; winsorized fallback (cap the
+    top decile of |returns|) when no earnings date lands in the window. Returns a decimal or None."""
+    try:
+        import pandas as pd
+        if log_ret is None or len(log_ret) < 15:
+            return None
+        recent = log_ret.tail(lookback)
+        vals = recent.values
+        dates = recent.index
+        keep = np.ones(len(vals), dtype=bool)
+        matched = False
+        for ed in earnings_dates or []:
+            try:
+                ed_ts = pd.Timestamp(ed)
+                if getattr(dates, "tz", None) is not None:
+                    ed_ts = ed_ts.tz_localize(dates.tz) if ed_ts.tzinfo is None else ed_ts.tz_convert(dates.tz)
+                deltas = np.abs((dates - ed_ts).total_seconds().to_numpy())
+                pos = int(np.argmin(deltas))
+            except Exception:
+                continue
+            # only exclude if this earnings date actually falls inside the measured window
+            if abs((dates[pos] - ed_ts).days) > 7:
+                continue
+            keep[max(0, pos - win_before): min(len(vals), pos + win_after + 1)] = False
+            matched = True
+        clean = vals[keep]
+        if matched and len(clean) >= 10:
+            return round(float(np.std(clean, ddof=1) * math.sqrt(252)), 4)
+        # No earnings inside the window → winsorize so any single jump can't inflate the baseline.
+        if len(vals) >= 15:
+            cap = float(np.percentile(np.abs(vals), 90))
+            wv = np.clip(vals, -cap, cap)
+            return round(float(np.std(wv, ddof=1) * math.sqrt(252)), 4)
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+    return None
+
+
+def _amc_bmo(ts) -> Optional[str]:
+    """Classify an earnings timestamp as AMC (after close) or BMO (before open) from its ET hour.
+    Midnight / no-time → None (unknown). Afternoon+ = AMC, morning = BMO."""
+    try:
+        import pandas as pd
+        t = pd.Timestamp(ts)
+        if t.tzinfo is not None:
+            t = t.tz_convert("America/New_York")
+        hr = t.hour
+        return "amc" if hr >= 12 else "bmo" if hr > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _info_earnings_ts(info: dict) -> list:
+    """Earnings datetimes from yfinance ``.info`` (NO lxml needed): earningsTimestamp is the most-recent
+    print, earningsTimestampStart/End the next window — each a unix ts WITH a time, so we get past dates
+    AND AMC/BMO even when the earnings_dates frame is unavailable."""
+    out = []
+    try:
+        import pandas as pd
+        for k in ("earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"):
+            v = info.get(k)
+            if isinstance(v, (int, float)) and v > 1e9:
+                out.append(pd.Timestamp(int(v), unit="s", tz="UTC").tz_convert("America/New_York"))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _dedupe_earn_ts(ts_list: list) -> list:
+    """One timestamp per calendar date, preferring the one that carries a real (non-midnight) time."""
+    try:
+        import pandas as pd
+    except Exception:  # noqa: BLE001
+        return ts_list
+    by_date: dict = {}
+    for t in ts_list:
+        try:
+            t = pd.Timestamp(t)
+        except Exception:  # noqa: BLE001
+            continue
+        d = t.date()
+        if d not in by_date or (t.hour != 0 and by_date[d].hour == 0):
+            by_date[d] = t
+    return sorted(by_date.values(), key=lambda t: t.date())
+
+
 def _context_sync(ticker: str) -> dict:
     """Realized vol (20/30d, annualized), 52-week high/low and the next earnings
     date, from ONE 1-year history pull. Best-effort: returns ``None`` defaults if
     yfinance is unavailable for the name."""
     out: dict = {"hv10": None, "hv20": None, "hv30": None, "next_earnings": None,
                  "week52_high": None, "week52_low": None, "hv_series": None, "har_rv30": None,
-                 "prev_close": None, "last_close": None}
+                 "prev_close": None, "last_close": None,
+                 # earnings timing + the ex-event diffusion HV (post-crush VRP baseline)
+                 "next_earnings_amc": None, "last_earnings": None, "days_since_earnings": None,
+                 "hv_diffusion": None}
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
+        log_ret = None                       # daily log returns (for the diffusion HV) — set if history loads
         hist = stock.history(period="1y")
         if hist is not None and not hist.empty:
             closes = hist["Close"].dropna()
@@ -309,30 +413,58 @@ def _context_sync(ticker: str) -> dict:
                 out["hv_series"] = [round(float(x), 4) for x in roll.tolist()]
             # HAR-RV forward realized-vol forecast (next ~1 month), a forward cross-check on HV30.
             out["har_rv30"] = _har_rv_forecast(log_ret.values)
-        # Next earnings — try the modern earnings_dates frame, then the calendar.
-        # Skipped entirely for funds/indices: they never report, and asking only
-        # buys two 404s and a spurious "may be delisted" line in the logs.
+        # Next earnings — the modern earnings_dates frame (past AND future) then the calendar. We KEEP the
+        # timestamp so a same-day print (usually AMC) is treated as UPCOMING, not already-past, and we track
+        # the LAST past print + the ex-event diffusion HV for the post-crush VRP baseline.
+        # Skipped entirely for funds/indices: they never report.
         if _reports_earnings(stock):
+            earn_ts: list = []
+            # (a) modern earnings_dates frame — richest (several past + future prints WITH times), but
+            #     needs lxml; on a slim image it raises ImportError and we fall through to (b)/(c).
             try:
                 ed = getattr(stock, "earnings_dates", None)
                 if ed is not None and not ed.empty:
-                    today = date.today()
-                    future = [ix.date() for ix in ed.index
-                              if hasattr(ix, "date") and ix.date() >= today]
-                    if future:
-                        out["next_earnings"] = min(future).isoformat()
+                    earn_ts += [ix for ix in ed.index if hasattr(ix, "date")]
+            except Exception:  # noqa: BLE001 — e.g. lxml not installed
+                pass
+            # (b) .info timestamps — NO lxml: the most-recent print + the next window, WITH times. This is
+            #     what makes last_earnings / days_since_earnings / AMC-BMO work without the frame.
+            try:
+                earn_ts += _info_earnings_ts(stock.info or {})
             except Exception:  # noqa: BLE001
                 pass
-            if out["next_earnings"] is None:
-                try:
-                    cal = stock.calendar
-                    ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
-                    if ed:
-                        d0 = ed[0] if isinstance(ed, (list, tuple)) else ed
-                        if hasattr(d0, "isoformat"):
-                            out["next_earnings"] = d0.isoformat()
-                except Exception:  # noqa: BLE001
-                    pass
+            # (c) calendar — next date only (no time).
+            try:
+                cal = stock.calendar
+                edc = cal.get("Earnings Date") if isinstance(cal, dict) else None
+                if edc:
+                    import pandas as pd
+                    d0 = edc[0] if isinstance(edc, (list, tuple)) else edc
+                    if hasattr(d0, "isoformat"):
+                        earn_ts.append(pd.Timestamp(d0))
+            except Exception:  # noqa: BLE001
+                pass
+
+            earn_ts = _dedupe_earn_ts(earn_ts)
+            today = date.today()
+            future = sorted((t for t in earn_ts if t.date() >= today), key=lambda t: t.date())
+            past = sorted((t for t in earn_ts if t.date() < today), key=lambda t: t.date())
+            if future:
+                ne = future[0]
+                out["next_earnings"] = ne.date().isoformat()
+                out["next_earnings_amc"] = _amc_bmo(ne)      # AMC = still ahead today; BMO/None handled by the gate
+            if past:
+                le = past[-1]
+                out["last_earnings"] = le.date().isoformat()
+                if log_ret is not None and len(log_ret) > 0:
+                    try:
+                        le_ts = le
+                        if getattr(log_ret.index, "tz", None) is not None and le_ts.tzinfo is None:
+                            le_ts = le_ts.tz_localize(log_ret.index.tz)
+                        out["days_since_earnings"] = int((log_ret.index > le_ts).sum())   # trading days since the print
+                    except Exception:  # noqa: BLE001
+                        pass
+            out["hv_diffusion"] = _diffusion_hv(log_ret, earn_ts)
     except Exception as exc:  # noqa: BLE001
         logger.debug("derivinc context fetch failed for %s: %s", ticker, exc)
     return out
@@ -691,6 +823,10 @@ def _vol_stats(ctx: dict, front_summary: dict) -> dict:
         "hv10_pct": round(ctx["hv10"] * 100, 1) if ctx.get("hv10") else None,
         "hv20_pct": round(ctx["hv20"] * 100, 1) if ctx.get("hv20") else None,
         "hv30_pct": round(hv_cur * 100, 1) if hv_cur else None,
+        # Ex-earnings-event diffusion HV + trading days since the last print — the clean baseline the desk
+        # judges a CRUSHED post-earnings IV against (so a fair post-crush premium isn't falsely vetoed).
+        "hv_diffusion_pct": round(ctx["hv_diffusion"] * 100, 1) if ctx.get("hv_diffusion") else None,
+        "days_since_earnings": ctx.get("days_since_earnings"),
         "har_rv_pct": har,                              # HAR-RV forward (~1mo) realized-vol forecast
         "iv_vs_har_pts": iv_vs_har,                     # implied − HAR forecast (vol pts); + = seller edge
         "iv_rank": iv_rank, "iv_percentile": iv_pctile,
@@ -1876,7 +2012,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
                  r: float, sofr_pct: float, hv: Optional[float], structures: list[str],
                  european: bool, next_earnings: Optional[str], min_prob: float,
                  min_income: float, ticker: str, focus: Optional[dict] = None,
-                 owns_underlying: bool = False,
+                 owns_underlying: bool = False, focus_only: bool = False,
                  ta_levels: Optional[dict] = None) -> tuple[list[dict], dict]:
     """All qualifying opportunities for one expiration + an expiry summary. ``owns_underlying`` = the user
     holds the shares → short calls are COVERED; otherwise they are NAKED (Reg-T margin). ``ta_levels`` =
@@ -1891,7 +2027,9 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     quant = _quant_block(rnd, calls, puts, strikes_all, spot, dte, atm_iv)
 
     exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-    earnings_before = (next_earnings if next_earnings and today.isoformat() < next_earnings <= exp_date.isoformat()
+    # A print DATED today is still AHEAD (earnings are usually after the close), so include it (<=) — the old
+    # strict < wrongly treated a same-day AMC print as already-past and skipped all the gap protection.
+    earnings_before = (next_earnings if next_earnings and today.isoformat() <= next_earnings <= exp_date.isoformat()
                        else None)
     macro = _macro_events_in_window(today, exp_date)
 
@@ -1900,6 +2038,11 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
                   earnings_before=earnings_before, macro=macro, min_prob=min_prob,
                   min_income=min_income, ticker=ticker)
     opps: list[dict] = []
+
+    if focus_only:
+        # Placed-/paper-trade REPRICE: only the injected focus needs scoring, so skip building the whole
+        # candidate ladder for every structure — the desk-score memory + latency win (no full scan per trade).
+        structures = []
 
     call_strikes = sorted(k for k in calls if k > spot * 1.001)
     put_strikes = sorted((k for k in puts if k < spot * 0.999), reverse=True)
@@ -2157,6 +2300,7 @@ async def run_derivative_income(
     target_expiration: Optional[str] = None,
     focus: Optional[dict] = None,
     owns_underlying: bool = False,
+    focus_only: bool = False,
     ta_levels: Optional[dict] = None,
 ) -> dict:
     """Deep-scan one underlying for income opportunities (≥``min_prob`` no-assignment,
@@ -2237,7 +2381,7 @@ async def run_derivative_income(
         opps, summary = _scan_expiry(
             chain, spot, dte, exp, today, sofr_frac, sofr_pct, hv, structures,
             european, ctx.get("next_earnings"), min_prob, min_income, ticker,
-            focus=focus, owns_underlying=owns_underlying, ta_levels=ta_levels,
+            focus=focus, owns_underlying=owns_underlying, focus_only=focus_only, ta_levels=ta_levels,
         )
         opportunities.extend(opps)
         expiry_summaries.append(summary)
@@ -2248,7 +2392,7 @@ async def run_derivative_income(
             pass
 
     # Calendars span TWO expiries → built here (not in _scan_expiry, which sees one chain) from the cache.
-    if "calendar" in structures:
+    if "calendar" in structures and not focus_only:
         try:
             opportunities.extend(_scan_calendars(chains_cache, spot, sofr_frac, min_income, hv))
         except Exception as exc:  # noqa: BLE001
@@ -2332,6 +2476,8 @@ async def run_derivative_income(
         "hv30_pct": round(ctx["hv30"] * 100, 1) if ctx.get("hv30") else None,
         "hv20_pct": round(ctx["hv20"] * 100, 1) if ctx.get("hv20") else None,
         "next_earnings": ctx.get("next_earnings"),
+        "next_earnings_amc": ctx.get("next_earnings_amc"),   # 'amc' (after close, still ahead today) | 'bmo' | None
+        "days_since_earnings": ctx.get("days_since_earnings"),
         "vol_stats": {**_vol_stats(ctx, expiry_summaries[0] if expiry_summaries else {}),
                       "term_structure": _term_structure(expiry_summaries)},
     }

@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware as StarletteSessionMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from . import yf_cache  # noqa: F401 — import-for-side-effect: pins the yfinance tz cache before any service imports/uses yfinance (kills the concurrent "Failed to create TzCache … File exists" race)
 from .config import settings
 from .database import init_db
 from .middleware import SessionMiddleware

@@ -81,9 +81,16 @@ def _bs_vec(S, K: float, T: float, r: float, sigma, right: str):
 
 # ── crash scenarios — FULL repricing (Taylor is invalid for large moves) ─────
 
-def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r: float) -> float:
+def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r: float,
+                     include_stock: bool = True) -> float:
     """Book P&L if the market instantly moves `move` (each name × its beta) and vol
-    jumps `vol_shock_pts`, by fully repricing every leg with Black-Scholes."""
+    jumps `vol_shock_pts`, by fully repricing every leg with Black-Scholes.
+
+    `include_stock=True` also revalues the SHARES behind the position (the long stock of a
+    covered call / collar, or any held underlying) at the crashed spot — the true economic
+    exposure. Set False to isolate the option overlay. Excluding the shares is exactly what
+    made a −50% crash look milder than a −34% one: a covered call's short call *decays* in a
+    selloff (a paper gain) while the far larger stock loss was invisible."""
     total = 0.0
     for p in positions:
         s_crash = p["spot"] * (1 + move * p.get("beta", 1.0))
@@ -94,6 +101,8 @@ def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r
             v0 = bs_price(p["spot"], lg["strike"], lg["dte_years"], r, iv0, ot)
             v1 = bs_price(s_crash, lg["strike"], lg["dte_years"], r, iv1, ot)
             total += lg["sign"] * lg["qty"] * _MULT * (v1 - v0)
+        if include_stock and p.get("shares"):
+            total += p["shares"] * (s_crash - p["spot"])   # signed: long>0 loses on the way down
     return total
 
 
@@ -135,6 +144,8 @@ def book_mc(positions: list[dict], r: float, mkt_vol: float, idx_spot: float,
             else:
                 v1 = np.maximum(0.0, lg["strike"] - s_sim)
             pnl += lg["sign"] * lg["qty"] * _MULT * (v1 - v0)
+        if p.get("shares"):                       # revalue held shares (covered call / collar / stock)
+            pnl += p["shares"] * (s_sim - p["spot"])
     idx_sim = idx_spot * np.exp(mkt)
     return {"pnl": pnl, "idx_sim": idx_sim, "horizon_years": dt, **_tail_stats(pnl)}
 
@@ -253,6 +264,7 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
         return None
 
     life_legs, n_short, short_strikes = [], 0, []
+    strikes_by_exp: dict[str, dict] = {}   # exp → {"C":[listed call strikes], "P":[...]} for real-leg remediation
     for l in opt:
         exp = str(l.get("expiration") or l.get("expiry") or "")[:10]
         if not exp:
@@ -277,6 +289,9 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
                 q = next((qq for k, qq in side.items() if abs(float(k) - strike) < 0.01), None)
                 if q and getattr(q, "iv", None):
                     iv = float(q.iv)
+                if exp not in strikes_by_exp:   # capture the LISTED strikes once (cheap — chain already fetched)
+                    strikes_by_exp[exp] = {"C": sorted(float(k) for k in calls.keys()),
+                                           "P": sorted(float(k) for k in puts.keys())}
             except Exception:  # noqa: BLE001
                 iv = None
         if iv is None:
@@ -288,7 +303,7 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
             dte = 30
         life_legs.append({"strike": strike, "right": right, "sign": sign,
                           "qty": float(l.get("qty") or l.get("contracts") or 1),
-                          "iv": iv, "dte_years": dte / 365.0})
+                          "iv": iv, "dte_years": dte / 365.0, "exp": exp, "dte_days": dte})
     if not life_legs:
         return None
     g = higher_order_greeks(life_legs, spot, r=r, stock_shares=0.0)   # OPTION LAYER ONLY
@@ -297,11 +312,27 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
     # structure + stock presence → so a short CALL can be flagged COVERED (excluded from the
     # naked-assignment total) vs naked. Any non-option long-share leg also counts as cover.
     structure = getattr(strategy, "strategy_type", None) or getattr(strategy, "structure", None)
-    has_stock = any(("stock" in str(l.get("type", "")).lower() or "share" in str(l.get("type", "")).lower())
-                    and float(l.get("shares") or l.get("qty") or 0) > 0 for l in legs)
+    # Signed share exposure behind the overlay (covered-call/collar long stock, or any holding) —
+    # the economic leg the crash / CVaR / ladder must revalue. Prefer parameters.shares (how the
+    # combo P&L path stores it); fall back to a stock/share leg in legs_data. long>0, short<0.
+    shares = 0.0
+    try:
+        shares = float(json.loads(strategy.parameters or "{}").get("shares") or 0)
+    except (ValueError, TypeError):
+        shares = 0.0
+    if not shares:
+        for l in legs:
+            if "stock" in str(l.get("type", "")).lower() or "share" in str(l.get("type", "")).lower():
+                try:
+                    q = abs(float(l.get("shares") or l.get("qty") or 0))
+                except (ValueError, TypeError):
+                    q = 0.0
+                if q:
+                    shares += (-1 if any(k in str(l.get("action", "")).upper() for k in ("SELL", "SHORT")) else 1) * q
+    has_stock = bool(shares)
     return {"ticker": ticker, "name": strategy.name, "spot": spot, "iv": avg_iv,
-            "n_short": n_short, "capital": round(capital, 0), "legs": life_legs,
-            "structure": structure, "has_stock": bool(has_stock), **g}
+            "n_short": n_short, "capital": round(capital, 0), "legs": life_legs, "shares": round(shares, 2),
+            "strikes_by_exp": strikes_by_exp, "structure": structure, "has_stock": bool(has_stock), **g}
 
 
 async def _index_puts(provider, dte_days: int, today: date):
@@ -581,24 +612,55 @@ def _vixy_dynamic_candidate(spot_vix, fwd_vix, idx, idx_sim, book_pnl, cvar0, bo
     }]
 
 
-def _verdict_and_actions(*, crash20_pct, short_vol, concentration, hedge_menu, cvar_pct, beta_delta_spy):
-    """Plain-language read + concrete actions for a retail holder."""
-    loss = abs(crash20_pct or 0)
-    if loss >= 40:
-        level, msg = "Dangerous", f"A −20% market month wipes ~{loss:.0f}% of your capital. This book is over-sized for its tail."
-    elif loss >= 20:
-        level, msg = "Elevated", f"A −20% market month costs ~{loss:.0f}% of capital — heavy for a premium-selling book."
-    elif loss >= 8:
-        level, msg = "Moderate", f"A −20% month costs ~{loss:.0f}% of capital — manageable but real."
+def _lvl(x: float) -> str:
+    return "Dangerous" if x >= 40 else "Elevated" if x >= 20 else "Moderate" if x >= 8 else "Contained"
+
+
+def _verdict_and_actions(*, scenarios, short_vol, concentration, hedge_menu, cvar_pct, beta_delta_spy):
+    """Plain-language read + concrete actions — TWO-SIDED. A short-gamma book loses on a big move
+    EITHER way, so the level is set by the worse tail (down OR up), and the melt-up is named when it
+    is the bigger one (a −20%-only verdict called a book with a huge squeeze tail 'Contained')."""
+    downs = [s for s in (scenarios or []) if (s.get("move_pct") or 0) < 0 and s.get("pct_of_capital") is not None]
+    ups = [s for s in (scenarios or []) if (s.get("move_pct") or 0) > 0 and s.get("pct_of_capital") is not None]
+    worst_down = min(downs, key=lambda s: s["pct_of_capital"], default=None)
+    worst_up = min(ups, key=lambda s: s["pct_of_capital"], default=None)
+    crash20 = next((s for s in downs if abs((s.get("move_pct") or 0) + 0.20) < 1e-6), None) or worst_down
+    d = abs((crash20 or {}).get("pct_of_capital") or 0)            # the "−20% month" downside reference
+    d_worst = abs((worst_down or {}).get("pct_of_capital") or 0)   # deepest downside on the ladder
+    u = abs((worst_up or {}).get("pct_of_capital") or 0)           # worst melt-up / squeeze
+    u_label = (worst_up or {}).get("label") or "melt-up"
+    worst = max(d_worst, u)
+    level = _lvl(worst)
+    up_bigger = u > d_worst + 1e-9
+
+    if up_bigger and u >= 4:
+        msg = (f"Short gamma cuts BOTH ways — and your BIGGER tail is the upside: a {u_label} costs "
+               f"~{u:.0f}% of capital, vs ~{d:.0f}% for a −20% month. A melt-up / short-squeeze, not a "
+               f"crash, is the under-hedged side here.")
+    elif u >= 8:
+        msg = (f"Two-sided tail: a −20% month costs ~{d:.0f}% of capital and a {u_label} ~{u:.0f}% — "
+               f"short gamma loses on a big move either way, so hedge both, not just the downside.")
+    elif d_worst >= 40:
+        msg = f"A −20% market month wipes ~{d:.0f}% of your capital (deepest downside ~{d_worst:.0f}%). Over-sized for its tail."
+    elif d_worst >= 20:
+        msg = f"A −20% market month costs ~{d:.0f}% of capital — heavy for a premium-selling book."
+    elif worst >= 8:
+        msg = f"A −20% month costs ~{d:.0f}% of capital (melt-up ~{u:.0f}%) — manageable but real."
     else:
-        level, msg = "Contained", f"A −20% month costs ~{loss:.0f}% of capital — a well-sized tail."
+        msg = f"A −20% month costs ~{d:.0f}% and a melt-up ~{u:.0f}% of capital — a well-sized tail on both sides."
+
     actions = []
+    if up_bigger and u >= 8:
+        actions.append(
+            f"Your dominant tail is a MELT-UP ({u_label} → ~{u:.0f}% of capital): the short-call / "
+            f"net-short-delta upside is under-protected. Cap it with call SPREADS (not naked calls), trim "
+            f"the biggest short calls, or add a small long-call/upside hedge — a downside index put does NOT help this side.")
     laddered = [c for c in concentration if c.get("laddered") or c.get("flags")]
     if laddered:
         names = ", ".join(c["ticker"] for c in laddered[:3])
         actions.append(f"De-concentrate {names}: laddered short strikes on one name are ONE bet — a single gap hits them all.")
-    if short_vol and loss >= 15:
-        actions.append("Reduce size or convert the biggest naked shorts to defined-risk spreads to cap the tail.")
+    if short_vol and worst >= 15:
+        actions.append("Reduce size or convert the biggest naked shorts to defined-risk spreads to cap the tail (both sides).")
     rec = next((c for c in hedge_menu if c.get("recommended")), None)
     if rec and rec.get("cost_effective"):
         actions.append(f"Add the recommended hedge ({rec['label']}, {rec['contracts']}×) — it lifts compound growth (+{rec['cagr_lift_pct']}% CAGR) while capping the crash.")
@@ -691,6 +753,479 @@ def _naked_assignment(positions: list[dict]) -> dict:
     }
 
 
+def _loss_by_name(positions: list[dict], r: float, move: float, vshock: float) -> list[dict]:
+    """Per-underlying P&L contribution at one scenario (whole position — shares INCLUDED), the
+    'who is actually hurting me' waterfall institutions lead with. Splits the option overlay from
+    the stock leg so a covered name shows where the loss really comes from. Sorted worst-first."""
+    agg: dict[str, dict] = {}
+    for p in positions:
+        whole = reprice_scenario([p], move, vshock, r)
+        opt = reprice_scenario([p], move, vshock, r, include_stock=False)
+        a = agg.setdefault(p["ticker"], {"ticker": p["ticker"], "pnl": 0.0, "option_pnl": 0.0,
+                                         "stock_pnl": 0.0, "beta": round(p.get("beta", 1.0), 2)})
+        a["pnl"] += whole
+        a["option_pnl"] += opt
+        a["stock_pnl"] += (whole - opt)
+    rows = sorted(agg.values(), key=lambda x: x["pnl"])
+    return [{**a, "pnl": round(a["pnl"], 0), "option_pnl": round(a["option_pnl"], 0),
+             "stock_pnl": round(a["stock_pnl"], 0)} for a in rows]
+
+
+# Independent-axis risk array (SPAN/RiskMetrics style): spot shock × vol shock, full reprice.
+_GRID_SPOT = [-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20]
+_GRID_VOL = [-10.0, 0.0, 10.0, 20.0, 30.0]   # absolute vol-point shocks (independent of the move)
+
+
+def _scenario_grid(positions: list[dict], r: float, book_capital: float) -> dict:
+    """2-D stress matrix — book P&L for every (spot move × vol-point shock) combination, whole
+    position repriced. This is the desk's risk array: it shows the short-gamma 'valley' (loss on a
+    move EITHER way) and the short-vega gradient (loss as vol rises) that a single row of tiles hides."""
+    rows = []
+    for mv in _GRID_SPOT:
+        cells = []
+        for vp in _GRID_VOL:
+            pnl = reprice_scenario(positions, mv, vp, r)
+            cells.append({"pnl": round(pnl, 0),
+                          "pct": round(pnl / book_capital * 100, 1) if book_capital else None})
+        rows.append({"move_pct": round(mv * 100, 0), "cells": cells})
+    return {"spot_moves": [round(m * 100, 0) for m in _GRID_SPOT],
+            "vol_shocks": [round(v, 0) for v in _GRID_VOL], "rows": rows}
+
+
+async def _book_factor_exposure(positions: list[dict], db) -> Optional[dict]:
+    """DETERMINISTIC factor decomposition of the book (no LLM, no invented links) — the pillar the
+    greeks miss: which SECTORS the book is really betting on, which names actually MOVE TOGETHER
+    (measured ρ → hidden concentration a per-name view hides), and which MACRO factors (rates, oil,
+    gold, USD, …) the whole book loads on. Reuses the shared correlated-assets registry: GICS
+    sectors + 1y returns, Pearson ρ. Labels are only ever attached to a correlation that is measured.
+
+    Returns {sectors, clusters, macro, drivers} in $ and ρ, or None if returns are unavailable.
+    DB reads are SEQUENTIAL on the shared session (see get_profiles' note)."""
+    from .correlated_assets_service import get_profiles, fetch_returns, pearson, _MACRO_PROXIES, _FACTOR_LABEL
+
+    tickers = sorted({p["ticker"] for p in positions})
+    if len(tickers) < 1:
+        return None
+    macro = [(m["factor"], m["label"], m["proxy"], float(m.get("sign", "1"))) for m in _MACRO_PROXIES if m["factor"] != "market"]
+    try:
+        profiles = await get_profiles(tickers, db)                          # sequential (shared session)
+        returns = await fetch_returns(tickers + [p for _, _, p, _ in macro], db)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("factor exposure fetch failed: %s", exc)
+        return None
+    if not returns:
+        return None
+
+    # Per-ticker committed capital + beta-weighted directional $ (delta incl. shares).
+    cap_by: dict[str, float] = {}
+    dir_by: dict[str, float] = {}
+    for p in positions:
+        t = p["ticker"]
+        cap_by[t] = cap_by.get(t, 0.0) + (p.get("capital") or 0.0)
+        dir_shares = (p.get("net_delta") or 0.0) + (p.get("shares") or 0.0)
+        dir_by[t] = dir_by.get(t, 0.0) + dir_shares * p.get("beta", 1.0) * p["spot"]
+
+    # 1) SECTOR buckets — where the committed capital and net direction actually sit.
+    sec_agg: dict[str, dict] = {}
+    for t in tickers:
+        sec = (profiles.get(t, {}).get("sector") or "Unclassified").strip() or "Unclassified"
+        s = sec_agg.setdefault(sec, {"sector": sec, "tickers": [], "capital": 0.0, "net_directional": 0.0})
+        s["tickers"].append(t)
+        s["capital"] += cap_by.get(t, 0.0)
+        s["net_directional"] += dir_by.get(t, 0.0)
+    sectors = sorted(({**s, "capital": round(s["capital"], 0), "net_directional": round(s["net_directional"], 0),
+                       "n": len(s["tickers"])} for s in sec_agg.values()),
+                     key=lambda x: -x["capital"])
+
+    # 2) CORRELATED CLUSTERS — names that measurably move together (ρ ≥ 0.6) = one bet.
+    def _al(a, b):
+        n = min(len(a), len(b))
+        return (a[-n:], b[-n:]) if n >= 40 else (None, None)
+    parent = list(range(len(tickers)))
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    pair_rho: dict[tuple, float] = {}
+    for i in range(len(tickers)):
+        for j in range(i + 1, len(tickers)):
+            a, b = _al(returns.get(tickers[i], []), returns.get(tickers[j], []))
+            if a is None:
+                continue
+            rho = pearson(a, b)
+            if rho is not None and rho >= 0.6:
+                pair_rho[(tickers[i], tickers[j])] = round(rho, 2)
+                ri, rj = _find(i), _find(j)
+                if ri != rj:
+                    parent[ri] = rj
+    groups: dict[int, list[str]] = {}
+    for k, t in enumerate(tickers):
+        groups.setdefault(_find(k), []).append(t)
+    clusters = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        rhos = [v for (a, b), v in pair_rho.items() if a in members and b in members]
+        clusters.append({"tickers": sorted(members), "capital": round(sum(cap_by.get(t, 0.0) for t in members), 0),
+                         "net_directional": round(sum(dir_by.get(t, 0.0) for t in members), 0),
+                         "avg_rho": round(sum(rhos) / len(rhos), 2) if rhos else None})
+    clusters.sort(key=lambda c: -c["capital"])
+
+    # 3) MACRO loadings of the WHOLE book — capital-weighted book return vs each macro proxy.
+    book_macro = []
+    series = [(t, returns.get(t)) for t in tickers if returns.get(t)]
+    n = min((len(s) for _, s in series), default=0)
+    if n >= 40 and series:
+        w = np.array([max(cap_by.get(t, 0.0), 0.0) for t, _ in series], dtype=float)
+        if w.sum() > 0:
+            w = w / w.sum()
+            driver = np.average(np.vstack([np.array(s[-n:]) for _, s in series]), axis=0, weights=w)
+            for factor, label, proxy, sign in macro:
+                mp = returns.get(proxy)
+                if not mp:
+                    continue
+                m = min(len(driver), len(mp))
+                if m < 40:
+                    continue
+                rho = pearson(list(driver[-m:]), mp[-m:])
+                if rho is not None and abs(rho) >= 0.4:
+                    book_macro.append({"factor": factor, "label": _FACTOR_LABEL.get(factor, label),
+                                       "rho": round(rho, 2)})
+            book_macro.sort(key=lambda x: -abs(x["rho"]))
+
+    return {"sectors": sectors, "clusters": clusters, "macro": book_macro,
+            "by_name": [{"ticker": t, "sector": profiles.get(t, {}).get("sector") or None,
+                         "capital": round(cap_by.get(t, 0.0), 0),
+                         "net_directional": round(dir_by.get(t, 0.0), 0)} for t in tickers]}
+
+
+# ── Per-position remediation optimizer (real legs, risk-vs-reward ranked) ─────
+_REM_DOWN, _REM_UP = -0.20, 0.30   # representative down / squeeze moves for per-position tail sizing
+
+
+def _pick_wing(strikes: list[float], ref: float, direction: int,
+               target_frac: float = 0.10, min_gap_frac: float = 0.03) -> Optional[float]:
+    """Nearest LISTED strike beyond `ref` (direction +1 higher / −1 lower) to ~target_frac OTM —
+    the real protective wing to turn a naked short into a defined-risk spread."""
+    if not strikes:
+        return None
+    tgt = ref * (1 + direction * target_frac)
+    cands = [s for s in strikes if (s - ref) * direction >= ref * min_gap_frac]
+    return min(cands, key=lambda s: abs(s - tgt)) if cands else None
+
+
+def _short_extrinsic(spot: float, lg: dict, r: float) -> float:
+    """$ of extrinsic (time value) still to collect on one short leg — the 'reward remaining'."""
+    right = "call" if lg["right"] == "C" else "put"
+    val = bs_price(spot, lg["strike"], lg["dte_years"], r, lg["iv"], right)
+    intrin = max(0.0, spot - lg["strike"]) if lg["right"] == "C" else max(0.0, lg["strike"] - spot)
+    return max(0.0, val - intrin) * _MULT * lg["qty"]
+
+
+def _position_side_metrics(p: dict, side: str, r: float) -> dict:
+    """This position's tail on `side` (whole position) + the premium still to collect on that side."""
+    move = _REM_UP if side == "up" else _REM_DOWN
+    right = "C" if side == "up" else "P"
+    tail = reprice_scenario([p], move, _vol_shock_for(move), r)
+    prem = sum(_short_extrinsic(p["spot"], lg, r) for lg in p["legs"] if lg["sign"] < 0 and lg["right"] == right)
+    return {"tail": tail, "premium_left": round(prem, 0)}
+
+
+def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
+    """Best CONCRETE fix for one position on `side` using REAL listed strikes: cap it with a spread
+    (buy a real wing) or close it — whichever cuts more tail per dollar while preserving premium.
+    Returns real leg strings, $ cost, premium kept, and tail before→after (all from live data)."""
+    move = _REM_UP if side == "up" else _REM_DOWN
+    vshock = _vol_shock_for(move)
+    right = "C" if side == "up" else "P"
+    ot = "call" if side == "up" else "put"
+    shorts = [lg for lg in p["legs"] if lg["sign"] < 0 and lg["right"] == right]
+    if not shorts:
+        return None
+    tgt = min(shorts, key=lambda lg: lg["strike"]) if side == "up" else max(shorts, key=lambda lg: lg["strike"])
+    spot, K, qty, iv, dte = p["spot"], tgt["strike"], tgt["qty"], tgt["iv"], tgt["dte_years"]
+    tail_before = reprice_scenario([p], move, vshock, r)
+    val_now = bs_price(spot, K, dte, r, iv, ot)
+    prem_leg = _short_extrinsic(spot, tgt, r)
+
+    opts = []
+    # CAP — buy a real wing beyond the short → defined-risk spread.
+    wing = _pick_wing((p.get("strikes_by_exp") or {}).get(tgt.get("exp"), {}).get(right, []), K, +1 if side == "up" else -1)
+    if wing:
+        wing_cost = bs_price(spot, wing, dte, r, iv, ot) * _MULT * qty
+        p_cap = {**p, "legs": p["legs"] + [{"strike": wing, "right": right, "sign": 1, "qty": qty, "iv": iv, "dte_years": dte}]}
+        tail_after = reprice_scenario([p_cap], move, vshock, r)
+        opts.append({"action": "cap", "cost": round(wing_cost, 0), "tail_after": round(tail_after, 0),
+                     "premium_kept": round(prem_leg - wing_cost, 0),
+                     "legs": f"BUY {qty:g}× {tgt.get('exp','')} {wing:g}{right} (vs your short {K:g}{right})",
+                     "detail": f"turns the naked {K:g}{right} into a {K:g}/{wing:g} spread",
+                     # structured legs so the UI can hand the REPAIRED spread to Evaluate for exact pricing.
+                     "prefill": {"ticker": p["ticker"], "legs": [
+                         {"action": "SELL", "type": ot.upper(), "strike": K, "expiration": tgt.get("exp"), "qty": int(qty)},
+                         {"action": "BUY", "type": ot.upper(), "strike": wing, "expiration": tgt.get("exp"), "qty": int(qty)},
+                     ]}})
+    # CLOSE — buy the short back.
+    p_close = {**p, "legs": [lg for lg in p["legs"] if lg is not tgt]}
+    opts.append({"action": "close", "cost": round(val_now * _MULT * qty, 0),
+                 "tail_after": round(reprice_scenario([p_close], move, vshock, r), 0),
+                 "premium_kept": 0.0,
+                 "legs": f"BUY-to-close {qty:g}× {tgt.get('exp','')} {K:g}{right}",
+                 "detail": "exit the leg entirely"})
+    # rank by LOSS REDUCED per $ spent (tail_after is less negative than tail_before → improvement
+    # is tail_after − tail_before, a positive number); break ties by premium kept.
+    def _eff(o):
+        improvement = o["tail_after"] - tail_before
+        return (improvement / max(o["cost"], 1.0), o["premium_kept"])
+    opts.sort(key=_eff, reverse=True)
+    best = opts[0]
+    return {"tail_before": round(tail_before, 0), "recommended": best,
+            "alt": next((o for o in opts if o["action"] != best["action"]), None)}
+
+
+def _offender_targets(positions: list[dict], side: str, r: float, *, tickers=None, top: int = 2) -> list[dict]:
+    """Rank the positions creating the most `side` risk vs the premium they still pay, worst first,
+    and attach each one's concrete remediation. Optionally restrict to `tickers` (a concentrated set)."""
+    pool = [p for p in positions if (tickers is None or p["ticker"] in tickers)]
+    scored = []
+    for p in pool:
+        m = _position_side_metrics(p, side, r)
+        if m["tail"] >= -1:            # only positions that actually LOSE on this side
+            continue
+        scored.append((p, m))
+    scored.sort(key=lambda pm: pm[1]["tail"])   # most negative first
+    out = []
+    for p, m in scored[:top]:
+        rem = _remediate_position(p, side, r)
+        if not rem:
+            continue
+        out.append({
+            "ticker": p["ticker"], "name": p.get("name") or p["ticker"],
+            "structure": p.get("structure"),
+            "risk": round(m["tail"], 0), "premium_left": m["premium_left"],
+            "why": f"{_usd0(m['tail'])} of the {'squeeze' if side == 'up' else '−20% crash'} loss"
+                   + (f", only {_usd0(m['premium_left'])} premium left to earn" if m["premium_left"] < abs(m["tail"]) else ""),
+            **rem,
+        })
+    return out
+
+
+# ── Institutional risk scorecard ─────────────────────────────────────────────
+# Standardized guardrails a professional vol desk runs the book against, each with the
+# book's ACTUAL value vs the industry limit, a status, and — for anything off-limit — the
+# CHEAPEST concrete trade that brings it back in line (with cost + premium-income impact).
+# Thresholds are the mainstream institutional ranges (Basel/￼fund-mandate style):
+_GUARDRAILS = {
+    "extreme_tail":  {"warn": 0.07, "breach": 0.10, "label": "Extreme tail cap",       "unit": "cap"},   # worst 1-mo downside
+    "cvar":          {"warn": 0.02, "breach": 0.03, "label": "CVaR 95% (1-mo)",         "unit": "cap"},
+    "var":           {"warn": 0.015, "breach": 0.02, "label": "VaR 95% (1-mo)",         "unit": "cap"},
+    "symmetry":      {"warn": 1.5,  "breach": 2.0,  "label": "Up/down tail symmetry",   "unit": "ratio"},
+    "name_conc":     {"warn": 0.20, "breach": 0.25, "label": "Single-name concentration", "unit": "cap"},
+    "cluster_conc":  {"warn": 0.30, "breach": 0.40, "label": "Correlated-cluster conc.", "unit": "cap"},
+    "sector_conc":   {"warn": 0.35, "breach": 0.45, "label": "Sector concentration",    "unit": "cap"},
+    "net_dir":       {"warn": 0.20, "breach": 0.30, "label": "Net directional (β-Δ)",   "unit": "cap"},
+}
+
+
+def _usd0(x) -> str:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{'−' if x < 0 else ''}${abs(x):,.0f}"
+
+
+def _pick_hedge(menu: list[dict], need_cvar: float):
+    """Cheapest hedge that cuts CVaR by ≥ need_cvar; else the biggest-reduction one (partial)."""
+    covering = [c for c in menu if (c.get("cvar_reduction") or 0) >= need_cvar and (c.get("annual_bleed") or 0) >= 0]
+    if covering:
+        return min(covering, key=lambda c: c.get("annual_bleed") or 1e18), True
+    if menu:
+        return max(menu, key=lambda c: c.get("cvar_reduction") or 0), False
+    return None, False
+
+
+def _hedge_trade_str(c: dict) -> str:
+    if not c:
+        return "—"
+    if c.get("instrument") == "VIXY":
+        return f"VIXY dynamic sleeve ({_usd0(c.get('sleeve_capital'))} cash)"
+    lo = c.get("long_strike") if c.get("long_strike") is not None else c.get("long_put")
+    sh = c.get("short_strike") if c.get("short_strike") is not None else c.get("short_put")
+    strikes = f"{lo:g}/{sh:g}" if (lo is not None and sh is not None) else (f"{lo:g}" if lo is not None else "")
+    return f"{c.get('instrument', 'SPX')} {strikes} {c.get('contracts', '')}×".strip()
+
+
+def _risk_scorecard(*, positions, r, book_capital, annual_income, scenarios, cvar_95, var_95,
+                    beta_delta_notional, beta_delta_spy, spy_price, concentration,
+                    factor_exposure, naked_assignment, hedge_menu) -> dict:
+    cap = max(float(book_capital or 0), 1.0)
+    carry = float(annual_income or 0)
+    positions = positions or []
+    checks: list[dict] = []
+
+    def _worse_side(tks):
+        d = sum(_position_side_metrics(p, "down", r)["tail"] for p in positions if p["ticker"] in tks)
+        u = sum(_position_side_metrics(p, "up", r)["tail"] for p in positions if p["ticker"] in tks)
+        return "down" if d <= u else "up"
+
+    def _status(val, key, higher_bad=True):
+        g = _GUARDRAILS[key]
+        if higher_bad:
+            return "breach" if val > g["breach"] else "warn" if val > g["warn"] else "pass"
+        return "breach" if val < g["breach"] else "warn" if val < g["warn"] else "pass"
+
+    def _carry_pct(cost):
+        return f" ({cost / carry * 100:.0f}% of carry)" if carry > 0 and cost else ""
+
+    downs = [s for s in scenarios if (s.get("move_pct") or 0) < 0 and s.get("pnl") is not None]
+    ups = [s for s in scenarios if (s.get("move_pct") or 0) > 0 and s.get("pnl") is not None]
+    worst_down = min((s["pnl"] for s in downs), default=0.0)
+    worst_up_row = min(ups, key=lambda s: s["pnl"], default=None)
+    worst_up = worst_up_row["pnl"] if worst_up_row else 0.0
+
+    # 1) EXTREME TAIL CAP — worst 1-month downside ≤ 10% of capital.
+    et = abs(worst_down) / cap
+    st = _status(et, "extreme_tail")
+    c = dict(key="extreme_tail", label=_GUARDRAILS["extreme_tail"]["label"], status=st,
+             value_pct=round(et * 100, 1), value_str=f"{_usd0(worst_down)} · {et*100:.0f}%",
+             limit_str="≤ 10% of capital",
+             note="Deepest 1-month crash on the ladder — a single black swan must not threaten solvency.")
+    if st != "pass" and hedge_menu:
+        gap = abs(worst_down) - _GUARDRAILS["extreme_tail"]["breach"] * cap
+        h, full = _pick_hedge(hedge_menu, gap)
+        if h:
+            after = abs(worst_down) - (h.get("crash_payoff_20") or h.get("cvar_reduction") or 0)
+            c["fix"] = {"headline": f"Add {_hedge_trade_str(h)}",
+                        "cost": f"{_usd0(h.get('annual_bleed'))}/yr" + _carry_pct(h.get("annual_bleed")),
+                        "effect": f"worst crash {_usd0(worst_down)} → {_usd0(-max(after,0))} ({max(after,0)/cap*100:.0f}% of cap){'' if full else ' — partial'}",
+                        "targets": _offender_targets(positions, "down", r, top=2)}
+    checks.append(c)
+
+    # 2) CVaR 95% ≤ 3% of capital.
+    if cvar_95 is not None:
+        cv = float(cvar_95) / cap
+        st = _status(cv, "cvar")
+        c = dict(key="cvar", label=_GUARDRAILS["cvar"]["label"], status=st,
+                 value_pct=round(cv * 100, 1), value_str=f"{_usd0(cvar_95)} · {cv*100:.1f}%",
+                 limit_str="≤ 2–3% of capital",
+                 note="Average loss in the worst 5% of months — the fund-mandate tail measure.")
+        if st != "pass" and hedge_menu:
+            gap = float(cvar_95) - _GUARDRAILS["cvar"]["breach"] * cap
+            h, full = _pick_hedge(hedge_menu, gap)
+            if h:
+                after = float(cvar_95) - (h.get("cvar_reduction") or 0)
+                c["fix"] = {"headline": f"Add {_hedge_trade_str(h)}",
+                            "cost": f"{_usd0(h.get('annual_bleed'))}/yr" + _carry_pct(h.get("annual_bleed")),
+                            "effect": f"CVaR {_usd0(cvar_95)} → {_usd0(max(after,0))} ({max(after,0)/cap*100:.1f}% of cap){'' if full else ' — partial, stack a 2nd'}",
+                            "targets": _offender_targets(positions, "down", r, top=2)}
+        checks.append(c)
+
+    # 3) VaR 95% ≤ 2% of capital.
+    if var_95 is not None:
+        vv = float(var_95) / cap
+        checks.append(dict(key="var", label=_GUARDRAILS["var"]["label"], status=_status(vv, "var"),
+                           value_pct=round(vv * 100, 1), value_str=f"{_usd0(var_95)} · {vv*100:.1f}%",
+                           limit_str="≤ 1.5–2% of capital",
+                           note="The 5%-worst-month loss threshold (CVaR’s companion)."))
+
+    # 4) TAIL SYMMETRY — neither tail more than ~1.5× the other.
+    a, b = abs(worst_down), abs(worst_up)
+    ratio = (max(a, b) / max(min(a, b), 1.0))
+    up_bigger = b > a
+    st = _status(ratio, "symmetry")
+    c = dict(key="symmetry", label=_GUARDRAILS["symmetry"]["label"], status=st,
+             value_pct=round(ratio, 1), value_str=f"{ratio:.1f}× ({'up' if up_bigger else 'down'} heavier)",
+             limit_str="≤ 1.5× either way",
+             note="A short-vol book must not hide an asymmetric melt-up (or crash) tail.")
+    if st != "pass":
+        if up_bigger:
+            tgts = _offender_targets(positions, "up", r, top=2)
+            n = abs(round(beta_delta_spy or 0))
+            c["fix"] = {"headline": f"Cap the short calls driving the melt-up" + (f" (or Buy ~{n} SPY to flatten β-Δ, {_usd0(n * (spy_price or 0))})" if n else ""),
+                        "cost": "each target priced below",
+                        "effect": f"shrinks the {worst_up_row['label'] if worst_up_row else 'squeeze'} tail toward the downside",
+                        "targets": tgts}
+        else:
+            c["fix"] = {"headline": "Downside-heavy — lift the crash floor",
+                        "cost": "each target priced below", "effect": "raises the worst-case toward the upside tail",
+                        "targets": _offender_targets(positions, "down", r, top=2)}
+    checks.append(c)
+
+    # 5-7) CONCENTRATION — single name / correlated cluster / sector, as % of committed capital.
+    fe = factor_exposure or {}
+    by_name = fe.get("by_name") or []
+    if by_name:
+        top = max(by_name, key=lambda x: x.get("capital") or 0)
+        share = (top.get("capital") or 0) / cap
+        st = _status(share, "name_conc")
+        c = dict(key="name_conc", label=_GUARDRAILS["name_conc"]["label"], status=st,
+                 value_pct=round(share * 100, 0), value_str=f"{top['ticker']} {share*100:.0f}%",
+                 limit_str="≤ 20–25% per name",
+                 note="No single underlying should dominate — a gap in one name shouldn’t sink the book.")
+        if st != "pass":
+            trim = (share - _GUARDRAILS["name_conc"]["breach"]) * cap
+            c["fix"] = {"headline": f"Reduce {top['ticker']} (biggest concentration)",
+                        "cost": "each target priced below",
+                        "effect": f"{top['ticker']} {share*100:.0f}% → {_GUARDRAILS['name_conc']['breach']*100:.0f}% of capital",
+                        "targets": _offender_targets(positions, _worse_side({top['ticker']}), r, tickers={top['ticker']}, top=2)}
+        checks.append(c)
+
+    clusters = fe.get("clusters") or []
+    if clusters:
+        top = max(clusters, key=lambda x: x.get("capital") or 0)
+        share = (top.get("capital") or 0) / cap
+        st = _status(share, "cluster_conc")
+        c = dict(key="cluster_conc", label=_GUARDRAILS["cluster_conc"]["label"], status=st,
+                 value_pct=round(share * 100, 0),
+                 value_str=f"{'·'.join(top['tickers'][:3])}{'…' if len(top['tickers'])>3 else ''} {share*100:.0f}% (ρ {top.get('avg_rho')})",
+                 limit_str="≤ 30–40% per cluster",
+                 note="Names that move together (measured ρ) are ONE bet — the hidden concentration.")
+        if st != "pass":
+            trim = (share - _GUARDRAILS["cluster_conc"]["breach"]) * cap
+            c["fix"] = {"headline": f"Cut the {'·'.join(top['tickers'][:3])} cluster (one bet, ρ {top.get('avg_rho')})",
+                        "cost": "each target priced below",
+                        "effect": f"cluster {share*100:.0f}% → {_GUARDRAILS['cluster_conc']['breach']*100:.0f}% of capital",
+                        "targets": _offender_targets(positions, _worse_side(set(top['tickers'])), r, tickers=set(top['tickers']), top=3)}
+        checks.append(c)
+
+    sectors = fe.get("sectors") or []
+    if len([s for s in sectors if (s.get("capital") or 0) > 0]) > 1:
+        top = max(sectors, key=lambda x: x.get("capital") or 0)
+        share = (top.get("capital") or 0) / cap
+        st = _status(share, "sector_conc")
+        c = dict(key="sector_conc", label=_GUARDRAILS["sector_conc"]["label"], status=st,
+                 value_pct=round(share * 100, 0), value_str=f"{top['sector']} {share*100:.0f}%",
+                 limit_str="≤ 35–45% per sector",
+                 note="Sector-wide shocks hit every name in it at once.")
+        if st != "pass":
+            c["fix"] = {"headline": f"Diversify out of {top['sector']} (or hedge the sector ETF)",
+                        "cost": "—", "effect": f"{top['sector']} {share*100:.0f}% → below limit"}
+        checks.append(c)
+
+    # 8) NET DIRECTIONAL — a premium book should be ~market-neutral.
+    nd = abs(beta_delta_notional or 0) / cap
+    st = _status(nd, "net_dir")
+    c = dict(key="net_dir", label=_GUARDRAILS["net_dir"]["label"], status=st,
+             value_pct=round(nd * 100, 0),
+             value_str=f"{_usd0(beta_delta_notional)} ({beta_delta_spy:+.0f} SPY-eq)" if beta_delta_spy is not None else _usd0(beta_delta_notional),
+             limit_str="≤ 20–30% of capital",
+             note="Big net delta = a hidden market bet on top of the premium book.")
+    if st != "pass" and beta_delta_spy:
+        n = abs(round(beta_delta_spy))
+        side = "Sell" if beta_delta_spy > 0 else "Buy"
+        cost = n * (spy_price or 0)
+        c["fix"] = {"headline": f"{side} ~{n} SPY to flatten β-Δ",
+                    "cost": f"{_usd0(cost)} capital · ~$0 premium hit",
+                    "effect": f"β-Δ {beta_delta_spy:+.0f} → ~0 (market-neutral)"}
+    checks.append(c)
+
+    n_breach = sum(1 for c in checks if c["status"] == "breach")
+    n_warn = sum(1 for c in checks if c["status"] == "warn")
+    grade = "At risk" if n_breach else "Watch" if n_warn else "Sound"
+    return {"grade": grade, "n_breach": n_breach, "n_warn": n_warn, "n_checks": len(checks),
+            "checks": sorted(checks, key=lambda c: {"breach": 0, "warn": 1, "pass": 2}[c["status"]])}
+
+
 async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
                                  *, hedge_target_pct: float = 0.6, crash_prob_annual: float = 0.05,
                                  hedge_dte_days: int = 90) -> dict:
@@ -743,13 +1278,16 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
     spy_price = idx / _SPY_DIV if idx > 0 else None
     beta_delta_spy = round(bw_delta_notional / spy_price, 0) if spy_price else None   # SPY-share equivalents
 
-    # #2 — FULL-REPRICE crash scenarios.
+    # #2 — FULL-REPRICE crash scenarios. Headline P&L now revalues the WHOLE position (shares
+    # included); the option overlay is split out so the user can see how much is the stock.
     scenarios = []
     for label, move, vshock in _CRASH:
-        pnl = reprice_scenario(positions, move, vshock, r)
-        scenarios.append({"label": label, "move_pct": move, "pnl": round(pnl, 0),
-                          "pct_of_capital": round(pnl / book_capital * 100, 1) if book_capital else None})
-    crash20_pct = next((s["pct_of_capital"] for s in scenarios if s["label"] == "−20%"), None)
+        whole = reprice_scenario(positions, move, vshock, r)
+        opt = reprice_scenario(positions, move, vshock, r, include_stock=False)
+        scenarios.append({"label": label, "move_pct": move, "pnl": round(whole, 0),
+                          "overlay_pnl": round(opt, 0), "stock_pnl": round(whole - opt, 0),
+                          "pct_of_capital": round(whole / book_capital * 100, 1) if book_capital else None})
+    book_stock_notional = sum(abs(p.get("shares") or 0) * p["spot"] for p in positions)
 
     # #2 — full-reval MC VaR/CVaR at a 1-month horizon (fat tails + skew).
     mc = book_mc(positions, r, mkt_vol, idx or 1.0) if idx > 0 else {"pnl": None, "var_95": None, "cvar_95": None, "var_99": None, "cvar_99": None}
@@ -827,10 +1365,26 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
     elif book_loss20 <= 0:
         hedge_note = "The book isn't net short the tail at −20% — no index hedge needed."
 
-    verdict = _verdict_and_actions(crash20_pct=crash20_pct, short_vol=net_gamma < 0,
+    # DETERMINISTIC factor / correlation / macro decomposition (sequential DB — shared session).
+    try:
+        factor_exposure = await _book_factor_exposure(positions, db)
+    except Exception as exc:  # noqa: BLE001 — a factor-data miss must never fail the desk
+        logger.debug("factor exposure failed: %s", exc)
+        factor_exposure = None
+
+    verdict = _verdict_and_actions(scenarios=scenarios, short_vol=net_gamma < 0,
                                    concentration=concentration, hedge_menu=hedge_menu,
                                    cvar_pct=(mc.get("cvar_95") or 0) / book_capital * 100 if book_capital else None,
                                    beta_delta_spy=beta_delta_spy)
+
+    # Institutional risk SCORECARD — standardized guardrails + the cheapest fix for each breach.
+    scorecard = _risk_scorecard(
+        positions=positions, r=r,
+        book_capital=book_capital, annual_income=annual_income, scenarios=scenarios,
+        cvar_95=mc.get("cvar_95"), var_95=mc.get("var_95"),
+        beta_delta_notional=bw_delta_notional, beta_delta_spy=beta_delta_spy, spy_price=spy_price,
+        concentration=concentration, factor_exposure=factor_exposure,
+        naked_assignment=_naked_assignment(positions), hedge_menu=hedge_menu)
 
     return _native({
         "positions": len(positions),
@@ -849,6 +1403,15 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
         "carry_yield_pct": round(annual_income / book_capital * 100, 1) if book_capital else None,
         "cvar_capital_pct": round((mc.get("cvar_95") or 0) / book_capital * 100, 1) if book_capital else None,
         "short_vol": bool(net_gamma < 0),
+        "stock_notional": round(book_stock_notional, 0),   # $ of shares behind the overlay (covered/collar/holding)
+        # Who is actually hurting me — per-name P&L at a −20% month (whole position, shares split out).
+        "loss_by_name": _loss_by_name(positions, r, _HEDGE_SCEN[0], _HEDGE_SCEN[1]),
+        # DETERMINISTIC factor read: sector buckets, correlated clusters (measured ρ), macro loadings.
+        "factor_exposure": factor_exposure,
+        # Institutional risk scorecard: standardized guardrails, book value vs limit, cheapest fix per breach.
+        "risk_scorecard": scorecard,
+        # 2-D risk array: book P&L for spot × vol shocks (the short-gamma valley + short-vega gradient).
+        "scenario_grid": _scenario_grid(positions, r, book_capital),
         "avg_beta": round(sum(abs(p["net_gamma"]) * p["beta"] for p in positions) / (sum(abs(p["net_gamma"]) for p in positions) or 1), 2),
         "var_95": mc.get("var_95"), "cvar_95": mc.get("cvar_95"),
         "var_99": mc.get("var_99"), "cvar_99": mc.get("cvar_99"),

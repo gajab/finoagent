@@ -8,7 +8,8 @@
  * and Spitznagel CAGR lift — plus a plain-language verdict + actions.
  */
 import { useState, useEffect } from 'react';
-import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2, Sparkles, RefreshCw } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2, Sparkles, RefreshCw, Grid3x3, Wrench, ArrowRight } from 'lucide-react';
 import { fetchBookTailRisk, fetchBookHedgeAdvice } from '../../api';
 import type { BookTailRiskResult } from '../../api';
 import CollapsibleSection from './CollapsibleSection';
@@ -84,11 +85,22 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
           className="flex items-center gap-2.5 flex-1 min-w-0 text-left">
           <div className="w-7 h-7 rounded-lg bg-warning/15 flex items-center justify-center text-warning shrink-0"><ShieldAlert className="w-4 h-4" /></div>
           <div className="flex-1 min-w-0">
-            <div className="font-semibold text-sm text-warning">Manage Book</div>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="font-semibold text-sm text-warning">Manage Book</span>
+              {data?.risk_scorecard && (() => {
+                const s = data.risk_scorecard!;
+                const cls = s.grade === 'At risk' ? 'badge-error' : s.grade === 'Watch' ? 'badge-warning' : 'badge-success';
+                return (
+                  <span className={`badge badge-xs ${cls} gap-1`}>
+                    {s.grade}{s.n_breach > 0 ? ` · ${s.n_breach} breach${s.n_breach !== 1 ? 'es' : ''}` : s.n_warn > 0 ? ` · ${s.n_warn} watch` : ''}
+                  </span>
+                );
+              })()}
+            </div>
             <div className="text-[10px] text-base-content/40 truncate">
               {data?.computed_at
                 ? `Updated ${ago(data.computed_at)} · click to ${open ? 'collapse' : 'view'}`
-                : 'Beta-weighted greeks · two-sided stress · 1-mo CVaR · assignment lab · ranked hedges'}
+                : 'Institutional guardrails · two-sided stress · 1-mo CVaR · factor & correlation · cheapest fix per breach'}
             </div>
           </div>
         </button>
@@ -115,62 +127,92 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
 
           {data && (
             <>
-              {/* Verdict */}
-              {v && (
-                <div className={`rounded-xl border p-2.5 ${lv.bg}`}>
-                  <div className="flex items-center gap-2">
-                    <span className={`text-xs font-bold uppercase tracking-wider ${lv.tone}`}>{v.level}</span>
-                    <span className="text-[11px] text-base-content/70">{v.summary}</span>
-                  </div>
-                </div>
-              )}
+              {/* Institutional risk scorecard — the lead intelligence: guardrails · your value vs limit · cheapest fix. */}
+              {data.risk_scorecard && <RiskScorecard sc={data.risk_scorecard} />}
+              {/* one-line plain read of the two-sided tail (terse) */}
+              {v && <div className="text-[11px] text-base-content/55 -mt-1">{v.summary}</div>}
 
-              {/* Aggregate exposure — greeks (Γ/Vega/Θ), directional (β-Δ), then income (carry) vs tail (CVaR) */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
-                <Tile label="Net Gamma" value={data.net_gamma?.toFixed(2) ?? '—'} tone={(data.net_gamma ?? 0) < 0 ? 'error' : 'success'} sub={data.short_vol ? 'SHORT vol (concave)' : 'long vol'} />
-                <Tile label="Net Vega" value={money(data.net_vega)} tone={(data.net_vega ?? 0) < 0 ? 'error' : 'success'} sub="$/+1 vol-pt" />
-                <Tile label="Net Θ / day" value={money(data.net_theta)} tone={(data.net_theta ?? 0) >= 0 ? 'success' : 'error'}
-                  sub={data.theta_net_liq_pct != null ? `${data.theta_net_liq_pct >= 0 ? '+' : ''}${data.theta_net_liq_pct}%/day of cap` : 'daily decay'} />
-                <Tile label="β-Δ (SPY-equiv)" value={data.beta_delta_spy != null ? `${data.beta_delta_spy >= 0 ? '+' : ''}${data.beta_delta_spy}` : '—'} tone="base" sub={`${money(data.beta_delta_notional)} notl · β ${data.avg_beta}`} />
-                <Tile label="Carry · θ/Net-Liq" value={data.carry_yield_pct != null ? `${data.carry_yield_pct}%/yr` : '—'} tone="success" sub="annualized · ~25%/yr healthy" />
-                <Tile label="CVaR 95%" value={money(data.cvar_95)} tone="warning"
-                  sub={data.cvar_capital_pct != null ? `${data.cvar_capital_pct}% of cap · 1mo` : (data.horizon || 'expected shortfall')} />
+              {/* Book vitals — the current metrics in one tight strip (replaces the scattered tiles). */}
+              <div className="flex flex-wrap gap-px rounded-lg overflow-hidden border border-white/[0.06]">
+                <Vital label="Capital" value={money(data.book_capital)} title={data.capital_basis} />
+                <Vital label="Carry" value={data.carry_yield_pct != null ? `${data.carry_yield_pct}%/yr` : '—'} tone="success" sub="θ yield" />
+                <Vital label="Net θ / day" value={money(data.net_theta)} tone={(data.net_theta ?? 0) >= 0 ? 'success' : 'error'}
+                  sub={data.theta_net_liq_pct != null ? `${data.theta_net_liq_pct}%/day` : undefined} />
+                <Vital label="CVaR · 1mo" value={money(data.cvar_95)} tone="warning" sub={data.cvar_capital_pct != null ? `${data.cvar_capital_pct}% cap` : undefined} />
+                <Vital label="β-Δ" value={data.beta_delta_spy != null ? `${data.beta_delta_spy >= 0 ? '+' : ''}${data.beta_delta_spy} SPY` : '—'} sub={data.avg_beta != null ? `β ${data.avg_beta}` : undefined} />
+                <Vital label="Net Vega" value={money(data.net_vega)} tone={(data.net_vega ?? 0) < 0 ? 'error' : 'success'} sub="/ vol-pt" />
+                <Vital label="Net Γ" value={data.net_gamma?.toFixed(2) ?? '—'} tone={(data.net_gamma ?? 0) < 0 ? 'error' : 'success'} sub={data.short_vol ? 'short vol' : 'long vol'} />
               </div>
 
-              {/* Book capital — spell out the "% of cap" denominator so it isn't a mystery */}
-              {data.book_capital != null && (
-                <div className="text-[10px] text-base-content/50 -mt-1 flex flex-wrap items-baseline gap-x-1.5" title={data.capital_basis}>
-                  <span className="text-base-content/40 uppercase tracking-wider text-[9px]">Book capital</span>
-                  <b className="text-base-content/75">{money(data.book_capital)}</b>
-                  <span className="cursor-help text-base-content/40">— the “% of cap” base: Σ committed capital (short-put strikes ×100 + short-call/other strike notional), the capital put to work. <b>Not</b> your whole account net-liq. Hover for detail.</span>
-                </div>
-              )}
-
-              {/* Income-vs-tail reality check — how many days of carry one 1-month tail erases */}
-              {data.carry_yield_pct != null && (data.cvar_95 ?? 0) > 0 && (data.net_theta ?? 0) > 0 && (
-                <div className="text-[10px] text-base-content/50 -mt-1">
-                  Reality check · a single 1-month CVaR tail ({money(data.cvar_95)}) erases
-                  {' '}<b className="text-warning">{Math.round((data.cvar_95 as number) / (data.net_theta as number))} days</b> of decay income —
-                  the concave trade-off you're hedging below.
-                </div>
-              )}
-
+              {/* Risk breakdown — the supporting evidence, tucked into one collapsible so the cockpit leads. */}
+              <CollapsibleSection title="Risk breakdown · stress · by-name · factor" accent="warning" icon={<TrendingDown className="w-3.5 h-3.5" />}>
+              <div className="space-y-3">
               {/* Stress scenarios (full reprice) — TWO-SIDED: short gamma loses either way */}
               <div>
-                <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><TrendingDown className="w-3 h-3" /> Stress scenarios · downside &amp; melt-up · full reprice (β-weighted{data.avg_beta ? ` · book β ${data.avg_beta}` : ''})</div>
+                <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><TrendingDown className="w-3 h-3" /> Stress scenarios · downside &amp; melt-up · full reprice (β-weighted{data.avg_beta ? ` · book β ${data.avg_beta}` : ''}{(data.stock_notional ?? 0) > 0 ? ' · incl. your shares' : ''})</div>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {data.crash_scenarios?.map(c => {
                     const up = c.move_pct > 0;
+                    const hasStock = c.stock_pnl != null && Math.abs(c.stock_pnl) >= 1;
                     return (
                     <div key={c.label} className={`rounded-lg border p-2 text-center ${up ? 'border-warning/25 bg-warning/[0.05]' : 'border-error/15 bg-error/[0.04]'}`}>
                       <div className="text-[9px] uppercase text-base-content/40">{c.label}</div>
                       <div className={`text-sm font-bold mt-0.5 ${up ? 'text-warning' : 'text-error'}`}>{money(c.pnl)}</div>
                       {c.pct_of_capital != null && <div className="text-[9px] text-base-content/40">{c.pct_of_capital}% of capital</div>}
+                      {hasStock && (
+                        <div className="text-[8px] text-base-content/35 mt-0.5" title="How the loss splits between the option overlay and the shares you hold behind it.">
+                          {money(c.overlay_pnl)} opt · {money(c.stock_pnl)} shares
+                        </div>
+                      )}
                     </div>
                   ); })}
                 </div>
-                <p className="text-[9px] text-base-content/40 mt-1">Short gamma loses on a big move in <b>either</b> direction — the amber melt-up rows are the upside risk a downside-only crash table hides. Full reprice (not a delta-gamma approximation).</p>
+                <p className="text-[9px] text-base-content/40 mt-1">
+                  Full reprice (not a delta-gamma approximation){(data.stock_notional ?? 0) > 0
+                    ? <> — and now revalues the <b>{money(data.stock_notional)} of shares</b> you hold behind covered calls/collars, not just the option overlay. That’s why a deeper crash is no longer <i>smaller</i>: the stock loss was previously invisible.</>
+                    : <>. Short gamma loses on a big move in <b>either</b> direction — the amber melt-up tiles are the upside risk a downside-only table hides.</>}
+                </p>
               </div>
+
+              {/* Who is hurting me — per-name loss waterfall at a −20% month (whole position). */}
+              {(data.loss_by_name?.length ?? 0) > 0 && (() => {
+                const rows = data.loss_by_name!.filter(r => Math.abs(r.pnl) >= 1);
+                const worst = Math.max(1, ...rows.map(r => Math.abs(r.pnl)));
+                return (
+                  <div>
+                    <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><Layers className="w-3 h-3" /> Where a −20% month hits — by name (whole position)</div>
+                    <div className="space-y-1">
+                      {rows.slice(0, 8).map(r => {
+                        const loss = r.pnl < 0;
+                        const w = Math.round((Math.abs(r.pnl) / worst) * 100);
+                        return (
+                          <div key={r.ticker} className="flex items-center gap-2 text-[11px]">
+                            <span className="w-14 font-semibold shrink-0">{r.ticker}</span>
+                            <div className="flex-1 h-3.5 rounded bg-base-300/30 overflow-hidden relative">
+                              <div className={`h-full ${loss ? 'bg-error/50' : 'bg-success/50'}`} style={{ width: `${w}%` }} />
+                            </div>
+                            <span className={`w-20 text-right tabular-nums shrink-0 ${loss ? 'text-error' : 'text-success'}`}>{money(r.pnl)}</span>
+                            <span className="w-24 text-right text-[9px] text-base-content/40 shrink-0 tabular-nums" title="Split: option overlay vs the shares behind it.">
+                              {Math.abs(r.stock_pnl) >= 1 ? `${money(r.option_pnl)}o·${money(r.stock_pnl)}s` : 'options'}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[9px] text-base-content/40 mt-1">Your true single-name crash contributors — the concentration a book-level number hides. <b>o</b> = option overlay, <b>s</b> = shares.</p>
+                  </div>
+                );
+              })()}
+
+              {/* Risk array — spot × vol heatmap (the short-gamma valley + short-vega gradient). */}
+              {(data.scenario_grid?.rows?.length ?? 0) > 0 && (
+                <ScenarioGrid grid={data.scenario_grid!} capital={data.book_capital} />
+              )}
+
+              {/* Factor & correlation — the REAL concentration (deterministic: GICS + measured ρ). */}
+              {data.factor_exposure && <FactorExposure fe={data.factor_exposure} />}
+              </div>
+              </CollapsibleSection>
 
               {/* Assignment / scenario lab — COLLAPSIBLE, collapsed by default */}
               {(data.assignment_ladder?.length ?? 0) > 0 && (
@@ -259,6 +301,72 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
               {((data.hedge_menu?.length ?? 0) > 0 || (v?.actions?.length ?? 0) > 0) && (
                 <CollapsibleSection title="Tail-hedge menu + what to do" accent="info" icon={<Umbrella className="w-3.5 h-3.5" />} defaultOpen>
                 <div className="space-y-2">
+
+                {/* Start-here hero — ONE budget-sized recommendation with the crash number before→after. */}
+                {(() => {
+                  const menu = data.hedge_menu || [];
+                  const rec = menu.find(c => c.recommended) || menu.find(c => c.cost_effective) || menu[0];
+                  if (!rec) return null;
+                  const before = Math.abs(data.crash_scenarios?.find(s => Math.abs(s.move_pct + 0.2) < 0.001)?.pnl ?? 0);
+                  const after = Math.max(0, before - (rec.crash_payoff_20 || 0));
+                  const carry = data.annual_income || 0;
+                  const budgetPct = carry > 0 ? (rec.annual_bleed / carry) * 100 : null;
+                  const lo = rec.long_strike ?? rec.long_put, sh = rec.short_strike ?? rec.short_put;
+                  const isVixy = rec.instrument === 'VIXY';
+                  const size = isVixy ? `${money(rec.sleeve_capital)} cash sleeve` : `${rec.contracts}× ${rec.instrument ?? 'SPX'} ${lo != null ? `${lo}${sh ? `/${sh}` : ''}` : ''}`.trim();
+                  return (
+                    <div className="rounded-xl border border-success/25 bg-success/[0.05] p-2.5">
+                      <div className="flex items-center gap-1.5 mb-1">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
+                        <span className="text-[10px] uppercase tracking-wider text-success font-bold">Start here</span>
+                        <span className="text-[11px] text-base-content/80 font-semibold">{rec.label}</span>
+                        <span className="ml-auto text-[9px] text-base-content/45">{rec.dte_days ? `~${rec.dte_days}d` : 'signal-based'}</span>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                        <div className="rounded-lg bg-base-300/25 p-1.5">
+                          <div className="text-[8px] uppercase text-base-content/40">Buy</div>
+                          <div className="text-[11px] font-semibold mt-0.5">{size}</div>
+                        </div>
+                        <div className="rounded-lg bg-base-300/25 p-1.5">
+                          <div className="text-[8px] uppercase text-base-content/40">Cost</div>
+                          <div className="text-[11px] font-semibold mt-0.5 text-warning">{money(rec.annual_bleed)}/yr{isVixy ? '*' : ''}</div>
+                          {budgetPct != null && <div className="text-[8px] text-base-content/40">{budgetPct.toFixed(0)}% of carry</div>}
+                        </div>
+                        <div className="rounded-lg bg-base-300/25 p-1.5">
+                          <div className="text-[8px] uppercase text-base-content/40">−20% month</div>
+                          <div className="text-[11px] font-semibold mt-0.5"><span className="text-error">{money(-before)}</span> <span className="text-base-content/30">→</span> <span className="text-success">{money(-after)}</span></div>
+                          {rec.offsets_pct != null && <div className="text-[8px] text-base-content/40">{rec.offsets_pct}% capped</div>}
+                        </div>
+                        <div className="rounded-lg bg-base-300/25 p-1.5">
+                          <div className="text-[8px] uppercase text-base-content/40">Compounding</div>
+                          <div className={`text-[11px] font-semibold mt-0.5 ${rec.cost_effective ? 'text-success' : 'text-base-content/60'}`}>{rec.cagr_lift_pct >= 0 ? '+' : ''}{rec.cagr_lift_pct}% CAGR</div>
+                          <div className="text-[8px] text-base-content/40">{rec.cost_effective ? 'pays for itself' : 'pure insurance'}</div>
+                        </div>
+                      </div>
+                      <p className="text-[9px] text-base-content/45 mt-1.5">
+                        {rec.cost_effective
+                          ? <>This one hedge <b>lifts</b> your compound growth while capping the crash — the rare case where protection is free. Size it once, roll it {data.assumptions?.hedge_rolls_per_year ? `~${data.assumptions.hedge_rolls_per_year}×/yr` : 'quarterly'}.</>
+                          : <>Pure insurance: it costs {budgetPct != null ? `${budgetPct.toFixed(0)}% of your carry` : 'some yield'} to cap a −20% month from {money(-before)} to {money(-after)}. Add it only if avoiding that drawdown matters more than the yield — otherwise de-risk the concentrated names above first.</>}
+                        {' '}The full menu below trades cost against protection.
+                      </p>
+                    </div>
+                  );
+                })()}
+
+                {/* If the MELT-UP is the bigger tail, say so — the downside menu below won't fix it. */}
+                {(() => {
+                  const cs = data.crash_scenarios || [];
+                  const wd = Math.min(0, ...cs.filter(s => s.move_pct < 0).map(s => s.pnl));
+                  const wu = cs.filter(s => s.move_pct > 0).reduce<{ pnl: number; label: string } | null>((m, s) => (m == null || s.pnl < m.pnl ? { pnl: s.pnl, label: s.label } : m), null);
+                  if (!wu || Math.abs(wu.pnl) <= Math.abs(wd)) return null;
+                  return (
+                    <div className="rounded-lg border border-warning/30 bg-warning/[0.06] p-2 text-[10px] text-base-content/80 flex items-start gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-warning mt-0.5 shrink-0" />
+                      <span>Your <b>bigger tail is the upside</b> — a {wu.label} loses {money(wu.pnl)} vs {money(wd)} for the worst downside. The hedges below protect the <b>downside</b>; for the squeeze, cap short calls / add call spreads or a small long-call (see “What to do”).</span>
+                    </div>
+                  );
+                })()}
+
                 {(data.hedge_menu?.length ?? 0) > 0 && (
                 <div className="rounded-xl border border-info/15 bg-info/[0.02] p-2.5 space-y-2">
                   <div className="text-[10px] uppercase tracking-wider text-info/80 font-semibold flex items-center gap-1">
@@ -329,7 +437,7 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                   {adviceErr && <div className="text-[11px] text-error flex items-start gap-1"><AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />{adviceErr}</div>}
                   {advice && <div className="text-[11px] text-base-content/80 whitespace-pre-wrap leading-relaxed">{advice}</div>}
                   {!advice && !adviceErr && !adviceLoading && (
-                    <p className="text-[10px] text-base-content/40">Sends only the computed book numbers (greeks, β, CVaR, crash P&Ls, hedge menu) to the model — it reasons over them for the best whole-book hedge, doing no arithmetic of its own.</p>
+                    <p className="text-[10px] text-base-content/40">Sends only computed data — greeks, CVaR, crash P&Ls, the per-name loss waterfall, and the <b>deterministic factor read</b> (GICS sectors, measured-ρ correlated clusters, macro loadings) — plus the hedge menu. The model reasons over your real concentration to say what to trim/hedge; it does no arithmetic and can’t invent a correlation the data didn’t measure.</p>
                   )}
                 </div>
                 </div>
@@ -350,13 +458,252 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
   );
 }
 
-function Tile({ label, value, sub, tone = 'base' }: { label: string; value: string; sub?: string; tone?: 'error' | 'success' | 'warning' | 'base' }) {
-  const c = tone === 'error' ? 'text-error' : tone === 'success' ? 'text-success' : tone === 'warning' ? 'text-warning' : 'text-base-content/80';
+type ScoreCard = NonNullable<BookTailRiskResult['risk_scorecard']>;
+type FixTarget = NonNullable<NonNullable<ScoreCard['checks'][number]['fix']>['targets']>[number];
+
+const GRADE = {
+  'At risk': { pill: 'bg-error text-error-content', band: 'bg-error/[0.07]', border: 'border-error/25' },
+  Watch: { pill: 'bg-warning text-warning-content', band: 'bg-warning/[0.07]', border: 'border-warning/25' },
+  Sound: { pill: 'bg-success text-success-content', band: 'bg-success/[0.07]', border: 'border-success/25' },
+} as const;
+
+function RiskScorecard({ sc }: { sc: ScoreCard }) {
+  const [showPass, setShowPass] = useState(false);
+  const g = GRADE[sc.grade as keyof typeof GRADE] || GRADE.Watch;
+  const flagged = sc.checks.filter(c => c.status !== 'pass');
+  const passed = sc.checks.filter(c => c.status === 'pass');
+  const total = sc.checks.length || 1;
+  const pct = (n: number) => `${(n / total) * 100}%`;
   return (
-    <div className="rounded-lg bg-base-300/25 p-2 text-center">
-      <div className="text-[9px] uppercase tracking-wider text-base-content/40">{label}</div>
-      <div className={`text-sm font-bold mt-0.5 ${c}`}>{value}</div>
-      {sub && <div className="text-[9px] text-base-content/40 mt-0.5">{sub}</div>}
+    <div className={`rounded-xl border ${g.border} overflow-hidden bg-base-100/30`}>
+      {/* Header band: grade + tallies */}
+      <div className={`flex items-center gap-2.5 px-3 py-2 ${g.band}`}>
+        <span className={`text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${g.pill}`}>{sc.grade}</span>
+        <div className="flex items-center gap-2.5 text-[10px] text-base-content/55">
+          {sc.n_breach > 0 && <span><b className="text-error">{sc.n_breach}</b> breached</span>}
+          {sc.n_warn > 0 && <span><b className="text-warning">{sc.n_warn}</b> watch</span>}
+          <span><b className="text-success">{passed.length}</b> ok</span>
+        </div>
+        <span className="ml-auto text-[8px] uppercase tracking-wider text-base-content/30 hidden sm:block">institutional guardrails</span>
+      </div>
+      {/* Proportion bar */}
+      <div className="flex h-[3px]">
+        <div className="bg-error" style={{ width: pct(sc.n_breach) }} />
+        <div className="bg-warning" style={{ width: pct(sc.n_warn) }} />
+        <div className="bg-success/50" style={{ width: pct(passed.length) }} />
+      </div>
+      {/* Rows */}
+      <div className="p-2 space-y-1.5">
+        {flagged.map(c => <ScoreRow key={c.key} c={c} />)}
+        {passed.length > 0 && (
+          <div className="pt-0.5">
+            <button className="w-full text-[10px] text-base-content/40 hover:text-base-content/60 flex items-center gap-1 px-1"
+              onClick={() => setShowPass(v => !v)}>
+              <CheckCircle2 className="w-3 h-3 text-success/70" /> {passed.length} within limits
+              {showPass ? <ChevronUp className="w-3 h-3 ml-auto" /> : <ChevronDown className="w-3 h-3 ml-auto" />}
+            </button>
+            {showPass && <div className="space-y-1.5 mt-1.5">{passed.map(c => <ScoreRow key={c.key} c={c} />)}</div>}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
+
+function ScoreRow({ c }: { c: ScoreCard['checks'][number] }) {
+  const [open, setOpen] = useState(c.status === 'breach');   // breaches show their fix by default
+  const hasFix = !!c.fix;
+  const s = c.status;
+  const accent = s === 'breach' ? 'border-error/60' : s === 'warn' ? 'border-warning/60' : 'border-success/40';
+  const valTone = s === 'breach' ? 'text-error' : s === 'warn' ? 'text-warning' : 'text-base-content/70';
+  return (
+    <div className={`rounded-lg bg-base-300/20 border-l-2 ${accent} overflow-hidden`}>
+      <div className={`flex items-center gap-2 px-2.5 py-1.5 ${hasFix ? 'cursor-pointer hover:bg-base-300/40 transition-colors' : ''}`}
+        onClick={() => hasFix && setOpen(o => !o)} title={c.note}>
+        <span className="text-[11px] font-medium flex-1 min-w-0 truncate text-base-content/80">{c.label}</span>
+        <div className="text-right shrink-0 leading-tight">
+          <div className={`text-[11px] font-semibold tabular-nums ${valTone}`}>{c.value_str}</div>
+          <div className="text-[8px] text-base-content/35">limit {c.limit_str}</div>
+        </div>
+        {hasFix ? (open ? <ChevronUp className="w-3.5 h-3.5 text-base-content/30 shrink-0" /> : <ChevronDown className="w-3.5 h-3.5 text-base-content/30 shrink-0" />)
+          : <span className="w-3.5 shrink-0" />}
+      </div>
+      {open && c.fix && <FixBody fix={c.fix} />}
+    </div>
+  );
+}
+
+function FixBody({ fix }: { fix: NonNullable<ScoreCard['checks'][number]['fix']> }) {
+  const targets = fix.targets || [];
+  return (
+    <div className="px-2.5 pb-2 pt-1 space-y-1.5">
+      <div className="text-[10px] leading-snug flex items-start gap-1.5">
+        <Wrench className="w-3 h-3 text-success mt-0.5 shrink-0" />
+        <span className="text-base-content/80"><b>{fix.headline}</b>{fix.effect && <span className="text-success/80"> — {fix.effect}</span>}</span>
+      </div>
+      {fix.cost && fix.cost !== 'each target priced below' && (
+        <div className="text-[10px] text-base-content/50 ml-[18px]">{fix.cost}</div>
+      )}
+      {targets.length > 0 && <div className="space-y-1.5">{targets.map((t, i) => <TargetRow key={i} t={t} />)}</div>}
+      {fix.alt && <div className="text-[9px] text-base-content/40 ml-[18px]">alt · {fix.alt}</div>}
+    </div>
+  );
+}
+
+function TargetRow({ t }: { t: FixTarget }) {
+  const navigate = useNavigate();
+  const rec = t.recommended;
+  const isCap = rec.action === 'cap';
+  const toEvaluate = () => {
+    if (!rec.prefill) return;
+    // EvaluateLeg carries no qty → expand each leg to one entry per contract (mirror RepairMenu).
+    const legs = rec.prefill.legs.flatMap(l =>
+      Array(Math.max(1, l.qty)).fill({ action: l.action, type: l.type, strike: l.strike, expiration: l.expiration }));
+    try { sessionStorage.setItem('evaluatePrefill', JSON.stringify({ ticker: rec.prefill!.ticker, legs })); } catch { /* ignore */ }
+    navigate('/strategies?mode=evaluate');
+  };
+  return (
+    <div className="rounded-lg bg-base-100/50 border border-white/[0.06] px-2 py-1.5">
+      <div className="flex items-center gap-1.5">
+        <span className="font-semibold text-[11px] text-base-content/85">{t.ticker}</span>
+        {t.structure && <span className="text-[9px] text-base-content/40">{t.structure.replace(/_/g, ' ')}</span>}
+        <span className="ml-auto text-[9px] text-base-content/45 tabular-nums text-right shrink-0">{money(t.risk)} risk · {money(t.premium_left)} left</span>
+      </div>
+      <div className="mt-1 flex items-center gap-2">
+        <span className={`badge badge-xs uppercase shrink-0 ${isCap ? 'badge-success' : 'badge-warning'}`}>{rec.action}</span>
+        <div className="flex-1 min-w-0">
+          <div className="text-[10px] text-base-content/85 font-medium truncate">{rec.legs}</div>
+          <div className="text-[9px] text-base-content/55 tabular-nums">
+            {money(rec.cost)} · <span className="text-error/90">{money(t.tail_before)}</span> → <span className="text-success">{money(rec.tail_after)}</span>
+            {rec.premium_kept > 0 && <span className="text-base-content/40"> · keeps {money(rec.premium_kept)}</span>}
+          </div>
+        </div>
+        {isCap && rec.prefill && (
+          <button onClick={toEvaluate} title="Open this spread in Evaluate with exact live-chain pricing"
+            className="btn btn-ghost btn-xs h-6 min-h-0 px-1.5 text-[9px] gap-0.5 text-info hover:bg-info/10 shrink-0">
+            Evaluate <ArrowRight className="w-3 h-3" />
+          </button>
+        )}
+      </div>
+      {t.alt && <div className="mt-0.5 text-[9px] text-base-content/35">or {t.alt.action}: {t.alt.legs} · {money(t.alt.cost)}</div>}
+    </div>
+  );
+}
+
+function FactorExposure({ fe }: { fe: NonNullable<BookTailRiskResult['factor_exposure']> }) {
+  const clusters = (fe.clusters || []).filter(c => c.tickers.length >= 2);
+  const sectors = (fe.sectors || []).filter(s => s.capital > 0).slice(0, 6);
+  const macro = fe.macro || [];
+  if (!clusters.length && sectors.length <= 1 && !macro.length) return null;
+  return (
+    <div className="rounded-lg border border-white/10 p-2.5 space-y-2">
+      <div className="text-[9px] uppercase tracking-wider text-base-content/40 flex items-center gap-1">
+        <Layers className="w-3 h-3" /> Factor &amp; correlation · your real concentration
+        <span className="ml-auto normal-case text-[8px] text-base-content/30">measured ρ · GICS — not opinion</span>
+      </div>
+
+      {/* Correlated clusters — names that MOVE TOGETHER = one bet, not diversification. */}
+      {clusters.length > 0 && (
+        <div className="space-y-1">
+          {clusters.map((c, i) => (
+            <div key={i} className="flex items-center gap-2 text-[11px] rounded bg-warning/[0.06] border border-warning/20 px-2 py-1">
+              <AlertTriangle className="w-3 h-3 text-warning shrink-0" />
+              <span className="font-semibold">{c.tickers.join(' · ')}</span>
+              {c.avg_rho != null && <span className="text-warning/80 text-[10px]">move together ρ {c.avg_rho}</span>}
+              <span className="ml-auto text-base-content/50 tabular-nums">{money(c.capital)} at work</span>
+            </div>
+          ))}
+          <p className="text-[9px] text-base-content/40">These names are <b>one bet</b> — a shock to any of them hits the whole cluster at once. That’s the concentration a per-name view hides.</p>
+        </div>
+      )}
+
+      {/* Sector buckets + macro loadings */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        {sectors.length > 1 && (
+          <div>
+            <div className="text-[8px] uppercase tracking-wider text-base-content/35 mb-1">Capital by sector</div>
+            <div className="space-y-0.5">
+              {sectors.map(s => (
+                <div key={s.sector} className="flex items-center gap-2 text-[10px]">
+                  <span className="truncate flex-1">{s.sector}</span>
+                  <span className="text-base-content/45">{s.n}</span>
+                  <span className="tabular-nums text-base-content/70 w-16 text-right">{money(s.capital)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {macro.length > 0 && (
+          <div>
+            <div className="text-[8px] uppercase tracking-wider text-base-content/35 mb-1">Macro the book loads on (measured ρ)</div>
+            <div className="flex flex-wrap gap-1">
+              {macro.map(m => (
+                <span key={m.factor} className={`badge badge-xs badge-outline ${Math.abs(m.rho) >= 0.6 ? 'badge-warning' : ''}`}
+                  title={`Book return vs ${m.label}: measured ρ = ${m.rho}`}>
+                  {m.label} {m.rho >= 0 ? '+' : ''}{m.rho}
+                </span>
+              ))}
+            </div>
+            <p className="text-[8px] text-base-content/35 mt-1">A move in these factors pushes the whole book one way — that’s your shared driver.</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ScenarioGrid({ grid, capital }: { grid: NonNullable<BookTailRiskResult['scenario_grid']>; capital?: number }) {
+  const maxAbs = Math.max(1, ...grid.rows.flatMap(r => r.cells.map(c => Math.abs(c.pnl))));
+  const bg = (v: number) => {
+    const t = Math.min(1, Math.abs(v) / maxAbs);
+    if (v < 0) return `rgba(239,68,68,${0.08 + 0.55 * t})`;   // loss → red
+    if (v > 0) return `rgba(34,197,94,${0.08 + 0.5 * t})`;    // gain → green
+    return 'transparent';
+  };
+  return (
+    <div>
+      <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1">
+        <Grid3x3 className="w-3 h-3" /> Risk array · book P&amp;L by spot move × vol shock (full reprice{capital ? ', whole position' : ''})
+      </div>
+      <div className="overflow-x-auto">
+        <table className="text-[10px] border-separate" style={{ borderSpacing: 2 }}>
+          <thead>
+            <tr>
+              <th className="text-left font-normal text-base-content/40 pr-1 whitespace-nowrap">spot ↓ · vol →</th>
+              {grid.vol_shocks.map(v => (
+                <th key={v} className="font-normal text-base-content/45 px-1 text-center whitespace-nowrap">{v >= 0 ? '+' : ''}{v}v</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {grid.rows.map(row => (
+              <tr key={row.move_pct}>
+                <td className="pr-1 text-base-content/55 whitespace-nowrap font-medium">{row.move_pct > 0 ? '+' : ''}{row.move_pct}%</td>
+                {row.cells.map((c, i) => (
+                  <td key={i} className="text-center tabular-nums rounded px-1 py-0.5 whitespace-nowrap"
+                    style={{ background: bg(c.pnl), minWidth: 54 }}
+                    title={c.pct != null ? `${c.pct}% of book capital` : undefined}>
+                    <span className={c.pnl < 0 ? 'text-error' : c.pnl > 0 ? 'text-success' : 'text-base-content/40'}>{money(c.pnl)}</span>
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-[9px] text-base-content/40 mt-1">Every cell fully reprices the book at that spot × vol corner. Read <b>down a column</b> for gamma (a move either way), <b>across a row</b> for vega (loss as vol rises). The deepest-red cell is your worst corner — size hedges to it.</p>
+    </div>
+  );
+}
+
+function Vital({ label, value, sub, tone = 'base', title }: { label: string; value: string; sub?: string; tone?: 'error' | 'success' | 'warning' | 'base'; title?: string }) {
+  const c = tone === 'error' ? 'text-error' : tone === 'success' ? 'text-success' : tone === 'warning' ? 'text-warning' : 'text-base-content/85';
+  return (
+    <div className="flex-1 min-w-[84px] bg-base-300/25 px-2.5 py-1.5" title={title}>
+      <div className="text-[8px] uppercase tracking-wider text-base-content/40 whitespace-nowrap">{label}</div>
+      <div className={`text-[12px] font-semibold tabular-nums leading-tight ${c}`}>{value}</div>
+      {sub && <div className="text-[8px] text-base-content/35 whitespace-nowrap">{sub}</div>}
+    </div>
+  );
+}
+
