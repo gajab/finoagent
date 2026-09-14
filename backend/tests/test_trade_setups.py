@@ -6,6 +6,7 @@ from app.services.trade_setup_service import (
     _snap, _option_play, compute_trade_setups,
     _equity_plan, _options_plan, _second_target, _edge, _event_risk, _candidate_plans,
     _passes_quality, _enrich_setup, _MIN_RR,
+    _meaningful_target, _position_setups,
 )
 
 # a realistic (whole + half dollar) strike board near spot 100
@@ -261,3 +262,38 @@ class TestQualityGate:
                       dealer=None, atm_iv=None, next_earnings=None, strikes=None)
         assert all(t.get("level") is None or t["level"] > 303.17 for t in s.get("targets", []))
         assert _passes_quality(s) is False           # nothing correctly-sided survives → dropped
+
+
+class TestTradeStyles:
+    """Multi-style setups (user: rarely 'trade now', spreads too thin, want day/swing/position)."""
+    _BULL = {"direction": "bullish", "strength": "strong", "regime": "trending", "rationale": "uptrend"}
+    _REG = {"regime": {"overall": "trending", "hurst_daily": 0.6, "playbook": "x", "favored": []},
+            "zscore": {"z": 0.2, "vwap": 100}}
+    _DEALER = {"net_gex": {"sign": "long"}, "walls": {}, "expected_move": {"em_30d": {"move_pct": 5}}}
+
+    def test_momentum_enter_now_and_style_tag(self):
+        zones = [_zone(95, "support", 6), _zone(108, "resistance", 5)]
+        setups = _build_setups(self._BULL, zones, 100.0, 3.0, self._DEALER, self._REG, 5, 100.0, _STRIKES)
+        assert all("style" in s for s in setups)                    # every setup carries a style
+        mom = [s for s in setups if s["type"] == "trend_momentum"]
+        assert mom and mom[0]["entry"]["level"] == 100.0            # entry AT spot = 'trade now'
+        assert mom[0]["risk_reward"] and mom[0]["risk_reward"] >= 1.0
+
+    def test_meaningful_target_widens_thin_reward(self):
+        # a structural target only 1% away is floored to a real move (max of 1.2 ATR, 4%, ~1× EM)
+        t = _meaningful_target("long", 100.0, 101.0, 100.0, 3.0, 5, "swing")
+        assert t == 105.0                                           # 5% EM move dominates
+        # position floors much bigger (≥15%)
+        tp = _meaningful_target("long", 100.0, 108.0, 100.0, 3.0, 5, "position")
+        assert tp >= 115.0
+
+    def test_position_setup_is_wide_and_big(self):
+        zones = [_zone(90, "support", 8), _zone(120, "resistance", 5)]
+        ind = {"movingAverages": {"sma200": 90, "sma50": 95}}
+        pos = _position_setups(self._BULL, zones, 100.0, 3.0, ind, 5)
+        assert pos and pos[0]["style"] == "position" and pos[0]["direction"] == "long"
+        p = pos[0]
+        assert p["entry"]["level"] == 90                            # buy the value zone (strong support / 200-DMA)
+        assert p["stop"]["level"] < 90 - 3                          # WIDE long-term stop (>1 ATR below)
+        assert p["risk_reward"] >= 1.5                              # long-term trade pays ≥1.5:1
+        assert (p["targets"][0]["level"] - 90) / 90 >= 0.15         # BIG target (≥15%)

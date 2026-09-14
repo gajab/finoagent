@@ -11,6 +11,7 @@ def _run_dual_direction_buffer_sync(
     downside_buffer_pct: float,
     upside_cap_pct: float,
     target_expiration: str | None = None,
+    entry_cost_mode: str = "standard",
 ) -> dict:
     """
     Simulates a Dual Direction Buffer strategy using the 4-Layer construction.
@@ -223,12 +224,73 @@ def _run_dual_direction_buffer_sync(
     # The spread width is `strike_diff`. We need a max loss of `l2_max_gain` - `buffer_loss`.
     strike_diff = buf_put['strike'] - buf_low_put['strike']
     if strike_diff > 0:
-        # Buffer absorption is precisely the nominal buffer percentage
+        # Buffer absorption is precisely the nominal buffer percentage. Round the
+        # transition ratio to a whole number so every derived leg quantity below
+        # stays an executable integer (fractional contracts can't be traded).
         buffer_value = current_price * downside_pct
         target_l3_max_loss = l2_max_gain - buffer_value
-        transition_contracts = round(target_l3_max_loss / strike_diff, 2)
+        transition_contracts = float(max(0, round(target_l3_max_loss / strike_diff)))
     else:
         transition_contracts = 0.0
+
+    # ── Entry-cost optimization (user-selectable) ──────────────────────────
+    # Adjust the recommended legs to the user's cost preference before pricing.
+    #   self_financing : tune the cap so the OPTIONS overlay (puts + short call,
+    #                    excl. the exposure call) nets to a credit/zero — the
+    #                    protection pays for itself; you still fund the exposure.
+    #   non_negative   : tune the cap so the structure isn't underwater at 0%
+    #                    (flat at expiry) — intrinsic value at spot ≥ net cost.
+    #   cheapest       : swap the deep-ITM exposure call for a near-ATM call so
+    #                    the total debit is far smaller (gives up true 1:1 delta).
+    #   standard       : the canonical 4-layer build (default, unchanged).
+    entry_cost_warning = None
+
+    def _overlay(cap):
+        return (2 * atm_put["mid"] - 2 * buf_put["mid"]
+                - transition_contracts * buf_put["mid"] + transition_contracts * buf_low_put["mid"]
+                - cap["mid"])
+
+    def _intrinsic_at_spot(l1, cap):
+        v1 = max(0, current_price - l1["strike"])
+        v2 = 2 * max(0, atm_put["strike"] - current_price) - 2 * max(0, buf_put["strike"] - current_price)
+        v3 = (-transition_contracts * max(0, buf_put["strike"] - current_price)
+              + transition_contracts * max(0, buf_low_put["strike"] - current_price))
+        v4 = -max(0, current_price - cap["strike"])
+        return v1 + v2 + v3 + v4
+
+    def _cap_candidates():
+        """Available call strikes above spot, richest (lowest) → widest (highest)."""
+        above = calls[calls["strike"] > current_price].sort_values("strike")
+        out = []
+        for strike in above["strike"].tolist():
+            c = find_closest_option(calls, strike)
+            if c:
+                out.append(c)
+        return out
+
+    if entry_cost_mode == "cheapest":
+        # Cheapest exposure: a near-ATM long call instead of the deep-ITM one.
+        atm_call = find_closest_option(calls, current_price)
+        if atm_call and atm_call["strike"] < cap_call["strike"]:
+            l1_call = atm_call
+            entry_cost_warning = ("Cheapest mode: exposure leg is a near-ATM call — much lower entry cost, "
+                                  "but delta < 1 so upside participation is not 1:1.")
+    elif entry_cost_mode in ("self_financing", "non_negative"):
+        cands = _cap_candidates()
+        # Highest cap strike (most retained upside) that meets the cost target.
+        chosen = None
+        for cap in sorted(cands, key=lambda c: c["strike"], reverse=True):
+            ok = (_overlay(cap) <= 0) if entry_cost_mode == "self_financing" \
+                else (_intrinsic_at_spot(l1_call, cap) >= (l1_call["mid"] + _overlay(cap)))
+            if ok:
+                chosen = cap
+                break
+        if chosen is not None:
+            cap_call = chosen
+        elif cands:
+            cap_call = min(cands, key=lambda c: c["strike"])   # richest available, best effort
+            entry_cost_warning = ("Could not reach the requested entry-cost target even at the richest cap — "
+                                  "used the lowest available cap strike; some debit remains.")
 
     # Determine base contracts for the investment amount
     # Total cash outlay per share = Layer 1 call + net options premium
@@ -240,10 +302,11 @@ def _run_dual_direction_buffer_sync(
         + transition_contracts * buf_low_put["mid"]
         - cap_call["mid"]
     )
-    
-    # We invest `amount` entirely into the structure.
+
+    # Simulate always returns whole, executable contracts (fractions can't be
+    # traded) — round to the nearest whole base contract, minimum 1.
     affordable_shares = amount / cost_per_unit if cost_per_unit > 0 else 0
-    base_contracts = affordable_shares / 100.0  # The number of 100-multiplier contracts we can buy
+    base_contracts = float(max(1, round(affordable_shares / 100.0)))
 
     # Calculate actual options cost metrics for the user to execute the synthetic trade
     net_options_premium = (
@@ -367,6 +430,15 @@ def _run_dual_direction_buffer_sync(
     buffer_cap_warnings = []
     if selection_warning:
         buffer_cap_warnings.append(selection_warning)
+    if entry_cost_warning:
+        buffer_cap_warnings.append(entry_cost_warning)
+    # Whole-contract rounding can push the real outlay past the requested amount.
+    if actual_structure_cost > amount * 1.1:
+        buffer_cap_warnings.append(
+            f"Smallest executable size is {int(base_contracts)} contract(s) ≈ "
+            f"${round(actual_structure_cost):,}, above your ${round(amount):,} budget — "
+            f"options trade in whole contracts, so this is the minimum for this underlying/expiration."
+        )
     buffer_diff = abs(actual_downside_buffer_pct * 100 - downside_buffer_pct)
     cap_diff = abs(actual_upside_cap_pct * 100 - upside_cap_pct)
     if buffer_diff > 1.0:
@@ -406,6 +478,27 @@ def _run_dual_direction_buffer_sync(
         "available_expirations": expirations[:15],
     }
 
+def _consolidate_legs(legs: list[dict]) -> list[dict]:
+    """Collapse legs that share action+type+strike into a single executable line
+    (e.g. the Layer-2 and Layer-3 buffer short puts sit on the same strike) and
+    drop anything that rounds to zero — the fewest orders the user actually trades."""
+    merged: dict = {}
+    order: list = []
+    for leg in legs:
+        if (leg.get("qty") or 0) <= 0:
+            continue
+        key = (leg.get("action"), leg.get("type"), round(float(leg.get("strike") or 0), 2))
+        if key in merged:
+            merged[key]["qty"] = round(merged[key]["qty"] + leg["qty"], 2)
+            # Keep it readable when two layers fold into one line.
+            if leg.get("layer") and leg["layer"] not in merged[key].get("layer", ""):
+                merged[key]["layer"] = "Buffer short (Layers 2 & 3)"
+        else:
+            merged[key] = dict(leg)
+            order.append(key)
+    return [merged[k] for k in order]
+
+
 async def run_dual_direction_buffer(
     ticker: str,
     amount: float,
@@ -413,6 +506,7 @@ async def run_dual_direction_buffer(
     downside_buffer_pct: float,
     upside_cap_pct: float,
     target_expiration: str | None = None,
+    entry_cost_mode: str = "standard",
 ) -> dict:
     """Async wrapper for run_dual_direction_buffer"""
     result = await asyncio.to_thread(
@@ -423,11 +517,12 @@ async def run_dual_direction_buffer(
         downside_buffer_pct,
         upside_cap_pct,
         target_expiration,
+        entry_cost_mode,
     )
-    # Drop any leg that computed to ~zero contracts (e.g. an unused transition
-    # spread) so the recommended structure never shows self-cancelling legs.
+    # Merge same-strike legs + drop zero-qty so the recommendation is the fewest
+    # executable lines with no self-cancelling phantom legs.
     if result.get("success") and result.get("legs"):
-        result["legs"] = [leg for leg in result["legs"] if leg.get("qty", 0) > 0]
+        result["legs"] = _consolidate_legs(result["legs"])
     return result
 
 
@@ -438,6 +533,7 @@ async def run_dual_direction_buffer_ibkr(
     downside_buffer_pct: float,
     upside_cap_pct: float,
     target_expiration: str | None = None,
+    entry_cost_mode: str = "standard",
 ) -> dict:
     """IBKR-optimized version: uses yfinance for strike/expiry identification,
     rounds all contract quantities to integers (math.ceil) for IBKR compatibility,
@@ -452,6 +548,7 @@ async def run_dual_direction_buffer_ibkr(
         downside_buffer_pct,
         upside_cap_pct,
         target_expiration,
+        entry_cost_mode,
     )
 
     if not result.get("success"):
@@ -479,9 +576,8 @@ async def run_dual_direction_buffer_ibkr(
     legs[4]["qty"] = l3_qty   # must match L3 sell
     legs[5]["qty"] = l4_qty
 
-    # Drop any leg that rounded to zero contracts (e.g. an unused transition
-    # spread) so the order doesn't carry self-cancelling phantom legs.
-    legs = [leg for leg in legs if leg["qty"] > 0]
+    # Merge same-strike legs + drop zero-qty → fewest executable lines.
+    legs = _consolidate_legs(legs)
 
     # Step 3: Recalculate actual structure cost with integer quantities
     # Net cost = sum of (signed qty * midPrice * 100)

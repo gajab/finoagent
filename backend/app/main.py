@@ -296,6 +296,108 @@ async def smtp_check(secret: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# Memory diagnostics — watch RSS, confirm the allocator, and hunt leaks in prod.
+# Admin-only (same secret as the waitlist endpoints). tracemalloc is OFF by default
+# (it itself costs memory + CPU); turn it on only for a hunt, then turn it back off.
+# ---------------------------------------------------------------------------
+
+_trace_baseline = None   # tracemalloc snapshot captured at ?trace=start, for ?trace=diff
+
+
+@app.get("/api/debug/memory")
+async def debug_memory(secret: str = "", trace: str = ""):
+    """RSS / GC / allocator snapshot; ``?trace=start|diff|stop`` drives a tracemalloc leak hunt.
+
+    Usage:
+      GET /api/debug/memory?secret=…               → current rss/peak/gc/allocator
+      GET /api/debug/memory?secret=…&trace=start   → begin tracing + capture a baseline
+      …exercise the suspect flow a few times…
+      GET /api/debug/memory?secret=…&trace=diff    → allocations that GREW since the baseline (the leak)
+      GET /api/debug/memory?secret=…&trace=stop    → stop tracing (do this when done — it has overhead)
+    """
+    global _trace_baseline
+    import gc
+    import tracemalloc
+
+    expected = (os.environ.get("WAITLIST_ADMIN_SECRET") or settings.SECRET_KEY[:16]).strip()
+    if not expected or secret != expected:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Current + peak RSS. /proc is the truth on Linux (Cloud Run); fall back to getrusage elsewhere.
+    def _mem_kb() -> tuple[int, int]:
+        try:
+            cur = peak = 0
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        cur = int(line.split()[1])
+                    elif line.startswith("VmHWM:"):
+                        peak = int(line.split()[1])
+            if cur:
+                return cur, (peak or cur)
+        except Exception:
+            pass
+        import resource
+        import sys as _sys
+        m = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss   # linux=KB, mac=bytes
+        kb = m // 1024 if _sys.platform == "darwin" else m
+        return kb, kb
+
+    def _allocator() -> str:
+        try:
+            with open("/proc/self/maps") as f:
+                maps = f.read()
+            if "libjemalloc" in maps:
+                return "jemalloc"
+            if "libtcmalloc" in maps:
+                return "tcmalloc"
+            return "glibc"
+        except Exception:
+            return "unknown"
+
+    cur_kb, peak_kb = _mem_kb()
+
+    trace = (trace or "").lower()
+    trace_msg = None
+    if trace == "start":
+        tracemalloc.start(25)
+        _trace_baseline = tracemalloc.take_snapshot()
+        trace_msg = "tracing ON + baseline captured"
+    elif trace == "stop":
+        _trace_baseline = None
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+        trace_msg = "tracing OFF"
+
+    top: list[str] = []
+    traced = None
+    if tracemalloc.is_tracing():
+        cur_t, peak_t = tracemalloc.get_traced_memory()
+        traced = {"current_mb": round(cur_t / 1e6, 1), "peak_mb": round(peak_t / 1e6, 1)}
+        snap = tracemalloc.take_snapshot()
+        if trace == "diff" and _trace_baseline is not None:
+            top = [f"+{round(s.size_diff/1e6, 2)}MB ({s.count_diff:+d} objs) {s.traceback[0]}"
+                   for s in snap.compare_to(_trace_baseline, "lineno")[:15]]
+        else:
+            top = [f"{round(s.size/1e6, 2)}MB ({s.count} objs) {s.traceback[0]}"
+                   for s in snap.statistics("lineno")[:15]]
+
+    return {
+        "rss_mb": round(cur_kb / 1024, 1),
+        "peak_rss_mb": round(peak_kb / 1024, 1),
+        "allocator": _allocator(),
+        "gc_counts": gc.get_count(),
+        "gc_objects": len(gc.get_objects()),
+        "gc_frozen": (gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else None),
+        "tracemalloc": ("on" if tracemalloc.is_tracing() else "off"),
+        "traced": traced,
+        "top": top,
+        "note": trace_msg,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Serve frontend static files in production (Docker)
 # ---------------------------------------------------------------------------
 

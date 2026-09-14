@@ -12,7 +12,7 @@ import { OpportunitySummary, LegsTable } from './DerivativeIncome';
 import CollapsibleSection from './trades/CollapsibleSection';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
 import type { DeskReviewParams, DeskEvaluateParams } from '../api';
-import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan, BlindRead } from '../types';
+import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan, BlindRead, PerSideLeg } from '../types';
 
 const money = (n: number | null | undefined, d = 0) =>
   n == null ? '—' : `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`;
@@ -175,6 +175,172 @@ const GROUP_LABEL = 'text-[9px] uppercase tracking-wider text-base-content/40 mb
 // placed-trade lifecycle read (My Trades → Quant algorithmic → full desk score)
 // renders the IDENTICAL section the Derivative Income scan shows, fed by the
 // /desk-score payload. `t` carries the grade fields; `q` is desk_metrics.quant.
+// One SIDE (call / put) of a two-sided trade — the leg-level tab. Shows only the quantities that
+// DECOMPOSE per side and reconcile to the trade (greeks, premium, breach, moneyness); the non-additive
+// ratios (Omega/Sortino/POP/CVaR) live on the Trade tab and are deliberately NOT repeated here.
+// `variant='manage'` is the HELD-position view: it drops the entry-only premium chip and re-frames the
+// greeks as the live risk you're carrying — the leaner metric set the Manage-This-Position read wants.
+export function SideQuantPanel({ side, variant = 'entry' }: { side: PerSideLeg; variant?: 'entry' | 'manage' }) {
+  const manage = variant === 'manage';
+  const g = side.greeks || {};
+  const m = side.moneyness || {};
+  const b = side.breach || {};
+  const num = (v?: number | null, d = 2) => (v == null ? '—' : String(Math.round(v * 10 ** d) / 10 ** d));
+  const tone = side.key === 'call' ? 'text-info' : 'text-warning';
+  const Tile = ({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) => (
+    <div className="rounded-lg border border-white/[0.06] bg-base-100/40 p-2" title={hint}>
+      <div className="text-[9px] uppercase tracking-wider text-base-content/45">{label}</div>
+      <div className="text-sm font-semibold tabular-nums">{value}</div>
+    </div>
+  );
+  return (
+    <div className="space-y-2.5 mb-1">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+        <span className={`font-bold uppercase tracking-wider ${tone}`}>{side.label}</span>
+        <span className="text-base-content/50">
+          {side.legs_n} leg{side.legs_n > 1 ? 's' : ''} · {side.strikes.filter(v => v != null).join(' / ')}
+          {side.short_strike != null && <> · short <b className="text-base-content/80">{side.short_strike}</b></>}
+        </span>
+        {!manage && (
+          <span className={`ml-auto font-mono font-semibold ${side.premium >= 0 ? 'text-success' : 'text-error'}`}>
+            {side.premium >= 0 ? '+' : '−'}${num(Math.abs(side.premium), 0)} {side.premium >= 0 ? 'credit' : 'debit'}
+          </span>
+        )}
+      </div>
+
+      {side.has_short ? (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <Tile label="Breach P(touch)" value={b.prob_touch_pct == null ? '—' : `${num(b.prob_touch_pct, 0)}%`}
+                hint="Probability this side's short EVER goes ITM before expiry (first-passage touch) — the honest breach odds for THIS leg, ~2× the expiry-ITM chance. The Trade tab's breach shows the worse of the two sides." />
+          <Tile label="Cushion" value={m.cushion_pct == null ? '—' : `${num(m.cushion_pct, 1)}%`}
+                hint="Distance from spot to this side's short strike." />
+          <Tile label="σ from spot" value={m.sigmas == null ? '—' : `${num(m.sigmas, 2)}σ`}
+                hint="Cushion in 1σ expected-move units. Under ~0.5σ = effectively at-the-money → directional, not cushioned." />
+          <Tile label="Assign prob" value={m.itm_prob_pct == null ? '—' : `${num(m.itm_prob_pct, 0)}%`}
+                hint="≈ |delta| of the binding short — the chance it finishes ITM (assignment) at expiry." />
+        </div>
+      ) : (
+        <div className="rounded-lg border border-white/[0.06] bg-base-100/40 p-2 text-[11px] text-base-content/55">
+          No short leg on this side — protective long only. No breach or assignment risk; it caps/defends the other side.
+        </div>
+      )}
+
+      <div>
+        <div className="text-[9px] uppercase tracking-wider text-base-content/45 mb-1">{manage ? 'Greeks now — this side (risk you carry; sums to trade net)' : 'Greeks — this side (the two sides sum to the trade net)'}</div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <Tile label="Δ Delta" value={num(g.net_delta, 1)} hint="Share-equivalent directional exposure ($ P&L per +$1 in the underlying) from this side's legs." />
+          <Tile label="Γ Gamma" value={num(g.net_gamma, 3)} hint="Delta change per +$1 move." />
+          <Tile label="ν Vega" value={num(g.net_vega, 1)} hint="$ per +1 vol-point." />
+          <Tile label="Θ Theta" value={num(g.net_theta, 1)} hint="$ per calendar day of decay." />
+        </div>
+      </div>
+
+      {side.defend && (
+        <p className="text-[11px] text-base-content/60">
+          <span className={`font-semibold ${tone}`}>Defend:</span> {side.defend.note}
+        </p>
+      )}
+
+      {/* FULL per-side grade. In the MANAGE view it is the HOLD/CLOSE algo (management_desk_score) run for
+          THIS side — NOT the entry grade; in the ENTER view (Find Opps / Evaluate / New-Trade reference) it
+          is the entry desk grade. Both: whole-trade base + inherited trade-scoped factors, leg factors for
+          this side. Grouped by dimension, same as the common tab. */}
+      {(() => {
+        const gd = manage
+          ? (side.mgmt_grade ? {
+              score: side.mgmt_grade.score, headline: side.mgmt_grade.signal.replace('_', ' '),
+              headTone: side.mgmt_grade.signal.includes('CLOSE') ? (side.mgmt_grade.signal === 'STRONG_CLOSE' ? 'text-error' : 'text-warning') : 'text-success',
+              base: side.mgmt_grade.anchor, baseLabel: side.mgmt_grade.anchor_label || 'hold-quality base',
+              factors: (side.mgmt_grade.contributions || []).map(c => ({ label: c.label, points: c.pts, detail: c.note, dimension: c.dimension })) as FactorItem[],
+              caption: 'this side · hold/close', foot: 'managing this leg',
+            } : null)
+          : (side.grade ? {
+              score: side.grade.score, headline: side.grade.algo_grade || undefined,
+              headTone: side.grade.algo_grade ? gradeTextTone(side.grade.algo_grade) : '',
+              base: side.grade.base_quality, baseLabel: 'base quality',
+              factors: [...(side.grade.grade_adjustments || []), ...(side.grade.ta_factors || [])] as FactorItem[],
+              caption: 'whole-trade base · this leg', foot: 'entering this leg',
+            } : null);
+        if (!gd) return null;
+        return (
+          <div className="mt-1 pt-2 border-t border-white/[0.06]">
+            <div className="flex items-center gap-2 mb-1.5">
+              <span className="text-[9px] uppercase tracking-wider text-base-content/45">{side.label} {manage ? 'manage grade' : 'desk grade'}</span>
+              <span className="text-[9px] text-base-content/35">{gd.caption}</span>
+              {gd.headline && <span className={`ml-auto text-sm font-bold ${gd.headTone}`}>{gd.headline}</span>}
+              <span className={`${gd.headline ? '' : 'ml-auto'} text-sm font-bold`}>{gd.score}<span className="text-[9px] text-base-content/40">/100</span></span>
+            </div>
+            {groupByDimension(gd.factors).map(([dim, factors]) => <FactorGroup key={dim} dim={dim} factors={factors} />)}
+            <p className="text-[9px] text-base-content/40 mt-1 leading-snug">
+              {gd.baseLabel} {gd.base} (whole-trade) + this side's factors = <b>{gd.score}</b>. Whole-trade factors read the same on both
+              sides; only the leg-specific ones (breach, moneyness, skew, structure, liquidity…) differ — {gd.foot}.
+            </p>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// Dimension display order (mirrors the backend _DIMENSION_ORDER); 'Other' catches any unmapped factor.
+export const DIM_ORDER = ['Loss probability', 'Vol edge', 'Structural defense', 'Regime',
+                   'Directional pressure', 'Consequence', 'Event', 'Execution'];
+
+type FactorItem = { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null };
+
+// One DIMENSION group of factors — the bars for that dimension + each bar's inline evidence. Replaces the
+// old option-math / TA split so every contribution to one risk dimension (Loss probability, Vol edge, …)
+// reads together, whether it came from the option math or the technical read.
+function FactorGroup({ dim, factors }: { dim: string; factors: FactorItem[] }) {
+  if (!factors.length) return null;
+  const net = Math.round(factors.reduce((s, a) => s + a.points, 0) * 10) / 10;
+  const withDetail = factors.filter(a => a.detail);
+  return (
+    <div className="mb-2">
+      <div className={GROUP_LABEL}>{dim}
+        {factors.some(a => a.earnings_impacted) && (
+          <span className="ml-2 badge badge-xs badge-warning badge-outline align-middle normal-case">earnings-aware</span>
+        )}
+        <span className={`ml-auto font-mono text-[10px] ${net > 0 ? 'text-success/80' : net < 0 ? 'text-error/80' : 'text-base-content/40'}`}>
+          {net > 0 ? '+' : ''}{net}
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {factors.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
+      </div>
+      {withDetail.length > 0 && (
+        <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
+          {withDetail.map((a, i) => (
+            <li key={i} className="flex gap-2 text-[11px] leading-snug">
+              <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
+              <span className="text-base-content/65">
+                <b className="text-base-content/85">{a.label}</b>
+                {a.earnings_impacted && a.baseline_points != null && (
+                  <span className="ml-1 inline-flex items-baseline gap-1 rounded bg-warning/15 border border-warning/30 px-1 text-[9px] text-warning/90 align-middle whitespace-nowrap">
+                    earnings: <span className="line-through opacity-60">{a.baseline_points > 0 ? '+' : ''}{a.baseline_points}</span>→<b>{a.points > 0 ? '+' : ''}{a.points}</b>
+                  </span>
+                )}
+                {' · '}{a.detail}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// Group a flat factor list by dimension, in DIM_ORDER (unmapped → 'Other' last).
+function groupByDimension(factors: FactorItem[]): [string, FactorItem[]][] {
+  const groups = new Map<string, FactorItem[]>();
+  for (const f of factors) {
+    const d = f.dimension || 'Other';
+    if (!groups.has(d)) groups.set(d, []);
+    groups.get(d)!.push(f);
+  }
+  return [...DIM_ORDER, 'Other'].filter(d => groups.has(d)).map(d => [d, groups.get(d)!] as [string, FactorItem[]]);
+}
+
 export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant Analysis", subtitle = "base + factor + TA → desk score" }: {
   t: DeskRankedTrade; q: any; defaultOpen?: boolean; title?: string; subtitle?: string;
 }) {
@@ -195,9 +361,30 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
   const deskState = vetoed ? { label: 'VETOED', cls: 'text-error' }
                   : waiting ? { label: 'WAIT · TIMING', cls: 'text-warning' }
                   : { label: 'DESK GRADE', cls: '' };
+  // Per-side (call/put) leg tabs — only when the trade has BOTH sides (strangle / straddle / condor /
+  // jade / collar). Default = the whole-trade view; a side tab is a lazily-rendered leg-level read.
+  const ps = t.per_side;
+  const hasSides = !!ps && Array.isArray(ps.sides) && ps.sides.length >= 2;
+  const [qtab, setQtab] = useState<'trade' | 'call' | 'put'>('trade');
+  const activeSide = hasSides && qtab !== 'trade' ? (ps!.sides.find(s => s.key === qtab) || null) : null;
   return (
     <CollapsibleSection title={title} accent="secondary" defaultOpen={defaultOpen}
       icon={<Cpu className="w-3 h-3" />} subtitle={subtitle}>
+      {hasSides && (
+        <div className="mb-2.5">
+          <div className="inline-flex rounded-lg border border-white/10 bg-base-100/40 p-0.5 text-[11px]">
+            {[['trade', 'Trade'] as const, ...ps!.sides.map(s => [s.key, s.label] as const)].map(([k, lbl]) => (
+              <button key={k} type="button" onClick={() => setQtab(k as 'trade' | 'call' | 'put')}
+                className={`px-2.5 py-1 rounded-md transition-colors ${qtab === k ? 'bg-secondary/20 text-secondary font-semibold' : 'text-base-content/60 hover:text-base-content'}`}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          {qtab !== 'trade' && <p className="text-[9.5px] text-base-content/45 mt-1 leading-snug">{ps!.note}</p>}
+        </div>
+      )}
+      {activeSide && <SideQuantPanel side={activeSide} />}
+      {qtab === 'trade' && (<>
       {/* Top: the desk's ONE verdict (state + grade), never a base-quant word that contradicts a veto */}
       <div className={`flex items-center gap-2 rounded-lg border p-2 mb-2.5 ${gradeTone(t.algo_grade)}`}>
         <span className={`text-sm font-bold uppercase tracking-wider ${deskState.cls}`}>{deskState.label}</span>
@@ -258,76 +445,23 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
         </div>
       )}
 
-      {/* 2) Option-math factor adjustments — bars, then the net at the end */}
-      {adjs.length > 0 && (
-        <div className="mb-2.5">
-          <div className={GROUP_LABEL}>Regime &amp; factor adjustments — option math (± on base)
-            {adjs.some(a => a.earnings_impacted) && (
-              <span className="ml-2 badge badge-xs badge-warning badge-outline align-middle normal-case">earnings-aware · with/without below</span>
-            )}
+      {/* 2) Factors grouped by DIMENSION — option-math + TA unified. Each factor is tagged with its risk
+             dimension on the backend (_FACTOR_TAXONOMY), so all evidence for one dimension (Loss probability,
+             Vol edge, Structural defense, …) reads together instead of split across "option math" vs "TA". */}
+      {(() => {
+        const all: FactorItem[] = [...adjs, ...tas];
+        if (!all.length) return <p className="text-[10px] text-base-content/40 mb-2">Neutral to the current regime — no factor tilts on this structure.</p>;
+        const grouped = groupByDimension(all);
+        return (
+          <div className="mb-2">
+            <div className="flex items-baseline gap-2 mb-1.5">
+              <span className={GROUP_LABEL}>Factors by dimension — ± on base</span>
+              <span className="ml-auto text-[9px] text-base-content/35">net {sgn(r1(adjNet + taNet))}</span>
+            </div>
+            {grouped.map(([dim, factors]) => <FactorGroup key={dim} dim={dim} factors={factors} />)}
           </div>
-          <div className="flex flex-wrap gap-2">
-            {adjs.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
-          </div>
-          <GroupFoot label="Net adjustment" value={adjNet} signed />
-          {/* Per-bar EVIDENCE — each option-math factor carries its own reason inline (symmetry with TA). */}
-          {adjs.some(a => a.detail) && (
-            <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
-              {adjs.filter(a => a.detail).map((a, i) => (
-                <li key={i} className="flex gap-2 text-[11px] leading-snug">
-                  <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
-                  <span className="text-base-content/65">
-                    <b className="text-base-content/85">{a.label}</b>
-                    {a.earnings_impacted && a.baseline_points != null && (
-                      <span className="ml-1 inline-flex items-baseline gap-1 rounded bg-warning/15 border border-warning/30 px-1 text-[9px] text-warning/90 align-middle whitespace-nowrap">
-                        earnings: <span className="line-through opacity-60">{a.baseline_points > 0 ? '+' : ''}{a.baseline_points}</span>→<b>{a.points > 0 ? '+' : ''}{a.points}</b>
-                      </span>
-                    )}
-                    {' · '}{a.detail}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-
-      {/* 3) TA factors — the technical read (6-mo daily) that tilts the score */}
-      <div className="mb-2">
-        <div className={GROUP_LABEL}>TA factors — regime &amp; structure · 6-mo daily (± on base)
-          {tas.some(a => a.earnings_impacted) && (
-            <span className="ml-2 badge badge-xs badge-warning badge-outline align-middle normal-case">earnings-aware · with/without below</span>
-          )}
-        </div>
-        {tas.length > 0 ? (
-          <div className="flex flex-wrap gap-2">
-            {tas.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
-          </div>
-        ) : (
-          <p className="text-[10px] text-base-content/40">Neutral to the current regime — no technical tilt on this structure.</p>
-        )}
-        <GroupFoot label="Net TA" value={taNet} signed />
-        {/* Per-factor EVIDENCE — the concrete price points (support/wall/value-area levels, GEX, node
-            volume, drift) behind each score, so the rating is auditable, not a black box. */}
-        {tas.some(a => a.detail) && (
-          <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
-            {tas.filter(a => a.detail).map((a, i) => (
-              <li key={i} className="flex gap-2 text-[11px] leading-snug">
-                <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
-                <span className="text-base-content/65">
-                  <b className="text-base-content/85">{a.label}</b>
-                  {a.earnings_impacted && a.baseline_points != null && (
-                    <span className="ml-1 inline-flex items-baseline gap-1 rounded bg-warning/15 border border-warning/30 px-1 text-[9px] text-warning/90 align-middle whitespace-nowrap">
-                      earnings: <span className="line-through opacity-60">{a.baseline_points > 0 ? '+' : ''}{a.baseline_points}</span>→<b>{a.points > 0 ? '+' : ''}{a.points}</b>
-                    </span>
-                  )}
-                  {' · '}{a.detail}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+        );
+      })()}
 
       {/* Reconciliation — how the pieces sum to the desk score */}
       <p className="text-[10px] text-base-content/45 pt-1.5 border-t border-white/[0.06]">
@@ -371,6 +505,7 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
       {!tas.some(a => a.detail) && t.ta_note && (
         <p className="text-[11px] text-base-content/55 mt-1.5"><span className="text-base-content/40">Technical read:</span> {t.ta_note}</p>
       )}
+      </>)}
     </CollapsibleSection>
   );
 }

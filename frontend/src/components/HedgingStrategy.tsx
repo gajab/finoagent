@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
   Shield, Loader2, AlertTriangle, Calendar, Percent,
   TrendingUp, TrendingDown, Info, ChevronDown, ChevronUp, Sliders,
@@ -18,14 +18,13 @@ import {
 import type { SavedStrategyItem } from '../api';
 import type {
   HedgingResponse, HedgeStructure, HedgeLeg, HedgeQuote, MarketConditions, IndexOverlay, AgentCreateInput,
-  RndCurve, RndSummary, HedgePriceHistory,
+  RndCurve, RndSummary, HedgePriceHistory, SuggestedPreferences, HedgeDeskRow,
 } from '../types';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, BarElement,
   LineController, BarController, ChartTooltip, ChartLegend, Filler);
 import { useAuth } from '../contexts/AuthContext';
 import AgentCreateModal from './AgentCreateModal';
-import PreTradeAdvisor, { type AdvisorMetric } from './PreTradeAdvisor';
 
 // ── Editable leg = just the choices the user can change ────────────────────
 interface EditLeg { action: 'BUY' | 'SELL'; type: 'CALL' | 'PUT'; strike: number; contracts: number; }
@@ -642,15 +641,22 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
   const [marketCheck, setMarketCheck] = useState<MarketConditions | null>(null);
   const [marketCheckLoading, setMarketCheckLoading] = useState(false);
   const [marketCheckTs, setMarketCheckTs] = useState<Date | null>(null);
+  const [marketCheckFor, setMarketCheckFor] = useState('');   // "TICKER:days" the check belongs to
+  const mcSeq = useRef(0);
   const [marketCheckDone, setMarketCheckDone] = useState(false);  // gates Step 2
   const [forceConfig, setForceConfig] = useState(false);          // user clicked "configure anyway"
   const [priceHist, setPriceHist] = useState<HedgePriceHistory | null>(null);
+  // Preferences are seeded from the live surface; once the user edits one we stop
+  // overwriting them (per ticker+horizon).
+  const [prefsTouched, setPrefsTouched] = useState(false);
+  const appliedPrefsFor = useRef<string>('');
+  const formRef = useRef<HTMLFormElement>(null);
   const [selected, setSelected] = useState(0);
   const [showRisks, setShowRisks] = useState(false);
   const [showOverlay, setShowOverlay] = useState(false);
   const [editing, setEditing] = useState(false);
   const [movePct, setMovePct] = useState(0);
-  const [detailTab, setDetailTab] = useState<'scenario' | 'risk' | 'legs' | 'tax'>('scenario');
+  const [detailTab, setDetailTab] = useState<'legs' | 'scenario' | 'risk' | 'tax'>('legs');
 
   // Per-hedge editable legs, keyed by hedge id.
   const [editedLegs, setEditedLegs] = useState<Record<string, EditLeg[]>>({});
@@ -667,13 +673,15 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
 
   const doMarketCheck = useCallback(async (t: string, h: number) => {
     if (!t) return;
+    const seq = ++mcSeq.current;
     setMarketCheckLoading(true);
     try {
       const mc = await getHedgingMarketCheck(t.toUpperCase(), 'SPY', h);
-      if (mc.available) { setMarketCheck(mc); setMarketCheckTs(new Date()); }
-      else setMarketCheck(null);
+      if (seq !== mcSeq.current) return;        // a newer ticker/days request superseded this one
+      if (mc.available) { setMarketCheck(mc); setMarketCheckTs(new Date()); setMarketCheckFor(`${t.toUpperCase()}:${h}`); }
+      else { setMarketCheck(null); setMarketCheckFor(''); }
     } catch {
-      setMarketCheck(null);
+      if (seq === mcSeq.current) { setMarketCheck(null); setMarketCheckFor(''); }
     } finally {
       setMarketCheckLoading(false);
       setMarketCheckDone(true);  // timing has been read at least once → reveal Step 2
@@ -697,6 +705,29 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
     }, 900);
     return () => clearTimeout(id);
   }, [ticker, horizon]);
+
+  // ── Algorithmic protection preferences ──────────────────────────────────
+  // The desk derives Floor / caps / Budget from the live surface. We seed the
+  // form once per ticker+horizon and back off the moment the user edits.
+  const applySuggested = useCallback((sp: SuggestedPreferences) => {
+    setDownside(sp.floor_pct);
+    setDownsideCap(sp.downside_cap_pct);
+    setUpside(sp.upside_cap_pct);
+    setUpsideGiveup(sp.giveup_pct);
+    setMaxCost(sp.budget_pct);
+  }, []);
+
+  useEffect(() => { setPrefsTouched(false); appliedPrefsFor.current = ''; }, [ticker, horizon]);
+
+  useEffect(() => {
+    const sp = marketCheck?.suggested_preferences;
+    if (!sp || !ticker || prefsTouched || loading) return;
+    const key = `${ticker.trim().toUpperCase()}:${horizon}`;
+    if (marketCheckFor !== key) return;          // suggestions are for a previous ticker/days — wait
+    if (appliedPrefsFor.current === key) return;
+    appliedPrefsFor.current = key;
+    applySuggested(sp);
+  }, [marketCheck, marketCheckFor, ticker, horizon, prefsTouched, loading, applySuggested]);
 
   const initEdits = (res: HedgingResponse) => {
     const map: Record<string, EditLeg[]> = {};
@@ -909,7 +940,7 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
       )}
 
       {/* Input form */}
-      <form onSubmit={handleSubmit} className="space-y-3">
+      <form ref={formRef} onSubmit={handleSubmit} className="space-y-3">
         {/* ── STEP 1 — what & how long (no share count needed yet) ── */}
         <div className="rounded-xl border border-white/[0.08] bg-base-200/30 p-3">
           <div className="flex items-center justify-between gap-2 mb-2">
@@ -1082,9 +1113,33 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
 
         {/* The three protection dials */}
         <div className="rounded-xl border border-secondary/20 bg-secondary/5 p-3">
-          <p className="text-xs font-semibold text-secondary mb-2 flex items-center gap-1.5">
-            <Shield className="w-3.5 h-3.5" /> Your protection preferences
-          </p>
+          <div className="flex items-start gap-2 flex-wrap mb-2">
+            <p className="text-xs font-semibold text-secondary flex items-center gap-1.5">
+              <Shield className="w-3.5 h-3.5" /> Your protection preferences
+            </p>
+            {marketCheck?.suggested_preferences && (
+              <span className={`badge badge-xs gap-1 ${prefsTouched ? 'badge-ghost' : 'badge-secondary'}`}>
+                {prefsTouched ? 'your overrides' : 'desk-derived'}
+              </span>
+            )}
+            {marketCheck?.suggested_preferences && prefsTouched && (
+              <button type="button" className="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[10px] text-secondary border border-secondary/25"
+                onClick={() => { applySuggested(marketCheck.suggested_preferences!); setPrefsTouched(false); }}>
+                <RotateCcw className="w-2.5 h-2.5" /> Reset to desk defaults
+              </button>
+            )}
+          </div>
+          {marketCheck?.suggested_preferences && !prefsTouched && marketCheckFor === `${ticker.trim().toUpperCase()}:${horizon}` && (
+            <div className="mb-2 rounded-md bg-base-100/40 border border-secondary/15 p-2 space-y-0.5">
+              <p className="text-[10px] font-medium text-secondary/90">
+                Seeded from today's surface — {marketCheck.suggested_preferences.regime.toLowerCase()} pricing,
+                floor targeted at a {marketCheck.suggested_preferences.target_breach_pct}% breach probability:
+              </p>
+              {marketCheck.suggested_preferences.why.map((w, i) => (
+                <p key={i} className="text-[10px] text-base-content/55 leading-snug">• {w}</p>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {/* Downside — two distinct styles */}
             <div className="rounded-lg bg-error/5 border border-error/15 p-2.5">
@@ -1100,13 +1155,13 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                         <span className="text-[10px] text-secondary/80">Suggested from market odds:</span>
                         <button type="button" className="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[10px] text-secondary border border-secondary/20"
                           title="Sets the Floor at the strike the market gives a 10% chance of breaching by expiry"
-                          onClick={() => setDownside(Math.min(40, Math.max(0, Math.round(-marketCheck.rnd!.floor_for_10pct_breach_pct))))}>
+                          onClick={() => { setDownside(Math.min(40, Math.max(0, Math.round(-marketCheck.rnd!.floor_for_10pct_breach_pct)))); setPrefsTouched(true); }}>
                           10% breach → −{Math.round(-marketCheck.rnd.floor_for_10pct_breach_pct)}%
                         </button>
                         {marketCheck.rnd.floor_for_5pct_breach_pct != null && (
                           <button type="button" className="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[10px] text-secondary border border-secondary/20"
                             title="Sets the Floor at the strike the market gives a 5% chance of breaching by expiry"
-                            onClick={() => setDownside(Math.min(40, Math.max(0, Math.round(-marketCheck.rnd!.floor_for_5pct_breach_pct))))}>
+                            onClick={() => { setDownside(Math.min(40, Math.max(0, Math.round(-marketCheck.rnd!.floor_for_5pct_breach_pct)))); setPrefsTouched(true); }}>
                             5% → −{Math.round(-marketCheck.rnd.floor_for_5pct_breach_pct)}%
                           </button>
                         )}
@@ -1116,7 +1171,7 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                   <div className="relative shrink-0 w-20">
                     <Percent className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40" />
                     <input type="number" className="input input-bordered input-sm w-full pl-7" value={downside}
-                      onChange={(e) => setDownside(Number(e.target.value))} min={0} max={40} step={1} required />
+                      onChange={(e) => { setDownside(Number(e.target.value)); setPrefsTouched(true); }} min={0} max={40} step={1} required />
                   </div>
                 </div>
                 {/* Downside cap — optional financing (insurance turns off) */}
@@ -1128,7 +1183,7 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                   <div className="relative shrink-0 w-20">
                     <Percent className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40" />
                     <input type="number" className="input input-bordered input-sm w-full pl-7" value={downsideCap}
-                      onChange={(e) => setDownsideCap(Number(e.target.value))} min={0} max={60} step={1} />
+                      onChange={(e) => { setDownsideCap(Number(e.target.value)); setPrefsTouched(true); }} min={0} max={60} step={1} />
                   </div>
                 </div>
               </div>
@@ -1146,7 +1201,7 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                   <div className="relative shrink-0 w-20">
                     <Percent className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40" />
                     <input type="number" className="input input-bordered input-sm w-full pl-7" value={upside}
-                      onChange={(e) => setUpside(Number(e.target.value))} min={0} max={60} step={1} />
+                      onChange={(e) => { setUpside(Number(e.target.value)); setPrefsTouched(true); }} min={0} max={60} step={1} />
                   </div>
                 </div>
                 {/* Give-up band */}
@@ -1161,7 +1216,7 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                   <div className="relative shrink-0 w-20">
                     <Percent className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40" />
                     <input type="number" className="input input-bordered input-sm w-full pl-7" value={upsideGiveup}
-                      onChange={(e) => setUpsideGiveup(Number(e.target.value))} min={0} max={40} step={1} required />
+                      onChange={(e) => { setUpsideGiveup(Number(e.target.value)); setPrefsTouched(true); }} min={0} max={40} step={1} required />
                   </div>
                 </div>
               </div>
@@ -1172,9 +1227,14 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
             <div className="relative">
               <Percent className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-base-content/40" />
               <input type="number" className="input input-bordered input-sm w-full pl-7" value={maxCost}
-                onChange={(e) => setMaxCost(Number(e.target.value))} min={0} max={20} step={0.1} required />
+                onChange={(e) => { setMaxCost(Number(e.target.value)); setPrefsTouched(true); }} min={0} max={20} step={0.1} required />
             </div>
-            <span className="text-[10px] text-base-content/40 mt-0.5">% of position value you'll spend.</span>
+            <span className="text-[10px] text-base-content/40 mt-0.5">
+              % of position value you'll spend.
+              {marketCheck?.suggested_preferences && (
+                <> Desk figure <span className="font-mono text-secondary">{marketCheck.suggested_preferences.budget_pct}%</span> — scaled to this name's own volatility and horizon, not a flat number.</>
+              )}
+            </span>
           </div>
         </div>
 
@@ -1212,6 +1272,33 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
 
       {result && result.hedges?.length > 0 && (
         <div className="space-y-4">
+          {/* Stale-result guard — the legs below must match the preferences above */}
+          {(() => {
+            const diffs: string[] = [];
+            const chk = (label: string, built: number | undefined, now: number, suf = '%') => {
+              if (built != null && Math.abs(Number(built) - Number(now)) > 1e-9) diffs.push(`${label} ${built}${suf} → ${now}${suf}`);
+            };
+            chk('Floor', result.protection_pct, downside);
+            chk('Downside cap', result.downside_cap, downsideCap);
+            chk('Upside cap', result.upside_pct, upside);
+            chk('Give-up', result.upside_giveup, upsideGiveup);
+            chk('Budget', result.max_cost_pct, maxCost);
+            chk('Horizon', result.horizon_days, horizon, 'd');
+            if (!diffs.length) return null;
+            return (
+              <div className="alert alert-warning py-2 text-xs flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span className="flex-1 min-w-0">
+                  These hedges were built with different preferences than the form now shows ({diffs.join(' · ')}). The legs below do not reflect your current inputs.
+                </span>
+                <button type="button" className="btn btn-xs btn-warning whitespace-nowrap" disabled={loading}
+                  onClick={() => formRef.current?.requestSubmit()}>
+                  <RefreshCw className="w-3 h-3" /> Rebuild with current
+                </button>
+              </div>
+            );
+          })()}
+
           {/* Position summary */}
           <div className="bg-base-200/40 rounded-xl p-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm border border-white/[0.03]">
             <span className="font-medium">{result.ticker}</span>
@@ -1223,44 +1310,113 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
             <span className="badge badge-warning badge-sm gap-1"><Wallet className="w-2.5 h-2.5" /> Budget ${(result.notional * result.max_cost_pct / 100).toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
           </div>
 
-          {/* Desk pick — best balance of near-zero cost + protection, given today's surface */}
-          {(() => {
-            const curve = result.rnd?.curve;
-            const volOfVol = result.rnd?.heston?.vol_of_vol ?? 0;
-            let best: { i: number; score: number; why: string } | null = null;
-            result.hedges.forEach((h, i) => {
-              const hm2 = metricsByHedge[h.id];
-              if (!hm2 || hm2.floor == null) return;                      // must actually protect
-              const ip = curve ? impliedProbs(curve, spot, hm2) : null;
-              const breach = ip?.breach ?? h.probs?.p_breach_floor_pct;
-              if (breach == null) return;
-              const costPct = Math.abs(hm2.cost_pct ?? 0);
-              const costScore = Math.max(0, 1 - costPct / 2);             // 0% cost → 1, 2%+ → 0
-              const protScore = 1 - breach / 100;                         // low breach odds → high
-              const volPen = h.smile_risk?.short_vol && volOfVol > 1.0 ? 0.12 : 0;
-              const budgetPen = hm2.within_budget ? 0 : 0.15;
-              const score = 0.45 * costScore + 0.55 * protScore - volPen - budgetPen;
-              if (!best || score > best.score) {
-                best = {
-                  i, score,
-                  why: `${hm2.is_credit ? 'net credit' : `${costPct.toFixed(1)}% cost`} · P(breach floor) ${breach.toFixed(0)}%`
-                    + (volPen ? ' · short-vol trimmed (vol-of-vol is high — gap risk)' : ''),
-                };
-              }
-            });
-            if (!best) return null;
-            const b: { i: number; score: number; why: string } = best;
-            const bh = result.hedges[b.i];
+          {/* ── Hedge Desk — institutional scorecard on the stock+overlay differential ── */}
+          {result.desk && (() => {
+            const desk = result.desk!;
+            const pick = desk.ranked.find((r) => r.id === desk.pick_id);
+            const pickIdx = result.hedges.findIndex((h) => h.id === desk.pick_id);
+            const pickHedge = pickIdx >= 0 ? result.hedges[pickIdx] : null;
+            if (!pick || !pickHedge) return null;
+            const gradeTone = (g: string) => g === 'A' ? 'text-success' : g === 'B' ? 'text-secondary' : g === 'C' ? 'text-warning' : 'text-error';
+            const barTone = (v: number) => v >= 75 ? 'bg-success/70' : v >= 55 ? 'bg-secondary/70' : v >= 38 ? 'bg-warning/70' : 'bg-error/70';
+            const sel = hedge ? desk.ranked.find((r) => r.id === hedge.id) : null;
+            const show = sel ?? pick;
+            const showHedge = (hedge && sel) ? hedge : pickHedge;
             return (
-              <div className="rounded-xl border border-secondary/25 bg-secondary/[0.06] p-3 flex items-center gap-3 flex-wrap">
-                <Sparkles className="w-4 h-4 text-secondary shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold">Desk pick — {bh.name}</p>
-                  <p className="text-[11px] text-base-content/60">Best balance of near-zero cost and protection on today's surface: {b.why}. Weighs cost vs market-implied breach odds, penalizes short-vol in a jumpy-vol regime and over-budget structures.</p>
+              <div className="rounded-xl border border-secondary/25 bg-secondary/[0.05] p-3 space-y-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-semibold text-secondary flex items-center gap-1.5">
+                    <Landmark className="w-3.5 h-3.5" /> Hedge Desk — quant recommendation
+                  </span>
+                  <span className="text-[10px] text-base-content/45">
+                    scored on <strong>stock + overlay vs stock alone</strong>, under the market&rsquo;s own density
+                  </span>
                 </div>
-                {selected !== b.i && (
-                  <button type="button" className="btn btn-secondary btn-xs" onClick={() => { setSelected(b.i); setMovePct(0); }}>Inspect</button>
-                )}
+
+                {/* Headline — grades whichever structure is selected */}
+                <div className="flex items-start gap-3 flex-wrap">
+                  <div className={`text-3xl font-bold leading-none whitespace-nowrap ${gradeTone(show.grade)}`}>{show.grade}
+                    <span className="text-sm font-mono font-normal text-base-content/50 ml-1">{show.score}</span>
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold flex items-center gap-2 flex-wrap">
+                      {showHedge.name}
+                      {show.id === pick.id
+                        ? <span className="badge badge-secondary badge-xs gap-0.5"><Sparkles className="w-2.5 h-2.5" /> desk pick</span>
+                        : <span className="text-[10px] font-normal text-base-content/45">rank {desk.ranked.findIndex((r) => r.id === show.id) + 1} of {desk.ranked.length}</span>}
+                    </p>
+                    <p className="text-[11px] text-base-content/60 leading-snug">
+                      Removes {fmt$(show.cvar_reduction)} ({show.tail_relief_pct}%) of tail risk
+                      {show.hedge_efficiency != null ? ` — ${show.hedge_efficiency}× per $1 spent` : ' at no net premium'};
+                      covers {show.loss_coverage_pct}% of expected losses, forfeits {fmt$(show.upside_forfeited)} of expected upside.
+                    </p>
+                  </div>
+                  {show.id !== pick.id && (
+                    <button type="button" className="btn btn-secondary btn-xs whitespace-nowrap" onClick={() => { setSelected(pickIdx); setMovePct(0); }}
+                      title={desk.verdict}>
+                      Desk pick: {pickHedge.name} ({pick.grade} {pick.score}) →
+                    </button>
+                  )}
+                </div>
+
+                {/* Baseline: what you're carrying unhedged */}
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-base-content/55 border-t border-secondary/15 pt-2">
+                  <span>Unhedged tail (CVaR95) <span className="font-mono text-error">{fmt$(desk.cvar_naked)}</span></span>
+                  <span>Expected loss <span className="font-mono">{fmt$(-desk.expected_naked_loss)}</span></span>
+                  <span>Expected gain <span className="font-mono text-success">+{fmt$(desk.expected_naked_gain)}</span></span>
+                  {desk.omega_naked != null && <span>Omega naked <span className="font-mono">{desk.omega_naked}</span></span>}
+                </div>
+
+                {/* Pillars for whichever structure is in focus */}
+                <div className="space-y-1.5">
+                  <p className="text-[10px] uppercase tracking-wider text-base-content/40">
+                    Scorecard — {showHedge.name}
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-1.5">
+                    {Object.entries(desk.pillar_labels).map(([k, label]) => {
+                      const v = show.pillars[k] ?? 0;
+                      const wgt = Math.round((desk.pillar_weights[k] ?? 0) * 100);
+                      return (
+                        <div key={k}>
+                          <div className="flex items-baseline justify-between gap-2">
+                            <span className="text-[10px] text-base-content/60">{label} <span className="text-base-content/30">{wgt}%</span></span>
+                            <span className="text-[10px] font-mono font-medium">{v}</span>
+                          </div>
+                          <div className="h-1.5 rounded-full bg-base-content/10 overflow-hidden">
+                            <div className={`h-full rounded-full ${barTone(v)}`} style={{ width: `${Math.min(100, v)}%` }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* The numbers a desk actually argues about */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 border-t border-secondary/15 pt-2">
+                  {[
+                    { l: 'Tail removed', v: fmt$(show.cvar_reduction), s: `${show.tail_relief_pct}% of the tail`, tone: 'text-success' },
+                    { l: 'Efficiency', v: show.hedge_efficiency != null ? `${show.hedge_efficiency}×` : 'free', s: '$ tail per $ spent', tone: 'text-base-content' },
+                    { l: 'Loss coverage', v: `${show.loss_coverage_pct}%`, s: 'of expected losses', tone: 'text-base-content' },
+                    { l: 'Indemnity', v: fmt$(show.expected_indemnity), s: 'E[payout when down]', tone: 'text-success' },
+                    { l: 'Upside given up', v: fmt$(show.upside_forfeited), s: 'E[gains forfeited]', tone: 'text-warning' },
+                    { l: 'Omega', v: show.omega_hedged != null ? `${show.omega_hedged}` : '—', s: show.omega_naked != null ? `vs ${show.omega_naked} naked` : 'hedged', tone: (show.omega_hedged ?? 0) > (show.omega_naked ?? 0) ? 'text-success' : 'text-base-content' },
+                  ].map((c) => (
+                    <div key={c.l} className="bg-base-100/40 rounded-md p-2">
+                      <p className="text-[9px] uppercase tracking-wide text-base-content/40">{c.l}</p>
+                      <p className={`text-sm font-mono font-semibold ${c.tone}`}>{c.v}</p>
+                      <p className="text-[9px] text-base-content/40 leading-tight">{c.s}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <p className="text-[10px] text-base-content/45">
+                  <strong className="text-base-content/60">Strengths:</strong> {show.strengths.join(', ')}.{' '}
+                  <strong className="text-base-content/60">Weakest link:</strong> {show.weakness}.{' '}
+                  {show.expected_overlay_pnl != null && (
+                    <>RND-expected overlay P&amp;L <span className="font-mono">{show.expected_overlay_pnl >= 0 ? '+' : '−'}{fmt$(Math.abs(show.expected_overlay_pnl))}</span> — the true expected cost of this insurance.{' '}</>
+                  )}
+                  {show.short_vol && 'Net short vol: a VIX spike works against this structure.'}
+                </p>
               </div>
             );
           })()}
@@ -1275,7 +1431,9 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
               <table className="table table-xs w-full">
                 <thead>
                   <tr className="text-base-content/60">
-                    <th>Structure</th><th>Net Cost</th><th>Protects</th>
+                    <th>Structure</th>
+                    <th title="Hedge-desk composite: tail efficiency, cost & carry, protection quality, risk/reward, regime fit and execution — scored on stock+overlay vs stock alone">Desk</th>
+                    <th>Net Cost</th><th>Protects</th>
                     <th title="Market-implied probability the stock breaches the floor by expiry (Breeden-Litzenberger risk-neutral density)">P(breach)</th>
                     <th>Worst Case</th>
                     <th title="Expected shortfall: average of the worst 5% outcomes, hedged">CVaR&nbsp;95%</th>
@@ -1301,6 +1459,12 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                             </span>
                           )}
                         </td>
+                        <td className="whitespace-nowrap">{h.desk ? (
+                          <span className={`inline-flex items-center justify-center gap-1 whitespace-nowrap min-w-[3rem] rounded-full border px-1.5 py-px text-[11px] leading-4 font-mono ${h.desk.grade === 'A' ? 'border-success/60 text-success' : h.desk.grade === 'B' ? 'border-secondary/60 text-secondary' : h.desk.grade === 'C' ? 'border-warning/60 text-warning' : 'border-error/60 text-error'}`}
+                            title={`${h.desk.score}/100 — removes ${fmt$(h.desk.cvar_reduction)} (${h.desk.tail_relief_pct}%) of tail risk; covers ${h.desk.loss_coverage_pct}% of expected losses. Weakest: ${h.desk.weakness}.`}>
+                            <span className="font-semibold">{h.desk.grade}</span><span className="opacity-80">{h.desk.score}</span>
+                          </span>
+                        ) : <span className="text-base-content/30">—</span>}</td>
                         <td className={`font-mono ${hm.is_credit ? 'text-success' : ''}`}>{hm.is_credit ? `+${fmt$(-hm.net_cost)}` : fmt$(hm.net_cost)}</td>
                         <td className="font-mono text-xs">{hm.floor != null ? `$${hm.floor}${hm.buffer_bottom != null ? `→$${hm.buffer_bottom}` : ''}` : '—'}</td>
                         <td className="font-mono text-xs">{(() => {
@@ -1478,14 +1642,14 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
 
               {/* Detail sub-tabs — collapse the deep panels so only one shows at a time */}
               <div role="tablist" className="tabs tabs-boxed bg-base-200/40 w-fit">
+                <button role="tab" className={`tab gap-1.5 ${detailTab === 'legs' ? 'tab-active' : ''}`} onClick={() => setDetailTab('legs')}>
+                  <Layers className="w-3.5 h-3.5" /> Legs {isEdited && <span className="w-1.5 h-1.5 rounded-full bg-accent" />}
+                </button>
                 <button role="tab" className={`tab gap-1.5 ${detailTab === 'scenario' ? 'tab-active' : ''}`} onClick={() => setDetailTab('scenario')}>
                   <Sliders className="w-3.5 h-3.5" /> Scenario
                 </button>
                 <button role="tab" className={`tab gap-1.5 ${detailTab === 'risk' ? 'tab-active' : ''}`} onClick={() => setDetailTab('risk')}>
-                  <Gauge className="w-3.5 h-3.5" /> Risk &amp; Greeks
-                </button>
-                <button role="tab" className={`tab gap-1.5 ${detailTab === 'legs' ? 'tab-active' : ''}`} onClick={() => setDetailTab('legs')}>
-                  <Layers className="w-3.5 h-3.5" /> Legs {isEdited && <span className="w-1.5 h-1.5 rounded-full bg-accent" />}
+                  <Gauge className="w-3.5 h-3.5" /> Greeks &amp; Risks
                 </button>
                 <button role="tab" className={`tab gap-1.5 ${detailTab === 'tax' ? 'tab-active' : ''}`} onClick={() => setDetailTab('tax')}>
                   <Landmark className="w-3.5 h-3.5" /> Tax
@@ -1847,73 +2011,6 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                   ))}
                 </div>
               )}
-
-              {/* Desk Review — pre-trade advisory (Risk · Trader · PM · Quant) */}
-              {(() => {
-                if (!hedge || !m) return null;
-                const reduces = risk ? risk.cvar_reduction > 0 : true;
-                const tone: 'good' | 'warn' | 'bad' = reduces && m.within_budget
-                  ? 'good' : (reduces || m.within_budget ? 'warn' : 'bad');
-                const quantMetrics: AdvisorMetric[] = [
-                  { label: 'Worst Loss', value: fmt$(m.max_loss), tone: 'bad', hint: 'Max loss on the hedged position' },
-                  { label: 'Floor', value: m.floor != null ? `$${m.floor}` : '—', hint: 'Protected floor price' },
-                  { label: 'Cap', value: m.cap != null ? `$${m.cap}` : 'None' },
-                  { label: m.is_credit ? 'Net Credit' : 'Net Cost', value: m.is_credit ? `+${fmt$(-m.net_cost)}` : fmt$(m.net_cost), tone: m.is_credit ? 'good' : '' },
-                  { label: 'CVaR95 ↓', value: risk ? fmt$(risk.cvar_reduction) : '—', tone: 'good', hint: 'Tail-loss reduction vs unhedged' },
-                  { label: 'Prob Pays', value: risk ? `${Math.round(risk.prob_pays * 100)}%` : '—', hint: 'Chance the hedge finishes profitable' },
-                  { label: 'Cost %', value: `${Math.abs(m.cost_pct).toFixed(2)}%`, tone: m.within_budget ? '' : 'warn' },
-                  { label: 'DTE', value: `${result.dte}` },
-                ];
-                const quantVerdict = {
-                  label: tone === 'good' ? 'Efficient protection' : tone === 'warn' ? 'Protection at a cost — weigh it' : 'Weak protection for the cost',
-                  tone,
-                  note: risk ? `cuts tail loss by ${fmt$(risk.cvar_reduction)} for ${m.is_credit ? 'a credit' : fmt$(m.net_cost)}` : undefined,
-                };
-                const llmMetrics = {
-                  current_price: spot,
-                  shares_held: result.shares,
-                  position_value: Math.round(result.shares * spot),
-                  net_cost: Math.round(m.net_cost), cost_pct: m.cost_pct, is_credit: m.is_credit ? 'yes' : 'no',
-                  protected_floor: m.floor, floor_pct: m.floor_pct, buffer_bottom: m.buffer_bottom,
-                  upside_cap: m.cap, cap_pct: m.cap_pct,
-                  max_loss: Math.round(m.max_loss), max_loss_pct: m.max_loss_pct,
-                  upside_breakeven: m.upside_breakeven,
-                  net_delta: m.greeks.delta, net_gamma: m.greeks.gamma, net_theta: m.greeks.theta, net_vega: m.greeks.vega,
-                  var95_hedged: risk ? Math.round(risk.var_hedged) : null,
-                  cvar95_hedged: risk ? Math.round(risk.cvar_hedged) : null,
-                  cvar95_unhedged: risk ? Math.round(risk.cvar_unhedged) : null,
-                  cvar_reduction: risk ? Math.round(risk.cvar_reduction) : null,
-                  prob_hedge_pays_pct: risk ? Math.round(risk.prob_pays * 100) : null,
-                  horizon_dte: result.dte, annualized_cost_pct: m.annualized,
-                };
-                // Full hedged-position payoff so the agents judge the whole profile.
-                const posValue = result.shares * spot;
-                const scenarios = [-30, -20, -10, -5, 0, 5, 10, 20].map(mv => {
-                  const P = spot * (1 + mv / 100);
-                  const pnl = result.shares * (P - spot) + hedgePnL(legs, P);
-                  return { move_pct: mv, price: Math.round(P * 100) / 100, pnl: Math.round(pnl), roi: posValue ? Math.round(pnl / posValue * 1000) / 10 : 0 };
-                });
-                return (
-                  <PreTradeAdvisor
-                    ticker={(ticker || '').toUpperCase()}
-                    strategyType={`hedge_${hedge.id}`}
-                    legs={legs.map(l => ({ action: l.action, contracts: l.contracts, type: l.type, strike: l.strike, expiration: l.expiration, iv: l.iv ?? undefined }))}
-                    llmMetrics={llmMetrics}
-                    scenarios={scenarios}
-                    breakevens={m.upside_breakeven ? [`$${m.upside_breakeven} (upside breakeven)`] : []}
-                    expiration={result.expiration}
-                    spot={spot}
-                    capital={posValue}
-                    dte={result.dte}
-                    stockShares={result.shares}
-                    maxLoss={-Math.abs(m.max_loss)}
-                    maxProfit={m.cap != null ? Math.round(result.shares * (m.cap - spot) + hedgePnL(legs, m.cap)) : null}
-                    quantMetrics={quantMetrics}
-                    quantVerdict={quantVerdict}
-                    notes={`${describe(hedge.id, m, spot)} Protecting ${result.shares} shares of ${(ticker || '').toUpperCase()} (long) — the hedge caps the loss; the "max loss" is the floored worst case, not a routine outcome.`}
-                  />
-                );
-              })()}
             </div>
           )}
         </div>

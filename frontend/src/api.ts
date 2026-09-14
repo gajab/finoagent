@@ -112,6 +112,15 @@ export async function fetchTradeSetups(
   );
 }
 
+// Intraday day-trade setups — lazy (fetched only when the Day-trade style is opened).
+export async function fetchDayTradeSetups(
+  ticker: string,
+): Promise<import('./types').DayTradeSetupsResponse> {
+  return apiFetch<import('./types').DayTradeSetupsResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/day-trade-setups`,
+  );
+}
+
 // LLM pre-trade review of a quant setup (+ optional sentiment/fundamental/analyst)
 export async function verifySetup(
   ticker: string,
@@ -1054,6 +1063,7 @@ export async function computeDualDirectionBuffer(params: {
   downside_buffer_pct: number;
   upside_cap_pct: number;
   target_expiration?: string;
+  entry_cost_mode?: string;
 }): Promise<any> {
   return apiFetch<any>(`/api/stock/${encodeURIComponent(params.ticker)}/strategies/dual-direction-buffer`, {
     method: 'POST',
@@ -1068,6 +1078,7 @@ export async function computeDualDirectionBufferIBKR(params: {
   downside_buffer_pct: number;
   upside_cap_pct: number;
   target_expiration?: string;
+  entry_cost_mode?: string;
 }): Promise<any> {
   return apiFetch<any>('/api/broker/strategy/dual-direction-buffer', {
     method: 'POST',
@@ -1165,6 +1176,16 @@ export async function build130_30Portfolio(
   });
 }
 
+// AI narrative for a long/short portfolio — separate, opt-in LLM action.
+export async function build130_30Insights(
+  params: Build130_30Params
+): Promise<{ llm_insights: string | null }> {
+  return apiFetch<{ llm_insights: string | null }>('/api/stock/strategies/130-30/insights', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
 export async function fetchExitAnalysis(ticker: string): Promise<ExitAnalysisData> {
   return apiFetch<ExitAnalysisData>(`/api/stock/${encodeURIComponent(ticker)}/exit-analysis`, {
     method: 'POST',
@@ -1256,6 +1277,22 @@ export async function deleteTLHPortfolio(id: number): Promise<void> {
 
 // ===== Saved Strategies =====
 
+// Roll-campaign overlay — present (non-null) once a trade has been rolled ≥1×. Lets the UI
+// treat a rolled position as ONE continuing trade with an adjusted cost basis, rather than a
+// string of disconnected close+open events. All fields are pure (no live quotes).
+export interface RollSummary {
+  count: number;                       // number of rolls so far
+  roll_realized_pnl: number;           // cumulative $ realized on the buy-backs (the cost-basis adjustment)
+  raw_net_credit: number | null;       // net entry credit of the CURRENT open legs (SELL +, BUY −), ×100
+  effective_net_credit: number | null; // raw_net_credit + roll_realized_pnl — the true premium banked
+  raw_breakevens: number[] | null;     // breakevens of the open legs at their own entry
+  effective_breakevens: number[] | null; // breakevens once roll-realized is folded into the cost basis
+  history: {                           // one entry per roll, newest last
+    roll_id: string; seq: number; date: string; realized: number;
+    buyback_cost?: number; new_credit?: number; from: string[]; to: string[]; note?: string | null;
+  }[];
+}
+
 export interface SavedStrategyItem {
   id: number;
   strategy_type: string;
@@ -1274,6 +1311,7 @@ export interface SavedStrategyItem {
   exit_prices?: any[] | null;
   exit_net?: number | null;
   bpr?: number | null;                 // buying-power reduction (backend Reg-T margin); BPR base for the closed ledger
+  roll?: RollSummary | null;           // roll-campaign overlay; null/absent if never rolled
   close_month?: string;                // 'YYYY-MM' bucket tag (only set by the closed-ledger endpoint)
   created_at: string;
   updated_at: string;
@@ -1300,12 +1338,35 @@ export interface ClosedLedgerResult {
   trades: SavedStrategyItem[];           // full records for the current month + any loose prior rows
   total_realized: number;                // frozen + current, the whole-book banked total
   stored: boolean;                       // true = prior months served from the DB cache
+  include_rolls?: boolean;               // echoes whether still-active rolled trades' partials are folded in
 }
 
 // Closed tab: current-month trades in full (expandable) + prior months as compact stored
 // summaries. The full closed history is no longer downloaded on every landing.
-export async function fetchClosedLedger(): Promise<ClosedLedgerResult> {
-  return apiFetch<ClosedLedgerResult>('/api/saved-strategies/trades/closed-ledger');
+// `includeRolls` opts in to still-active ROLLED trades' partial realized (hidden by default —
+// a rolled campaign is still in play, so its roll P&L stays out of the Closed ledger).
+export async function fetchClosedLedger(includeRolls = false): Promise<ClosedLedgerResult> {
+  const qs = includeRolls ? '?include_rolls=true' : '';
+  return apiFetch<ClosedLedgerResult>(`/api/saved-strategies/trades/closed-ledger${qs}`);
+}
+
+// Lazily load one prior (frozen) month's full trade records when the user expands its band.
+export async function fetchClosedLedgerMonth(month: string): Promise<SavedStrategyItem[]> {
+  return apiFetch<SavedStrategyItem[]>(`/api/saved-strategies/trades/closed-ledger/${encodeURIComponent(month)}`);
+}
+
+// Delete just the option legs OR the stock leg of a closed combo trade. Returns the updated
+// trade, or null if that emptied it and the whole (fully-closed) trade was removed.
+export async function deleteClosedPart(id: number, part: 'options' | 'stock'): Promise<SavedStrategyItem | null> {
+  return apiFetch<SavedStrategyItem | null>(`/api/saved-strategies/${id}/delete-closed-part`, {
+    method: 'POST',
+    body: JSON.stringify({ part }),
+  });
+}
+
+// Undo a close — restore a closed (or partially-closed) trade to Active with all its legs.
+export async function reopenTrade(id: number): Promise<SavedStrategyItem> {
+  return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${id}/reopen`, { method: 'POST' });
 }
 
 export async function fetchSavedStrategies(strategyType: string): Promise<SavedStrategyItem[]> {
@@ -1422,6 +1483,22 @@ export async function closePosition(id: number, data: {
   note?: string | null;
 }): Promise<SavedStrategyItem> {
   return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${id}/close-position`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+// Roll a placed trade — buy back the tested leg(s) and open replacement leg(s) in ONE action.
+// The trade stays ACTIVE as one continuing campaign; the buy-back's realized P&L is banked as a
+// cost-basis adjustment (tagged as a roll) instead of a separate closed trade. Returns the
+// updated trade, whose `roll` overlay carries the new effective breakeven / net credit.
+export async function rollPosition(id: number, data: {
+  close_legs: { leg_index: number; exit_price: number }[];
+  open_legs: { action: 'buy' | 'sell'; type: 'call' | 'put'; strike: number; expiration: string; qty: number; premium: number }[];
+  executed_at?: string;
+  note?: string | null;
+}): Promise<SavedStrategyItem> {
+  return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${id}/roll-position`, {
     method: 'POST',
     body: JSON.stringify(data),
   });
@@ -1669,8 +1746,8 @@ export interface BookTailRiskResult {
   var_95?: number | null; cvar_95?: number | null; var_99?: number | null; cvar_99?: number | null;
   horizon?: string;
   concentration?: { ticker: string; trades: number; short_legs: number; net_gamma: number; net_vega: number; net_delta: number; beta?: number; gamma_share_pct: number; laddered: boolean; flags: string[] }[];
-  // Per-underlying P&L at a −20% month (whole position; option overlay vs shares split out).
-  loss_by_name?: { ticker: string; pnl: number; option_pnl: number; stock_pnl: number; beta: number }[];
+  // Per-underlying OPTION-OVERLAY P&L at a −20% month (options only; stock is a separate holding).
+  loss_by_name?: { ticker: string; pnl: number; beta: number }[];
   // 2-D risk array: book P&L for each (spot move × vol-point shock).
   scenario_grid?: { spot_moves: number[]; vol_shocks: number[]; rows: { move_pct: number; cells: { pnl: number; pct: number | null }[] }[] };
   // Institutional risk scorecard: standardized guardrails, book value vs limit, cheapest fix per breach.
@@ -1683,9 +1760,10 @@ export interface BookTailRiskResult {
         headline: string; cost?: string; effect?: string; alt?: string;
         // Position-specific remediation with REAL legs, ranked by risk vs remaining premium.
         targets?: {
-          ticker: string; name: string; structure?: string | null;
+          ticker: string; name: string; trade_id?: number | null; structure?: string | null;
           risk: number; premium_left: number; why: string; tail_before: number;
           recommended: RemediationLeg; alt?: RemediationLeg | null;
+          short?: { strike: number; right: string; qty: number } | null;   // targeted short leg — always closeable
         }[];
       };
     }[];
@@ -1697,7 +1775,7 @@ export interface BookTailRiskResult {
     macro?: { factor: string; label: string; rho: number }[];
     by_name?: { ticker: string; sector: string | null; capital: number; net_directional: number }[];
   } | null;
-  crash_scenarios?: { label: string; move_pct: number; pnl: number; pct_of_capital: number | null; overlay_pnl?: number; stock_pnl?: number }[];
+  crash_scenarios?: { label: string; move_pct: number; pnl: number; pct_of_capital: number | null }[];
   assignment_ladder?: { move_pct: number; pnl: number; put_assignment_capital: number; call_cover_cost: number; puts_itm: number; calls_itm: number }[];
   naked_assignment?: { put_capital: number; call_capital: number; total: number; n_naked_puts: number; n_naked_calls: number };
   hedge_menu?: BookHedgeCandidate[];
@@ -1722,17 +1800,72 @@ export interface RepairAlternative {
   max_loss: number | null; max_gain: number; breakevens: number[];
   greeks: { delta: number; gamma: number; theta: number; vega: number }; theta_day: number;
   defined_risk: boolean; upside_risk_free: boolean; pop_pct: number | null;
+  ev?: number | null;                                    // E[P&L] under the lognormal law
+  d_pop?: number | null; d_max_loss?: number | null; d_ev?: number | null;   // vs the Hold baseline
   turns_profitable: boolean;
-  legs?: { action: string; right: string; strike: number; qty: number; dte_days: number | null }[];
+  legs?: { action: string; right: string; strike: number; qty: number; dte_days: number | null; expiry?: string | null }[];
+}
+// One factor in the recoverability build-up — a probability driver (kind 'prob') or a technical
+// read (kind 'ta'). favorable: true = helps a recovery, false = works against it, null = neutral/2-sided.
+export interface DefendFactor { label: string; kind: 'prob' | 'ta'; favorable: boolean | null; detail: string }
+// Lens 1 — how recoverable the trade is from here, WITH the auditable build-up behind the score.
+export interface DefendRecoverability {
+  recovery_score: number | null;          // P(finish at/above breakeven) holding as-is — the anchor
+  breakeven: number | null; needed_move_pct: number | null; dist_to_be_sigma: number | null;
+  expected_move?: number | null;          // ±1σ $ move to expiry (the yardstick for the needed move)
+  tested_delta: number; severity: 'fresh' | 'deep' | 'assigned' | 'healthy';
+  factors?: DefendFactor[];               // prob drivers + TA factors that explain / tilt the score
+  outlook?: { tilt: 'favorable' | 'adverse' | 'balanced'; note: string } | null;   // net TA tilt on the odds
+}
+// Lens 2 — assignment / exercise risk and its dollar consequence.
+export interface DefendAssignment {
+  p_itm: number | null; extrinsic: number; intrinsic: number;
+  early_assignment_risk: boolean; early_reason: string | null;
+  pin_ratio: number | null; effective_basis: number; assignment_capital: number; consequence: string;
+}
+export interface DefendCostOfWaiting { in_trading_days: number; dte_left: number; recovery_pop: number | null; expected_pnl: number | null; }
+// Lens 5 — CONTEXT, computed in the SAME core fetch (folded in, no second click): recoverable time
+// value, where price sits, the sector cohort, the vol state, and any earnings before expiry.
+export interface DefendContext {
+  loss_read?: { time_value_recoverable: number };
+  technical?: { support: number | null; resistance: number | null; note: string };
+  sector?: { themes: string[]; peers: string[]; note: string };
+  earnings?: { before_expiry: boolean; date: string | null; days: number | null; note: string };
+  vol_note?: string;
 }
 export interface RepairMenuResult {
   error?: string; ticker?: string; tested?: boolean; cushion_pct?: number;
   short_right?: 'P' | 'C'; short_strike?: number; spot?: number; dte_days?: number; contracts?: number;
   unrealized_pnl?: number; pricing?: string; structure?: string; alternatives?: RepairAlternative[];
+  recoverability?: DefendRecoverability; assignment?: DefendAssignment;
+  cost_of_waiting?: DefendCostOfWaiting[]; context?: DefendContext;
+  hold?: { pop_pct: number | null; expected_pnl: number | null; max_loss: number | null;
+           greeks?: { delta: number; gamma: number; theta: number; vega: number }; breakevens?: number[] };
 }
-// Institutional repair menu for a tested short-premium trade (roll / spread / hedge / wheel / close).
-export async function fetchTradeRepairMenu(id: number, quoteSource = 'yfinance'): Promise<RepairMenuResult> {
+// The Defend desk for a tested short-premium trade: recoverability (+TA outlook) + assignment + the
+// priced action menu (roll / spread / strangle / hedge / wheel / hold / close) + context — one fetch.
+export async function fetchDefendMenu(id: number, quoteSource = 'yfinance'): Promise<RepairMenuResult> {
   return apiFetch(`/api/saved-strategies/${id}/repair-menu?quote_source=${encodeURIComponent(quoteSource)}`);
+}
+// Back-compat alias.
+export const fetchTradeRepairMenu = fetchDefendMenu;
+
+// Lens 7 — WAR ROOM: a Quant → Risk → PM defense cascade, fed ONLY the computed Defend numbers.
+// LLM synthesizes; never invents data. Each role carries the specific metrics it leaned on.
+export interface DefendCommitteeRole { role: string; stance: string; rationale: string; metrics?: string[] }
+export interface DefendCommittee {
+  error?: string;
+  quant?: DefendCommitteeRole; risk?: DefendCommitteeRole; pm?: DefendCommitteeRole;
+  verdict?: {
+    primary_action: string; why: string; confidence?: string | null;
+    alternates: { action: string; why: string }[]; do_not: string | null;
+  };
+  data_sent?: unknown;
+}
+export async function fetchDefendCommittee(id: number, defend: RepairMenuResult, quoteSource = 'yfinance'): Promise<DefendCommittee> {
+  return apiFetch(`/api/saved-strategies/${id}/defend/committee?quote_source=${encodeURIComponent(quoteSource)}`, {
+    method: 'POST', body: JSON.stringify({ defend }),
+  });
 }
 
 export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance', marginMode?: string): Promise<LivePnlResponse> {
@@ -1808,6 +1941,7 @@ export interface ManagementContribution {
   pts: number;
   favorable: boolean;
   note: string;
+  dimension?: string | null;   // risk dimension for UI grouping (holder-relabel aware)
 }
 // The deep management read — scan factors re-signed + take-profit/time overlay → hold/close.
 export interface ManagementLens {
@@ -1999,7 +2133,7 @@ export interface PreTradeDeskMetrics {
 export async function fetchPreTradeMetrics(payload: {
   ticker: string; expiration?: string | null; spot: number; capital: number; dte: number;
   stockShares?: number; legs: PreTradeLeg[]; scenarios: PreTradeScenario[];
-  maxLoss?: number | null; maxProfit?: number | null; sofrPct?: number;
+  maxLoss?: number | null; maxProfit?: number | null; sofrPct?: number; strategyType?: string;
 }): Promise<PreTradeDeskMetrics> {
   return apiFetch<PreTradeDeskMetrics>(`/api/saved-strategies/pre-trade-metrics`, {
     method: 'POST',
@@ -2008,7 +2142,7 @@ export async function fetchPreTradeMetrics(payload: {
       capital: payload.capital, dte: payload.dte, stock_shares: payload.stockShares ?? 0,
       legs: payload.legs, scenarios: payload.scenarios,
       max_loss: payload.maxLoss ?? null, max_profit: payload.maxProfit ?? null,
-      sofr_pct: payload.sofrPct ?? 5.0,
+      sofr_pct: payload.sofrPct ?? 5.0, strategy_type: payload.strategyType ?? '',
     }),
   });
 }

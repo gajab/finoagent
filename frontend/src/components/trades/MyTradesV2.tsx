@@ -27,11 +27,11 @@ import {
   TrendingUp, TrendingDown, Clock, BarChart3, Activity,
   Brain, Send, Bot, History, PlusCircle, X, Target,
   DollarSign, Percent, Calendar, Shield, Zap, List, ExternalLink, Trash2, Pencil, Check,
-  Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp, Cpu, Wrench,
+  Layers, RotateCcw, Plus, Gauge, LogOut, LineChart, Filter, ArrowDownUp, Cpu,
 } from 'lucide-react';
 import {
-  fetchActiveTrades, fetchClosedLedger, fetchTradeLivePnl, fetchTradeAdvisor,
-  appendTradeTransaction, fetchTradeTransactions, createAgent,
+  fetchActiveTrades, fetchClosedLedger, fetchClosedLedgerMonth, deleteClosedPart, reopenTrade, fetchTradeLivePnl, fetchTradeAdvisor,
+  appendTradeTransaction, fetchTradeTransactions, createAgent, rollPosition,
   deleteTrade, updateSavedStrategy, saveTradePnlSnapshot,
 } from '../../api';
 import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind, ClosedMonthSummary } from '../../api';
@@ -41,7 +41,7 @@ import TransactionHistoryPanel from './TransactionHistoryPanel';
 import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
 import InstitutionalDesk from './InstitutionalDesk';
-import RepairMenu from './RepairMenu';
+import DefendPanel from './DefendPanel';
 import { QuantAnalysisLoader } from './QuantExitCard';
 import CloseTradeModal from './CloseTradeModal';
 import BookTailRisk from './BookTailRisk';
@@ -457,6 +457,7 @@ interface ClosedLedgerRow {
   legsSummary: string;         // compact leg brief, e.g. "−1 P120 · +1 P115"
   isPartial: boolean;          // realized from a partial close of a still-active trade (legs remain open)
   closedAt: string | null;     // when the close happened (exit_date, or latest closed_leg for a partial)
+  part: 'all' | 'options' | 'stock';   // combos split into an options row + a stock row (deletable apart)
 }
 
 const round2 = (x: number) => Math.round(x * 100) / 100;
@@ -579,13 +580,18 @@ function summarizeClosedLegs(legs: ClosedLeg[]): string {
   }).join(' · ');
 }
 
-/** Build the full ledger row for one closed trade. Pure — reads only persisted data. */
-function buildClosedLedger(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): ClosedLedgerRow {
-  const legs: ClosedLeg[] = Array.isArray(trade.parameters?.closed_legs) ? trade.parameters.closed_legs : [];
+/** Build ONE ledger row from a set of closed legs (a whole trade, or just its option/stock part).
+ *  Pure — reads only persisted data. `bprOverride` lets the caller split the trade's BPR across
+ *  the option and stock rows so the two sum back to the whole-trade figure. */
+function buildOneRow(
+  trade: SavedStrategyItem, legs: ClosedLeg[], part: 'all' | 'options' | 'stock',
+  isPartial: boolean, closedAt: string | null, pnl?: LivePnlResponse | null,
+  bprOverride?: number,
+): ClosedLedgerRow {
   const struct = legs.length ? closedStructure(legs) : { key: 'other', label: tradeStructure(trade).label };
 
   // Schedule-D gross legs: a short leg sells to open / buys to close; a long leg the reverse.
-  let cost = 0, proceeds = 0, sawPrices = false;
+  let cost = 0, proceeds = 0, sawPrices = false, legRealized = 0, sawRealized = false;
   for (const l of legs) {
     const qty = Math.abs(Number(l.qty) || 0);
     if (qty <= 0) continue;
@@ -595,43 +601,83 @@ function buildClosedLedger(trade: SavedStrategyItem, pnl?: LivePnlResponse | nul
     sawPrices = true;
     if (isShortAction(l.action)) { proceeds += entry * mult * qty; cost += exit * mult * qty; }
     else { cost += entry * mult * qty; proceeds += exit * mult * qty; }
+    if (l.realized != null) { legRealized += Number(l.realized); sawRealized = true; }
   }
 
-  // Realized: leg-derived (proceeds − cost) keeps the three columns reconciling on screen;
-  // fall back to the stored cumulative realized_pnl / legacy exit_net when legs lack prices.
-  const storedReal = trade.parameters?.realized_pnl != null ? Number(trade.parameters.realized_pnl)
-    : (trade.exit_net != null ? Number(trade.exit_net) : null);
+  // Realized: leg-derived (proceeds − cost) keeps the three columns reconciling on screen; fall
+  // back to the legs' own stored `realized` (per-part), else the trade's cumulative realized_pnl.
+  const storedReal = sawRealized ? round2(legRealized)
+    : (trade.parameters?.realized_pnl != null ? Number(trade.parameters.realized_pnl)
+      : (trade.exit_net != null ? Number(trade.exit_net) : null));
   const costBasis = sawPrices ? round2(cost) : null;
   const proceedsV = sawPrices ? round2(proceeds) : null;
   const realized = sawPrices ? round2(proceeds - cost) : storedReal;
 
-  // A still-active trade that carries closed_legs is a PARTIAL close: the realized chunk shows in
-  // this ledger, while the open remainder stays in the Active tab.
-  const isPartial = trade.trade_status !== 'closed';
-  const closedAt = isPartial
-    ? legs.reduce<string | null>((mx, l) => (l.closed_at && (!mx || l.closed_at > mx) ? l.closed_at : mx), null)
-    : (trade.exit_date ?? null);
-
-  // BPR is authoritative from the BACKEND (Reg-T margin via calc_reg_t_margin — CSP reads
-  // ~20% margin, not full collateral) — but the backend field is the WHOLE trade's margin, which
-  // for a partial close reflects the still-open remainder, not what was closed. So use it only for
-  // a full close; for a partial, base the annualization on the CLOSED chunk's own capital.
-  const backendBpr = !isPartial && typeof trade.bpr === 'number' && trade.bpr > 0 ? trade.bpr : null;
-  const cap = backendBpr != null
-    ? { value: round2(backendBpr), basis: 'Reg-T margin' }
-    : closedCapitalBase(trade, legs, struct.key, pnl, costBasis);
+  // BPR: an explicit split override wins; else the whole-trade backend Reg-T margin (full close
+  // only — for a partial it reflects the still-open remainder, so fall to the closed chunk).
+  let cap: { value: number | null; basis: string };
+  if (bprOverride !== undefined) {
+    cap = { value: round2(bprOverride), basis: part === 'stock' ? 'stock notional' : 'Reg-T margin (net of stock)' };
+  } else {
+    const backendBpr = !isPartial && typeof trade.bpr === 'number' && trade.bpr > 0 ? trade.bpr : null;
+    cap = backendBpr != null
+      ? { value: round2(backendBpr), basis: 'Reg-T margin' }
+      : closedCapitalBase(trade, legs, struct.key, pnl, costBasis);
+  }
   return {
     costBasis, proceeds: proceedsV, realized,
     capitalBase: cap.value, capitalBasis: cap.basis,
     structureLabel: struct.label, legsSummary: summarizeClosedLegs(legs),
-    isPartial, closedAt,
+    isPartial, closedAt, part,
   };
 }
 
-/** Stored cumulative realized P&L for a closed trade (for the header total) — authoritative. */
-function closedRealized(trade: SavedStrategyItem): number | null {
-  if (trade.parameters?.realized_pnl != null) return Number(trade.parameters.realized_pnl);
-  return trade.exit_net != null ? Number(trade.exit_net) : null;
+/** Closed legs that should COUNT in the ledger for this view. A fully-closed trade always counts
+ *  every leg (rolls included — the campaign is over). A still-active (partial) trade hides the
+ *  legs banked by a roll unless the user opted in — mirrors the backend's _closed_cost_proceeds /
+ *  _closed_realized so the on-screen numbers match the server totals. */
+function visibleClosedLegs(trade: SavedStrategyItem, includeRolls: boolean): ClosedLeg[] {
+  const all: ClosedLeg[] = Array.isArray(trade.parameters?.closed_legs) ? trade.parameters.closed_legs : [];
+  const isPartial = trade.trade_status !== 'closed';
+  if (includeRolls || !isPartial) return all;
+  return all.filter((l: any) => !l.roll);
+}
+
+/** One closed trade → its ledger row(s). A combo (option legs AND a stock leg) splits into a
+ *  combined OPTIONS row and a separate STOCK row so each can be deleted independently; everything
+ *  else stays a single row. Row realized/cost/proceeds always sum back to the trade totals. */
+function buildClosedLedgerRows(trade: SavedStrategyItem, pnl?: LivePnlResponse | null, includeRolls = true): ClosedLedgerRow[] {
+  const allLegs: ClosedLeg[] = visibleClosedLegs(trade, includeRolls);
+  const isPartial = trade.trade_status !== 'closed';
+  const closedAt = isPartial
+    ? allLegs.reduce<string | null>((mx, l) => (l.closed_at && (!mx || l.closed_at > mx) ? l.closed_at : mx), null)
+    : (trade.exit_date ?? null);
+
+  const optionLegs = allLegs.filter(l => (l.type || '').toLowerCase() !== 'stock');
+  const stockLegs = allLegs.filter(l => (l.type || '').toLowerCase() === 'stock');
+  if (optionLegs.length === 0 || stockLegs.length === 0) {
+    return [buildOneRow(trade, allLegs, 'all', isPartial, closedAt, pnl)];   // single-part trade
+  }
+  // Combo: split BPR — the stock IS the capital (its notional); the options are covered, so they
+  // take whatever whole-trade Reg-T margin remains above the stock (≈0 for a covered call/collar).
+  const stockNotional = round2(stockLegs.reduce((s, l) => s + Math.abs(Number(l.entry_price) || 0) * Math.abs(Number(l.qty) || 0), 0));
+  const optBpr = typeof trade.bpr === 'number' ? Math.max(0, round2(trade.bpr - stockNotional)) : 0;
+  return [
+    buildOneRow(trade, optionLegs, 'options', isPartial, closedAt, pnl, optBpr),
+    buildOneRow(trade, stockLegs, 'stock', isPartial, closedAt, pnl, stockNotional),
+  ];
+}
+
+/** Stored cumulative realized P&L for a closed trade (for the header total) — authoritative.
+ *  A still-active rolled trade's roll realized is excluded unless opted in (mirrors the backend),
+ *  since that P&L is a cost-basis adjustment to a campaign that's still open. */
+function closedRealized(trade: SavedStrategyItem, includeRolls = true): number | null {
+  const full = trade.parameters?.realized_pnl != null ? Number(trade.parameters.realized_pnl)
+    : (trade.exit_net != null ? Number(trade.exit_net) : null);
+  if (full == null) return null;
+  const isPartial = trade.trade_status !== 'closed';
+  if (isPartial && !includeRolls) return round2(full - Number(trade.roll?.roll_realized_pnl || 0));
+  return full;
 }
 
 function GroupSummary({ trades, pnlMap, isIncome = false, excludeStock = false }: {
@@ -803,9 +849,13 @@ function TradeCard({
   const startRoll = (legIdx: number) => {
     const leg = trade.legs_data?.[legIdx];
     if (!leg) return;
+    // Prefill the buy-back price from the leg's current mark so the realized/target preview is
+    // live the moment the form opens; the user overwrites it with the real fill.
+    const q = (pnl?.current_quotes || []).find((c: any) => c.leg === legIdx);
+    const mid = q && (q as any).mid != null ? Number((q as any).mid) : null;
     setRollState({
       legIdx,
-      closePrice: '',
+      closePrice: mid != null ? String(mid) : '',
       newAction: leg.action === 'buy' ? 'buy' : 'sell',
       newType: (leg.type?.toLowerCase() === 'put' ? 'put' : 'call'),
       newContracts: leg.qty ?? 1,
@@ -820,25 +870,23 @@ function TradeCard({
   const commitRoll = async () => {
     if (!rollState) return;
     const { legIdx, closePrice, newAction, newType, newContracts, newStrike, newExpiration, newPremium } = rollState;
-    if (!newStrike || !newExpiration || !newPremium) {
-      setRollState(s => s && ({ ...s, error: 'Fill in all new leg fields' }));
+    if (!newStrike || !newExpiration || !newPremium || !closePrice) {
+      setRollState(s => s && ({ ...s, error: 'Enter the buy-back price and all new-leg fields' }));
       return;
     }
     setRollState(s => s && ({ ...s, saving: true, error: null }));
     try {
-      const oldLeg = trade.legs_data?.[legIdx];
-      const newLegs = (trade.legs_data || []).map((l: any, i: number) =>
-        i === legIdx
-          ? { action: newAction, type: newType, qty: newContracts, strike: parseFloat(newStrike), expiration: newExpiration, premium: parseFloat(newPremium), label: l.label ?? `Leg ${i + 1}` }
-          : l
-      );
-      await updateSavedStrategy(trade.id, { legs_data: newLegs });
-      const closePriceNum = parseFloat(closePrice) || 0;
-      if (closePriceNum > 0 && oldLeg) {
-        const qty = oldLeg.qty ?? 1;
-        const closeNote = `Rolled ${oldLeg.action} ${oldLeg.type} $${oldLeg.strike} @ $${closePriceNum}/share (${qty} contracts) → ${newAction} ${newType} $${newStrike} exp ${newExpiration}`;
-        await appendTradeTransaction(trade.id, { action: 'adjust', quantity: 0, price: closePriceNum, note: closeNote, source: 'manual', executed_at: new Date().toISOString() });
-      }
+      // Real roll: close the tested leg + open the replacement in ONE call. The backend banks the
+      // buy-back realized as a cost-basis adjustment (tagged as a roll), keeps the trade active,
+      // and carries the running P&L into the new cost basis — no more silent leg-swap that lost
+      // the old premium and banked nothing.
+      await rollPosition(trade.id, {
+        close_legs: [{ leg_index: legIdx, exit_price: parseFloat(closePrice) }],
+        open_legs: [{
+          action: newAction, type: newType, strike: parseFloat(newStrike),
+          expiration: newExpiration, qty: Number(newContracts) || 1, premium: parseFloat(newPremium),
+        }],
+      });
       setRollState(null);
       onPositionChanged(trade.id);
     } catch (e: any) {
@@ -982,6 +1030,21 @@ function TradeCard({
   const hasPartialRealized = !isClosed && realizedPnl != null && Math.abs(realizedPnl) > 0.005;
   const closedLegs: any[] = Array.isArray(trade.parameters?.closed_legs) ? trade.parameters.closed_legs : [];
 
+  // Roll campaign: a rolled trade is ONE continuing position. The realized banked on the
+  // buy-backs is a cost-basis adjustment (roll.roll_realized_pnl), NOT a closed gain — so we
+  // separate it from any genuine partial close and headline the campaign P&L (live unrealized +
+  // roll realized), which is the only number that says whether the whole trade is ahead.
+  const roll = (trade.roll && (trade.roll.count || 0) > 0) ? trade.roll : null;
+  const rollRealized = roll ? Number(roll.roll_realized_pnl || 0) : 0;
+  const isRolled = !!roll;
+  const genuinePartial = !isClosed && realizedPnl != null ? realizedPnl - rollRealized : 0;
+  const hasGenuinePartial = !isClosed && Math.abs(genuinePartial) > 0.005;
+  const campaignPnl = (isRolled && !isClosed && pnl?.unrealized_pnl != null)
+    ? pnl.unrealized_pnl + rollRealized : null;
+  // Only the generic "partial close" banner is superseded by the roll card; genuine partials
+  // (a real take-some-off close) still show through hasGenuinePartial.
+  const showRollCard = isRolled && !isClosed;
+
   // Static class strings so Tailwind's JIT actually generates them (no safelist).
   const TINT_CLASSES: Record<string, string> = {
     success: 'border-l-success/50 bg-success/[0.03] hover:bg-success/[0.06]',
@@ -1006,6 +1069,11 @@ function TradeCard({
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-bold text-sm">{trade.ticker}</span>
             <span className="badge badge-xs badge-ghost opacity-70">{struct.label}</span>
+            {isRolled && roll && (
+              <span className="badge badge-xs badge-warning gap-0.5" title={`Rolled ${roll.count}× — one continuing campaign. Roll realized ${rollRealized >= 0 ? '+' : '−'}$${Math.abs(rollRealized).toFixed(0)} folded into the cost basis.`}>
+                <RotateCcw className="w-2.5 h-2.5" /> ×{roll.count}
+              </span>
+            )}
             {expiry && (
               <span className="text-[10px] text-base-content/50">
                 exp {fmtDate(expiry)}{dte != null ? ` (${fmtDTE(dte)})` : ''}
@@ -1084,8 +1152,72 @@ function TradeCard({
       {isExpanded && (
         <div className="border-t border-white/[0.04] px-4 py-4 space-y-4">
 
-          {/* Realized P&L — closed trades and partial closes bank realized here */}
-          {(isClosed || hasPartialRealized) && realizedPnl != null && (
+          {/* Roll campaign — a rolled trade is ONE continuing position; headline the campaign
+              P&L and the roll-adjusted cost basis, and keep roll realized distinct from a close. */}
+          {showRollCard && roll && (
+            <div className="rounded-xl border border-warning/25 bg-warning/[0.05] px-3 py-2.5 space-y-2">
+              <div className="flex items-center gap-2">
+                <RotateCcw className="w-4 h-4 text-warning shrink-0" />
+                <span className="text-[9px] uppercase tracking-wider text-warning/70 font-semibold">
+                  Rolled {roll.count}× · one continuing campaign
+                </span>
+                {campaignPnl != null && (
+                  <span className="ml-auto text-right leading-tight">
+                    <span className="text-[9px] uppercase tracking-wider text-base-content/40 block">Campaign P&amp;L</span>
+                    <span className={`text-lg font-bold ${campaignPnl >= 0 ? 'text-success' : 'text-error'}`}>
+                      {campaignPnl >= 0 ? '+' : '−'}{fmtMoney(Math.abs(campaignPnl))}
+                    </span>
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 text-[10px]">
+                <div>
+                  <span className="text-base-content/40 block">Roll realized (cost basis)</span>
+                  <span className={rollRealized >= 0 ? 'text-success font-semibold' : 'text-error font-semibold'}>
+                    {rollRealized >= 0 ? '+' : '−'}{fmtMoney(Math.abs(rollRealized))}
+                  </span>
+                </div>
+                {pnl?.unrealized_pnl != null && (
+                  <div>
+                    <span className="text-base-content/40 block">Open legs (unrealized)</span>
+                    <span className={pnl.unrealized_pnl >= 0 ? 'text-success font-semibold' : 'text-error font-semibold'}>
+                      {pnl.unrealized_pnl >= 0 ? '+' : '−'}{fmtMoney(Math.abs(pnl.unrealized_pnl))}
+                    </span>
+                  </div>
+                )}
+                {roll.effective_net_credit != null && (
+                  <div>
+                    <span className="text-base-content/40 block">Effective net credit</span>
+                    <span className="font-semibold">{roll.effective_net_credit < 0 ? '−' : ''}{fmtMoney(Math.abs(roll.effective_net_credit))}</span>
+                  </div>
+                )}
+                {roll.effective_breakevens && roll.effective_breakevens.length > 0 && (
+                  <div>
+                    <span className="text-base-content/40 block">Effective breakeven{roll.effective_breakevens.length > 1 ? 's' : ''}</span>
+                    <span className="font-semibold">{roll.effective_breakevens.map(b => `$${b.toFixed(2)}`).join(' / ')}</span>
+                    {roll.raw_breakevens && roll.raw_breakevens.length > 0 && (
+                      <span className="text-base-content/30"> · was {roll.raw_breakevens.map(b => `$${b.toFixed(2)}`).join(' / ')}</span>
+                    )}
+                  </div>
+                )}
+              </div>
+              {hasGenuinePartial && (
+                <div className="text-[10px] text-base-content/50">
+                  Plus a genuine partial close:{' '}
+                  <span className={genuinePartial >= 0 ? 'text-success' : 'text-error'}>
+                    {genuinePartial >= 0 ? '+' : '−'}{fmtMoney(Math.abs(genuinePartial))}
+                  </span>{' '}banked.
+                </div>
+              )}
+              <div className="text-[9px] text-base-content/35">
+                Roll P&amp;L is a cost-basis adjustment — it stays out of the Closed tab until the whole trade
+                is closed (toggle it on there to preview).
+              </div>
+            </div>
+          )}
+
+          {/* Realized P&L — closed trades and (non-rolled) partial closes bank realized here */}
+          {(isClosed || (hasPartialRealized && !isRolled)) && realizedPnl != null && (
             <div className={`rounded-xl border px-3 py-2.5 flex items-center gap-3 ${realizedPnl >= 0 ? 'border-success/25 bg-success/[0.05]' : 'border-error/25 bg-error/[0.05]'}`}>
               <LogOut className={`w-4 h-4 shrink-0 ${realizedPnl >= 0 ? 'text-success' : 'text-error'}`} />
               <div className="min-w-0">
@@ -1926,6 +2058,71 @@ function TradeCard({
                                       />
                                     </div>
                                   </div>
+                                  {(() => {
+                                    // Live decision aids: realized on the buy-back, the roll's net cash, and — the
+                                    // number the user asked for — the credit to collect on the new leg to keep the
+                                    // WHOLE campaign (all prior rolls included) at least break-even.
+                                    const rl = trade.legs_data?.[rollState.legIdx] || {};
+                                    const oldQty = Number(rl.qty ?? rl.contracts ?? 1) || 1;
+                                    const isShortOld = /sell|short/i.test(rl.action || '');
+                                    const epIdx = isComboLike ? rollState.legIdx + 1 : rollState.legIdx;
+                                    const oldEntry = Number(trade.entry_prices?.[epIdx]?.price ?? rl.premium ?? rl.mid ?? rl.price ?? 0) || 0;
+                                    const buyback = parseFloat(rollState.closePrice);
+                                    const newPrem = parseFloat(rollState.newPremium);
+                                    const newQty = Number(rollState.newContracts) || 1;
+                                    const priorRoll = Number(trade.roll?.roll_realized_pnl ?? 0);
+                                    const priorCount = Number(trade.roll?.count ?? 0);
+                                    const hasBB = isFinite(buyback), hasNP = isFinite(newPrem);
+                                    if (!hasBB && !hasNP) return null;
+                                    const realizedClose = hasBB ? (isShortOld ? oldEntry - buyback : buyback - oldEntry) * 100 * oldQty : null;
+                                    const buybackCost = hasBB ? buyback * 100 * oldQty : null;
+                                    const oldEntryCredit = (isShortOld ? oldEntry : -oldEntry) * 100 * oldQty;
+                                    const netBasisBefore = oldEntryCredit + priorRoll;
+                                    const targetCredit = buybackCost != null ? buybackCost - netBasisBefore : null;
+                                    const targetPerShare = targetCredit != null && newQty > 0 ? targetCredit / (100 * newQty) : null;
+                                    const newCredit = hasNP ? (rollState.newAction === 'sell' ? 1 : -1) * newPrem * 100 * newQty : null;
+                                    const campaignAfter = realizedClose != null ? priorRoll + realizedClose : null;
+                                    const netRollCash = buybackCost != null && newCredit != null ? (isShortOld ? -buybackCost : buybackCost) + newCredit : null;
+                                    const meets = newCredit != null && targetCredit != null ? newCredit >= targetCredit - 0.005 : null;
+                                    const sign = (v: number) => `${v >= 0 ? '+' : '−'}${fmtMoney(Math.abs(v))}`;
+                                    return (
+                                      <div className="rounded-md bg-base-100/60 border border-warning/10 p-2 space-y-1 text-[10px]">
+                                        <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                                          {realizedClose != null && (
+                                            <div className="flex justify-between"><span className="text-base-content/40">Realized on buy-back</span>
+                                              <span className={realizedClose >= 0 ? 'text-success font-semibold' : 'text-error font-semibold'}>{sign(realizedClose)}</span></div>
+                                          )}
+                                          {netRollCash != null && (
+                                            <div className="flex justify-between"><span className="text-base-content/40">Net roll {netRollCash >= 0 ? 'credit' : 'debit'}</span>
+                                              <span className={netRollCash >= 0 ? 'text-success font-semibold' : 'text-error font-semibold'}>{sign(netRollCash)}</span></div>
+                                          )}
+                                          {campaignAfter != null && (
+                                            <div className="flex justify-between"><span className="text-base-content/40">Campaign realized after{priorCount > 0 ? ` (${priorCount} prior)` : ''}</span>
+                                              <span className={campaignAfter >= 0 ? 'text-success font-semibold' : 'text-error font-semibold'}>{sign(campaignAfter)}</span></div>
+                                          )}
+                                          {newCredit != null && (
+                                            <div className="flex justify-between"><span className="text-base-content/40">New leg {newCredit >= 0 ? 'credit' : 'debit'}</span>
+                                              <span className="font-semibold">{sign(newCredit)}</span></div>
+                                          )}
+                                        </div>
+                                        {targetCredit != null && (
+                                          <div className={`flex items-center gap-1.5 rounded px-1.5 py-1 ${meets == null ? 'bg-base-200/40' : meets ? 'bg-success/10' : 'bg-error/10'}`}>
+                                            <Target className={`w-3 h-3 shrink-0 ${meets == null ? 'text-warning' : meets ? 'text-success' : 'text-error'}`} />
+                                            <span className="text-base-content/70">
+                                              {targetCredit <= 0
+                                                ? <>Break-even cushion already covers the buy-back — any credit keeps the campaign green.</>
+                                                : <>To keep the campaign break-even, collect <b>≥ {fmtMoney(targetCredit)}</b>{targetPerShare != null ? ` (${targetPerShare >= 0 ? '' : '−'}$${Math.abs(targetPerShare).toFixed(2)}/sh × ${newQty})` : ''} on the new leg.</>}
+                                            </span>
+                                            {meets != null && newCredit != null && targetCredit > 0 && (
+                                              <span className={`ml-auto shrink-0 font-semibold ${meets ? 'text-success' : 'text-error'}`}>
+                                                {meets ? 'on track' : `short ${fmtMoney(targetCredit - newCredit)}`}
+                                              </span>
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })()}
                                   {rollState.error && <p className="text-xs text-error">{rollState.error}</p>}
                                   <div className="flex gap-2">
                                     <button
@@ -2119,13 +2316,22 @@ function TradeCard({
             );
           })()}
 
-          {/* Repair / adjust — institutional alternatives for a tested short-premium trade */}
-          {(trade.legs_data || []).some((l: any) => /sell|short/i.test(l.action || '') && /call|put/i.test(l.type || '')) && (
-            <CollapsibleSection title="Repair / adjust · manage a tested trade" accent="warning"
-              icon={<Wrench className="w-3 h-3" />} subtitle="roll · cap into spread · hedge · wheel · close — payoffs & risk">
-              <RepairMenu tradeId={trade.id} quoteSource={quoteSource} />
-            </CollapsibleSection>
-          )}
+          {/* Defend — the trouble-trade desk: recoverability (+ TA outlook) · assignment · synthetic
+              reframe · priced repair/adjust menu (rolled in) · cost-of-waiting · context · war-room.
+              Flagged NEEDS DEFENSE when underwater; opening it runs the whole analysis in one click
+              (kept collapsed by default so the heavy TA+chain compute fires only on demand, not for
+              every trade on landing). */}
+          {(trade.legs_data || []).some((l: any) => /sell|short/i.test(l.action || '') && /call|put/i.test(l.type || '')) && (() => {
+            const inTrouble = pnl?.unrealized_pnl != null && pnl.unrealized_pnl < 0;
+            return (
+              <CollapsibleSection title="Defend this trade" accent="warning"
+                icon={<Shield className="w-3 h-3" />}
+                subtitle="recoverability · assignment · priced repairs · context · war-room — one click"
+                badge={inTrouble ? <span className="badge badge-xs badge-error font-semibold">NEEDS DEFENSE</span> : undefined}>
+                <DefendPanel tradeId={trade.id} quoteSource={quoteSource} ticker={trade.ticker} />
+              </CollapsibleSection>
+            );
+          })()}
 
           {/* Payoff diagram — P&L vs underlying (all trade types), collapsed by default */}
           {pnl && pnl.scenarios && pnl.scenarios.length > 1 && (
@@ -2450,40 +2656,95 @@ interface DisplayMonth {
   count: number; cost: number; proceeds: number; realized: number; bpr: number; wins: number; scored: number;
 }
 
-function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, onDeleteTrade }: {
+function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, includeRolls = false, onDeleteTrade }: {
   trades: SavedStrategyItem[];
   pnlMap: Record<number, LivePnlResponse>;
   frozenMonths?: ClosedMonthSummary[];   // prior immutable months, stored server-side — summary only
   currentMonth?: string | null;          // 'YYYY-MM' of the one expandable (live) month
+  includeRolls?: boolean;                 // fold still-active rolled trades' roll realized into the rows
   onDeleteTrade: (id: number) => void;
 }) {
   const [sortKey, setSortKey] = useState<ClosedSortKey>('closed');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
-  const [deletingId, setDeletingId] = useState<number | null>(null);
-  const [collapsedMonths, setCollapsedMonths] = useState<Set<string>>(new Set());
-  const toggleMonth = (k: string) => setCollapsedMonths(prev => {
-    const n = new Set(prev); n.has(k) ? n.delete(k) : n.add(k); return n;
-  });
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);   // `${tradeId}-${part}`
+  const [reopeningId, setReopeningId] = useState<number | null>(null);
+  // Only the CURRENT (live) month is open by default; every prior month — computed or frozen —
+  // starts collapsed (summary only) and expands on click. A frozen month lazy-loads its rows.
+  const [expandedMonths, setExpandedMonths] = useState<Set<string>>(() => new Set(currentMonth ? [currentMonth] : []));
+  const [lazyRows, setLazyRows] = useState<Record<string, SavedStrategyItem[]>>({});
+  const [loadingMonths, setLoadingMonths] = useState<Set<string>>(new Set());
+  const [monthErr, setMonthErr] = useState<Record<string, string>>({});
 
-  // Backend delete THEN local cleanup (onDeleteTrade only prunes local state — mirrors TradeCard).
-  const handleDelete = async (t: SavedStrategyItem, label: string) => {
-    if (!window.confirm(`Delete ${t.ticker} ${label} from your closed journal? This cannot be undone.`)) return;
-    setDeletingId(t.id);
-    try { await deleteTrade(t.id); onDeleteTrade(t.id); }
-    catch { setDeletingId(null); }
+  const loadMonth = useCallback((month: string) => {
+    setLoadingMonths(s => new Set(s).add(month));
+    setMonthErr(e => { const n = { ...e }; delete n[month]; return n; });
+    fetchClosedLedgerMonth(month)
+      .then(ts => setLazyRows(m => ({ ...m, [month]: ts })))
+      .catch(err => setMonthErr(e => ({ ...e, [month]: err?.message || 'Failed to load month' })))
+      .finally(() => setLoadingMonths(s => { const n = new Set(s); n.delete(month); return n; }));
+  }, []);
+
+  const toggleMonth = (key: string, frozen: boolean) => {
+    const willExpand = !expandedMonths.has(key);
+    setExpandedMonths(prev => {
+      const n = new Set(prev);
+      n.has(key) ? n.delete(key) : n.add(key);
+      return n;
+    });
+    // Lazy-load a stored month's rows the first time it's opened (side effect kept out of the updater).
+    if (willExpand && frozen && !lazyRows[key] && !loadingMonths.has(key)) loadMonth(key);
   };
 
-  const rows: ClosedRow[] = useMemo(() => trades.map(t => {
-    const led = buildClosedLedger(t, pnlMap[t.id]);
+  const toClosedRows = useCallback((t: SavedStrategyItem): ClosedRow[] => {
     const opened = t.entry_date ? new Date(t.entry_date).getTime() : null;
-    // Close date = exit_date for a full close, or the partial-close date (led.closedAt).
-    const closed = led.closedAt ? new Date(led.closedAt).getTime() : null;
-    const held = opened != null && closed != null
-      ? Math.max(1, Math.round((closed - opened) / 86400000))
-      : (opened != null ? Math.max(1, daysHeld(t.entry_date)) : null);
-    const ann = led.realized != null && led.capitalBase && held != null ? annualizedSimple(led.realized, led.capitalBase, held) : null;
-    return { trade: t, ...led, opened, closed, held, ann };
-  }), [trades, pnlMap]);
+    return buildClosedLedgerRows(t, pnlMap[t.id], includeRolls).map(led => {
+      // Close date = exit_date for a full close, or the partial-close date (led.closedAt).
+      const closed = led.closedAt ? new Date(led.closedAt).getTime() : null;
+      const held = opened != null && closed != null
+        ? Math.max(1, Math.round((closed - opened) / 86400000))
+        : (opened != null ? Math.max(1, daysHeld(t.entry_date)) : null);
+      const ann = led.realized != null && led.capitalBase && held != null ? annualizedSimple(led.realized, led.capitalBase, held) : null;
+      return { trade: t, ...led, opened, closed, held, ann };
+    });
+  }, [pnlMap, includeRolls]);
+
+  // Backend delete THEN reload. A single-part row deletes the whole trade; a combo's option/stock
+  // row deletes only that part (backend recomputes realized, drops the trade if nothing remains).
+  const handleDelete = async (row: ClosedRow) => {
+    const t = row.trade;
+    const label = row.part === 'options' ? 'option legs' : row.part === 'stock' ? 'stock leg' : row.structureLabel;
+    if (!window.confirm(`Delete ${t.ticker} ${label} from your closed journal? This cannot be undone.`)) return;
+    const key = `${t.id}-${row.part}`;
+    setDeletingKey(key);
+    try {
+      if (row.part === 'all') await deleteTrade(t.id);
+      else await deleteClosedPart(t.id, row.part);
+      setDeletingKey(null);
+      const month = t.close_month || (row.closedAt ? row.closedAt.slice(0, 7) : null);
+      onDeleteTrade(t.id);                                   // parent prunes local state + reloads
+      if (month && lazyRows[month]) loadMonth(month);        // refresh a lazily-expanded frozen month
+    } catch { setDeletingKey(null); }
+  };
+
+  // Undo a mistaken close — restore the whole trade to Active (works from either row of a combo).
+  const handleReopen = async (t: SavedStrategyItem) => {
+    if (!window.confirm(`Re-open ${t.ticker} back to Active with all its legs? This undoes the close and clears its realized P&L.`)) return;
+    setReopeningId(t.id);
+    try {
+      await reopenTrade(t.id);
+      const month = t.close_month || null;
+      onDeleteTrade(t.id);                              // parent prunes from Closed + reloads (it's Active now)
+      if (month && lazyRows[month]) loadMonth(month);   // refresh a lazily-expanded frozen month
+    } catch { setReopeningId(null); }
+  };
+
+  const rows: ClosedRow[] = useMemo(() => trades.flatMap(toClosedRows), [trades, toClosedRows]);
+  // Rows for any lazily-expanded frozen months, keyed by month.
+  const lazyMonthRows = useMemo(() => {
+    const out: Record<string, ClosedRow[]> = {};
+    for (const [month, ts] of Object.entries(lazyRows)) out[month] = ts.flatMap(toClosedRows);
+    return out;
+  }, [lazyRows, toClosedRows]);
 
   // Active-column comparator (applied WITHIN each month group).
   const cmp = useMemo(() => {
@@ -2524,24 +2785,41 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
       key === 'undated' ? 'Undated'
         : sample != null ? new Date(sample).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
           : new Date(`${key}-01T00:00:00`).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    // Band subtotals count TRADES (not split rows), so a combo's two rows read as one closed
+    // trade; the $ sums are over rows (each part's realized/cost/proceeds sums back to the trade).
+    const bandMetrics = (rs: ClosedRow[]) => {
+      const byTrade = new Map<number, { sum: number; scored: boolean }>();
+      for (const r of rs) {
+        const c = byTrade.get(r.trade.id) || { sum: 0, scored: false };
+        if (r.realized != null) { c.sum += r.realized; c.scored = true; }
+        byTrade.set(r.trade.id, c);
+      }
+      const tr = [...byTrade.values()];
+      return {
+        count: byTrade.size,
+        scored: tr.filter(t => t.scored).length,
+        wins: tr.filter(t => t.scored && t.sum > 0).length,
+        cost: rs.reduce((s, r) => s + (r.costBasis ?? 0), 0),
+        proceeds: rs.reduce((s, r) => s + (r.proceeds ?? 0), 0),
+        realized: rs.reduce((s, r) => s + (r.realized ?? 0), 0),
+        bpr: rs.reduce((s, r) => s + (r.capitalBase ?? 0), 0),
+      };
+    };
     const computed: DisplayMonth[] = Array.from(m.entries()).map(([key, rs]) => ({
       key, frozen: false, label: labelOf(key, rs[0].closed),
-      rows: [...rs].sort(cmp),
-      count: rs.length,
-      cost: rs.reduce((s, r) => s + (r.costBasis ?? 0), 0),
-      proceeds: rs.reduce((s, r) => s + (r.proceeds ?? 0), 0),
-      realized: rs.reduce((s, r) => s + (r.realized ?? 0), 0),
-      bpr: rs.reduce((s, r) => s + (r.capitalBase ?? 0), 0),
-      wins: rs.filter(r => (r.realized ?? 0) > 0).length,
-      scored: rs.filter(r => r.realized != null).length,
+      rows: [...rs].sort(cmp), ...bandMetrics(rs),
     }));
     const frozen: DisplayMonth[] = frozenMonths
       .filter(f => !m.has(f.month))   // disjoint by construction; guard against a rare overlap
-      .map(f => ({
-        key: f.month, frozen: true, label: f.label, rows: null,
-        count: f.count, cost: f.cost, proceeds: f.proceeds, realized: f.realized,
-        bpr: f.bpr, wins: f.wins, scored: f.scored,
-      }));
+      .map(f => {
+        const lazy = lazyMonthRows[f.month];   // rows fetched when this stored month was expanded
+        return {
+          key: f.month, frozen: true, label: f.label,
+          rows: lazy ? [...lazy].sort(cmp) : null,   // band subtotals stay from the stored summary
+          count: f.count, cost: f.cost, proceeds: f.proceeds, realized: f.realized,
+          bpr: f.bpr, wins: f.wins, scored: f.scored,
+        };
+      });
     const groups = [...computed, ...frozen];
     const chronoAsc = sortKey === 'closed' && sortDir === 'asc';
     groups.sort((a, b) => {
@@ -2550,7 +2828,7 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
       return chronoAsc ? a.key.localeCompare(b.key) : b.key.localeCompare(a.key);
     });
     return groups;
-  }, [rows, cmp, sortKey, sortDir, frozenMonths]);
+  }, [rows, cmp, sortKey, sortDir, frozenMonths, lazyMonthRows]);
 
   const toggleSort = (k: ClosedSortKey) => {
     if (k === sortKey) setSortDir(d => (d === 'asc' ? 'desc' : 'asc'));
@@ -2558,14 +2836,22 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
   };
 
   // Grand totals — current-month rows PLUS every stored prior-month summary (the whole book).
+  // $ sums are over rows; count/wins/scored are per TRADE (a combo's split rows = one trade).
   const fr = frozenMonths;
   const tCost = rows.reduce((s, r) => s + (r.costBasis ?? 0), 0) + fr.reduce((s, f) => s + f.cost, 0);
   const tProceeds = rows.reduce((s, r) => s + (r.proceeds ?? 0), 0) + fr.reduce((s, f) => s + f.proceeds, 0);
   const tRealized = rows.reduce((s, r) => s + (r.realized ?? 0), 0) + fr.reduce((s, f) => s + f.realized, 0);
   const tBpr = rows.reduce((s, r) => s + (r.capitalBase ?? 0), 0) + fr.reduce((s, f) => s + f.bpr, 0);
-  const wins = rows.filter(r => (r.realized ?? 0) > 0).length + fr.reduce((s, f) => s + f.wins, 0);
-  const scored = rows.filter(r => r.realized != null).length + fr.reduce((s, f) => s + f.scored, 0);
-  const totalClosed = rows.length + fr.reduce((s, f) => s + f.count, 0);
+  const curByTrade = new Map<number, { sum: number; scored: boolean }>();
+  for (const r of rows) {
+    const c = curByTrade.get(r.trade.id) || { sum: 0, scored: false };
+    if (r.realized != null) { c.sum += r.realized; c.scored = true; }
+    curByTrade.set(r.trade.id, c);
+  }
+  const curTr = [...curByTrade.values()];
+  const wins = curTr.filter(t => t.scored && t.sum > 0).length + fr.reduce((s, f) => s + f.wins, 0);
+  const scored = curTr.filter(t => t.scored).length + fr.reduce((s, f) => s + f.scored, 0);
+  const totalClosed = curByTrade.size + fr.reduce((s, f) => s + f.count, 0);
 
   const SortTh = ({ k, label, align = 'right', hint }: { k: ClosedSortKey; label: string; align?: 'left' | 'right'; hint?: string }) => (
     <th className={align === 'left' ? 'text-left' : 'text-right'}>
@@ -2587,13 +2873,18 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
   const renderRow = (r: ClosedRow) => {
     const rz = r.realized;
     const rzCls = rz == null ? '' : rz >= 0 ? 'text-success' : 'text-error';
+    const delKey = `${r.trade.id}-${r.part}`;
     return (
-      <tr key={r.trade.id} className="hover:bg-base-200/30 border-base-300/30 group">
+      <tr key={delKey} className="hover:bg-base-200/30 border-base-300/30 group">
         {/* Brief: ticker · structure, with the leg summary underneath */}
         <td className="text-left align-top">
           <div className="flex items-center gap-1.5">
             <span className="font-semibold text-sm">{r.trade.ticker}</span>
             <span className="text-[11px] text-base-content/50">{r.structureLabel}</span>
+            {r.part !== 'all' && (
+              <span className="badge badge-xs badge-ghost text-[8px] uppercase tracking-wider text-base-content/45"
+                title="Part of a combo trade — this row can be deleted on its own.">{r.part}</span>
+            )}
             {r.isPartial && (
               <span className="badge badge-xs badge-warning badge-outline text-[9px] font-semibold"
                 title="Realized from a PARTIAL close — the rest of this trade is still open in the Active tab.">
@@ -2601,7 +2892,7 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
               </span>
             )}
           </div>
-          {r.legsSummary && <div className="text-[10px] text-base-content/35 tabular-nums mt-0.5">{r.legsSummary}{r.isPartial && <span className="text-warning/60"> · closed leg{(r.trade.parameters?.closed_legs?.length ?? 0) !== 1 ? 's' : ''}</span>}</div>}
+          {r.legsSummary && <div className="text-[10px] text-base-content/35 tabular-nums mt-0.5">{r.legsSummary}</div>}
         </td>
         <td className="text-right whitespace-nowrap text-base-content/70">{r.trade.entry_date ? fmtDate(r.trade.entry_date) : '—'}</td>
         <td className="text-right whitespace-nowrap text-base-content/70">{r.closedAt ? fmtDate(r.closedAt) : '—'}</td>
@@ -2613,14 +2904,23 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
         <td className={`text-right whitespace-nowrap tabular-nums font-medium ${r.ann == null ? '' : r.ann >= 0 ? 'text-success' : 'text-error'}`}>
           {r.ann == null ? <span className="text-base-content/25">—</span> : fmtAnnualized(r.ann)}
         </td>
-        <td className="text-right">
+        <td className="text-right whitespace-nowrap">
+          <button
+            className="btn btn-ghost btn-xs px-1 text-base-content/20 hover:text-success opacity-0 group-hover:opacity-100 transition-opacity"
+            title="Re-open this trade — restore it to Active with all its legs (undo the close)"
+            disabled={reopeningId === r.trade.id}
+            onClick={() => handleReopen(r.trade)}
+          >
+            {reopeningId === r.trade.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+          </button>
           <button
             className="btn btn-ghost btn-xs px-1 text-base-content/20 hover:text-error opacity-0 group-hover:opacity-100 transition-opacity"
-            title="Delete this closed trade from the journal"
-            disabled={deletingId === r.trade.id}
-            onClick={() => handleDelete(r.trade, r.structureLabel)}
+            title={r.part === 'all' ? 'Delete this closed trade from the journal'
+              : `Delete just the ${r.part === 'options' ? 'option legs' : 'stock leg'} of this trade`}
+            disabled={deletingKey === delKey}
+            onClick={() => handleDelete(r)}
           >
-            {deletingId === r.trade.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+            {deletingKey === delKey ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
           </button>
         </td>
       </tr>
@@ -2644,28 +2944,30 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
             <th></th>
           </tr>
         </thead>
-        {/* One tbody per close-month: a summary band (subtotals) + that month's trades. */}
+        {/* One tbody per close-month: a summary band (subtotals) + that month's trades. Only the
+            current month is open by default; prior months (computed or stored) expand on click —
+            a stored month lazily fetches its rows. */}
         {months.map(g => {
-          // A frozen prior month is a stored summary (no rows shipped) — never expandable.
-          const collapsed = g.frozen || collapsedMonths.has(g.key);
+          const expanded = expandedMonths.has(g.key);
+          const collapsed = !expanded;
           const isCurrent = !g.frozen && g.key === currentMonth;
+          const loadingRows = g.frozen && loadingMonths.has(g.key);
+          const rowErr = g.frozen ? monthErr[g.key] : undefined;
           const roc = g.bpr > 0 ? (g.realized / g.bpr) * 100 : null;   // month return on capital (not annualized)
           return (
             <tbody key={g.key}>
               <tr
-                className={`bg-base-200/50 border-t-2 border-base-300/50 text-xs font-medium ${g.frozen ? '' : 'hover:bg-base-200/70 cursor-pointer'}`}
-                onClick={g.frozen ? undefined : () => toggleMonth(g.key)}
-                title={g.frozen ? 'Prior month — stored summary, not re-priced' : (collapsed ? 'Expand this month' : 'Collapse this month')}
+                className="bg-base-200/50 border-t-2 border-base-300/50 text-xs font-medium hover:bg-base-200/70 cursor-pointer"
+                onClick={() => toggleMonth(g.key, g.frozen)}
+                title={collapsed ? 'Expand this month' : 'Collapse this month'}
               >
                 <td colSpan={4} className="text-left">
                   <div className="flex items-center gap-1.5">
-                    {g.frozen
-                      ? <History className="w-3 h-3 text-base-content/30 shrink-0" />
-                      : (collapsed ? <ChevronDown className="w-3.5 h-3.5 text-base-content/40" /> : <ChevronUp className="w-3.5 h-3.5 text-base-content/40" />)}
+                    {collapsed ? <ChevronDown className="w-3.5 h-3.5 text-base-content/40" /> : <ChevronUp className="w-3.5 h-3.5 text-base-content/40" />}
                     <span className="font-semibold text-sm text-base-content/90">{g.label}</span>
                     {isCurrent && <span className="badge badge-xs badge-success badge-outline text-[8px] uppercase tracking-wider">this month</span>}
-                    {g.frozen && <span className="text-[9px] uppercase tracking-wider text-base-content/30"
-                      title="Immutable — summarized once and stored in the DB, not re-fetched on every visit">stored</span>}
+                    {g.frozen && <span className="text-[9px] uppercase tracking-wider text-base-content/30 flex items-center gap-0.5"
+                      title="Immutable — summarized once and stored in the DB; its rows load on demand when you expand it"><History className="w-2.5 h-2.5" />stored</span>}
                     <span className="text-[11px] text-base-content/45">
                       · {g.count} closed{g.scored > 0 && ` · ${g.wins}/${g.scored} win (${Math.round((g.wins / g.scored) * 100)}%)`}
                     </span>
@@ -2681,7 +2983,17 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
                 </td>
                 <td></td>
               </tr>
-              {!collapsed && g.rows && g.rows.map(renderRow)}
+              {expanded && g.rows && g.rows.map(renderRow)}
+              {expanded && loadingRows && (
+                <tr><td colSpan={10} className="text-center text-[11px] text-base-content/40 py-3">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin inline mr-1.5" />Loading {g.label}…
+                </td></tr>
+              )}
+              {expanded && rowErr && (
+                <tr><td colSpan={10} className="text-center text-[11px] text-error/70 py-3">
+                  {rowErr} · <button className="underline hover:text-error" onClick={() => loadMonth(g.key)}>retry</button>
+                </td></tr>
+              )}
             </tbody>
           );
         })}
@@ -2832,8 +3144,8 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
               <div className="text-center text-xs text-base-content/40 py-4">No {structCounts.find(s => s.key === structFilter)?.label} trades in this group.</div>
             )}
             {shown.map(trade => (
+              <div key={trade.id} id={`trade-card-${trade.id}`} className="scroll-mt-20">
               <TradeCard
-                key={trade.id}
                 trade={trade}
                 group={classifyTrade(trade)}
                 pnl={pnlMap[trade.id]}
@@ -2853,6 +3165,7 @@ function GroupSection({ purpose, trades, pnlMap, ...props }: {
                 onAdvisorQuestion={(q: string) => props.onAdvisorQuestion(trade.id, q)}
                 showHistory={props.openHistoryIds.has(trade.id)}
               />
+              </div>
             ))}
           </div>
         </div>
@@ -2889,6 +3202,9 @@ export default function MyTradesV2() {
   // current month's trades come down in full. See fetchClosedLedger / the backend closed-ledger.
   const [frozenMonths, setFrozenMonths] = useState<ClosedMonthSummary[]>([]);
   const [closedMonth, setClosedMonth] = useState<string | null>(null);
+  // Closed tab: OFF by default, a rolled trade's partial (roll) realized is hidden — the campaign
+  // is still live. Toggling this folds those roll partials into the Closed ledger to preview them.
+  const [showRollPartials, setShowRollPartials] = useState(false);
 
   // Modals
   const [updateTrade, setUpdateTrade] = useState<SavedStrategyItem | null>(null);
@@ -2905,7 +3221,7 @@ export default function MyTradesV2() {
       // still-open partial-close realized) ships as full rows. Active tab: the open book.
       let data: SavedStrategyItem[];
       if (activeStatus === 'closed') {
-        const led = await fetchClosedLedger();
+        const led = await fetchClosedLedger(showRollPartials);
         data = led.trades;
         setFrozenMonths(led.frozen_months);
         setClosedMonth(led.current_month);
@@ -2932,7 +3248,7 @@ export default function MyTradesV2() {
     } finally {
       setLoading(false);
     }
-  }, [activeStatus]);
+  }, [activeStatus, showRollPartials]);
 
   useEffect(() => { loadTrades(); }, [loadTrades]);
 
@@ -3072,7 +3388,7 @@ export default function MyTradesV2() {
   const hasPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
   // Closed tab: banked realized P&L (authoritative stored total), not live unrealized —
   // the current-month rows PLUS every frozen prior month's stored realized.
-  const totalRealized = trades.reduce((s, t) => s + (closedRealized(t) ?? 0), 0)
+  const totalRealized = trades.reduce((s, t) => s + (closedRealized(t, showRollPartials) ?? 0), 0)
     + frozenMonths.reduce((s, m) => s + (m.realized || 0), 0);
   const closedCount = trades.length + frozenMonths.reduce((s, m) => s + m.count, 0);
 
@@ -3214,14 +3530,28 @@ export default function MyTradesV2() {
 
       {/* Book-level short-vol / tail-risk desk (active book only) */}
       {!loading && activeStatus === 'active' && trades.length > 0 && (
-        <BookTailRisk quoteSource={quoteSource} />
+        <BookTailRisk quoteSource={quoteSource} onManageTrade={(id) => {
+          // Deep-link from a scorecard "Close" CTA to the actual position card: expand + scroll to it.
+          setExpandedIds(prev => { const n = new Set(prev); n.add(id); return n; });
+          requestAnimationFrame(() => document.getElementById(`trade-card-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+        }} />
       )}
 
       {/* Closed — a plain realized-P&L ledger (sortable), not the management cards.
           Current month expands to per-trade rows; prior months show stored summary bands only. */}
       {activeStatus === 'closed' && !loading && (trades.length > 0 || frozenMonths.length > 0) && (
-        <ClosedLedger trades={trades} pnlMap={pnlMap} frozenMonths={frozenMonths}
-          currentMonth={closedMonth} onDeleteTrade={handleDeleteTrade} />
+        <>
+          <div className="flex items-center justify-end mb-2">
+            <label className="flex items-center gap-1.5 text-[11px] cursor-pointer text-base-content/60 hover:text-base-content/90"
+                   title="Rolled trades are still live, so their per-roll realized P&L is hidden here by default. Turn on to preview the roll gains/losses banked so far.">
+              <input type="checkbox" className="checkbox checkbox-xs" checked={showRollPartials}
+                onChange={e => setShowRollPartials(e.target.checked)} />
+              Show rolled trades' partial gains
+            </label>
+          </div>
+          <ClosedLedger trades={trades} pnlMap={pnlMap} frozenMonths={frozenMonths}
+            currentMonth={closedMonth} includeRolls={showRollPartials} onDeleteTrade={handleDeleteTrade} />
+        </>
       )}
 
       {/* Active — grouped management cards */}

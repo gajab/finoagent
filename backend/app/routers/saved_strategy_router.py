@@ -68,6 +68,7 @@ class SavedStrategyOut(BaseModel):
     exit_prices: Optional[list] = None
     exit_net: Optional[float] = None
     bpr: Optional[float] = None          # buying-power reduction (Reg-T margin); annualization base
+    roll: Optional[dict] = None          # roll campaign overlay (cost-basis adj + effective breakevens); None if never rolled
     created_at: str
     updated_at: str
 
@@ -168,6 +169,92 @@ class NotesUpdateIn(BaseModel):
 # Helpers
 # --------------------------------------------------------------------------
 
+def _roll_realized(params: dict) -> float:
+    """Cumulative realized P&L ($) banked from ROLLS specifically (the cost-basis
+    adjustment), as opposed to genuine closes. Authoritative source is the sum of
+    closed_legs tagged ``roll``; falls back to the stored ``roll_realized_pnl`` scalar
+    when the legs aren't tagged (older data). See [[trade-pnl-math]] convention."""
+    legs = params.get("closed_legs") or []
+    tagged = [l for l in legs if l.get("roll")]
+    if tagged:
+        return round(sum(float(l.get("realized") or 0) for l in tagged), 2)
+    try:
+        return round(float(params.get("roll_realized_pnl") or 0.0), 2)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _roll_summary(s: SavedStrategy) -> Optional[dict]:
+    """Roll-campaign overlay for a trade that has been rolled ≥1× — the numbers that
+    let the user treat a rolled position as ONE continuing trade with an adjusted cost
+    basis, rather than a string of disconnected close+open events.
+
+    Pure (no market data): everything derives from persisted legs + the banked roll
+    realized. The effective breakeven reuses the exact payoff engine by folding the
+    roll-realized into the entry cost — so it reconciles byte-for-byte with the live
+    breakeven math. Returns None for a trade that was never rolled (zero overhead on
+    the common path)."""
+    try:
+        params = json.loads(s.parameters) if s.parameters else {}
+    except (ValueError, TypeError):
+        return None
+    roll_realized = _roll_realized(params)
+    rolls = params.get("rolls") or []
+    count = len(rolls)
+    if count == 0 and abs(roll_realized) < 0.005:
+        return None
+
+    try:
+        legs = json.loads(s.legs_data) if s.legs_data else []
+        entry_prices = json.loads(s.entry_prices) if s.entry_prices else []
+    except (ValueError, TypeError):
+        legs, entry_prices = [], []
+
+    opt_legs = [l for l in legs if str(l.get("type", "")).upper() in ("CALL", "PUT")]
+    leg_metas = [{"i": i, "_leg": l, "strike": l.get("strike"), "type": l.get("type"),
+                  "qty": l.get("qty") or l.get("contracts") or 1, "action": l.get("action")}
+                 for i, l in enumerate(opt_legs)]
+    raw_net = option_legs_net_debit(leg_metas, entry_prices) if leg_metas else None
+
+    # Optional linear stock/futures leg for a covered/combo payoff.
+    shares = float(params.get("shares") or 0)
+    stock = None
+    if shares > 0:
+        avg = params.get("avg_cost")
+        if avg in (None, "") and entry_prices:
+            avg = (entry_prices[0] or {}).get("price")
+        try:
+            avg_f = float(avg)
+        except (TypeError, ValueError):
+            avg_f = 0.0
+        if avg_f > 0:
+            signed = -shares if "short" in (s.strategy_type or "").lower() else shares
+            stock = {"shares": signed, "avg_cost": avg_f, "mult": float(params.get("multiplier") or 1.0)}
+
+    payoff_legs = [{
+        "strike": float(m["strike"]),
+        "right": _leg_right(m["type"]),
+        "sign": -1 if _is_short_action(m["action"]) else 1,
+        "qty": float(m["qty"] or 1),
+    } for m in leg_metas if m.get("strike") is not None]
+
+    raw_be = eff_be = None
+    if raw_net is not None and (payoff_legs or stock):
+        from ..services.trade_math import structure_breakevens
+        raw_be = structure_breakevens(payoff_legs, raw_net, stock)
+        eff_be = structure_breakevens(payoff_legs, raw_net + roll_realized, stock)
+
+    return {
+        "count": count,
+        "roll_realized_pnl": round(roll_realized, 2),
+        "raw_net_credit": raw_net,
+        "effective_net_credit": round(raw_net + roll_realized, 2) if raw_net is not None else None,
+        "raw_breakevens": raw_be,
+        "effective_breakevens": eff_be,
+        "history": rolls,
+    }
+
+
 def _to_out(s: SavedStrategy) -> SavedStrategyOut:
     return SavedStrategyOut(
         id=s.id,
@@ -189,6 +276,7 @@ def _to_out(s: SavedStrategy) -> SavedStrategyOut:
         created_at=s.created_at.isoformat(),
         updated_at=s.updated_at.isoformat(),
         bpr=_closed_trade_bpr(s),
+        roll=_roll_summary(s),
     )
 
 
@@ -566,6 +654,27 @@ def _has_banked_realized(s: SavedStrategy) -> bool:
         return False
 
 
+def _has_shown_realized(s: SavedStrategy, include_rolls: bool = False) -> bool:
+    """Whether a trade should surface in the Closed tab. A CLOSED trade always does.
+    A still-active trade shows only when it banked realized from a genuine (partial)
+    close; realized banked *purely* from rolls is hidden by default — the campaign is
+    still in play — and revealed only when the user opts in with ``include_rolls``."""
+    if s.trade_status == "closed":
+        return True
+    if not _has_banked_realized(s):
+        return False
+    if include_rolls:
+        return True
+    p = _safe_params(s)
+    if any(not l.get("roll") for l in (p.get("closed_legs") or [])):
+        return True
+    try:
+        total = float(p.get("realized_pnl") or 0)
+    except (ValueError, TypeError):
+        total = 0.0
+    return abs(total - _roll_realized(p)) > 0.005
+
+
 # ── Closed-tab monthly rollups ────────────────────────────────────────────────
 # A closed trade never re-prices, so a PRIOR month's realized numbers are immutable.
 # We compute each prior month ONCE, store the small rollup in the DB cache, and stop
@@ -630,30 +739,46 @@ def _close_month_of(s: SavedStrategy, params: dict) -> Optional[str]:
     return iso[:7] if iso and len(iso) >= 7 else None
 
 
-def _closed_realized(s: SavedStrategy, params: dict) -> Optional[float]:
+def _closed_realized(s: SavedStrategy, params: dict, include_rolls: bool = True) -> Optional[float]:
     """Authoritative banked realized P&L — mirrors the frontend's closedRealized():
-    parameters.realized_pnl, else the legacy exit_net."""
+    parameters.realized_pnl, else the legacy exit_net.
+
+    ``include_rolls`` only affects a still-ACTIVE trade: a roll banks realized into
+    realized_pnl as a cost-basis adjustment, but the campaign is still live, so the
+    Closed tab excludes that roll portion by default (include_rolls=False). A fully
+    CLOSED trade always reports its whole realized (the campaign is over — rolls
+    included), regardless of the flag."""
     rp = params.get("realized_pnl")
+    base: Optional[float] = None
     if rp is not None:
         try:
-            return float(rp)
+            base = float(rp)
         except (ValueError, TypeError):
-            pass
-    if s.exit_net is not None:
+            base = None
+    if base is None and s.exit_net is not None:
         try:
-            return float(s.exit_net)
+            base = float(s.exit_net)
         except (ValueError, TypeError):
-            return None
-    return None
+            base = None
+    if base is None:
+        return None
+    if s.trade_status != "closed" and not include_rolls:
+        base -= _roll_realized(params)
+    return round(base, 2)
 
 
-def _closed_cost_proceeds(params: dict) -> tuple[Optional[float], Optional[float]]:
+def _closed_cost_proceeds(params: dict, include_roll_legs: bool = True) -> tuple[Optional[float], Optional[float]]:
     """Σ buys (cost) and Σ sells (proceeds) from closed_legs — mirrors buildClosedLedger:
     a short leg sells-to-open / buys-to-close; a long leg the reverse. (None, None) when the
-    legs carry no prices (then realized falls back to the stored cumulative value)."""
+    legs carry no prices (then realized falls back to the stored cumulative value).
+
+    ``include_roll_legs=False`` skips legs banked by a roll, so a still-active rolled trade's
+    Closed-tab row reflects only its genuine (non-roll) closes by default."""
     cost = proceeds = 0.0
     saw = False
     for l in (params.get("closed_legs") or []):
+        if not include_roll_legs and l.get("roll"):
+            continue
         try:
             qty = abs(float(l.get("qty") or 0))
         except (ValueError, TypeError):
@@ -686,19 +811,23 @@ def _closed_row_out(s: SavedStrategy) -> dict:
     return d
 
 
-def _compute_closed_ledger(rows: list[SavedStrategy], now_m: str) -> dict:
+def _compute_closed_ledger(rows: list[SavedStrategy], now_m: str, include_rolls: bool = False) -> dict:
     """Partition closed/partial trades into frozen prior-month rollups, loose ids, and the
-    current-month + loose full rows. Pure arithmetic over persisted fields — no pricing."""
+    current-month + loose full rows. Pure arithmetic over persisted fields — no pricing.
+
+    A fully-closed trade always counts its whole realized (rolls included — the campaign is
+    done); a still-active partial excludes its roll-banked portion unless ``include_rolls``."""
     contribs = []
     partial_months: set[str] = set()
     for s in rows:
         params = _safe_params(s)
         m = _close_month_of(s, params) or "undated"
         is_partial = s.trade_status != "closed"
-        cost, proceeds = _closed_cost_proceeds(params)
+        count_rolls = include_rolls or not is_partial
+        cost, proceeds = _closed_cost_proceeds(params, include_roll_legs=count_rolls)
         contribs.append({
             "s": s, "month": m, "is_partial": is_partial,
-            "realized": _closed_realized(s, params),
+            "realized": _closed_realized(s, params, include_rolls=count_rolls),
             "cost": cost, "proceeds": proceeds, "bpr": _closed_trade_bpr(s),
         })
         if is_partial and m != "undated":
@@ -744,9 +873,10 @@ def _compute_closed_ledger(rows: list[SavedStrategy], now_m: str) -> dict:
 
 
 def _closed_ledger_response(now_m: str, frozen: list[dict], current_rows: list[SavedStrategy],
-                            stored: bool) -> dict:
+                            stored: bool, include_rolls: bool = False) -> dict:
     total = sum((g.get("realized") or 0) for g in frozen)
-    total += sum((_closed_realized(s, _safe_params(s)) or 0) for s in current_rows)
+    total += sum((_closed_realized(s, _safe_params(s), include_rolls=include_rolls) or 0)
+                 for s in current_rows)
     return {
         "current_month": now_m,
         "current_month_label": _month_label(now_m),
@@ -754,6 +884,7 @@ def _closed_ledger_response(now_m: str, frozen: list[dict], current_rows: list[S
         "trades": [_closed_row_out(s) for s in current_rows],
         "total_realized": round(total, 2),
         "stored": stored,
+        "include_rolls": include_rolls,
     }
 
 
@@ -772,6 +903,11 @@ async def _closed_ledger_sig(db: AsyncSession, user_id: int) -> str:
 
 @router.get("/trades/closed-ledger")
 async def closed_ledger(
+    include_rolls: bool = Query(
+        False,
+        description="Also surface still-active ROLLED trades' partial realized (the cost-basis "
+                    "adjustment banked on each roll). Off by default — a rolled campaign is still "
+                    "in play, so its roll P&L stays out of the Closed ledger until opted in."),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -785,11 +921,29 @@ async def closed_ledger(
     Storage: the prior-month rollups live in the DB cache, guarded by a self-validating
     signature (see _closed_ledger_sig). On a signature hit we reuse the stored summaries and
     fetch only the current slice (current-month closes + active partials + loose ids), so the
-    older closed rows are never even loaded."""
+    older closed rows are never even loaded.
+
+    Rolls: the cached (default) path never counts a still-active trade's roll-banked realized —
+    those trades are the campaign that's still open. ``include_rolls=true`` is an opt-in that
+    recomputes cold with the roll partials folded in (frozen fully-closed months are identical
+    either way, so nothing about the cache needs to change)."""
     from ..services.cache_service import get_cached, set_cached
     from sqlalchemy import or_
 
     now_m = _now_month()
+
+    if include_rolls:
+        # Opt-in view: recompute cold with roll partials included. Skip the (roll-excluding)
+        # cache entirely rather than store a second variant — the toggle is a deliberate,
+        # infrequent user action.
+        all_rows = list((await db.execute(select(SavedStrategy).where(
+            SavedStrategy.user_id == user.id, SavedStrategy.trade_status.isnot(None),
+        ))).scalars().all())
+        shown = [s for s in all_rows if _has_shown_realized(s, include_rolls=True)]
+        comp = _compute_closed_ledger(shown, now_m, include_rolls=True)
+        return _closed_ledger_response(now_m, comp["frozen"], comp["current_rows"],
+                                       stored=False, include_rolls=True)
+
     sig = await _closed_ledger_sig(db, user.id)
     cached = await get_cached(db, _closed_ledger_key(user.id))
 
@@ -808,14 +962,14 @@ async def closed_ledger(
             SavedStrategy.trade_status.isnot(None),
             or_(*conds),
         ))).scalars().all())
-        current = [s for s in rows if s.trade_status == "closed" or _has_banked_realized(s)]
+        current = [s for s in rows if _has_shown_realized(s, include_rolls=False)]
         return _closed_ledger_response(now_m, frozen, current, stored=True)
 
     # Cold or stale → recompute everything and refreeze the prior months.
     all_rows = list((await db.execute(select(SavedStrategy).where(
         SavedStrategy.user_id == user.id, SavedStrategy.trade_status.isnot(None),
     ))).scalars().all())
-    closed_or_banked = [s for s in all_rows if s.trade_status == "closed" or _has_banked_realized(s)]
+    closed_or_banked = [s for s in all_rows if _has_shown_realized(s, include_rolls=False)]
     comp = _compute_closed_ledger(closed_or_banked, now_m)
     try:
         await set_cached(db, _closed_ledger_key(user.id), {
@@ -827,6 +981,85 @@ async def closed_ledger(
     return _closed_ledger_response(now_m, comp["frozen"], comp["current_rows"], stored=False)
 
 
+@router.get("/trades/closed-ledger/{month}")
+async def closed_ledger_month(
+    month: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Full closed-trade records for ONE prior 'YYYY-MM' month — lazily loaded when the user
+    expands a stored (frozen) month band on the Closed tab. Frozen months hold only fully-closed
+    trades (partials are never frozen), so match on exit_date within the month, then confirm each
+    row's canonical close-month to guard the tz edge."""
+    import re
+    if not re.fullmatch(r"\d{4}-\d{2}", month or ""):
+        raise HTTPException(status_code=400, detail="month must be 'YYYY-MM'")
+    y, mo = int(month[:4]), int(month[5:7])
+    start = _dt.datetime(y, mo, 1, tzinfo=_dt.timezone.utc)
+    end = _dt.datetime(y + (1 if mo == 12 else 0), (1 if mo == 12 else mo + 1), 1, tzinfo=_dt.timezone.utc)
+    rows = list((await db.execute(select(SavedStrategy).where(
+        SavedStrategy.user_id == user.id,
+        SavedStrategy.trade_status == "closed",
+        SavedStrategy.exit_date >= start,
+        SavedStrategy.exit_date < end,
+    ).order_by(SavedStrategy.exit_date.desc()))).scalars().all())
+    return [_closed_row_out(s) for s in rows if _close_month_of(s, _safe_params(s)) == month]
+
+
+class DeleteClosedPartIn(BaseModel):
+    part: str = Field(..., description="'options' | 'stock'")
+
+
+@router.post("/{strategy_id}/delete-closed-part", response_model=Optional[SavedStrategyOut])
+async def delete_closed_part(
+    strategy_id: int,
+    body: DeleteClosedPartIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete just the OPTION legs or the STOCK leg from a closed trade's realized ledger, so a
+    combo (e.g. a covered call's stock vs its call) can be pruned one part at a time. Recomputes
+    realized_pnl from the kept closed_legs. If nothing is left AND the trade is fully closed, the
+    whole trade is deleted (returns null); a still-active partial just loses its banked chunk and
+    stays open. Bumps updated_at, which invalidates the frozen closed-ledger cache signature."""
+    part = (body.part or "").lower()
+    if part not in ("options", "stock"):
+        raise HTTPException(status_code=400, detail="part must be 'options' or 'stock'")
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+    closed = list(params.get("closed_legs") or [])
+
+    def _is_stock(l: dict) -> bool:
+        return (l.get("type") or "").lower() == "stock"
+
+    keep = [l for l in closed if (_is_stock(l) if part == "options" else not _is_stock(l))]
+    if len(keep) == len(closed):
+        raise HTTPException(status_code=400, detail=f"No {part} legs to delete on this trade")
+
+    # Nothing left AND fully closed → drop the whole trade.
+    if not keep and strategy.trade_status == "closed":
+        await db.delete(strategy)
+        await db.commit()
+        return None
+
+    params["closed_legs"] = keep
+    new_real = round(sum(float(l.get("realized") or 0) for l in keep), 2)
+    params["realized_pnl"] = new_real
+    strategy.parameters = json.dumps(params)
+    if strategy.trade_status == "closed":
+        strategy.exit_net = new_real
+        strategy.exit_prices = json.dumps(
+            [{"leg_index": r.get("leg_index"), "exit_price": r.get("exit_price")} for r in keep])
+    await db.commit()
+    await db.refresh(strategy)
+    return _to_out(strategy)
+
+
 @router.get("/trades", response_model=list[SavedStrategyOut])
 async def list_trades(
     status: Optional[str] = Query(None, description="Filter: 'active' or 'closed'"),
@@ -834,6 +1067,10 @@ async def list_trades(
         False,
         description="With status='closed', also return still-ACTIVE trades that banked realized "
                     "P&L from a partial close, so their realized portion shows in the Closed ledger."),
+    include_rolls: bool = Query(
+        False,
+        description="With status='closed'+include_partial, also include trades whose only banked "
+                    "realized came from ROLLS (hidden by default — the campaign is still open)."),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -851,7 +1088,7 @@ async def list_trades(
     result = await db.execute(q)
     rows = result.scalars().all()
     if status == "closed" and include_partial:
-        rows = [s for s in rows if s.trade_status == "closed" or _has_banked_realized(s)]
+        rows = [s for s in rows if _has_shown_realized(s, include_rolls=include_rolls)]
     return [_to_out(s) for s in rows]
 
 
@@ -989,10 +1226,17 @@ async def close_position(
     offset = 1 if (shares > 0 and len(entry_prices) == len(legs) + 1) else 0
 
     def _leg_entry(i: int, leg: dict) -> float:
+        # Robust entry premium — the SAME resolver get_live_pnl uses (leg's own premium →
+        # entry_prices matched by strike/right → positional). This keeps realized-at-close
+        # consistent with live P&L AND stops a combo's option leg from inheriting the stock's
+        # entry_prices[0] when the array length doesn't line up (the "$278 CSP" bug).
+        p = _leg_entry_premium(leg, i + offset, entry_prices)
+        if p is not None:
+            return p
         j = i + offset
         ep = (entry_prices[j] or {}).get("price") if 0 <= j < len(entry_prices) else None
         if ep in (None, ""):
-            ep = leg.get("premium") or leg.get("mid") or leg.get("price")
+            ep = leg.get("mid") or leg.get("price")
         try:
             return float(ep or 0)
         except (TypeError, ValueError):
@@ -1024,6 +1268,7 @@ async def close_position(
             "strike": leg.get("strike"), "qty": qty, "entry_price": round(entry, 4),
             "exit_price": round(exitp, 4), "realized": round(realized, 2),
             "closed_at": executed.isoformat(),
+            "leg": leg,   # full original leg (expiry etc.) so a mistaken close can be re-opened faithfully
         })
         db.add(TradeTransaction(
             strategy_id=strategy.id, action="close", leg_index=i,
@@ -1075,6 +1320,298 @@ async def close_position(
             [{"leg_index": r.get("leg_index"), "exit_price": r.get("exit_price")} for r in closed_records]
         )
         strategy.exit_net = params["realized_pnl"]   # realized P&L (legacy field kept populated)
+
+    await db.commit()
+    await db.refresh(strategy)
+    return _to_out(strategy)
+
+
+class RollLegIn(BaseModel):
+    """One replacement option leg to roll INTO (open)."""
+    action: str = Field(..., description="'buy' | 'sell'")
+    type: str = Field(..., description="'call' | 'put'")
+    strike: float = Field(..., gt=0)
+    expiration: str = Field(..., min_length=4)   # ISO 'YYYY-MM-DD'
+    qty: float = Field(..., gt=0)
+    premium: float = Field(..., ge=0)            # per-share credit(sell)/debit(buy) at the roll fill
+
+
+class RollPositionIn(BaseModel):
+    """Roll one or more legs in ONE action — buy back the tested leg(s) and open the
+    replacement leg(s) — keeping the position as a single continuing campaign. Realized
+    P&L on the bought-back legs is banked as a cost-basis ADJUSTMENT (tagged as a roll),
+    not as a standalone closed trade, so the Closed tab isn't polluted while the trade is
+    still live and the new cost basis carries the running P&L forward."""
+    close_legs: list[ClosePositionLegIn] = Field(default_factory=list)   # legs to roll out of
+    open_legs: list[RollLegIn] = Field(default_factory=list)             # legs to roll into
+    executed_at: Optional[str] = None
+    note: Optional[str] = None
+
+
+@router.post("/{strategy_id}/roll-position", response_model=SavedStrategyOut)
+async def roll_position(
+    strategy_id: int,
+    body: RollPositionIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Roll a placed trade: close the tested leg(s) and open the replacement leg(s) as ONE
+    continuing campaign, so the realized P&L on the buy-back adjusts the cost basis instead of
+    being reported as a separate closed trade.
+
+    Every other platform books a roll as *close old + open new*, which scatters one economic
+    trade across two P&L lines and makes it impossible to see whether the campaign is still
+    ahead. Here the trade stays ACTIVE, the buy-back realized is banked into
+    parameters.realized_pnl AND parameters.roll_realized_pnl (and each closed_legs record is
+    tagged ``roll``), and the effective breakeven / net credit fold that running total in — see
+    _roll_summary + trade_math.roll_target_credit. A user can roll the same trade any number of
+    times; the roll realized accumulates. Reuses the exact realized-at-close resolver
+    (_leg_entry → _leg_entry_premium) that live P&L uses, so the numbers reconcile."""
+    import datetime as dt
+    import uuid
+    from ..services.trade_math import realized_close_pnl
+
+    result = await db.execute(
+        select(SavedStrategy).where(
+            SavedStrategy.id == strategy_id,
+            SavedStrategy.user_id == user.id,
+            SavedStrategy.trade_status == "active",
+        )
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Active trade not found")
+    if not body.close_legs and not body.open_legs:
+        raise HTTPException(status_code=400, detail="A roll needs at least one leg to close or open")
+
+    legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+    entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
+    shares = float(params.get("shares") or 0)
+    offset = 1 if (shares > 0 and len(entry_prices) == len(legs) + 1) else 0
+
+    def _leg_entry(i: int, leg: dict) -> float:
+        # SAME robust resolver as close_position / live P&L (leg premium → strike/right → positional).
+        p = _leg_entry_premium(leg, i + offset, entry_prices)
+        if p is not None:
+            return p
+        j = i + offset
+        ep = (entry_prices[j] or {}).get("price") if 0 <= j < len(entry_prices) else None
+        if ep in (None, ""):
+            ep = leg.get("mid") or leg.get("price")
+        try:
+            return float(ep or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    executed = dt.datetime.now(dt.timezone.utc)
+    if body.executed_at:
+        try:
+            executed = dt.datetime.fromisoformat(body.executed_at)
+        except (ValueError, TypeError):
+            pass
+
+    roll_id = uuid.uuid4().hex[:12]
+    prior_rolls = list(params.get("rolls") or [])
+    seq = len(prior_rolls) + 1
+
+    close_idx = {l.leg_index for l in body.close_legs if 0 <= l.leg_index < len(legs)}
+    exit_of = {l.leg_index: float(l.exit_price) for l in body.close_legs}
+    closed_records = list(params.get("closed_legs") or [])
+    realized_total = 0.0
+    buyback_cost = 0.0            # $ paid to buy back short legs (informational, for the roll record)
+    from_descr: list[str] = []
+
+    # ---- roll OUT of the tested legs (bank realized, tagged as a roll) ----
+    for i in sorted(close_idx):
+        leg = legs[i]
+        qty = float(leg.get("qty") or leg.get("contracts") or 1)
+        entry = _leg_entry(i, leg)
+        exitp = exit_of[i]
+        is_short = any(k in str(leg.get("action", "")).upper() for k in ("SELL", "SHORT"))
+        realized = realized_close_pnl(leg.get("action", ""), entry, exitp, qty, is_option=True)
+        realized_total += realized
+        if is_short:
+            buyback_cost += exitp * 100.0 * qty
+        closed_records.append({
+            "leg_index": i, "action": leg.get("action"), "type": leg.get("type"),
+            "strike": leg.get("strike"), "qty": qty, "entry_price": round(entry, 4),
+            "exit_price": round(exitp, 4), "realized": round(realized, 2),
+            "closed_at": executed.isoformat(), "leg": leg,
+            "roll": True, "roll_id": roll_id, "roll_seq": seq,
+        })
+        db.add(TradeTransaction(
+            strategy_id=strategy.id, action="close", leg_index=i,
+            quantity=(qty if is_short else -qty),
+            price=exitp, fees=0.0, executed_at=executed, source="manual",
+            note=f"roll:{roll_id} · out {leg.get('action')} {leg.get('type')} ${leg.get('strike')} @ ${exitp}",
+        ))
+        from_descr.append(
+            f"{leg.get('action')} {leg.get('type')} ${leg.get('strike')}"
+            f"{' exp ' + str(leg.get('expiration') or leg.get('expiry')) if (leg.get('expiration') or leg.get('expiry')) else ''}")
+
+    remaining_legs = [l for i, l in enumerate(legs) if i not in close_idx]
+
+    # ---- roll INTO the replacement legs (open, appended to the same position) ----
+    new_credit = 0.0
+    to_descr: list[str] = []
+    added_legs: list[dict] = []
+    for nl in body.open_legs:
+        is_sell = nl.action.lower() == "sell"
+        leg_dict = {
+            "action": nl.action.lower(), "type": nl.type.lower(),
+            "strike": float(nl.strike), "qty": float(nl.qty),
+            "expiration": nl.expiration, "premium": float(nl.premium),
+            "label": f"{'Short' if is_sell else 'Long'} {nl.type.title()} ${nl.strike:g}",
+        }
+        added_legs.append(leg_dict)
+        new_credit += (1 if is_sell else -1) * float(nl.premium) * float(nl.qty) * 100.0
+        db.add(TradeTransaction(
+            strategy_id=strategy.id, action="add", leg_index=None,
+            quantity=(-nl.qty if is_sell else nl.qty),   # short opens negative, long positive
+            price=float(nl.premium), fees=0.0, executed_at=executed, source="manual",
+            note=f"roll:{roll_id} · into {leg_dict['action']} {leg_dict['type']} ${nl.strike:g} exp {nl.expiration}",
+        ))
+        to_descr.append(f"{leg_dict['action']} {leg_dict['type']} ${nl.strike:g} exp {nl.expiration}")
+
+    new_legs_data = remaining_legs + added_legs
+
+    # Rebuild entry_prices to mirror the new legs_data (stock at [0] on a combo, then one
+    # strike/type-tagged row per leg using each leg's own entry premium) so the robust
+    # strike/right resolver always lines up — avoids the positional "$278 CSP" drift.
+    new_entry_prices: list[dict] = []
+    if shares > 0:
+        if offset == 1 and entry_prices:
+            new_entry_prices.append(entry_prices[0])
+        else:
+            new_entry_prices.append({"price": params.get("avg_cost")})
+    for l in new_legs_data:
+        new_entry_prices.append({
+            "price": l.get("premium"), "strike": l.get("strike"), "type": l.get("type"),
+        })
+
+    params["realized_pnl"] = round(float(params.get("realized_pnl") or 0.0) + realized_total, 2)
+    params["roll_realized_pnl"] = round(float(params.get("roll_realized_pnl") or 0.0) + realized_total, 2)
+    params["closed_legs"] = closed_records
+    params["rolls"] = prior_rolls + [{
+        "roll_id": roll_id, "seq": seq, "date": executed.isoformat(),
+        "realized": round(realized_total, 2), "buyback_cost": round(buyback_cost, 2),
+        "new_credit": round(new_credit, 2), "from": from_descr, "to": to_descr,
+        "note": body.note or None,
+    }]
+    params.pop("last_pnl", None)          # stale — the legs just changed; force a fresh refresh
+    params.pop("last_pnl_at", None)
+
+    new_leg_metas = [{"i": i, "_leg": l, "strike": l.get("strike"), "type": l.get("type"),
+                      "qty": l.get("qty") or 1, "action": l.get("action")}
+                     for i, l in enumerate(new_legs_data)
+                     if str(l.get("type", "")).upper() in ("CALL", "PUT")]
+    nd = option_legs_net_debit(new_leg_metas, new_entry_prices) if new_leg_metas else None
+    if nd is not None:
+        strategy.entry_net_debit = nd
+
+    strategy.legs_data = json.dumps(new_legs_data)
+    strategy.entry_prices = json.dumps(new_entry_prices)
+    strategy.parameters = json.dumps(params)
+
+    # A roll keeps the trade ACTIVE. Only a roll into literally nothing (and no stock) collapses
+    # to a close — a degenerate case, but handled so the trade doesn't get stranded.
+    if not new_legs_data and float(params.get("shares") or 0) == 0:
+        strategy.trade_status = "closed"
+        strategy.exit_date = executed
+        strategy.exit_net = params["realized_pnl"]
+
+    await db.commit()
+    await db.refresh(strategy)
+    return _to_out(strategy)
+
+
+@router.post("/{strategy_id}/reopen", response_model=SavedStrategyOut)
+async def reopen_trade(
+    strategy_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Undo a close — restore a closed (or partially-closed) trade to ACTIVE with all its legs,
+    for when the user closed one by mistake.
+
+    Reverses close_position / close_trade: rebuilds legs_data from the GENUINE closed_legs (each
+    record keeps the full original leg going forward; legacy records reconstruct from their flat
+    fields, so a pre-this-change close may come back without its expiry — the user can edit it),
+    restores shares, clears the genuine-close realized / exit_* fields, and deletes the 'close'
+    ledger rows so a mistaken close leaves no trace (and, for stock, so the ledger walk doesn't
+    immediately re-close it). ROLL-banked legs are preserved (they're cost-basis adjustments to a
+    still-open campaign, and their replacement legs are already live — restoring them would double
+    the position); their roll realized is kept. Idempotent-safe: a trade with nothing genuine to
+    undo is a 400."""
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+    closed = list(params.get("closed_legs") or [])
+    # A ROLL's closed legs are cost-basis adjustments to a still-open campaign, not closes to
+    # undo — and their replacement legs are already live. Reopen must leave them alone, or it
+    # would restore a rolled-out leg on top of the one it was rolled into (doubling the position).
+    restorable = [r for r in closed if not r.get("roll")]
+    roll_legs = [r for r in closed if r.get("roll")]
+    if strategy.trade_status != "closed" and not restorable:
+        raise HTTPException(status_code=400, detail="Nothing to re-open — this trade has no closed legs to undo")
+
+    legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+
+    def _restore_leg(rec: dict) -> dict:
+        leg = rec.get("leg")
+        if isinstance(leg, dict) and leg:
+            return dict(leg)
+        return {   # legacy fallback — expiry may be missing (record didn't keep the full leg)
+            "action": rec.get("action"), "type": rec.get("type"),
+            "strike": rec.get("strike"), "qty": rec.get("qty"),
+            "premium": rec.get("entry_price"),
+            "expiration": rec.get("expiration") or rec.get("expiry"),
+        }
+
+    restored_shares = 0.0
+    for rec in restorable:
+        if (rec.get("type") or "").lower() == "stock":
+            try:
+                restored_shares += abs(float(rec.get("qty") or 0))
+            except (ValueError, TypeError):
+                pass
+            if rec.get("entry_price") not in (None, ""):
+                params["avg_cost"] = rec.get("entry_price")
+        else:
+            legs.append(_restore_leg(rec))
+
+    if restored_shares > 0:
+        params["shares"] = float(params.get("shares") or 0) + restored_shares
+
+    # Keep the roll history (and its realized) intact; only the genuine-close realized is undone.
+    if roll_legs:
+        params["closed_legs"] = roll_legs
+        roll_real = round(sum(float(r.get("realized") or 0) for r in roll_legs), 2)
+        params["realized_pnl"] = roll_real
+        params["roll_realized_pnl"] = roll_real
+    else:
+        params.pop("closed_legs", None)
+        params.pop("realized_pnl", None)
+        params.pop("roll_realized_pnl", None)
+    params.pop("last_pnl", None)          # stale snapshot from the closed state
+    params.pop("last_pnl_at", None)
+
+    strategy.legs_data = json.dumps(legs)
+    strategy.parameters = json.dumps(params)
+    strategy.trade_status = "active"
+    strategy.exit_date = None
+    strategy.exit_prices = None
+    strategy.exit_net = None
+
+    close_txns = (await db.execute(select(TradeTransaction).where(
+        TradeTransaction.strategy_id == strategy.id, TradeTransaction.action == "close"))).scalars().all()
+    for t in close_txns:
+        await db.delete(t)
 
     await db.commit()
     await db.refresh(strategy)
@@ -1302,10 +1839,10 @@ async def book_hedge_advice(
             _pick(s, ("label", "move_pct", "pnl", "pct_of_capital")) for s in (d.get("crash_scenarios") or [])],
         "concentration_by_underlying": [
             _pick(c, ("ticker", "beta", "trades", "short_legs", "gamma_share_pct", "laddered")) for c in (d.get("concentration") or [])],
-        "stock_notional_usd": d.get("stock_notional"),
-        # WHO actually loses in a −20% month (whole position, shares split) — target hedges here.
-        "loss_by_name_at_minus20pct": [
-            _pick(x, ("ticker", "pnl", "option_pnl", "stock_pnl", "beta")) for x in (d.get("loss_by_name") or [])][:10],
+        "stock_notional_ref_usd": d.get("stock_notional"),   # shares held (reference only — NOT in the P&L)
+        # WHO actually loses in a −20% month (OPTION OVERLAY only — stock is a separate holding) — target here.
+        "loss_by_name_at_minus20pct_option_overlay": [
+            _pick(x, ("ticker", "pnl", "beta")) for x in (d.get("loss_by_name") or [])][:10],
         # DETERMINISTIC factor read (measured ρ / GICS sectors — NOT your opinion, do not override it):
         #   sectors = where capital & net direction sit; clusters = names that move together (hidden
         #   concentration); macro = which factors (rates/oil/gold/USD/…) the whole book loads on.
@@ -1346,8 +1883,9 @@ async def book_hedge_advice(
         "1) Name the book's REAL concentration: the correlated_clusters and the top sectors — these are "
         "the names that move together, so a hit to one hits the whole cluster (cite the tickers + avg_rho).\n"
         "2) Name the macro_loadings that matter (e.g. rates/oil/gold/USD) and what event would light them up.\n"
-        "3) Point to loss_by_name_at_minus20pct — which specific NAMES drive the crash, and whether it's "
-        "the option overlay or the shares (stock_pnl) doing the damage.\n"
+        "3) Point to loss_by_name_at_minus20pct_option_overlay — which specific NAMES drive the option-overlay "
+        "crash loss (this desk manages the option income only; the shares behind covered calls are a separate "
+        "core holding and are NOT in the P&L — stock_notional_ref is reference-only for assignment sizing).\n"
         "3b) Check stress_scenarios BOTH signs: if a melt-up / squeeze (positive move_pct) loses MORE than "
         "the −20% downside, the UPSIDE is the under-hedged tail — say so and recommend call spreads / "
         "trimming the biggest short calls / a small long-call hedge, NOT a downside index put (which does "
@@ -2127,11 +2665,11 @@ async def get_repair_menu(
                     iv = getattr(q, "iv", None)
                     book.setdefault(float(k), {})[rt] = {"mid": float(mid) if mid else None,
                                                          "iv": float(iv) if iv else None}
-            return adte, book
+            return adte, book, str(exp)[:10]
         except Exception:  # noqa: BLE001 — no chain → pure BS fallback in the engine
-            return target_dte, {}
+            return target_dte, {}, None
 
-    (n_dte, near_book), (f_dte, far_book) = await _chain_for(dte_days), await _chain_for(dte_days + roll_days)
+    (n_dte, near_book, n_exp), (f_dte, far_book, f_exp) = await _chain_for(dte_days), await _chain_for(dte_days + roll_days)
     chains = {k: v for k, v in ((n_dte, near_book), (f_dte, far_book)) if v}
     atm_iv = 0.30
     near_atm = min(near_book.keys(), key=lambda k: abs(k - spot)) if near_book else None
@@ -2142,10 +2680,348 @@ async def get_repair_menu(
                 atm_iv = v
                 break
 
+    # Ex-dividend before expiry only bears on an ITM short call (early-assignment risk), so fetch it
+    # best-effort ONLY in that case — CSPs / OTM trades (the common tested trade) pay nothing extra.
+    ex_div = None
+    if any(l["right"] == "C" and l["sign"] < 0 and spot > l["strike"] for l in legs):
+        try:
+            import asyncio
+            import yfinance as yf
+
+            def _next_div():
+                t = yf.Ticker(strategy.ticker)
+                cal = getattr(t, "calendar", None)
+                when = (cal or {}).get("Ex-Dividend Date") if isinstance(cal, dict) else None
+                divs = getattr(t, "dividends", None)
+                amt = float(divs.iloc[-1]) if (divs is not None and len(divs)) else None   # last paid ≈ next
+                return amt, when
+
+            amt, when = await asyncio.to_thread(_next_div)
+            if amt and amt > 0 and when is not None:
+                try:
+                    days = (dt.date.fromisoformat(str(when)[:10]) - dt.date.today()).days
+                except (ValueError, TypeError):
+                    days = None
+                if days is not None and 0 <= days <= dte_days:
+                    ex_div = {"amount": amt, "days": days}
+        except Exception:  # noqa: BLE001 — best-effort; deep-ITM extrinsic heuristic still applies
+            ex_div = None
+
     menu = repair_alternatives(legs=legs, spot=spot, dte_days=dte_days, roll_days=roll_days,
-                               atm_iv=atm_iv, chains=chains or None)
+                               atm_iv=atm_iv, chains=chains or None, ex_div=ex_div,
+                               near_expiry=(n_exp or near_exp), far_expiry=f_exp,
+                               base_date=dt.date.today().isoformat())
     menu["ticker"] = strategy.ticker
+
+    # TA + context enrichment: fold the technicals INTO the recoverability read (structure / momentum /
+    # volume-profile / gamma regime tilt the model odds) and attach the "what broke & setup" context —
+    # so one click on Defend shows everything (no second fetch). Best-effort; failures leave the core intact.
+    try:
+        import asyncio
+        rec = menu.get("recoverability") or {}
+        ta_factors, outlook, context = await asyncio.to_thread(
+            _defend_ta_context, strategy.ticker, spot, dte_days, menu.get("short_right"),
+            rec.get("breakeven"), (menu.get("assignment") or {}).get("extrinsic"), menu.get("contracts") or 1)
+        if rec:
+            rec.setdefault("factors", []).extend(ta_factors)
+            rec["outlook"] = outlook
+        menu["context"] = context
+    except Exception:  # noqa: BLE001 — TA is an overlay; the core recoverability/actions still stand
+        pass
     return menu
+
+
+class DefendPayloadIn(BaseModel):
+    """The already-computed Defend payload the panel POSTs to the context / committee lenses, so the
+    server reasons over the SAME numbers without re-pricing the chain (one heavy fetch per trade)."""
+    defend: dict = Field(default_factory=dict)
+
+
+# ── Defend TA / context helpers (deterministic; fold the technicals INTO the recoverability read) ──
+def _ema(arr, span: int):
+    import numpy as np
+    a = np.asarray(arr, dtype=float)
+    if len(a) == 0:
+        return a
+    k = 2.0 / (span + 1.0)
+    out = np.empty_like(a)
+    out[0] = a[0]
+    for i in range(1, len(a)):
+        out[i] = a[i] * k + out[i - 1] * (1.0 - k)
+    return out
+
+
+def _poc(closes, volumes, bins: int = 30):
+    """Volume point-of-control: the price bin that traded the most volume over the window."""
+    import numpy as np
+    c = np.asarray(closes, dtype=float); v = np.asarray(volumes, dtype=float)
+    if len(c) < 5 or v.sum() <= 0:
+        return None
+    lo, hi = float(c.min()), float(c.max())
+    if hi <= lo:
+        return None
+    edges = np.linspace(lo, hi, bins + 1)
+    idx = np.clip(np.digitize(c, edges) - 1, 0, bins - 1)
+    vol = np.zeros(bins)
+    for i, vi in zip(idx, v):
+        vol[int(i)] += float(vi)
+    b = int(vol.argmax())
+    return round(float((edges[b] + edges[b + 1]) / 2.0), 2)
+
+
+def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n):
+    """Best-effort DETERMINISTIC technicals that TILT the recovery odds (structure · breakeven-vs-level ·
+    momentum · RSI · volume-profile · gamma regime) + the 'what broke & setup' context (recoverable time
+    value · realized-vol state · sector cohort · earnings). Returns (ta_factors, outlook, context).
+    A tested PUT recovers on an UP move, a tested CALL on a DOWN move — every factor is signed to that."""
+    import datetime as dt
+    import numpy as np
+    import yfinance as yf
+    from ..services.stock_service import find_support_resistance, calculate_rsi
+    from ..services.dealer_positioning_service import _collect_contracts, _net_gex_at, _gamma_flip
+    from ..services import correlated_assets_service as cas
+
+    need_up = (right == "P")
+    ta: list[dict] = []
+    context: dict = {}
+    stock = yf.Ticker(ticker)
+    px = float(spot) if spot else None
+
+    # history-derived: structure · breakeven-vs-level · momentum · RSI · POC · realized-vol state
+    try:
+        hist = stock.history(period="6mo", interval="1d")
+        if hist is not None and not hist.empty:
+            highs = hist["High"].tolist(); lows = hist["Low"].tolist()
+            closes = hist["Close"].tolist(); vols = hist["Volume"].tolist()
+            sup, res = find_support_resistance(highs, lows, closes)
+            px = px or (closes[-1] if closes else None)
+            if px and sup and res:
+                context["technical"] = {"support": sup, "resistance": res,
+                    "note": (f"Spot ${px:.2f}: support ${sup:.2f} ({((px-sup)/px*100):.1f}% below), "
+                             f"resistance ${res:.2f} ({((res-px)/px*100):.1f}% above).")}
+                if need_up:
+                    ta.append({"label": "Structure", "kind": "ta", "favorable": bool(sup < px),
+                               "detail": f"support ${sup:.2f} sits {((px-sup)/px*100):.1f}% below — a floor that can halt the slide"})
+                else:
+                    ta.append({"label": "Structure", "kind": "ta", "favorable": bool(res > px),
+                               "detail": f"resistance ${res:.2f} sits {((res-px)/px*100):.1f}% above — a ceiling that can cap the rise"})
+                if be:
+                    if need_up and be > res:
+                        ta.append({"label": "Breakeven vs resistance", "kind": "ta", "favorable": False,
+                                   "detail": f"breakeven ${be:.2f} is ABOVE resistance ${res:.2f} — you must break a ceiling to recover"})
+                    elif (not need_up) and be < sup:
+                        ta.append({"label": "Breakeven vs support", "kind": "ta", "favorable": False,
+                                   "detail": f"breakeven ${be:.2f} is BELOW support ${sup:.2f} — a floor must break for you to recover"})
+            c = np.asarray(closes, dtype=float)
+            if len(c) >= 26:
+                macd = _ema(c, 12) - _ema(c, 26); sigl = _ema(macd, 9)
+                bull = bool(macd[-1] > sigl[-1])
+                fav = bull if need_up else (not bull)
+                ta.append({"label": "Momentum (MACD)", "kind": "ta", "favorable": bool(fav),
+                           "detail": (f"MACD {'above' if bull else 'below'} signal — momentum {'up' if bull else 'down'}, "
+                                      f"{'with' if fav else 'against'} the {'bounce' if need_up else 'pullback'} you need")})
+            rsi = calculate_rsi(c)
+            if rsi is not None and len(rsi):
+                rv = float(rsi[-1])
+                fav = (rv < 35) if need_up else (rv > 65)
+                ta.append({"label": "RSI", "kind": "ta", "favorable": bool(fav),
+                           "detail": f"RSI {rv:.0f} — {'oversold, bounce-prone' if rv < 35 else 'overbought, pullback-prone' if rv > 65 else 'neutral'}"})
+            poc = _poc(closes, vols)
+            if poc and px:
+                nearpoc = abs(px - poc) / px < 0.02
+                ta.append({"label": "Volume profile", "kind": "ta", "favorable": bool(nearpoc),
+                           "detail": (f"spot is on the POC ${poc:.2f} — a high-volume magnet that tends to stall moves" if nearpoc
+                                      else f"POC ${poc:.2f} ({((poc-px)/px*100):+.1f}%) — the high-volume shelf is away from spot")})
+            rets = np.diff(np.log(c)) if len(c) > 1 else np.array([])
+            if len(rets) > 60:
+                hv20 = float(np.std(rets[-20:]) * (252 ** 0.5) * 100); hv60 = float(np.std(rets[-60:]) * (252 ** 0.5) * 100)
+                state = "spiking" if hv20 > hv60 * 1.3 else "cooling" if hv20 < hv60 * 0.8 else "steady"
+                context["vol_note"] = f"Realized vol {state} (HV20 {hv20:.0f}% vs HV60 {hv60:.0f}%)."
+    except Exception:  # noqa: BLE001
+        pass
+
+    # gamma regime — dealers LONG γ (moves suppressed / mean-reverting) helps a bounce; SHORT γ (amplified) hurts.
+    try:
+        s = px or (float(spot) if spot else None)
+        if s:
+            contracts, _exps = _collect_contracts(stock, s)
+            if len(contracts) >= 10:
+                net = _net_gex_at(contracts, s); flip = _gamma_flip(contracts, s)
+                long_g = net >= 0
+                flip_txt = f", flip ${flip:.2f}" if flip else ""
+                ta.append({"label": "Gamma regime", "kind": "ta", "favorable": bool(long_g),
+                           "detail": (f"dealers LONG gamma (net GEX +{net/1e6:.0f}M{flip_txt}) — moves suppressed / mean-reverting, helps a bounce back" if long_g
+                                      else f"dealers SHORT gamma (net GEX {net/1e6:.0f}M{flip_txt}) — moves amplified, works against a recovery")})
+    except Exception:  # noqa: BLE001
+        pass
+
+    # context: recoverable time value + sector cohort + earnings-before-expiry
+    context["loss_read"] = {"time_value_recoverable": round(float(extrinsic or 0.0) * 100.0 * (contracts_n or 1), 0)}
+    try:
+        themes = cas.themes_for(ticker) or []
+        peers = [p for p in (cas.theme_peers(ticker) or []) if p.upper() != str(ticker).upper()][:8]
+        context["sector"] = {"themes": themes, "peers": peers,
+            "note": (f"{ticker} sits in {', '.join(themes)} — if the cohort is red together it's systemic; a sector hedge may beat a single-name repair."
+                     if themes else "No mapped sector theme for this name.")}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ed = cas._next_earnings_sync(ticker)
+        if ed:
+            edd = dt.date.fromisoformat(str(ed)[:10]); days = (edd - dt.date.today()).days
+            before = bool(dte is not None and 0 <= days <= dte)
+            context["earnings"] = {"before_expiry": before, "date": edd.isoformat(), "days": days,
+                "note": (f"Earnings {edd.isoformat()} in {days}d — BEFORE expiry: a binary gap that can leap the strike; defending/closing ahead of it is its own call."
+                         if before else f"Next earnings {edd.isoformat()} ({days}d) — outside this expiry.")}
+    except Exception:  # noqa: BLE001
+        pass
+
+    # outlook — net tilt from the TA factors that carry a direction.
+    dirn = [f for f in ta if f.get("favorable") is not None]
+    favs = sum(1 for f in dirn if f["favorable"]); adv = sum(1 for f in dirn if not f["favorable"])
+    if dirn:
+        tilt = "favorable" if favs > adv else "adverse" if adv > favs else "balanced"
+        note = (f"Technicals lean {tilt.upper()} for a recovery ({favs} favorable / {adv} adverse) — "
+                + ("they back the model odds." if tilt == "favorable"
+                   else "treat the raw recovery odds as OPTIMISTIC." if tilt == "adverse"
+                   else "they neither help nor hurt the model odds."))
+    else:
+        tilt, note = "balanced", "Not enough technical data to tilt the recovery odds."
+    return ta, {"tilt": tilt, "note": note}, context
+
+
+@router.post("/{strategy_id}/defend/committee")
+async def run_defend_committee(
+    strategy_id: int,
+    body: DefendPayloadIn,
+    quote_source: str = "yfinance",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lens 7 — the WAR ROOM. A Quant → Risk → PM DEFENSE cascade fed ONLY the computed Defend numbers
+    (recoverability, assignment, the HOLD baseline, the CLOSE benchmark, cost-of-waiting, and the
+    priced repairs). One structured LLM call: the model synthesizes and picks a path but NEVER invents
+    data. Returns {quant, risk, pm, verdict}."""
+    import json as _json
+    from ..services.llm_service import clean_json_text
+
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured. Please add it in Settings.")
+
+    d = body.defend or {}
+    alts = d.get("alternatives") or []
+    if not alts:
+        return {"error": "Run the defend analysis first — the committee reasons over its numbers."}
+
+    rec = d.get("recoverability") or {}
+    asg = d.get("assignment") or {}
+    hold = next((a for a in alts if a.get("category") == "hold"), {})
+    close = next((a for a in alts if a.get("category") == "exit"), {})
+    repairs = sorted([a for a in alts if a.get("category") not in ("exit", "hold")],
+                     key=lambda a: (a.get("d_pop") if a.get("d_pop") is not None else -999), reverse=True)[:4]
+    cw = d.get("cost_of_waiting") or []
+
+    def _legs(a):
+        return " ".join(f"{'−' if l.get('action') == 'SELL' else '+'}{l.get('qty')}{l.get('right')}{l.get('strike')}"
+                        for l in (a.get("legs") or []) if l.get("right") in ("P", "C"))
+    repairs_txt = "\n".join(
+        f"  - {a.get('name')}: [{_legs(a)}] net {a.get('net_cash')}, max loss {a.get('max_loss')}, "
+        f"PoP {a.get('pop_pct')}% (Δ{a.get('d_pop')} vs hold), E[P&L] {a.get('ev')}, defined_risk {a.get('defined_risk')}"
+        for a in repairs) or "  (none priced)"
+    cw_txt = "; ".join(f"+{x.get('in_trading_days')}d → PoP {x.get('recovery_pop')}%, E[P&L] {x.get('expected_pnl')}"
+                       for x in cw) or "n/a"
+    outlook = rec.get("outlook") or {}
+    ta_facts = [f for f in (rec.get("factors") or []) if f.get("kind") == "ta"]
+    ta_txt = "; ".join(f"{f.get('label')} [{'FAVORABLE' if f.get('favorable') else 'ADVERSE' if f.get('favorable') is False else 'neutral'}] {f.get('detail')}"
+                       for f in ta_facts) or "n/a"
+    ctxb = d.get("context") or {}
+    ctx_extra = " ".join(x for x in [ctxb.get("vol_note"), (ctxb.get("sector") or {}).get("note"),
+                                     (ctxb.get("earnings") or {}).get("note")] if x) or "n/a"
+    ctx = (
+        f"TESTED TRADE — {d.get('ticker')} {d.get('structure')} · tested {d.get('short_right')} ${d.get('short_strike')} "
+        f"· spot ${d.get('spot')} · {d.get('dte_days')}d · cushion {d.get('cushion_pct')}% · mark-to-close {d.get('unrealized_pnl')}\n\n"
+        f"RECOVERABILITY: recovery {rec.get('recovery_score')}% (P finish ≥ breakeven ${rec.get('breakeven')}), needs "
+        f"{rec.get('needed_move_pct')}% ({rec.get('dist_to_be_sigma')}σ, ±${rec.get('expected_move')} expected move), "
+        f"severity {rec.get('severity')}, tested Δ {rec.get('tested_delta')}\n"
+        f"TECHNICAL OUTLOOK: {outlook.get('tilt')} — {outlook.get('note')}\n"
+        f"TA FACTORS: {ta_txt}\n"
+        f"ASSIGNMENT: P(ITM) {asg.get('p_itm')}%, time value ${asg.get('extrinsic')}, early-exercise {asg.get('early_assignment_risk')} "
+        f"({asg.get('early_reason')}), effective basis ${asg.get('effective_basis')}, capital ${asg.get('assignment_capital')}\n"
+        f"HOLD (do nothing): PoP {hold.get('pop_pct')}%, E[P&L] {hold.get('ev')}, max loss {hold.get('max_loss')}\n"
+        f"CLOSE now: realizes {close.get('net_cash')}\n"
+        f"COST OF WAITING: {cw_txt}\n"
+        f"CONTEXT: {ctx_extra}\n"
+        f"PRICED REPAIRS (ranked by Δrecovery vs hold):\n{repairs_txt}\n"
+    )
+    sys_prompt = (
+        "You are a 3-seat DEFENSE COMMITTEE for a tested short-premium options trade that has gone against the "
+        "trader. The premium-income thesis is DEAD; your ONLY mandate is to minimize expected loss / maximize "
+        "recovery FROM HERE. You are given every number: recoverability (with a TECHNICAL OUTLOOK + signed TA "
+        "factors), assignment, a HOLD (do-nothing) baseline, a CLOSE benchmark, the cost of waiting, and a menu "
+        "of PRICED repairs.\n"
+        "HARD RULES: reason ONLY from these numbers — NEVER invent a correlation, level, price, or fact; the quant "
+        "(PoP, Δ-vs-hold, E[P&L], greeks) and the TA factors are GIVEN and correct — never recompute them; a repair "
+        "must BEAT hold (Δrecovery > 0 and/or a materially smaller or newly-defined max loss) to justify its cost, "
+        "and CLOSE is always the honest fallback. Be DETAILED and METRIC-DENSE: every sentence cites specific "
+        "numbers, and the roles must AGREE with the final verdict (no contradictions).\n"
+        "THREE SEATS (each: a short stance, a 2–4 sentence rationale citing ≥3 specific numbers, and a `metrics` "
+        "list of the exact figures leaned on):\n"
+        "• QUANT — the odds: recovery %, needed move in σ, how the TA OUTLOOK tilts those odds, which repair moves "
+        "Δrecovery most and at what E[P&L] vs hold.\n"
+        "• RISK — assignment P(ITM), early-exercise, capital at stake, max loss defined vs open, whether the repair "
+        "caps the tail and by how much, whether the trader can take assignment.\n"
+        "• PM — weigh it and pick ONE path: hold, a NAMED repair, take-assignment-and-wheel, or close.\n"
+        "Return STRICT JSON, nothing else:\n"
+        '{"quant":{"stance":"<=6 words","rationale":"2-4 sentences, number-dense","metrics":["figure","figure","figure"]},'
+        '"risk":{"stance":"...","rationale":"...","metrics":["...","..."]},'
+        '"pm":{"stance":"...","rationale":"...","metrics":["...","..."]},'
+        '"verdict":{"primary_action":"the ONE action — name the repair, or Hold / Close",'
+        '"why":"2-3 sentences citing recovery %, Δrecovery, E[P&L], max loss and the TA tilt",'
+        '"confidence":"low|medium|high",'
+        '"alternates":[{"action":"second choice","why":"one line, why it is second not first"},'
+        '{"action":"third choice","why":"one line"}],'
+        '"do_not":"the one tempting mistake to avoid, tied to a number (or null)"}}'
+    )
+    messages = [{"role": "system", "content": sys_prompt},
+                {"role": "user", "content": ctx + "\nDeliberate as the three seats, then return ONLY the JSON object."}]
+    try:
+        raw = await call_llm(api_key=api_key, model="gpt-4o", messages=messages, max_tokens=1100, temperature=0.2)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Defense committee failed: {exc}")
+    try:
+        parsed = _json.loads(clean_json_text(raw))
+    except Exception:  # noqa: BLE001
+        return {"error": "The committee returned an unparseable response — try again."}
+
+    def _role(key, title):
+        x = parsed.get(key) or {}
+        mets = x.get("metrics")
+        mets = [str(m) for m in mets][:6] if isinstance(mets, list) else []
+        return {"role": title, "stance": (x.get("stance") or "").strip(),
+                "rationale": (x.get("rationale") or "").strip(), "metrics": mets}
+
+    def _alt(a):
+        if isinstance(a, dict):
+            return {"action": (a.get("action") or "").strip(), "why": (a.get("why") or "").strip()}
+        return {"action": str(a).strip(), "why": ""}          # tolerate a bare-string alternate
+    verdict = parsed.get("verdict")
+    if isinstance(verdict, dict):
+        alts = verdict.get("alternates") or []
+        verdict = {"primary_action": (verdict.get("primary_action") or "").strip(),
+                   "why": (verdict.get("why") or "").strip(),
+                   "confidence": (verdict.get("confidence") or "").strip().lower() or None,
+                   "alternates": [_alt(a) for a in alts if a][:3],
+                   "do_not": (verdict.get("do_not") or None)}
+    else:
+        verdict = None
+    return {"quant": _role("quant", "Quant"), "risk": _role("risk", "Risk"), "pm": _role("pm", "PM"),
+            "verdict": verdict, "data_sent": ctx}
 
 
 @router.get("/{strategy_id}/live-pnl")
@@ -4332,6 +5208,7 @@ class PreTradeMetricsRequest(BaseModel):
     max_loss: Optional[float] = None
     max_profit: Optional[float] = None
     sofr_pct: float = 5.0
+    strategy_type: str = ""   # anchors the Quant recommendation (buffer/hedge/income/…)
 
 
 @router.post("/pre-trade-metrics")
@@ -4408,7 +5285,8 @@ async def run_pre_trade_metrics(
         compute_pretrade_metrics,
         [lg for lg in opt_legs if lg["iv"]], float(body.spot), scenarios,
         float(body.capital or 0), body.max_loss, body.max_profit,
-        avg_iv, dte, stock_shares, 0.05, float(body.sofr_pct or 5.0),
+        avg_iv, dte, stock_shares, 0.05, float(body.sofr_pct or 5.0), None,
+        body.strategy_type,
     )
 
 

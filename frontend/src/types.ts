@@ -376,6 +376,7 @@ export interface TradeSetup {
     options?: { pop_pct: number | null; ev: number | null; basis: string };
   };
   event_risk?: { type: string; date: string; in_days: number; warning: string } | null;
+  style?: 'day' | 'swing' | 'position' | string;
   entry_style?: { type: string; label: string; note: string; distance_pct: number };
   horizon?: { label: string; style?: string; est_days?: number; atrs_to_t1?: number; note: string };
   from_current?: { to_entry_pct: number | null; to_t1_pct: number | null };
@@ -401,6 +402,13 @@ export interface TradeSetupsData {
   meta: { sources_ok: Record<string, boolean> };
 }
 export interface TradeSetupsResponse { ticker: string; trade_setups: TradeSetupsData; cached?: boolean }
+
+export interface DayTradeSetupsData {
+  price: number | null; as_of: string; atr: number | null;
+  vwap?: Record<string, unknown>; opening_range?: { high: number; low: number; bars: number } | null;
+  setups: TradeSetup[]; meta?: { has_vwap?: boolean; has_opening_range?: boolean };
+}
+export interface DayTradeSetupsResponse { ticker: string; day_trade_setups: DayTradeSetupsData; cached?: boolean }
 
 // ===== Chart patterns =====
 export interface PatternPoint { idx: number; date: string; price: number; label: string }
@@ -1909,6 +1917,7 @@ export interface HedgeStructure {
   notes: string[];
   probs?: HedgeProbabilities | null;   // market-implied (Breeden-Litzenberger RND)
   smile_risk?: SmileRisk | null;       // Vanna-Volga VIX-spike exposure
+  desk?: HedgeDeskRow | null;          // institutional hedge-desk scorecard
 }
 
 // Per-structure market-implied probabilities from the risk-neutral density.
@@ -1967,6 +1976,54 @@ export interface RndSummary {
   heston?: HestonParams | null;
 }
 
+// Algorithmically-derived protection preferences (from the live vol surface).
+export interface SuggestedPreferences {
+  floor_pct: number;
+  downside_cap_pct: number;
+  upside_cap_pct: number;
+  giveup_pct: number;
+  budget_pct: number;
+  target_breach_pct: number;
+  regime: string;
+  needs_financing: boolean;
+  why: string[];
+}
+
+// One structure's institutional hedge-desk scorecard.
+export interface HedgeDeskRow {
+  id: string;
+  score: number;
+  grade: 'A' | 'B' | 'C' | 'D';
+  pillars: Record<string, number>;
+  hedge_efficiency: number | null;
+  cvar_reduction: number;
+  tail_relief_pct: number;
+  cvar_hedged: number;
+  expected_overlay_pnl: number;
+  expected_indemnity: number;
+  upside_forfeited: number;
+  loss_coverage_pct: number;
+  reward_ratio: number | null;
+  omega_hedged: number | null;
+  omega_naked: number | null;
+  sortino_hedged: number | null;
+  strengths: string[];
+  weakness: string;
+  short_vol: boolean;
+}
+
+export interface HedgeDesk {
+  ranked: HedgeDeskRow[];
+  pick_id: string;
+  verdict: string;
+  cvar_naked: number;
+  expected_naked_loss: number;
+  expected_naked_gain: number;
+  omega_naked: number | null;
+  pillar_labels: Record<string, string>;
+  pillar_weights: Record<string, number>;
+}
+
 // Daily history + light technicals for the hedge-context price chart.
 export interface HedgePriceHistory {
   available: boolean;
@@ -1997,6 +2054,7 @@ export interface MarketConditions {
   spot?: number;
   rnd?: RndSummary | null;
   next_earnings?: { date: string; days: number; inside_horizon: boolean } | null;
+  suggested_preferences?: SuggestedPreferences | null;
   beta: number | null;
   score?: number;
   verdict?: 'Favorable' | 'Fair' | 'Expensive';
@@ -2073,6 +2131,7 @@ export interface HedgingResponse {
   chain: { puts: HedgeQuote[]; calls: HedgeQuote[] };
   market: MarketConditions | null;
   rnd: RndSummary | null;
+  desk?: HedgeDesk | null;
   index_overlay: IndexOverlay | null;
   risks: BoxSpreadRisk[];
   available_expirations: string[];
@@ -3921,9 +3980,55 @@ export interface DeskMetrics {
   };
 }
 
+// Per-SIDE (call/put) leg decomposition for the Quant Analysis leg tabs. Only the quantities that
+// DECOMPOSE per side and SUM to the trade aggregate live here (greeks, premium, breach, moneyness) —
+// the non-additive ratios (Omega/Sortino/POP/CVaR) stay trade-level only. `null` when the structure
+// is single-type (a naked put / vertical), so the UI shows no side tabs.
+export interface PerSideLeg {
+  key: 'call' | 'put';
+  label: string;                                     // "Call side" | "Put side"
+  legs_n: number;
+  strikes: (number | null)[];
+  short_strike: number | null;                       // the binding (nearest-spot) short on this side
+  has_short: boolean;
+  greeks: { net_delta?: number; net_gamma?: number; net_vega?: number; net_theta?: number;
+            net_vanna?: number; net_charm?: number; net_volga?: number };
+  premium: number;                                   // + = net credit collected on this side (additive)
+  breach: { prob_touch_pct: number | null; sigma_pct: number | null };  // P(this side ever goes ITM)
+  moneyness: { cushion_pct: number | null; sigmas: number | null;
+               short_delta: number | null; itm_prob_pct: number | null };
+  defend: { roll_dir: string; roll_to: string; note: string } | null;
+  // Full per-side ENTRY desk grade (flow A): whole-trade base + inherited trade-scoped factors, with
+  // LEG-scoped factors (Breach/Moneyness/Skew/Structure/Liquidity/Systemic-beta/Undefined-risk) recomputed
+  // for THIS side. Rendered on the entry side tabs (Find Opportunities / Evaluate / New Trade reference).
+  grade?: {
+    score: number; base_quality: number; algo_grade?: string | null; approval_odds?: string | null;
+    grade_adjustments: FactorRow[]; ta_factors: FactorRow[];
+    grade_blocking?: string[]; grade_timing_hold?: string[];
+  } | null;
+  // Per-side MANAGEMENT grade (flow B): the HOLD/CLOSE algo run per side — whole-trade hold-quality base +
+  // holder-re-signed factors, leg factors specialized to this side. Rendered on the Manage side tabs.
+  mgmt_grade?: {
+    score: number; signal: string; anchor: number; anchor_label?: string;
+    contributions: { label: string; pts: number; favorable: boolean; note: string; dimension?: string | null }[];
+    factors_net: number;
+  } | null;
+}
+export interface FactorRow {
+  label: string; points: number; detail?: string; baseline_points?: number;
+  earnings_impacted?: boolean; dimension?: string | null;
+}
+export interface PerSideQuant {
+  sides: PerSideLeg[];
+  expected_move_pct: number | null;
+  reconcile: { net_delta?: number; net_gamma?: number; net_vega?: number; net_theta?: number; premium: number };
+  note: string;
+}
+
 export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   desk_metrics: DeskMetrics;
   desk_score: number;
+  per_side?: PerSideQuant | null;                    // call/put leg tabs; null for single-type structures
   ta_note?: string;
   algo_grade?: string;          // A–F after the full deterministic pre-vet
   approval_odds?: string;       // high | medium | low | auto_reject | wait (timing hold)
@@ -3932,8 +4037,8 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   grade_blocking?: string[];    // STRUCTURAL hard fails (crushed vol, etc.) → grade F
   grade_timing_hold?: string[]; // TIMING holds (momentum against a REACHABLE strike) → WAIT, keeps its quality letter
   base_quality?: number;        // the algorithmic_quant base score BEFORE regime/factor adjustments
-  grade_adjustments?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean }[];  // signed option-math contributions → desk_score (baseline_points = value WITHOUT the earnings-aware adjustment)
-  ta_factors?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean }[]; // signed technical/regime contributions → desk_score (baseline_points = the value WITHOUT the earnings-aware adjustment, for the with/without comparison)
+  grade_adjustments?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null }[];  // signed option-math contributions → desk_score (dimension = risk dimension for UI grouping; baseline_points = value WITHOUT the earnings-aware adjustment)
+  ta_factors?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null }[]; // signed technical/regime contributions → desk_score (dimension = risk dimension for UI grouping; baseline_points = the value WITHOUT the earnings-aware adjustment)
   qp?: {                        // Q-vs-P: implied (risk-neutral) vs physical (realized) read
     implied_vol_pct?: number | null; realized_vol_pct?: number | null; weight_vol_pct?: number | null;
     iv_hv_ratio?: number | null;                     // < 1 = negative VRP (implied under-prices risk)

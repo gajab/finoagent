@@ -87,7 +87,7 @@ export default function PreTradeAdvisor(props: PreTradeAdvisorProps) {
     setDeskLoading(true);
     fetchPreTradeMetrics({
       ticker, expiration, spot: spot!, capital: capital!, dte: dte!, stockShares,
-      legs, scenarios: scenarios ?? [], maxLoss, maxProfit,
+      legs, scenarios: scenarios ?? [], maxLoss, maxProfit, strategyType,
     })
       .then(m => { if (!cancelled) setDesk(m); })
       .catch(() => { if (!cancelled) setDesk(null); })

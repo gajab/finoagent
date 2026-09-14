@@ -10,8 +10,17 @@
  * STRONG_HOLD / HOLD / CLOSE / STRONG_CLOSE. A booked winner with premium left and a
  * manageable tail keeps reading HOLD — no reflexive "you're green, close".
  */
-import { QpBoundary } from '../DeskReview';
-import type { ManagementAnalysis as MA, ManagementLens } from '../../api';
+import { useState } from 'react';
+import { QpBoundary, SideQuantPanel, DIM_ORDER } from '../DeskReview';
+import type { ManagementAnalysis as MA, ManagementLens, ManagementContribution } from '../../api';
+import type { PerSideQuant } from '../../types';
+
+// Group the holder contributions by risk dimension (same order as the entry desk), 'Other' last.
+function groupContribs(cs: ManagementContribution[]): [string, ManagementContribution[]][] {
+  const g = new Map<string, ManagementContribution[]>();
+  for (const c of cs) { const d = c.dimension || 'Other'; if (!g.has(d)) g.set(d, []); g.get(d)!.push(c); }
+  return [...DIM_ORDER, 'Other'].filter(d => g.has(d)).map(d => [d, g.get(d)!] as [string, ManagementContribution[]]);
+}
 
 // One computed base lens — shows the FULL arithmetic: sub-score bar × weight = points
 // toward the base, so the base is never a black-box number.
@@ -62,19 +71,42 @@ function FactorRow({ label, pts, favorable, note }: { label: string; pts: number
   );
 }
 
-export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
+export default function ManagementAnalysis({ ma, qp, perSide }: { ma: MA; qp?: any; perSide?: PerSideQuant | null }) {
   const s = SIGNAL[ma.signal] || SIGNAL.HOLD;
   const overlayNet = ma.overlay.reduce((a, o) => a + o.pts, 0);
+  // Per-side (call/put) tabs for a two-sided held position — the hold/close SCORE stays whole-trade
+  // (it doesn't decompose per leg); the side tabs surface the live per-side risk (breach / cushion /
+  // greeks-now / defend) so you can see WHICH side is under pressure and how to defend it.
+  const hasSides = !!perSide && Array.isArray(perSide.sides) && perSide.sides.length >= 2;
+  const [tab, setTab] = useState<'trade' | 'call' | 'put'>('trade');
+  const activeSide = hasSides && tab !== 'trade' ? (perSide!.sides.find(x => x.key === tab) || null) : null;
 
   return (
     <div className="rounded-lg border border-secondary/20 bg-secondary/[0.03] p-3 space-y-3">
       <div className="flex items-center gap-2">
-        <span className="text-[10px] uppercase tracking-wider font-semibold text-secondary/70">Management analysis</span>
-        <span className="text-[9px] text-base-content/35">scan factors · re-read for a holder</span>
+        <span className="text-[10px] uppercase tracking-wider font-semibold text-secondary/70">Manage This Position</span>
+        <span className="text-[9px] text-base-content/35">hold vs close · your live position</span>
         <span className={`badge badge-sm font-semibold ml-auto ${s.cls}`}>{s.label}</span>
         <span className="text-sm font-bold">{ma.score}<span className="text-[10px] text-base-content/40">/100</span></span>
       </div>
 
+      {hasSides && (
+        <div>
+          <div className="inline-flex rounded-lg border border-white/10 bg-base-100/40 p-0.5 text-[11px]">
+            {[['trade', 'Manage'] as const, ...perSide!.sides.map(x => [x.key, x.label] as const)].map(([k, lbl]) => (
+              <button key={k} type="button" onClick={() => setTab(k as 'trade' | 'call' | 'put')}
+                className={`px-2.5 py-1 rounded-md transition-colors ${tab === k ? 'bg-secondary/20 text-secondary font-semibold' : 'text-base-content/60 hover:text-base-content'}`}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          {tab !== 'trade' && <p className="text-[9.5px] text-base-content/45 mt-1 leading-snug">Live per-side risk of your position. The hold/close score is whole-trade — it doesn't split per leg.</p>}
+        </div>
+      )}
+
+      {activeSide && <SideQuantPanel side={activeSide} variant="manage" />}
+
+      {tab === 'trade' && (<>
       {/* Structural advice — covered vs naked call (capital already committed) */}
       {ma.advisories && ma.advisories.length > 0 && ma.advisories.map((a, i) => (
         <div key={i} className="text-[11px] rounded-lg border border-warning/25 bg-warning/[0.06] px-2 py-1.5 text-warning/90 leading-snug">{a}</div>
@@ -104,25 +136,37 @@ export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
       {/* Re-signed scan + dynamic-greek factors — the holder interpretation */}
       {ma.contributions.length > 0 && (
         <div>
-          <div className={GROUP}>Factors · re-signed for your position (adjust the base)</div>
-          <div className="grid sm:grid-cols-2 gap-x-4 gap-y-1.5">
-            {ma.contributions.map((c, i) => <FactorRow key={i} {...c} />)}
-          </div>
-          <div className="text-right text-[10px] font-semibold mt-1 text-base-content/60">
+          <div className={GROUP}>Factors by dimension · re-signed for your position (adjust the base)</div>
+          {/* Grouped by risk dimension (Loss probability, Vol edge, Structural defense, …) — the SAME taxonomy
+              as the entry desk, so a holder reads all the evidence for one dimension together. Each group:
+              the re-signed bars + their inline WHY (breach/touch %, wall distance, defensibility, …). */}
+          {groupContribs(ma.contributions).map(([dim, cs]) => {
+            const net = cs.reduce((s, c) => s + c.pts, 0);
+            return (
+              <div key={dim} className="mb-2">
+                <div className="flex items-baseline gap-2 mb-0.5">
+                  <span className="text-[9px] uppercase tracking-wider text-base-content/40">{dim}</span>
+                  <span className={`ml-auto font-mono text-[9px] ${net > 0 ? 'text-success/70' : net < 0 ? 'text-error/70' : 'text-base-content/40'}`}>{sgn(net)}</span>
+                </div>
+                <div className="grid sm:grid-cols-2 gap-x-4 gap-y-1.5">
+                  {cs.map((c, i) => <FactorRow key={i} {...c} />)}
+                </div>
+                {cs.some(c => c.note) && (
+                  <ul className="mt-1 space-y-0.5 border-t border-white/[0.05] pt-1">
+                    {cs.filter(c => c.note).map((c, i) => (
+                      <li key={i} className="flex gap-2 text-[11px] leading-snug">
+                        <span className={`font-mono font-semibold shrink-0 tabular-nums ${c.pts >= 0 ? 'text-success' : 'text-error'}`}>{sgn(c.pts)}</span>
+                        <span className="text-base-content/65"><b className="text-base-content/85">{c.label}</b> · {c.note}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            );
+          })}
+          <div className="text-right text-[10px] font-semibold mt-1 border-t border-white/[0.06] pt-1 text-base-content/60">
             Net factors <span className={ma.factors_net >= 0 ? 'text-success' : 'text-error'}>{sgn(ma.factors_net)}</span>
           </div>
-          {/* Per-factor EVIDENCE — the WHY behind each hold/close factor, inline (like the entry desk's Quant
-              Analysis): breach/touch %, which wall & how far, fortified, defensibility, systemic beta, … */}
-          {ma.contributions.some(c => c.note) && (
-            <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
-              {ma.contributions.filter(c => c.note).map((c, i) => (
-                <li key={i} className="flex gap-2 text-[11px] leading-snug">
-                  <span className={`font-mono font-semibold shrink-0 tabular-nums ${c.pts >= 0 ? 'text-success' : 'text-error'}`}>{sgn(c.pts)}</span>
-                  <span className="text-base-content/65"><b className="text-base-content/85">{c.label}</b> · {c.note}</span>
-                </li>
-              ))}
-            </ul>
-          )}
         </div>
       )}
 
@@ -146,6 +190,7 @@ export default function ManagementAnalysis({ ma, qp }: { ma: MA; qp?: any }) {
       {ma.overrides.length > 0 && (
         <div className="text-[10px] text-warning/80">Override: {ma.overrides.join('; ')}</div>
       )}
+      </>)}
     </div>
   );
 }

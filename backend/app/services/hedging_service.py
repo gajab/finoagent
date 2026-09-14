@@ -1282,6 +1282,30 @@ async def run_hedging_strategy(
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"RND annotation error: {exc}")
 
+    # Institutional hedge-desk scorecard — ranks every structure on the
+    # stock+overlay differential under the market's own density.
+    desk = None
+    try:
+        if rnd_summary and rnd_summary.get("curve"):
+            from .hedge_desk_service import score_hedge_desk
+            from .lifecycle_service import payoff_distribution_metrics
+            desk = await asyncio.to_thread(
+                score_hedge_desk, built["hedges"],
+                spot=spot, shares=shares, notional=notional,
+                curve=rnd_summary["curve"], market=dict(market, rnd=rnd_summary),
+                horizon_days=horizon_days, budget_pct=max_cost_pct,
+                pnl_at_price=_pnl_at_price,
+                payoff_metrics=payoff_distribution_metrics,
+            )
+            if desk:
+                for h in built["hedges"]:
+                    row = desk["by_id"].get(h["id"])
+                    if row:
+                        h["desk"] = row
+                desk.pop("by_id", None)   # already attached per structure
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"hedge desk scoring error: {exc}")
+
     # Beta-weighted index put overlay (best-effort; never blocks the main menu).
     index_overlay = None
     try:
@@ -1317,6 +1341,7 @@ async def run_hedging_strategy(
         "chain": built["chain"],
         "market": market,
         "rnd": rnd_summary,
+        "desk": desk,
         "index_overlay": index_overlay,
         "risks": _build_risks(),
         "available_expirations": expirations[:15],
@@ -1447,6 +1472,17 @@ async def run_market_conditions_check(
                                        "inside_horizon": days_to <= horizon_days}
     except Exception:  # noqa: BLE001
         pass
+
+    # Algorithmic protection preferences — the form is seeded from the live
+    # surface (breach odds, vol richness, gap regime) instead of constants.
+    try:
+        from .hedge_desk_service import suggest_preferences
+        sp = suggest_preferences(market, spot, horizon_days, market.get("beta"),
+                                 puts=puts, calls=calls)
+        if sp:
+            market["suggested_preferences"] = sp
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"preference suggestion error: {exc}")
     return market
 
 

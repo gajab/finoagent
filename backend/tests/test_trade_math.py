@@ -30,6 +30,7 @@ from app.services.trade_math import (
     mid_price,
     prob_itm_lognormal,
     realized_close_pnl,
+    roll_target_credit,
     simple_annualized_pct,
     summarize_trade_actions,
     walk_ledger,
@@ -742,6 +743,51 @@ class TestRealizedClosePnl:
         s = realized_close_pnl("SELL", 2.0, 1.2, 1, is_option=True)
         l = realized_close_pnl("BUY", 2.0, 1.2, 1, is_option=True)
         assert s == pytest.approx(-l)
+
+
+class TestRollTargetCredit:
+    """The 'what premium do I need on the next roll' number — target = buyback − net cushion."""
+
+    def test_target_covers_buyback_minus_cushion(self):
+        # Bought back the tested short for $400; effective net credit banked so far $100 (open
+        # leg $250 credit − $150 of roll losses). Need ≥ $300 to get back to flat.
+        assert roll_target_credit(400.0, 100.0) == 300.0
+
+    def test_fat_cushion_can_go_negative(self):
+        # Cheap buy-back ($120) under a big banked cushion ($400) → already whole; any credit is gravy.
+        assert roll_target_credit(120.0, 400.0) == -280.0
+
+    def test_no_cushion_target_equals_buyback(self):
+        assert roll_target_credit(250.0, 0.0) == 250.0
+
+    def test_roll_math_reconciles_with_realized_close(self):
+        # Full campaign: sell CSP $2 (credit 200), buy back $3.50 (realized −150 via realized_close_pnl),
+        # open new for $2.50. Cushion into the NEXT roll = new credit(250) + prior roll realized(−150) = 100.
+        prior_roll_realized = realized_close_pnl("SELL", 2.0, 3.5, 1, is_option=True)   # −150
+        assert prior_roll_realized == pytest.approx(-150.0)
+        new_open_credit = 2.5 * 100 * 1                                                  # 250
+        cushion = new_open_credit + prior_roll_realized                                  # 100
+        # If the new leg is now worth $4.00 (buyback $400), break-even needs $300 on the next roll.
+        assert roll_target_credit(400.0, cushion) == 300.0
+
+
+class TestRollEffectiveBreakeven:
+    """Cost-basis adjustment falls out of structure_breakevens by folding roll-realized into
+    the entry cost (storage convention: credit positive)."""
+
+    def test_short_put_breakeven_shifts_with_roll_loss(self):
+        # New short put K95 sold for $2.50 (entry_cost +250). Raw breakeven = 95 − 2.50 = 92.50.
+        leg = [{"strike": 95.0, "right": "P", "sign": -1, "qty": 1}]
+        raw = structure_breakevens(leg, 250.0)
+        assert raw == [pytest.approx(92.5)]
+        # A −$150 roll loss shrinks the effective credit to $1.00 → effective breakeven 94.00 (worse).
+        eff = structure_breakevens(leg, 250.0 + (-150.0))
+        assert eff == [pytest.approx(94.0)]
+
+    def test_roll_gain_pushes_breakeven_further_out(self):
+        leg = [{"strike": 95.0, "right": "P", "sign": -1, "qty": 1}]
+        eff = structure_breakevens(leg, 250.0 + 100.0)   # +$100 roll gain → net $3.50
+        assert eff == [pytest.approx(91.5)]
 
 
 if __name__ == "__main__":

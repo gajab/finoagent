@@ -156,3 +156,131 @@ class TestPartition:
     def test_empty_book(self):
         comp = R._compute_closed_ledger([], NOW)
         assert comp["frozen"] == [] and comp["current_rows"] == [] and comp["loose_ids"] == []
+
+
+# ── Rolls — a rolled trade is ONE continuing campaign, hidden from Closed by default ──
+
+def _roll_leg(realized, *, entry=2.0, exit=3.0, strike=100, action="sell", type="put", qty=1,
+              closed_at="2026-09-10T00:00:00+00:00", roll_id="r1", seq=1):
+    return {"type": type, "action": action, "qty": qty, "strike": strike,
+            "entry_price": entry, "exit_price": exit, "realized": realized,
+            "closed_at": closed_at, "roll": True, "roll_id": roll_id, "roll_seq": seq}
+
+
+def _genuine_leg(realized, *, entry=2.0, exit=0.5, strike=100, action="sell", type="put", qty=1,
+                 closed_at="2026-09-11T00:00:00+00:00"):
+    return {"type": type, "action": action, "qty": qty, "strike": strike,
+            "entry_price": entry, "exit_price": exit, "realized": realized, "closed_at": closed_at}
+
+
+class TestRollRealized:
+    def test_sums_tagged_roll_legs(self):
+        params = {"closed_legs": [_roll_leg(-150), _roll_leg(50, roll_id="r2", seq=2)]}
+        assert R._roll_realized(params) == -100.0
+
+    def test_falls_back_to_scalar_when_untagged(self):
+        assert R._roll_realized({"roll_realized_pnl": -80.0}) == -80.0
+
+    def test_zero_when_no_roll_info(self):
+        assert R._roll_realized({"realized_pnl": 300.0}) == 0.0
+
+
+class TestRollAwareClosedRealized:
+    def test_active_excludes_roll_by_default(self):
+        s = _mk(1, "active", "2026-09", -100.0, legs=[_roll_leg(-100)])
+        assert R._closed_realized(s, R._safe_params(s), include_rolls=False) == 0.0
+        assert R._closed_realized(s, R._safe_params(s), include_rolls=True) == -100.0
+
+    def test_active_keeps_genuine_partial_drops_roll(self):
+        # realized_pnl 70 = genuine +170 and roll −100
+        s = _mk(1, "active", "2026-09", 70.0, legs=[_genuine_leg(170.0), _roll_leg(-100.0)])
+        assert R._closed_realized(s, R._safe_params(s), include_rolls=False) == 170.0
+        assert R._closed_realized(s, R._safe_params(s), include_rolls=True) == 70.0
+
+    def test_closed_always_full_regardless_of_flag(self):
+        s = _mk(1, "closed", "2026-09", 70.0, legs=[_genuine_leg(170.0), _roll_leg(-100.0)])
+        assert R._closed_realized(s, R._safe_params(s), include_rolls=False) == 70.0
+        assert R._closed_realized(s, R._safe_params(s), include_rolls=True) == 70.0
+
+
+class TestRollAwareCostProceeds:
+    def test_skips_roll_legs_when_excluded(self):
+        params = {"closed_legs": [_genuine_leg(150.0, entry=2.0, exit=0.5),
+                                  _roll_leg(-100.0, entry=2.0, exit=3.0)]}
+        # Genuine short put only: proceeds 200, cost 50.
+        assert R._closed_cost_proceeds(params, include_roll_legs=False) == (50.0, 200.0)
+        # Both legs: + the roll leg (sell 2.0 → buy 3.0): proceeds +200, cost +300.
+        assert R._closed_cost_proceeds(params, include_roll_legs=True) == (350.0, 400.0)
+
+
+class TestHasShownRealized:
+    def test_roll_only_active_hidden_by_default(self):
+        s = _mk(1, "active", "2026-09", -100.0, legs=[_roll_leg(-100)])
+        assert R._has_shown_realized(s, include_rolls=False) is False
+        assert R._has_shown_realized(s, include_rolls=True) is True
+
+    def test_genuine_partial_always_shown(self):
+        s = _mk(1, "active", "2026-09", 170.0, legs=[_genuine_leg(170.0)])
+        assert R._has_shown_realized(s, include_rolls=False) is True
+
+    def test_mixed_active_shown_because_genuine_present(self):
+        s = _mk(1, "active", "2026-09", 70.0, legs=[_genuine_leg(170.0), _roll_leg(-100.0)])
+        assert R._has_shown_realized(s, include_rolls=False) is True
+
+    def test_closed_always_shown(self):
+        s = _mk(1, "closed", "2026-09", -100.0, legs=[_roll_leg(-100)])
+        assert R._has_shown_realized(s, include_rolls=False) is True
+
+
+class TestRollLedgerIntegration:
+    def test_roll_only_active_total_excluded_by_default(self):
+        # One genuine closed (+55) and one roll-only active (−100, this month).
+        rows = [_mk(1, "closed", "2026-09", 55.0),
+                _mk(2, "active", "2026-09", -100.0, legs=[_roll_leg(-100)])]
+        comp = R._compute_closed_ledger(rows, NOW, include_rolls=False)
+        resp = R._closed_ledger_response(NOW, comp["frozen"], comp["current_rows"],
+                                         stored=False, include_rolls=False)
+        # The active roll trade contributes 0 by default → total is just the genuine close.
+        assert resp["total_realized"] == 55.0
+
+    def test_roll_included_when_opted_in(self):
+        rows = [_mk(1, "closed", "2026-09", 55.0),
+                _mk(2, "active", "2026-09", -100.0, legs=[_roll_leg(-100)])]
+        comp = R._compute_closed_ledger(rows, NOW, include_rolls=True)
+        resp = R._closed_ledger_response(NOW, comp["frozen"], comp["current_rows"],
+                                         stored=False, include_rolls=True)
+        assert resp["total_realized"] == -45.0   # 55 + (−100)
+
+
+class TestRollSummary:
+    """_roll_summary — the cost-basis overlay: effective breakeven folds roll-realized into
+    the entry cost, reconciling with structure_breakevens (see test_trade_math)."""
+
+    def _rolled_csp(self):
+        params = {"rolls": [{"roll_id": "r1", "seq": 1, "realized": -150.0}],
+                  "roll_realized_pnl": -150.0,
+                  "closed_legs": [_roll_leg(-150.0, strike=100, entry=2.0, exit=3.5)]}
+        now = dt.datetime(2026, 9, 20, tzinfo=dt.timezone.utc)
+        return SimpleNamespace(
+            id=1, trade_status="active", strategy_type="cash_secured_put",
+            parameters=json.dumps(params),
+            legs_data=json.dumps([{"type": "put", "action": "sell", "strike": 95, "qty": 1,
+                                   "premium": 2.5, "expiration": "2026-12-19"}]),
+            entry_prices=json.dumps([{"price": 2.5, "strike": 95, "type": "put"}]),
+            result_snapshot="{}", exit_prices=None, name="t1", ticker="XYZ", notes=None,
+            order_source="manual", entry_net_debit=None, entry_date=None, exit_date=None,
+            exit_net=None, created_at=now, updated_at=now)
+
+    def test_effective_breakeven_absorbs_roll_loss(self):
+        roll = R._roll_summary(self._rolled_csp())
+        assert roll is not None
+        assert roll["count"] == 1
+        assert roll["roll_realized_pnl"] == -150.0
+        assert roll["raw_net_credit"] == 250.0
+        assert roll["effective_net_credit"] == 100.0
+        assert roll["raw_breakevens"] == [92.5]        # 95 − 2.50
+        assert roll["effective_breakevens"] == [94.0]  # 95 − 1.00 (credit shrunk by the roll loss)
+
+    def test_none_when_never_rolled(self):
+        s = _mk(1, "active", "2026-09", 0.0)
+        assert R._roll_summary(s) is None

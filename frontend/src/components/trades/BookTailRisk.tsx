@@ -7,9 +7,9 @@
  * offers a MENU of index (SPX, European) tail hedges ranked by risk-reduction-per-$
  * and Spitznagel CAGR lift — plus a plain-language verdict + actions.
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2, Sparkles, RefreshCw, Grid3x3, Wrench, ArrowRight } from 'lucide-react';
+import { Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, ChevronDown, ChevronUp, Compass, CheckCircle2, Sparkles, RefreshCw, ArrowRight, Grid3x3 } from 'lucide-react';
 import { fetchBookTailRisk, fetchBookHedgeAdvice } from '../../api';
 import type { BookTailRiskResult } from '../../api';
 import CollapsibleSection from './CollapsibleSection';
@@ -30,7 +30,7 @@ const LEVEL: Record<string, { tone: string; bg: string }> = {
   Contained: { tone: 'text-success', bg: 'border-success/25 bg-success/[0.05]' },
 };
 
-export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
+export default function BookTailRisk({ quoteSource, onManageTrade }: { quoteSource: string; onManageTrade?: (id: number) => void }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);      // initial STORED-snapshot load
   const [refreshing, setRefreshing] = useState(false); // user-triggered live recompute
@@ -127,16 +127,11 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
 
           {data && (
             <>
-              {/* Institutional risk scorecard — the lead intelligence: guardrails · your value vs limit · cheapest fix. */}
-              {data.risk_scorecard && <RiskScorecard sc={data.risk_scorecard} />}
-              {/* one-line plain read of the two-sided tail (terse) */}
-              {v && <div className="text-[11px] text-base-content/55 -mt-1">{v.summary}</div>}
-
-              {/* Book vitals — the current metrics in one tight strip (replaces the scattered tiles). */}
-              <div className="flex flex-wrap gap-px rounded-lg overflow-hidden border border-white/[0.06]">
+              {/* ── GLOBAL METRICS HUD — pinned to the top as bordered metric cards ── */}
+              <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-7 gap-1.5">
                 <Vital label="Capital" value={money(data.book_capital)} title={data.capital_basis} />
                 <Vital label="Carry" value={data.carry_yield_pct != null ? `${data.carry_yield_pct}%/yr` : '—'} tone="success" sub="θ yield" />
-                <Vital label="Net θ / day" value={money(data.net_theta)} tone={(data.net_theta ?? 0) >= 0 ? 'success' : 'error'}
+                <Vital label="Net Θ / day" value={money(data.net_theta)} tone={(data.net_theta ?? 0) >= 0 ? 'success' : 'error'}
                   sub={data.theta_net_liq_pct != null ? `${data.theta_net_liq_pct}%/day` : undefined} />
                 <Vital label="CVaR · 1mo" value={money(data.cvar_95)} tone="warning" sub={data.cvar_capital_pct != null ? `${data.cvar_capital_pct}% cap` : undefined} />
                 <Vital label="β-Δ" value={data.beta_delta_spy != null ? `${data.beta_delta_spy >= 0 ? '+' : ''}${data.beta_delta_spy} SPY` : '—'} sub={data.avg_beta != null ? `β ${data.avg_beta}` : undefined} />
@@ -144,33 +139,39 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                 <Vital label="Net Γ" value={data.net_gamma?.toFixed(2) ?? '—'} tone={(data.net_gamma ?? 0) < 0 ? 'error' : 'success'} sub={data.short_vol ? 'short vol' : 'long vol'} />
               </div>
 
+              {/* ── ACTION CENTER — guardrail breaches + the exact trade to fix each ── */}
+              {data.risk_scorecard && <RiskScorecard sc={data.risk_scorecard} onManage={onManageTrade} />}
+              {v && <div className="text-[11px] text-base-content/55 -mt-1">{v.summary}</div>}
+
               {/* Risk breakdown — the supporting evidence, tucked into one collapsible so the cockpit leads. */}
               <CollapsibleSection title="Risk breakdown · stress · by-name · factor" accent="warning" icon={<TrendingDown className="w-3.5 h-3.5" />}>
               <div className="space-y-3">
               {/* Stress scenarios (full reprice) — TWO-SIDED: short gamma loses either way */}
               <div>
-                <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><TrendingDown className="w-3 h-3" /> Stress scenarios · downside &amp; melt-up · full reprice (β-weighted{data.avg_beta ? ` · book β ${data.avg_beta}` : ''}{(data.stock_notional ?? 0) > 0 ? ' · incl. your shares' : ''})</div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {data.crash_scenarios?.map(c => {
-                    const up = c.move_pct > 0;
-                    const hasStock = c.stock_pnl != null && Math.abs(c.stock_pnl) >= 1;
-                    return (
-                    <div key={c.label} className={`rounded-lg border p-2 text-center ${up ? 'border-warning/25 bg-warning/[0.05]' : 'border-error/15 bg-error/[0.04]'}`}>
-                      <div className="text-[9px] uppercase text-base-content/40">{c.label}</div>
-                      <div className={`text-sm font-bold mt-0.5 ${up ? 'text-warning' : 'text-error'}`}>{money(c.pnl)}</div>
-                      {c.pct_of_capital != null && <div className="text-[9px] text-base-content/40">{c.pct_of_capital}% of capital</div>}
-                      {hasStock && (
-                        <div className="text-[8px] text-base-content/35 mt-0.5" title="How the loss splits between the option overlay and the shares you hold behind it.">
-                          {money(c.overlay_pnl)} opt · {money(c.stock_pnl)} shares
-                        </div>
-                      )}
+                <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><TrendingDown className="w-3 h-3" /> Stress scenarios · option overlay · downside &amp; melt-up{data.avg_beta ? ` · book β ${data.avg_beta}` : ''}</div>
+                {(() => {
+                  const scen = data.crash_scenarios || [];
+                  const maxLoss = Math.max(1, ...scen.filter(c => c.pnl < 0).map(c => Math.abs(c.pnl)));
+                  return (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                      {scen.map(c => {
+                        const loss = c.pnl < 0;
+                        const t = Math.min(1, Math.abs(c.pnl) / maxLoss);   // heat: deepest loss = darkest red
+                        const bg = loss ? `rgba(239,68,68,${(0.06 + 0.5 * t).toFixed(3)})` : 'rgba(34,197,94,0.10)';
+                        return (
+                          <div key={c.label} className="rounded-lg border border-base-content/[0.06] p-2 text-center" style={{ background: bg }}
+                            title={c.pct_of_capital != null ? `${c.pct_of_capital}% of capital` : undefined}>
+                            <div className="text-[8px] uppercase tracking-wider text-base-content/55">{c.label}</div>
+                            <div className={`font-mono text-sm font-bold tabular-nums mt-0.5 ${loss ? 'text-base-content' : 'text-success'}`}>{money(c.pnl)}</div>
+                            {c.pct_of_capital != null && <div className="font-mono text-[9px] text-base-content/50 tabular-nums">{c.pct_of_capital}% cap</div>}
+                          </div>
+                        );
+                      })}
                     </div>
-                  ); })}
-                </div>
+                  );
+                })()}
                 <p className="text-[9px] text-base-content/40 mt-1">
-                  Full reprice (not a delta-gamma approximation){(data.stock_notional ?? 0) > 0
-                    ? <> — and now revalues the <b>{money(data.stock_notional)} of shares</b> you hold behind covered calls/collars, not just the option overlay. That’s why a deeper crash is no longer <i>smaller</i>: the stock loss was previously invisible.</>
-                    : <>. Short gamma loses on a big move in <b>either</b> direction — the amber melt-up tiles are the upside risk a downside-only table hides.</>}
+                  Full reprice of the <b>option overlay only</b> — the long shares behind covered calls/collars are a separate core holding, not counted here. So your short calls <b>print</b> in a selloff (green) and the real risk is the <b>melt-up</b> (red). Stock is used only to mark a call covered and to size assignment capital below.
                 </p>
               </div>
 
@@ -180,31 +181,28 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                 const worst = Math.max(1, ...rows.map(r => Math.abs(r.pnl)));
                 return (
                   <div>
-                    <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><Layers className="w-3 h-3" /> Where a −20% month hits — by name (whole position)</div>
+                    <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1"><Layers className="w-3 h-3" /> Where a −20% month hits — by name (option overlay)</div>
                     <div className="space-y-1">
                       {rows.slice(0, 8).map(r => {
                         const loss = r.pnl < 0;
                         const w = Math.round((Math.abs(r.pnl) / worst) * 100);
                         return (
                           <div key={r.ticker} className="flex items-center gap-2 text-[11px]">
-                            <span className="w-14 font-semibold shrink-0">{r.ticker}</span>
+                            <span className="w-14 font-mono font-semibold shrink-0">{r.ticker}</span>
                             <div className="flex-1 h-3.5 rounded bg-base-300/30 overflow-hidden relative">
                               <div className={`h-full ${loss ? 'bg-error/50' : 'bg-success/50'}`} style={{ width: `${w}%` }} />
                             </div>
-                            <span className={`w-20 text-right tabular-nums shrink-0 ${loss ? 'text-error' : 'text-success'}`}>{money(r.pnl)}</span>
-                            <span className="w-24 text-right text-[9px] text-base-content/40 shrink-0 tabular-nums" title="Split: option overlay vs the shares behind it.">
-                              {Math.abs(r.stock_pnl) >= 1 ? `${money(r.option_pnl)}o·${money(r.stock_pnl)}s` : 'options'}
-                            </span>
+                            <span className={`w-20 text-right font-mono tabular-nums shrink-0 ${loss ? 'text-error' : 'text-success'}`}>{money(r.pnl)}</span>
                           </div>
                         );
                       })}
                     </div>
-                    <p className="text-[9px] text-base-content/40 mt-1">Your true single-name crash contributors — the concentration a book-level number hides. <b>o</b> = option overlay, <b>s</b> = shares.</p>
+                    <p className="text-[9px] text-base-content/40 mt-1">Your single-name option-overlay contributors at a −20% month (a red bar loses, green gains). Sums to the −20% stress tile above.</p>
                   </div>
                 );
               })()}
 
-              {/* Risk array — spot × vol heatmap (the short-gamma valley + short-vega gradient). */}
+              {/* Vol-sensitivity surface — spot × vol heatmap of the same option-overlay reprice. */}
               {(data.scenario_grid?.rows?.length ?? 0) > 0 && (
                 <ScenarioGrid grid={data.scenario_grid!} capital={data.book_capital} />
               )}
@@ -302,56 +300,8 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                 <CollapsibleSection title="Tail-hedge menu + what to do" accent="info" icon={<Umbrella className="w-3.5 h-3.5" />} defaultOpen>
                 <div className="space-y-2">
 
-                {/* Start-here hero — ONE budget-sized recommendation with the crash number before→after. */}
-                {(() => {
-                  const menu = data.hedge_menu || [];
-                  const rec = menu.find(c => c.recommended) || menu.find(c => c.cost_effective) || menu[0];
-                  if (!rec) return null;
-                  const before = Math.abs(data.crash_scenarios?.find(s => Math.abs(s.move_pct + 0.2) < 0.001)?.pnl ?? 0);
-                  const after = Math.max(0, before - (rec.crash_payoff_20 || 0));
-                  const carry = data.annual_income || 0;
-                  const budgetPct = carry > 0 ? (rec.annual_bleed / carry) * 100 : null;
-                  const lo = rec.long_strike ?? rec.long_put, sh = rec.short_strike ?? rec.short_put;
-                  const isVixy = rec.instrument === 'VIXY';
-                  const size = isVixy ? `${money(rec.sleeve_capital)} cash sleeve` : `${rec.contracts}× ${rec.instrument ?? 'SPX'} ${lo != null ? `${lo}${sh ? `/${sh}` : ''}` : ''}`.trim();
-                  return (
-                    <div className="rounded-xl border border-success/25 bg-success/[0.05] p-2.5">
-                      <div className="flex items-center gap-1.5 mb-1">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
-                        <span className="text-[10px] uppercase tracking-wider text-success font-bold">Start here</span>
-                        <span className="text-[11px] text-base-content/80 font-semibold">{rec.label}</span>
-                        <span className="ml-auto text-[9px] text-base-content/45">{rec.dte_days ? `~${rec.dte_days}d` : 'signal-based'}</span>
-                      </div>
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
-                        <div className="rounded-lg bg-base-300/25 p-1.5">
-                          <div className="text-[8px] uppercase text-base-content/40">Buy</div>
-                          <div className="text-[11px] font-semibold mt-0.5">{size}</div>
-                        </div>
-                        <div className="rounded-lg bg-base-300/25 p-1.5">
-                          <div className="text-[8px] uppercase text-base-content/40">Cost</div>
-                          <div className="text-[11px] font-semibold mt-0.5 text-warning">{money(rec.annual_bleed)}/yr{isVixy ? '*' : ''}</div>
-                          {budgetPct != null && <div className="text-[8px] text-base-content/40">{budgetPct.toFixed(0)}% of carry</div>}
-                        </div>
-                        <div className="rounded-lg bg-base-300/25 p-1.5">
-                          <div className="text-[8px] uppercase text-base-content/40">−20% month</div>
-                          <div className="text-[11px] font-semibold mt-0.5"><span className="text-error">{money(-before)}</span> <span className="text-base-content/30">→</span> <span className="text-success">{money(-after)}</span></div>
-                          {rec.offsets_pct != null && <div className="text-[8px] text-base-content/40">{rec.offsets_pct}% capped</div>}
-                        </div>
-                        <div className="rounded-lg bg-base-300/25 p-1.5">
-                          <div className="text-[8px] uppercase text-base-content/40">Compounding</div>
-                          <div className={`text-[11px] font-semibold mt-0.5 ${rec.cost_effective ? 'text-success' : 'text-base-content/60'}`}>{rec.cagr_lift_pct >= 0 ? '+' : ''}{rec.cagr_lift_pct}% CAGR</div>
-                          <div className="text-[8px] text-base-content/40">{rec.cost_effective ? 'pays for itself' : 'pure insurance'}</div>
-                        </div>
-                      </div>
-                      <p className="text-[9px] text-base-content/45 mt-1.5">
-                        {rec.cost_effective
-                          ? <>This one hedge <b>lifts</b> your compound growth while capping the crash — the rare case where protection is free. Size it once, roll it {data.assumptions?.hedge_rolls_per_year ? `~${data.assumptions.hedge_rolls_per_year}×/yr` : 'quarterly'}.</>
-                          : <>Pure insurance: it costs {budgetPct != null ? `${budgetPct.toFixed(0)}% of your carry` : 'some yield'} to cap a −20% month from {money(-before)} to {money(-after)}. Add it only if avoiding that drawdown matters more than the yield — otherwise de-risk the concentrated names above first.</>}
-                        {' '}The full menu below trades cost against protection.
-                      </p>
-                    </div>
-                  );
-                })()}
+                {/* Start-here hero — ONE budget-sized recommendation + a prominent Stage CTA. */}
+                <HedgeHero data={data} />
 
                 {/* If the MELT-UP is the bigger tail, say so — the downside menu below won't fix it. */}
                 {(() => {
@@ -376,7 +326,7 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                   <div className="overflow-x-auto">
                     <table className="table table-xs w-full text-[11px]">
                       <thead><tr className="text-[8px] uppercase text-base-content/30">
-                        <th>Hedge</th><th>Strikes</th><th>×</th><th>Cost/yr</th><th>Offsets −20%</th><th title="Book CVaR-95 reduction">CVaR cut</th><th title="Spitznagel: compound-growth lift">CAGR</th>
+                        <th className="text-left">Hedge</th><th className="text-right">Strikes</th><th className="text-right">×</th><th className="text-right">Cost/yr</th><th className="text-right">Offsets −20%</th><th className="text-right" title="Book CVaR-95 reduction">CVaR cut</th><th className="text-right" title="Spitznagel: compound-growth lift">CAGR</th>
                       </tr></thead>
                       <tbody>
                         {data.hedge_menu!.map((c, i) => {
@@ -386,18 +336,18 @@ export default function BookTailRisk({ quoteSource }: { quoteSource: string }) {
                             : c.instrument === 'VIXY' ? 'badge-accent' : 'badge-info';
                           const isVixy = c.instrument === 'VIXY';
                           return (
-                          <tr key={i} className={c.recommended ? 'bg-success/[0.06]' : ''}>
+                          <tr key={i} className={`transition-colors ${c.recommended ? 'bg-info/[0.08] hover:bg-info/[0.12]' : 'hover:bg-base-300/40'}`}>
                             <td className="whitespace-nowrap" title={isVixy ? c.signal : undefined}>
                               {c.recommended && <CheckCircle2 className="w-3 h-3 text-success inline mr-1" />}
                               <span className={`badge badge-xs mr-1 ${badge} badge-outline`}>{c.instrument ?? 'SPX'}</span>
                               {c.label}
                             </td>
-                            <td className="font-mono">{isVixy ? `${money(c.sleeve_capital)} cash` : (lo != null ? `${lo}${sh ? `/${sh}` : ''}` : '—')}</td>
-                            <td>{c.contracts ?? (isVixy ? 'sig' : '—')}</td>
-                            <td className={isVixy ? 'text-success/90' : 'text-warning/90'}>{money(c.annual_bleed)}{isVixy ? '*' : ''}</td>
-                            <td>{c.offsets_pct != null ? `${c.offsets_pct}%` : '—'}</td>
-                            <td className="text-success/90">{money(c.cvar_reduction)}</td>
-                            <td className={c.cagr_lift_pct >= 0 ? 'text-success font-semibold' : 'text-error'}>{c.cagr_lift_pct >= 0 ? '+' : ''}{c.cagr_lift_pct}%</td>
+                            <td className="font-mono tabular-nums text-right">{isVixy ? `${money(c.sleeve_capital)} cash` : (lo != null ? `${lo}${sh ? `/${sh}` : ''}` : '—')}</td>
+                            <td className="font-mono tabular-nums text-right">{c.contracts ?? (isVixy ? 'sig' : '—')}</td>
+                            <td className={`font-mono tabular-nums text-right ${isVixy ? 'text-success/90' : 'text-warning/90'}`}>{money(c.annual_bleed)}{isVixy ? '*' : ''}</td>
+                            <td className="font-mono tabular-nums text-right">{c.offsets_pct != null ? `${c.offsets_pct}%` : '—'}</td>
+                            <td className="font-mono tabular-nums text-right text-success/90">{money(c.cvar_reduction)}</td>
+                            <td className={`font-mono tabular-nums text-right ${c.cagr_lift_pct >= 0 ? 'text-success font-semibold' : 'text-error'}`}>{c.cagr_lift_pct >= 0 ? '+' : ''}{c.cagr_lift_pct}%</td>
                           </tr>
                         ); })}
                       </tbody>
@@ -467,7 +417,9 @@ const GRADE = {
   Sound: { pill: 'bg-success text-success-content', band: 'bg-success/[0.07]', border: 'border-success/25' },
 } as const;
 
-function RiskScorecard({ sc }: { sc: ScoreCard }) {
+type OnManage = ((id: number) => void) | undefined;
+
+function RiskScorecard({ sc, onManage }: { sc: ScoreCard; onManage?: OnManage }) {
   const [showPass, setShowPass] = useState(false);
   const g = GRADE[sc.grade as keyof typeof GRADE] || GRADE.Watch;
   const flagged = sc.checks.filter(c => c.status !== 'pass');
@@ -476,13 +428,13 @@ function RiskScorecard({ sc }: { sc: ScoreCard }) {
   const pct = (n: number) => `${(n / total) * 100}%`;
   return (
     <div className={`rounded-xl border ${g.border} overflow-hidden bg-base-100/30`}>
-      {/* Header band: grade + tallies */}
+      {/* Header band: grade + status chips */}
       <div className={`flex items-center gap-2.5 px-3 py-2 ${g.band}`}>
         <span className={`text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded ${g.pill}`}>{sc.grade}</span>
-        <div className="flex items-center gap-2.5 text-[10px] text-base-content/55">
-          {sc.n_breach > 0 && <span><b className="text-error">{sc.n_breach}</b> breached</span>}
-          {sc.n_warn > 0 && <span><b className="text-warning">{sc.n_warn}</b> watch</span>}
-          <span><b className="text-success">{passed.length}</b> ok</span>
+        <div className="flex items-center gap-1.5 text-[10px] font-mono">
+          {sc.n_breach > 0 && <span className="px-1.5 py-0.5 rounded bg-error/15 text-error font-semibold tabular-nums">{sc.n_breach} BREACHED</span>}
+          {sc.n_warn > 0 && <span className="px-1.5 py-0.5 rounded bg-warning/15 text-warning font-semibold tabular-nums">{sc.n_warn} WATCH</span>}
+          <span className="px-1.5 py-0.5 rounded bg-success/10 text-success/90 font-semibold tabular-nums">{passed.length} OK</span>
         </div>
         <span className="ml-auto text-[8px] uppercase tracking-wider text-base-content/30 hidden sm:block">institutional guardrails</span>
       </div>
@@ -494,7 +446,7 @@ function RiskScorecard({ sc }: { sc: ScoreCard }) {
       </div>
       {/* Rows */}
       <div className="p-2 space-y-1.5">
-        {flagged.map(c => <ScoreRow key={c.key} c={c} />)}
+        {flagged.map(c => <ScoreRow key={c.key} c={c} onManage={onManage} />)}
         {passed.length > 0 && (
           <div className="pt-0.5">
             <button className="w-full text-[10px] text-base-content/40 hover:text-base-content/60 flex items-center gap-1 px-1"
@@ -502,7 +454,7 @@ function RiskScorecard({ sc }: { sc: ScoreCard }) {
               <CheckCircle2 className="w-3 h-3 text-success/70" /> {passed.length} within limits
               {showPass ? <ChevronUp className="w-3 h-3 ml-auto" /> : <ChevronDown className="w-3 h-3 ml-auto" />}
             </button>
-            {showPass && <div className="space-y-1.5 mt-1.5">{passed.map(c => <ScoreRow key={c.key} c={c} />)}</div>}
+            {showPass && <div className="space-y-1.5 mt-1.5">{passed.map(c => <ScoreRow key={c.key} c={c} onManage={onManage} />)}</div>}
           </div>
         )}
       </div>
@@ -510,7 +462,7 @@ function RiskScorecard({ sc }: { sc: ScoreCard }) {
   );
 }
 
-function ScoreRow({ c }: { c: ScoreCard['checks'][number] }) {
+function ScoreRow({ c, onManage }: { c: ScoreCard['checks'][number]; onManage?: OnManage }) {
   const [open, setOpen] = useState(c.status === 'breach');   // breaches show their fix by default
   const hasFix = !!c.fix;
   const s = c.status;
@@ -518,74 +470,104 @@ function ScoreRow({ c }: { c: ScoreCard['checks'][number] }) {
   const valTone = s === 'breach' ? 'text-error' : s === 'warn' ? 'text-warning' : 'text-base-content/70';
   return (
     <div className={`rounded-lg bg-base-300/20 border-l-2 ${accent} overflow-hidden`}>
-      <div className={`flex items-center gap-2 px-2.5 py-1.5 ${hasFix ? 'cursor-pointer hover:bg-base-300/40 transition-colors' : ''}`}
+      <div className={`flex items-center gap-2 px-2.5 py-2 ${hasFix ? 'cursor-pointer hover:bg-base-300/40 transition-colors' : ''}`}
         onClick={() => hasFix && setOpen(o => !o)} title={c.note}>
-        <span className="text-[11px] font-medium flex-1 min-w-0 truncate text-base-content/80">{c.label}</span>
+        <span className="text-[11px] font-medium flex-1 min-w-0 truncate text-base-content/85">{c.label}</span>
         <div className="text-right shrink-0 leading-tight">
-          <div className={`text-[11px] font-semibold tabular-nums ${valTone}`}>{c.value_str}</div>
+          <div className={`font-mono text-[11px] font-semibold tabular-nums ${valTone}`}>{c.value_str}</div>
           <div className="text-[8px] text-base-content/35">limit {c.limit_str}</div>
         </div>
         {hasFix ? (open ? <ChevronUp className="w-3.5 h-3.5 text-base-content/30 shrink-0" /> : <ChevronDown className="w-3.5 h-3.5 text-base-content/30 shrink-0" />)
           : <span className="w-3.5 shrink-0" />}
       </div>
-      {open && c.fix && <FixBody fix={c.fix} />}
+      {open && c.fix && <FixBody fix={c.fix} onManage={onManage} />}
     </div>
   );
 }
 
-function FixBody({ fix }: { fix: NonNullable<ScoreCard['checks'][number]['fix']> }) {
+function FixBody({ fix, onManage }: { fix: NonNullable<ScoreCard['checks'][number]['fix']>; onManage?: OnManage }) {
   const targets = fix.targets || [];
   return (
-    <div className="px-2.5 pb-2 pt-1 space-y-1.5">
-      <div className="text-[10px] leading-snug flex items-start gap-1.5">
-        <Wrench className="w-3 h-3 text-success mt-0.5 shrink-0" />
-        <span className="text-base-content/80"><b>{fix.headline}</b>{fix.effect && <span className="text-success/80"> — {fix.effect}</span>}</span>
+    <div className="px-2.5 pb-2.5 pt-1 space-y-2">
+      {/* AI insight callout */}
+      <div className="rounded-md border border-info/25 bg-info/[0.07] px-2 py-1.5 flex items-start gap-1.5">
+        <Sparkles className="w-3.5 h-3.5 text-info mt-0.5 shrink-0" />
+        <div className="text-[10px] leading-snug text-base-content/85">
+          <b>{fix.headline}</b>
+          {fix.effect && <span className="text-info/90"> — {fix.effect}</span>}
+          {fix.cost && fix.cost !== 'each target priced below' && <span className="text-base-content/50"> · {fix.cost}</span>}
+        </div>
       </div>
-      {fix.cost && fix.cost !== 'each target priced below' && (
-        <div className="text-[10px] text-base-content/50 ml-[18px]">{fix.cost}</div>
-      )}
-      {targets.length > 0 && <div className="space-y-1.5">{targets.map((t, i) => <TargetRow key={i} t={t} />)}</div>}
-      {fix.alt && <div className="text-[9px] text-base-content/40 ml-[18px]">alt · {fix.alt}</div>}
+      {targets.length > 0 && <div className="space-y-1.5">{targets.map((t, i) => <TargetRow key={i} t={t} onManage={onManage} />)}</div>}
+      {fix.alt && <div className="text-[9px] text-base-content/40">alt · {fix.alt}</div>}
     </div>
   );
 }
 
-function TargetRow({ t }: { t: FixTarget }) {
+function StatCell({ label, value, tone = 'base' }: { label: string; value: string; tone?: 'error' | 'success' | 'warning' | 'base' }) {
+  const m = {
+    error: { t: 'text-error', bg: 'bg-error/[0.08]' },
+    success: { t: 'text-success', bg: 'bg-success/[0.08]' },
+    warning: { t: 'text-warning', bg: 'bg-warning/[0.06]' },
+    base: { t: 'text-base-content/80', bg: 'bg-base-300/30' },
+  }[tone];
+  return (
+    <div className={`rounded px-1 py-1 text-center ${m.bg}`}>
+      <div className="text-[7px] uppercase tracking-wider text-base-content/40 leading-none">{label}</div>
+      <div className={`font-mono text-[11px] font-semibold tabular-nums leading-none mt-1 ${m.t}`}>{value}</div>
+    </div>
+  );
+}
+
+function TargetRow({ t, onManage }: { t: FixTarget; onManage?: OnManage }) {
   const navigate = useNavigate();
   const rec = t.recommended;
-  const isCap = rec.action === 'cap';
+  const capOpt = [rec, t.alt].find(o => o && o.action === 'cap' && o.prefill) || null;
+  const recIsCap = rec.action === 'cap';
+  const rc = (ty: string) => (ty === 'CALL' ? 'C' : 'P');
+  const buyLeg = capOpt?.prefill?.legs.find(l => l.action === 'BUY');
+  const short = t.short;   // targeted short leg — ALWAYS closeable, even when no cap wing exists
   const toEvaluate = () => {
-    if (!rec.prefill) return;
-    // EvaluateLeg carries no qty → expand each leg to one entry per contract (mirror RepairMenu).
-    const legs = rec.prefill.legs.flatMap(l =>
-      Array(Math.max(1, l.qty)).fill({ action: l.action, type: l.type, strike: l.strike, expiration: l.expiration }));
-    try { sessionStorage.setItem('evaluatePrefill', JSON.stringify({ ticker: rec.prefill!.ticker, legs })); } catch { /* ignore */ }
+    const pf = capOpt?.prefill; if (!pf) return;
+    // EvaluateLeg carries no qty → expand to one entry per contract (mirror RepairMenu).
+    const legs = pf.legs.flatMap(l => Array(Math.max(1, l.qty)).fill({ action: l.action, type: l.type, strike: l.strike, expiration: l.expiration }));
+    try { sessionStorage.setItem('evaluatePrefill', JSON.stringify({ ticker: pf.ticker, legs })); } catch { /* ignore */ }
     navigate('/strategies?mode=evaluate');
   };
   return (
-    <div className="rounded-lg bg-base-100/50 border border-white/[0.06] px-2 py-1.5">
-      <div className="flex items-center gap-1.5">
-        <span className="font-semibold text-[11px] text-base-content/85">{t.ticker}</span>
-        {t.structure && <span className="text-[9px] text-base-content/40">{t.structure.replace(/_/g, ' ')}</span>}
-        <span className="ml-auto text-[9px] text-base-content/45 tabular-nums text-right shrink-0">{money(t.risk)} risk · {money(t.premium_left)} left</span>
+    <div className="rounded-lg border border-base-content/10 bg-base-100/50 p-2 space-y-2">
+      {/* Row 1 · WHO + why it's flagged (its risk vs the premium still to earn) */}
+      <div className="flex items-baseline gap-1.5">
+        <span className="font-mono font-semibold text-[11px] text-base-content/90">{t.ticker}</span>
+        {t.structure && <span className="text-[9px] text-base-content/45">{t.structure.replace(/_/g, ' ')}</span>}
+        <span className="ml-auto text-[9px] text-base-content/40 font-mono tabular-nums">{money(t.premium_left)} left to earn</span>
       </div>
-      <div className="mt-1 flex items-center gap-2">
-        <span className={`badge badge-xs uppercase shrink-0 ${isCap ? 'badge-success' : 'badge-warning'}`}>{rec.action}</span>
-        <div className="flex-1 min-w-0">
-          <div className="text-[10px] text-base-content/85 font-medium truncate">{rec.legs}</div>
-          <div className="text-[9px] text-base-content/55 tabular-nums">
-            {money(rec.cost)} · <span className="text-error/90">{money(t.tail_before)}</span> → <span className="text-success">{money(rec.tail_after)}</span>
-            {rec.premium_kept > 0 && <span className="text-base-content/40"> · keeps {money(rec.premium_kept)}</span>}
-          </div>
-        </div>
-        {isCap && rec.prefill && (
-          <button onClick={toEvaluate} title="Open this spread in Evaluate with exact live-chain pricing"
-            className="btn btn-ghost btn-xs h-6 min-h-0 px-1.5 text-[9px] gap-0.5 text-info hover:bg-info/10 shrink-0">
-            Evaluate <ArrowRight className="w-3 h-3" />
+
+      {/* Row 2 · the fix, as an ALIGNED labelled strip (risk → after · cost · keeps) */}
+      <div className="grid grid-cols-4 gap-1">
+        <StatCell label="Risk now" value={money(t.tail_before)} tone="error" />
+        <StatCell label="After fix" value={money(rec.tail_after)} tone="success" />
+        <StatCell label="Cost" value={money(rec.cost)} tone="warning" />
+        <StatCell label="Keeps" value={money(rec.premium_kept)} />
+      </div>
+
+      {/* Row 3 · the two real actions */}
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {buyLeg && capOpt && (
+          <button onClick={toEvaluate} title="Open this spread in Evaluate for exact live-chain pricing"
+            className={`btn btn-xs h-7 min-h-0 gap-1 font-mono normal-case ${recIsCap ? 'btn-primary' : 'btn-outline btn-primary'}`}>
+            BUY {buyLeg.qty}× {buyLeg.strike}{rc(buyLeg.type)} <ArrowRight className="w-3 h-3" />
           </button>
         )}
+        {short && (
+          <button onClick={() => (onManage && t.trade_id != null ? onManage(t.trade_id) : undefined)}
+            title={t.trade_id != null ? 'Jump to this position to close it' : undefined}
+            className={`btn btn-xs h-7 min-h-0 normal-case font-mono ${!recIsCap ? 'btn-warning' : 'btn-ghost text-base-content/55 hover:text-error'}`}>
+            Close {short.strike}{short.right}
+          </button>
+        )}
+        <span className="ml-auto text-[8px] text-base-content/30 self-center">recommended: {recIsCap ? 'cap' : 'close'}</span>
       </div>
-      {t.alt && <div className="mt-0.5 text-[9px] text-base-content/35">or {t.alt.action}: {t.alt.legs} · {money(t.alt.cost)}</div>}
     </div>
   );
 }
@@ -622,12 +604,17 @@ function FactorExposure({ fe }: { fe: NonNullable<BookTailRiskResult['factor_exp
         {sectors.length > 1 && (
           <div>
             <div className="text-[8px] uppercase tracking-wider text-base-content/35 mb-1">Capital by sector</div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               {sectors.map(s => (
-                <div key={s.sector} className="flex items-center gap-2 text-[10px]">
-                  <span className="truncate flex-1">{s.sector}</span>
-                  <span className="text-base-content/45">{s.n}</span>
-                  <span className="tabular-nums text-base-content/70 w-16 text-right">{money(s.capital)}</span>
+                <div key={s.sector}>
+                  <div className="flex items-baseline gap-2 text-[10px]">
+                    <span className="truncate flex-1 text-base-content/75">{s.sector}</span>
+                    <span className="text-base-content/40 font-mono">{s.n}</span>
+                    <span className="tabular-nums font-mono text-base-content/70 w-16 text-right">{money(s.capital)}</span>
+                  </div>
+                  {(s.tickers?.length ?? 0) > 0 && (
+                    <div className="font-mono text-[9px] text-base-content/40 truncate" title={s.tickers.join(' · ')}>{s.tickers.join(' · ')}</div>
+                  )}
                 </div>
               ))}
             </div>
@@ -663,7 +650,7 @@ function ScenarioGrid({ grid, capital }: { grid: NonNullable<BookTailRiskResult[
   return (
     <div>
       <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1 flex items-center gap-1">
-        <Grid3x3 className="w-3 h-3" /> Risk array · book P&amp;L by spot move × vol shock (full reprice{capital ? ', whole position' : ''})
+        <Grid3x3 className="w-3 h-3" /> Vol sensitivity · option-overlay P&amp;L by spot move × vol shock
       </div>
       <div className="overflow-x-auto">
         <table className="text-[10px] border-separate" style={{ borderSpacing: 2 }}>
@@ -671,16 +658,16 @@ function ScenarioGrid({ grid, capital }: { grid: NonNullable<BookTailRiskResult[
             <tr>
               <th className="text-left font-normal text-base-content/40 pr-1 whitespace-nowrap">spot ↓ · vol →</th>
               {grid.vol_shocks.map(v => (
-                <th key={v} className="font-normal text-base-content/45 px-1 text-center whitespace-nowrap">{v >= 0 ? '+' : ''}{v}v</th>
+                <th key={v} className="font-mono font-normal text-base-content/45 px-1 text-center whitespace-nowrap">{v >= 0 ? '+' : ''}{v}v</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {grid.rows.map(row => (
               <tr key={row.move_pct}>
-                <td className="pr-1 text-base-content/55 whitespace-nowrap font-medium">{row.move_pct > 0 ? '+' : ''}{row.move_pct}%</td>
+                <td className="pr-1 font-mono text-base-content/55 whitespace-nowrap font-medium">{row.move_pct > 0 ? '+' : ''}{row.move_pct}%</td>
                 {row.cells.map((c, i) => (
-                  <td key={i} className="text-center tabular-nums rounded px-1 py-0.5 whitespace-nowrap"
+                  <td key={i} className="text-center font-mono tabular-nums rounded px-1 py-0.5 whitespace-nowrap"
                     style={{ background: bg(c.pnl), minWidth: 54 }}
                     title={c.pct != null ? `${c.pct}% of book capital` : undefined}>
                     <span className={c.pnl < 0 ? 'text-error' : c.pnl > 0 ? 'text-success' : 'text-base-content/40'}>{money(c.pnl)}</span>
@@ -691,18 +678,75 @@ function ScenarioGrid({ grid, capital }: { grid: NonNullable<BookTailRiskResult[
           </tbody>
         </table>
       </div>
-      <p className="text-[9px] text-base-content/40 mt-1">Every cell fully reprices the book at that spot × vol corner. Read <b>down a column</b> for gamma (a move either way), <b>across a row</b> for vega (loss as vol rises). The deepest-red cell is your worst corner — size hedges to it.</p>
+      <p className="text-[9px] text-base-content/40 mt-1">Same option-overlay reprice as the stress tiles, sampled on a spot × vol lattice. Read <b>down a column</b> for gamma (a move either way), <b>across a row</b> for vega (loss as vol rises). Deepest-red cell = your worst corner.</p>
     </div>
   );
 }
 
-function Vital({ label, value, sub, tone = 'base', title }: { label: string; value: string; sub?: string; tone?: 'error' | 'success' | 'warning' | 'base'; title?: string }) {
-  const c = tone === 'error' ? 'text-error' : tone === 'success' ? 'text-success' : tone === 'warning' ? 'text-warning' : 'text-base-content/85';
+function HeroCell({ label, sub, tone = 'base', children }: { label: string; sub?: string; tone?: 'warning' | 'success' | 'base'; children: ReactNode }) {
+  const c = tone === 'warning' ? 'text-warning' : tone === 'success' ? 'text-success' : 'text-base-content/90';
   return (
-    <div className="flex-1 min-w-[84px] bg-base-300/25 px-2.5 py-1.5" title={title}>
+    <div className="rounded-lg bg-base-300/30 px-2 py-1.5">
+      <div className="text-[8px] uppercase tracking-wider text-base-content/40">{label}</div>
+      <div className={`font-mono text-[11px] font-semibold tabular-nums mt-0.5 ${c}`}>{children}</div>
+      {sub && <div className="text-[8px] text-base-content/40 mt-0.5">{sub}</div>}
+    </div>
+  );
+}
+
+function HedgeHero({ data }: { data: BookTailRiskResult }) {
+  const [copied, setCopied] = useState(false);
+  const menu = data.hedge_menu || [];
+  const rec = menu.find(c => c.recommended) || menu.find(c => c.cost_effective) || menu[0];
+  if (!rec) return null;
+  const before = Math.abs(data.crash_scenarios?.find(s => Math.abs(s.move_pct + 0.2) < 0.001)?.pnl ?? 0);
+  const after = Math.max(0, before - (rec.crash_payoff_20 || 0));
+  const carry = data.annual_income || 0;
+  const budgetPct = carry > 0 ? (rec.annual_bleed / carry) * 100 : null;
+  const lo = rec.long_strike ?? rec.long_put, sh = rec.short_strike ?? rec.short_put;
+  const isVixy = rec.instrument === 'VIXY';
+  const inst = rec.instrument ?? 'SPX';
+  const strikes = lo != null ? `${lo}${sh ? `/${sh}` : ''}` : '';
+  const size = isVixy ? `${money(rec.sleeve_capital)} cash` : `${rec.contracts}× ${inst} ${strikes}`.trim();
+  const ticket = isVixy
+    ? `Dynamic VIXY sleeve — ${money(rec.sleeve_capital)} cash, deploy on VIX backwardation (~${money(rec.annual_bleed)}/yr drag)`
+    : `BUY ${rec.contracts}× ${inst} ${strikes} put spread (~${rec.dte_days}d) — tail hedge, ~${money(rec.annual_bleed)}/yr`;
+  const stage = async () => {
+    try { await navigator.clipboard.writeText(ticket); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* ignore */ }
+  };
+  return (
+    <div className="rounded-xl border border-success/30 bg-success/[0.06] p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-[10px] uppercase tracking-wider text-success font-bold px-1.5 py-0.5 rounded bg-success/15">Start here</span>
+        <span className="text-[12px] text-base-content/90 font-semibold">{rec.label}</span>
+        <span className="ml-auto text-[9px] text-base-content/45">{rec.dte_days ? `~${rec.dte_days}d` : 'signal-based'}</span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 mb-2.5">
+        <HeroCell label="Trade">{size}</HeroCell>
+        <HeroCell label="Cost" tone="warning" sub={budgetPct != null ? `${budgetPct.toFixed(0)}% of carry` : undefined}>{money(rec.annual_bleed)}/yr{isVixy ? '*' : ''}</HeroCell>
+        <HeroCell label="−20% month" sub={rec.offsets_pct != null ? `${rec.offsets_pct}% capped` : undefined}>
+          <span className="text-error">{money(-before)}</span> <span className="text-base-content/30">➔</span> <span className="text-success">{money(-after)}</span>
+        </HeroCell>
+        <HeroCell label="Compounding" tone={rec.cost_effective ? 'success' : 'base'} sub={rec.cost_effective ? 'pays for itself' : 'insurance'}>{rec.cagr_lift_pct >= 0 ? '+' : ''}{rec.cagr_lift_pct}% CAGR</HeroCell>
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <button onClick={stage} className={`btn btn-sm gap-1.5 normal-case ${copied ? 'btn-success' : 'btn-success btn-outline'}`}>
+          {copied ? <><CheckCircle2 className="w-4 h-4" /> Ticket copied</> : <>Stage {inst} trade <ArrowRight className="w-4 h-4" /></>}
+        </button>
+        <span className="text-[9px] text-base-content/40">copies the exact ticket to paste into your broker</span>
+      </div>
+    </div>
+  );
+}
+
+
+function Vital({ label, value, sub, tone = 'base', title }: { label: string; value: string; sub?: string; tone?: 'error' | 'success' | 'warning' | 'base'; title?: string }) {
+  const c = tone === 'error' ? 'text-error' : tone === 'success' ? 'text-success' : tone === 'warning' ? 'text-warning' : 'text-base-content/90';
+  return (
+    <div className="rounded-lg border border-base-content/10 bg-base-300/25 px-2.5 py-2 hover:border-base-content/20 transition-colors" title={title}>
       <div className="text-[8px] uppercase tracking-wider text-base-content/40 whitespace-nowrap">{label}</div>
-      <div className={`text-[12px] font-semibold tabular-nums leading-tight ${c}`}>{value}</div>
-      {sub && <div className="text-[8px] text-base-content/35 whitespace-nowrap">{sub}</div>}
+      <div className={`font-mono text-[13px] font-semibold tabular-nums leading-tight mt-0.5 ${c}`}>{value}</div>
+      {sub && <div className="text-[8px] text-base-content/35 whitespace-nowrap mt-0.5">{sub}</div>}
     </div>
   );
 }

@@ -151,30 +151,27 @@ class TestTwoSidedStress:
         assert _vol_shock_for(0.20) < 0       # melt-up → vol crushes
 
 
-class TestWholePositionStock:
-    """The shares behind a covered call / collar are part of the crash — excluding them made a
-    −50% look milder than a −34% (short call decays = paper gain, huge stock loss invisible)."""
+class TestOptionOverlayOnly:
+    """Manage Book is OPTION-income management: the long shares behind a covered call are a
+    separate core holding, NOT counted in the crash/CVaR P&L (stock only marks the call covered +
+    sizes assignment). Default reprice is options-only; a covered call therefore PROFITS in a crash."""
     def _covered(self):   # long 100 sh + short 1 OTM call, spot 100
         return [{"ticker": "AAA", "spot": 100.0, "beta": 1.0, "iv": 0.30, "shares": 100,
                  "legs": [{"strike": 110, "right": "C", "sign": -1, "qty": 1, "iv": 0.30, "dte_years": 45 / 365}]}]
 
-    def test_stock_included_makes_the_crash_monotonic_and_worse(self):
+    def test_default_ignores_the_shares(self):
         b = self._covered()
-        overlay = [reprice_scenario(b, mv, vs, 0.045, include_stock=False) for mv, vs in [(-0.10, 8), (-0.34, 30), (-0.50, 45)]]
-        whole = [reprice_scenario(b, mv, vs, 0.045) for mv, vs in [(-0.10, 8), (-0.34, 30), (-0.50, 45)]]
-        # whole-position loss must grow monotonically with the crash size…
-        assert whole[2] < whole[1] < whole[0] < 0
-        # …and each whole loss is materially worse than the option-overlay-only number.
-        assert all(w < o for w, o in zip(whole, overlay))
+        no_sh = [{**b[0], "shares": 0}]
+        assert reprice_scenario(b, -0.30, 20, 0.045) == reprice_scenario(no_sh, -0.30, 20, 0.045)
 
-    def test_overlay_excludes_shares(self):
+    def test_covered_call_overlay_profits_in_a_crash(self):
         b = self._covered()
-        assert reprice_scenario(b, -0.30, 20, 0.045, include_stock=False) != reprice_scenario(b, -0.30, 20, 0.045)
+        # short call decays to zero in a selloff → the overlay is a GAIN either way down.
+        assert reprice_scenario(b, -0.10, 8, 0.045) > 0 and reprice_scenario(b, -0.50, 45, 0.045) > 0
 
-    def test_short_shares_flip_the_sign(self):
-        long_b = self._covered()
-        short_b = [{**long_b[0], "shares": -100}]
-        assert reprice_scenario(short_b, -0.30, 20, 0.045) > reprice_scenario(long_b, -0.30, 20, 0.045)
+    def test_include_stock_true_is_opt_in(self):
+        b = self._covered()
+        assert reprice_scenario(b, -0.30, 20, 0.045, include_stock=True) < reprice_scenario(b, -0.30, 20, 0.045)
 
 
 class TestLossByNameAndGrid:
@@ -186,14 +183,14 @@ class TestLossByNameAndGrid:
              "legs": [{"strike": 72, "right": "P", "sign": -1, "qty": 3, "iv": 0.28, "dte_years": 45 / 365}]},
         ]
 
-    def test_loss_by_name_splits_stock_and_sorts_worst_first(self):
+    def test_loss_by_name_is_options_only_and_sorted_worst_first(self):
         from app.services.book_tail_risk import _loss_by_name
         rows = _loss_by_name(self._book(), 0.045, -0.20, 15.0)
-        assert [r["ticker"] for r in rows] == sorted([r["ticker"] for r in rows], key=lambda t: {x["ticker"]: x["pnl"] for x in rows}[t])
+        assert [r["pnl"] for r in rows] == sorted(r["pnl"] for r in rows)   # worst (most negative) first
+        assert all("stock_pnl" not in r for r in rows)                      # no stock split — options only
         aaa = next(r for r in rows if r["ticker"] == "AAA")
         ccc = next(r for r in rows if r["ticker"] == "CCC")
-        assert aaa["stock_pnl"] < 0 and ccc["stock_pnl"] == 0          # only the covered name has a stock loss
-        assert all(abs(r["pnl"] - (r["option_pnl"] + r["stock_pnl"])) < 1 for r in rows)  # parts reconcile
+        assert aaa["pnl"] > 0 and ccc["pnl"] < 0    # covered call gains on the downside; the CSP loses
 
     def test_scenario_grid_shape_and_short_gamma_valley(self):
         from app.services.book_tail_risk import _scenario_grid, _GRID_SPOT, _GRID_VOL

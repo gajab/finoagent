@@ -502,7 +502,7 @@ async def get_trade_setups(
         ticker = "^" + ticker[1:]
     ticker = ticker.upper()
 
-    cache_key = f"setups:{ticker}:v1"
+    cache_key = f"setups:{ticker}:v2"          # v2: multi-style (swing momentum + position) + meaningful targets
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return {"ticker": ticker, "trade_setups": cached, "cached": True}
@@ -517,6 +517,40 @@ async def get_trade_setups(
 
     await set_cached(db, cache_key, result, ttl_seconds=900)
     return {"ticker": ticker, "trade_setups": result, "cached": False}
+
+
+@router.get("/{ticker}/day-trade-setups")
+async def get_day_trade_setups(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Intraday DAY-TRADE setups (5m/15m structure + session VWAP + opening range). Kept in its own
+    lazy endpoint so the main Setups load stays free of the extra intraday fetches. Short cache TTL
+    (intraday moves fast)."""
+    import asyncio
+    import yfinance as yf
+    from ..services.day_trade_service import compute_day_trade_setups
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"day-setups:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "day_trade_setups": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_day_trade_setups(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Day-trade analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No intraday data available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=300)
+    return {"ticker": ticker, "day_trade_setups": result, "cached": False}
 
 
 @router.get("/{ticker}/chart-patterns")
@@ -2065,6 +2099,7 @@ class DualDirectionBufferIn(BaseModel):
     downside_buffer_pct: float = Field(..., ge=0, le=50, description="Downside protection buffer % (0-50)")
     upside_cap_pct: float = Field(..., ge=0, le=100, description="Upside gain cap % (0-100)")
     target_expiration: str | None = Field(default=None, description="Specific expiration date (YYYY-MM-DD)")
+    entry_cost_mode: str = Field(default="standard", description="standard | self_financing | non_negative | cheapest")
 
 @router.post("/{ticker}/strategies/dual-direction-buffer")
 async def compute_dual_direction_buffer(
@@ -2085,6 +2120,7 @@ async def compute_dual_direction_buffer(
             downside_buffer_pct=body.downside_buffer_pct,
             upside_cap_pct=body.upside_cap_pct,
             target_expiration=body.target_expiration,
+            entry_cost_mode=body.entry_cost_mode,
         )
         if "error" in result:
             raise HTTPException(400, result["error"])
@@ -2904,10 +2940,51 @@ async def build_130_30(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Build a 130/30 enhanced equity portfolio with scenario analysis and tax projections."""
+    """Build a 130/30 enhanced equity portfolio with scenario analysis and tax projections.
+
+    This is a purely quantitative build — no LLM is called here so the response is fast and
+    free of token cost. The AI narrative is a separate, opt-in action: POST
+    /strategies/130-30/insights.
+    """
     try:
-        # Get OpenAI key for LLM insights (optional)
+        result = await run_130_30_portfolio(
+            long_positions=[p.model_dump() for p in body.long_positions],
+            short_positions=[p.model_dump() for p in body.short_positions],
+            investment_amount=body.investment_amount,
+            leverage_ratio=body.leverage_ratio,
+            tax_rate_st=body.tax_rate_st,
+            tax_rate_lt=body.tax_rate_lt,
+            openai_key=None,  # LLM narrative is a separate opt-in action
+        )
+        if result.get("error"):
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("130/30 portfolio build failed")
+        raise HTTPException(status_code=500, detail=f"Portfolio build failed: {exc}")
+
+
+@router.post("/strategies/130-30/insights")
+async def build_130_30_insights(
+    body: Build130_30In,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """AI narrative for a long/short portfolio (opt-in, separate LLM action).
+
+    Recomputes the portfolio deterministically (cheap, cached upstream) and then runs the
+    LLM strategist pass over it. Kept separate from the build so the quantitative dashboard
+    renders instantly and users only spend tokens when they explicitly ask for analysis.
+    """
+    try:
         openai_key = await get_user_api_key(db, user.id, "openai_api_key")
+        if not openai_key:
+            raise HTTPException(
+                status_code=400,
+                detail="An OpenAI API key is required for AI analysis. Add one in Settings.",
+            )
         openai_model = (await get_user_api_key(db, user.id, "openai_model")) or "gpt-4o"
 
         result = await run_130_30_portfolio(
@@ -2922,12 +2999,12 @@ async def build_130_30(
         )
         if result.get("error"):
             raise HTTPException(status_code=400, detail=result["error"])
-        return result
+        return {"llm_insights": result.get("llm_insights")}
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("130/30 portfolio build failed")
-        raise HTTPException(status_code=500, detail=f"Portfolio build failed: {exc}")
+        logger.exception("130/30 portfolio insights failed")
+        raise HTTPException(status_code=500, detail=f"Portfolio analysis failed: {exc}")
 
 
 # =========================================================================

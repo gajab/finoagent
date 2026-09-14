@@ -155,14 +155,15 @@ export default function QuantExitCard({ q, trade, pnl, deskFocus }: {
       {/* ── DEEP view — the scan's quant engine, every factor RE-SIGNED for a holder ── */}
       {full?.management_analysis && (
         <div className="pt-1" onClick={(e) => e.stopPropagation()}>
-          <ManagementAnalysis ma={full.management_analysis} qp={full.qp} />
+          <ManagementAnalysis ma={full.management_analysis} qp={full.qp} perSide={full.opp?.per_side} />
           {full.opp && (
             <details className="group mt-2">
               <summary className="text-[9px] uppercase tracking-wider text-base-content/30 cursor-pointer list-none flex items-center gap-1">
                 <span className="group-open:hidden">▸</span><span className="hidden group-open:inline">▾</span>
                 Raw entry factors · how this would score as a NEW trade (reference)
               </summary>
-              <div className="mt-1"><QuantAnalysisSection t={full.opp} q={full.opp?.desk_metrics?.quant} /></div>
+              <div className="mt-1"><QuantAnalysisSection t={full.opp} q={full.opp?.desk_metrics?.quant}
+                title="As a New Trade (reference)" subtitle="how this exact structure would grade if opened today" /></div>
             </details>
           )}
         </div>
@@ -217,8 +218,11 @@ export function QuantAnalysisLoader({ trade, pnl, deskFocus }: {
   if (!full) return null;
   return (
     <div className="space-y-2">
-      {full.management_analysis && <ManagementAnalysis ma={full.management_analysis} qp={full.qp} />}
-      <QuantAnalysisSection t={full.opp} q={full.opp?.desk_metrics?.quant} defaultOpen />
+      {full.management_analysis && <ManagementAnalysis ma={full.management_analysis} qp={full.qp} perSide={full.opp?.per_side} />}
+      {/* Entry-desk reference — COLLAPSED (lazy). Opening the top Quant Analysis leads with the
+          Manage-This-Position read; the "as a new trade" full metric set renders only on click. */}
+      <QuantAnalysisSection t={full.opp} q={full.opp?.desk_metrics?.quant}
+        title="As a New Trade (reference)" subtitle="how this exact structure would grade if opened today" />
     </div>
   );
 }

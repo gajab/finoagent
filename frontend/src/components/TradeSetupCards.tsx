@@ -19,7 +19,7 @@ function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: strin
 import { DirectionBadge, ConfidencePill, InfoTip } from './taUi';
 import IndicatorAIConsole from './IndicatorAIConsole';
 import PayoffDiagram from './PayoffDiagram';
-import { analyzeTa, verifySetup, trackTrade } from '../api';
+import { analyzeTa, verifySetup, trackTrade, fetchDayTradeSetups } from '../api';
 
 const money = (n?: number | null) => (n == null ? '—' : `$${n.toFixed(2)}`);
 const pctFrom = (n?: number | null) => (n == null ? '—' : `${n > 0 ? '+' : ''}${n}%`);
@@ -392,32 +392,88 @@ function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker
   );
 }
 
+const STYLE_TABS: { k: 'swing' | 'position' | 'day'; label: string; hint: string }[] = [
+  { k: 'swing', label: 'Swing', hint: 'days–weeks' },
+  { k: 'position', label: 'Position', hint: 'weeks–months' },
+  { k: 'day', label: 'Day trade', hint: 'intraday' },
+];
+
 export default function TradeSetupCards({ data, ticker }: { data: TradeSetupsData; ticker: string }) {
   const [showDossier, setShowDossier] = useState(false);
+  const [tab, setTab] = useState<'swing' | 'position' | 'day'>('swing');
+  const [dayData, setDayData] = useState<TradeSetup[] | null>(null);
+  const [dayLoading, setDayLoading] = useState(false);
+  const [dayErr, setDayErr] = useState<string | null>(null);
+  const [dayTried, setDayTried] = useState(false);
+
   const setups = data.setups || [];
   const dossier = (data.dossier || {}) as Record<string, unknown>;
-  if (!setups.length) {
-    return (
-      <div className="glass-card p-6 text-center">
-        <Crosshair className="w-6 h-6 mx-auto text-base-content/30 mb-2" />
-        <p className="text-sm font-semibold text-base-content/70">No high-conviction setup right now</p>
-        <p className="text-xs text-base-content/50 mt-1">The signals don't line up into a clean trade yet. Check the key levels in <b>Advanced</b>, or wait for structure to develop.</p>
-      </div>
-    );
-  }
+  const swing = setups.filter(s => (s.style || 'swing') !== 'position');
+  const position = setups.filter(s => s.style === 'position');
+
+  const loadDay = () => {
+    setDayLoading(true); setDayErr(null); setDayTried(true);
+    fetchDayTradeSetups(ticker)
+      .then(r => setDayData(r.day_trade_setups?.setups || []))
+      .catch((e: unknown) => setDayErr(e instanceof Error ? e.message : 'No intraday data available'))
+      .finally(() => setDayLoading(false));
+  };
+  const pick = (t: 'swing' | 'position' | 'day') => { setTab(t); if (t === 'day' && !dayTried) loadDay(); };
+
+  const count = (k: string) => k === 'swing' ? swing.length : k === 'position' ? position.length : (dayData?.length ?? null);
+  const active = tab === 'swing' ? swing : tab === 'position' ? position : (dayData || []);
+
   return (
     <div className="space-y-3">
-      <div className="flex justify-end">
-        <button className="btn btn-ghost btn-xs gap-1 text-base-content/50" onClick={() => setShowDossier(s => !s)}>
-          <Code2 className="w-3.5 h-3.5" /> {showDossier ? 'Hide' : 'View'} full dossier JSON
+      {/* trade-style selector */}
+      <div className="flex items-center gap-1 flex-wrap">
+        <div className="flex items-center gap-1 bg-base-200/40 p-1 rounded-xl">
+          {STYLE_TABS.map(t => {
+            const n = count(t.k);
+            return (
+              <button key={t.k} onClick={() => pick(t.k)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${tab === t.k ? 'bg-primary/15 text-primary shadow-sm' : 'text-base-content/50 hover:text-base-content hover:bg-base-100/40'}`}>
+                {t.label}{n != null ? ` (${n})` : ''} <span className="text-[9px] font-normal text-base-content/40">{t.hint}</span>
+              </button>
+            );
+          })}
+        </div>
+        <button className="btn btn-ghost btn-xs gap-1 text-base-content/50 ml-auto" onClick={() => setShowDossier(s => !s)}>
+          <Code2 className="w-3.5 h-3.5" /> {showDossier ? 'Hide' : 'View'} JSON
         </button>
       </div>
+
       {showDossier && (
         <pre className="text-[10px] bg-base-300/60 rounded-lg p-2.5 overflow-auto max-h-72 text-base-content/70 border border-white/[0.05]">
           {JSON.stringify(dossier, null, 2)}
         </pre>
       )}
-      {setups.map((s, i) => <SetupCard key={i} setup={s} ticker={ticker} spot={data.price} dossier={dossier} />)}
+
+      {tab === 'day' && dayLoading && (
+        <div className="glass-card p-6 flex items-center justify-center gap-2 text-sm text-base-content/60">
+          <Loader2 className="w-4 h-4 animate-spin" /> Scanning intraday 5m/15m structure, VWAP &amp; the opening range…
+        </div>
+      )}
+      {tab === 'day' && dayErr && !dayLoading && (
+        <div className="glass-card p-4 text-sm text-base-content/60">{dayErr} — intraday setups need live market-hours data.</div>
+      )}
+      {!(tab === 'day' && (dayLoading || dayErr)) && (
+        active.length === 0 ? (
+          <div className="glass-card p-6 text-center">
+            <Crosshair className="w-6 h-6 mx-auto text-base-content/30 mb-2" />
+            <p className="text-sm font-semibold text-base-content/70">
+              {tab === 'position' ? 'No long-term entry lined up' : tab === 'day' ? 'No clean intraday setup right now' : 'No high-conviction swing setup right now'}
+            </p>
+            <p className="text-xs text-base-content/50 mt-1">
+              {tab === 'position' ? 'No strong value zone to accumulate into with a worthwhile reward yet.'
+                : tab === 'day' ? 'Price is mid-range vs VWAP / the opening range — wait for a break or a VWAP reclaim.'
+                : "The signals don't line up into a clean trade yet — check the other styles or the Advanced levels."}
+            </p>
+          </div>
+        ) : (
+          active.map((s, i) => <SetupCard key={`${tab}-${i}`} setup={s} ticker={ticker} spot={data.price} dossier={dossier} />)
+        )
+      )}
     </div>
   );
 }

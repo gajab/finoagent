@@ -11,7 +11,7 @@ import {
 import type { SavedStrategyItem } from '../api';
 import { roundToTick } from '../utils/tickSize';
 import { OrderConfirmationModal } from './OrderConfirmationModal';
-import PreTradeAdvisor, { type AdvisorMetric } from './PreTradeAdvisor';
+import QuantRecommendationCard from './QuantRecommendationCard';
 import type { BrokerOrderLeg } from '../types';
 import {
     Chart as ChartJS, CategoryScale, LinearScale, PointElement,
@@ -91,12 +91,12 @@ export function DualDirectionBuffer() {
     const [duration, setDuration] = useState<number>(365);
     const [downsideBuffer, setDownsideBuffer] = useState<number>(15);
     const [upsideCap, setUpsideCap] = useState<number>(15);
+    const [entryCostMode, setEntryCostMode] = useState<'standard' | 'self_financing' | 'non_negative' | 'cheapest'>('standard');
 
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [result, setResult] = useState<DualDirectionResult | null>(null);
     const [customLegs, setCustomLegs] = useState<CustomOptionLeg[]>([]);
-    const [bondYield, setBondYield] = useState<number>(3.0);
 
     // Data source
     const [quoteSource, setQuoteSource] = useState<'yfinance' | 'ibkr'>('yfinance');
@@ -137,9 +137,9 @@ export function DualDirectionBuffer() {
     const [showSavedList, setShowSavedList] = useState(false);
 
     const hasUnevaluatedChanges = useMemo(() => {
-        const currentSnapshot = JSON.stringify(customLegs.map(l => ({ ...l, id: undefined }))) + `|by=${bondYield}`;
+        const currentSnapshot = JSON.stringify(customLegs.map(l => ({ ...l, id: undefined })));
         return customLegs.length > 0 && currentSnapshot !== legsSnapshot;
-    }, [customLegs, legsSnapshot, bondYield]);
+    }, [customLegs, legsSnapshot]);
 
     // Dual Direction Buffer only offers monthly expirations in the picker.
     const monthlyExpirations = useMemo(
@@ -303,10 +303,9 @@ export function DualDirectionBuffer() {
         setCustomLegs(prev => prev.filter(leg => leg.id !== id));
     };
 
-    /** Fill custom execution table from recommended legs at mid price. */
-    const autofillRecommended = () => {
-        if (!result) return;
-        const mapped: CustomOptionLeg[] = result.legs.map((leg, i) => ({
+    /** Map a result's recommended legs into the custom-execution table (mid price). */
+    const autofillFrom = (res: DualDirectionResult) => {
+        const mapped: CustomOptionLeg[] = res.legs.map((leg, i) => ({
             id: `auto_${i}_${Math.random().toString(36).substr(2, 5)}`,
             action: leg.action as 'Buy' | 'Sell',
             qty: leg.qty,
@@ -330,9 +329,9 @@ export function DualDirectionBuffer() {
     const evaluateOutcomes = () => {
         if (!result || customLegs.length === 0) return;
 
-        // Fine-grained 1% increments across a wide window so the curve visibly
-        // flattens into its plateaus on both sides (the true max gain / max loss).
-        const RANGE = 50;
+        // Fine-grained 1% increments across the full -100%..+100% range so the
+        // curve flattens into its plateaus (the true max gain / max loss).
+        const RANGE = 100;
         const priceChanges: number[] = [];
         for (let pct = -RANGE; pct <= RANGE; pct++) priceChanges.push(pct / 100);
 
@@ -343,10 +342,6 @@ export function DualDirectionBuffer() {
         const tradeCost = customLegs.reduce((sum, leg) =>
             sum + (leg.action === 'Buy' ? 1 : -1) * leg.price * leg.qty * 100, 0);
         const totalDeployed = Math.max(0, tradeCost) + baseMargin;
-
-        // Interest earned on margin money (cash collateral earns yield)
-        const durationDays = result.actualDte ?? result.durationDays ?? duration;
-        const marginInterest = baseMargin * (bondYield / 100) * (durationDays / 365);
 
         const calcScenario = (change: number) => {
             const simPrice = currentPrice * (1 + change);
@@ -366,8 +361,8 @@ export function DualDirectionBuffer() {
             // by underlying price for defined-risk spreads, only for naked positions)
             const scenarioMargin = baseMargin;
 
-            // P&L = options payout - trade cost + interest on margin cash
-            const pnl = optionsPayout - tradeCost + marginInterest;
+            // P&L = options payout - trade cost
+            const pnl = optionsPayout - tradeCost;
             // ROI based on total capital deployed (debit + margin)
             const roi = totalDeployed > 0 ? (pnl / totalDeployed) * 100 : 0;
 
@@ -375,7 +370,6 @@ export function DualDirectionBuffer() {
                 underlyingChangePct: Math.round(change * 100 * 100) / 100,
                 simulatedPrice: Math.round(simPrice * 100) / 100,
                 optionsPayout: Math.round(optionsPayout * 100) / 100,
-                marginInterest: Math.round(marginInterest * 100) / 100,
                 pnl: Math.round(pnl * 100) / 100,
                 totalDeployed: Math.round(totalDeployed * 100) / 100,
                 margin: Math.round(scenarioMargin * 100) / 100,
@@ -442,7 +436,7 @@ export function DualDirectionBuffer() {
         }
 
         setEvaluatedScenarios(finalScenarios);
-        setLegsSnapshot(JSON.stringify(customLegs.map(l => ({ ...l, id: undefined }))) + `|by=${bondYield}`);
+        setLegsSnapshot(JSON.stringify(customLegs.map(l => ({ ...l, id: undefined }))));
     };
 
     // ---------------------------------------------------------------------------
@@ -456,7 +450,7 @@ export function DualDirectionBuffer() {
 
         setSavingStrategy(true);
         try {
-            const params = { ticker, amount, duration, downsideBuffer, upsideCap, quoteSource, bondYield, pricingMode };
+            const params = { ticker, amount, duration, downsideBuffer, upsideCap, quoteSource, pricingMode, entryCostMode };
             const legsForSave = customLegs.map(({ id, ...rest }) => rest);
             const snapshot = {
                 currentPrice: result.currentPrice,
@@ -508,8 +502,8 @@ export function DualDirectionBuffer() {
         setDownsideBuffer(p.downsideBuffer ?? 15);
         setUpsideCap(p.upsideCap ?? 15);
         setQuoteSource(p.quoteSource ?? 'yfinance');
-        setBondYield(p.bondYield ?? 5.0);
         setPricingMode(p.pricingMode ?? 'mid');
+        setEntryCostMode(p.entryCostMode ?? 'standard');
 
         // Reconstruct result from snapshot + legs
         const snap = saved.result_snapshot;
@@ -581,6 +575,7 @@ export function DualDirectionBuffer() {
             duration_days: Number(duration),
             downside_buffer_pct: Number(downsideBuffer),
             upside_cap_pct: Number(upsideCap),
+            entry_cost_mode: entryCostMode,
             ...(selectedExpiration ? { target_expiration: selectedExpiration } : {}),
         };
 
@@ -592,6 +587,7 @@ export function DualDirectionBuffer() {
                 setError(data.error);
             } else {
                 setResult(data);
+                autofillFrom(data);   // auto-populate the custom-execution legs on Simulate
             }
         } catch (err: any) {
             setError(err.message || 'An unexpected error occurred');
@@ -695,7 +691,7 @@ export function DualDirectionBuffer() {
     // ---------------------------------------------------------------------------
 
     return (
-        <div className="space-y-6">
+        <div className="space-y-4">
             {/* Header */}
             <div className="border-l-4 border-secondary bg-secondary/10 p-4 rounded-r-xl">
                 <h3 className="font-bold flex items-center gap-2 text-secondary">
@@ -708,8 +704,8 @@ export function DualDirectionBuffer() {
                 </p>
             </div>
 
-            {/* Input grid */}
-            <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+            {/* Input grid — items-end so every input bottom-aligns even when a label wraps to two lines */}
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
                 <div className="form-control">
                     <label className="label"><span className="label-text font-medium flex items-center gap-1">
                         <Layers className="w-4 h-4 text-primary" /> Ref Asset
@@ -802,7 +798,23 @@ export function DualDirectionBuffer() {
                     )}
                 </div>
 
-                <button className="btn btn-secondary" onClick={calculateStrategy} disabled={loading}>
+                {/* Entry-cost optimization mode */}
+                <div className="form-control">
+                    <label className="label py-1"><span className="label-text text-xs font-medium">Optimize entry cost</span></label>
+                    <select
+                        className="select select-bordered select-sm w-56"
+                        value={entryCostMode}
+                        onChange={(e) => setEntryCostMode(e.target.value as typeof entryCostMode)}
+                        title="How to optimize the recommended legs' upfront cost"
+                    >
+                        <option value="standard">Standard (deep-ITM, best 1:1)</option>
+                        <option value="self_financing">Self-financing overlay (~0 net)</option>
+                        <option value="non_negative">Non-negative if flat at 0%</option>
+                        <option value="cheapest">Cheapest (near-ATM exposure)</option>
+                    </select>
+                </div>
+
+                <button className="btn btn-secondary ml-auto" onClick={calculateStrategy} disabled={loading}>
                     {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Calculator className="w-5 h-5 mr-2" />}
                     Simulate Dual Direction
                 </button>
@@ -850,7 +862,7 @@ export function DualDirectionBuffer() {
 
             {/* ════════════════════════ RESULTS ════════════════════════ */}
             {result && (
-                <div className="mt-4 space-y-6 animate-fade-in">
+                <div className="mt-4 space-y-4 animate-fade-in">
 
                     {result.ibkr_mode && (
                         <div className="flex items-center gap-2 text-xs text-info bg-info/10 border border-info/20 rounded-xl px-3 py-2 w-fit">
@@ -944,9 +956,6 @@ export function DualDirectionBuffer() {
                                     </p>
                                 </div>
                                 <div className="flex gap-2 items-center text-sm flex-wrap justify-end">
-                                    <button className="btn btn-sm btn-outline btn-info gap-1" onClick={autofillRecommended}>
-                                        <Layers className="w-3 h-3" /> Autofill Recommended
-                                    </button>
                                     <button className="btn btn-sm btn-outline btn-accent" onClick={addCustomLeg}>+ Add Leg</button>
                                     {customLegs.length > 0 && (
                                         <button
@@ -964,7 +973,7 @@ export function DualDirectionBuffer() {
                             {customLegs.length === 0 ? (
                                 <div className="text-center py-4 bg-base-200/30 rounded-xl border border-dashed border-white/[0.05]">
                                     <span className="text-sm opacity-50">
-                                        No custom legs. Click &apos;Autofill Recommended&apos; or &apos;+ Add Leg&apos; to start.
+                                        No legs yet. Run &apos;Simulate Dual Direction&apos; to auto-fill the recommended legs, or &apos;+ Add Leg&apos;.
                                     </span>
                                 </div>
                             ) : (
@@ -1063,27 +1072,6 @@ export function DualDirectionBuffer() {
                                             Total Capital Deployed:{' '}
                                             <span className="text-error">${customTotalDeployed.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                         </div>
-                                        {customMargin > 0 && (
-                                            <div className="flex items-center gap-2 mt-1 text-xs font-normal opacity-80">
-                                                <span>Yield on Cash (margin):</span>
-                                                <input
-                                                    type="number"
-                                                    className="input input-bordered input-xs w-16 font-mono text-right"
-                                                    value={bondYield}
-                                                    onChange={e => setBondYield(Number(e.target.value))}
-                                                    min={0}
-                                                    max={20}
-                                                    step={0.1}
-                                                />
-                                                <span>%</span>
-                                                <span className="text-success">
-                                                    +${(customMargin * (bondYield / 100) * ((result?.actualDte ?? result?.durationDays ?? duration) / 365)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                                </span>
-                                                <span className="opacity-60">
-                                                    ({result?.actualDte ?? result?.durationDays ?? duration}d)
-                                                </span>
-                                            </div>
-                                        )}
                                     </div>
 
                                     {/* ── Evaluate + Save Buttons ── */}
@@ -1189,12 +1177,11 @@ export function DualDirectionBuffer() {
                         // Chart: all points (smooth curve) minus crossover-inserted rows
                         const chartScenarios = evaluatedScenarios.filter(s => !s.isCrossover);
                         // Table: 5% intervals near the money, 10% out wide, + crossover breakeven rows
-                        const majorPcts = new Set([-50, -40, -30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30, 40, 50]);
+                        const majorPcts = new Set([-100, -90, -80, -70, -60, -50, -40, -30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100]);
                         const tableScenarios = evaluatedScenarios.filter(s =>
                             s.isCrossover || majorPcts.has(s.underlyingChangePct)
                         );
                         const baseMarginValue = evaluatedScenarios[0]?.margin ?? 0;
-                        const hasCashYield = evaluatedScenarios[0]?.marginInterest > 0;
 
                         return (
                         <div className="glass-card">
@@ -1350,16 +1337,15 @@ export function DualDirectionBuffer() {
                                 </div>
 
                                 {/* ── Table: major 5% intervals + breakeven rows only ── */}
-                                <div className="overflow-x-auto">
-                                    <table className="table table-pro w-full text-center text-sm">
+                                <div className="overflow-x-auto max-h-96 overflow-y-auto rounded-lg border border-white/[0.05]">
+                                    <table className="table table-pro table-pin-rows w-full text-center text-sm">
                                         <thead>
                                             <tr>
-                                                <th className="bg-base-200/40">Market</th>
-                                                <th className="bg-base-200/40">Price</th>
-                                                <th className="bg-base-200/40">Options Payout</th>
-                                                {hasCashYield && <th className="bg-base-200/40">Cash Yield</th>}
-                                                <th className="bg-base-200/40">P&L</th>
-                                                <th className="bg-base-200/40">ROI</th>
+                                                <th className="bg-base-200/60">Market</th>
+                                                <th className="bg-base-200/60">Price</th>
+                                                <th className="bg-base-200/60">Options Payout</th>
+                                                <th className="bg-base-200/60">P&L</th>
+                                                <th className="bg-base-200/60">ROI</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -1393,11 +1379,6 @@ export function DualDirectionBuffer() {
                                                     <td className="font-semibold">
                                                         ${s.optionsPayout.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
                                                     </td>
-                                                    {hasCashYield && (
-                                                        <td className="text-success">
-                                                            +${s.marginInterest.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
-                                                        </td>
-                                                    )}
                                                     <td className={`font-bold ${s.pnl > 0 ? 'text-success' : s.pnl < 0 ? 'text-error' : 'opacity-50'}`}>
                                                         {s.pnl > 0 ? '+' : ''}${Math.abs(s.pnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}
                                                         {s.pnl < 0 && <span className="text-[10px] ml-0.5">loss</span>}
@@ -1415,75 +1396,24 @@ export function DualDirectionBuffer() {
                         );
                     })()}
 
-                    {/* ══════════════════ DESK REVIEW (pre-trade) ══════════════════ */}
+                    {/* ══════════════════ QUANT RECOMMENDATION ══════════════════ */}
                     {evaluatedScenarios.length > 0 && payoffBounds && (() => {
                         const mg = payoffBounds.maxGain, ml = payoffBounds.maxLoss;
-                        const money = (v: number) => `$${Math.round(v).toLocaleString()}`;
-                        const pctStr = (v: number) => `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
-                        const legsForAdvisor = customLegs.map(l => ({
-                            action: l.action, qty: l.qty, type: l.type, strike: l.strike,
-                            expiration: result.expirationDate,
-                        }));
-
-                        // Understand the WHOLE profile — not just max gain vs the deep-tail max loss.
                         const scenarios = evaluatedScenarios
                             .filter(s => !s.isCrossover && s.underlyingChangePct % 5 === 0)
                             .map(s => ({ move_pct: s.underlyingChangePct, price: s.simulatedPrice, roi: s.roi, pnl: s.pnl }));
-                        // Breakevens (where ROI crosses 0) and the nearest downside one = the real cushion.
-                        const crossovers = evaluatedScenarios.filter(s => s.isCrossover);
-                        const downBE = crossovers.filter(c => c.underlyingChangePct < 0)
-                            .sort((a, b) => b.underlyingChangePct - a.underlyingChangePct)[0];
-                        const cushionPct = downBE ? Math.abs(downBE.underlyingChangePct) : null;
-                        // Loss at a plausible adverse move (-20%) — the realistic downside, vs the tail.
-                        const stress = evaluatedScenarios.find(s => !s.isCrossover && Math.round(s.underlyingChangePct) === -20);
-
-                        const quantMetrics: AdvisorMetric[] = [
-                            { label: 'Max Gain', value: pctStr(mg.roi), tone: 'good', hint: 'Capped upside (payoff plateau)' },
-                            { label: 'Max Loss', value: pctStr(ml.roi), tone: 'bad', hint: 'Deep-tail loss — only near a total collapse (underlying → $0)' },
-                            { label: 'Breakeven', value: downBE ? pctStr(downBE.underlyingChangePct) : '—', hint: 'Underlying move where the trade turns negative' },
-                            { label: 'Downside Cushion', value: cushionPct != null ? `${cushionPct.toFixed(1)}%` : '—', tone: cushionPct != null && cushionPct >= 10 ? 'good' : 'warn', hint: 'How far the underlying can fall before any loss' },
-                            { label: 'Loss @ −20%', value: stress ? pctStr(stress.roi) : '—', tone: stress && stress.roi >= -10 ? 'good' : 'warn', hint: 'Realistic adverse-move loss (vs the deep tail)' },
-                            { label: 'Down Buffer', value: `${result.parameters.actualDownsideBuffer.toFixed(1)}%` },
-                            { label: 'Up Cap', value: `${result.parameters.actualUpsideCap.toFixed(1)}%` },
-                            { label: 'Capital', value: money(customTotalDeployed) },
-                        ];
-                        // Verdict from the SHAPE (cushion + capped gain), not max-gain ÷ tail-loss.
-                        const tone: 'good' | 'warn' | 'bad' =
-                            cushionPct != null && cushionPct >= 12 && mg.roi > 0 ? 'good'
-                            : cushionPct != null && cushionPct >= 6 ? 'warn' : 'bad';
-                        const quantVerdict = {
-                            label: tone === 'good' ? 'Wide buffer — favorable shape'
-                                : tone === 'warn' ? 'Usable buffer — mind the tail' : 'Thin buffer / poor shape',
-                            tone,
-                            note: `Profitable on any move above ${downBE ? pctStr(downBE.underlyingChangePct) : 'breakeven'}, capped at ${pctStr(mg.roi)}. `
-                                + `Max loss ${pctStr(ml.roi)} only near a collapse — a −20% move is just ${stress ? pctStr(stress.roi) : 'modest'}.`,
-                        };
-                        const llmMetrics = {
-                            current_price: result.currentPrice,
-                            max_gain_pct: mg.roi, 'max_gain_$': Math.round(mg.pnl),
-                            'max_loss_pct (deep tail, underlying→0)': ml.roi, 'max_loss_$': Math.round(ml.pnl),
-                            downside_breakeven_pct: downBE ? downBE.underlyingChangePct : null,
-                            downside_cushion_pct: cushionPct,
-                            'loss_at_-20pct_move_pct': stress ? stress.roi : null,
-                            total_capital: Math.round(customTotalDeployed),
-                            spread_margin: Math.round(customMargin),
-                            net_debit: Math.round(customTradeCost),
-                            downside_buffer_pct: result.parameters.actualDownsideBuffer,
-                            upside_cap_pct: result.parameters.actualUpsideCap,
-                            dte: result.actualDte,
-                            expiration: result.expirationDate,
-                        };
+                        const legsForCard = customLegs.map(l => ({
+                            action: l.action, qty: l.qty, type: l.type, strike: l.strike, expiration: result.expirationDate,
+                        }));
                         const stockShares = customLegs
                             .filter(l => l.type === 'Equity')
                             .reduce((s, l) => s + (l.action === 'Buy' ? 1 : -1) * l.qty * 100, 0);
                         return (
-                            <PreTradeAdvisor
+                            <QuantRecommendationCard
                                 ticker={ticker}
                                 strategyType="dual_direction_buffer"
-                                legs={legsForAdvisor}
-                                llmMetrics={llmMetrics}
+                                legs={legsForCard}
                                 scenarios={scenarios}
-                                breakevens={crossovers.map(c => `${pctStr(c.underlyingChangePct)} (≈$${c.simulatedPrice.toFixed(0)})`)}
                                 expiration={result.expirationDate}
                                 spot={result.currentPrice}
                                 capital={customTotalDeployed}
@@ -1491,9 +1421,6 @@ export function DualDirectionBuffer() {
                                 stockShares={stockShares}
                                 maxLoss={Math.round(ml.pnl)}
                                 maxProfit={Math.round(mg.pnl)}
-                                quantMetrics={quantMetrics}
-                                quantVerdict={quantVerdict}
-                                notes={`Dual Direction Buffer: stays positive on drops within a ${result.parameters.actualDownsideBuffer.toFixed(1)}% buffer, participates up to a +${result.parameters.actualUpsideCap.toFixed(1)}% cap. The max loss only occurs near a near-total collapse of the underlying, not on ordinary moves.`}
                             />
                         );
                     })()}

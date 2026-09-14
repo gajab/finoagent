@@ -143,6 +143,35 @@ def realized_close_pnl(action: str, entry_price: float, exit_price: float,
     return per * (100.0 if is_option else 1.0) * float(qty)
 
 
+# ── Rolls — treat as ONE continuing campaign, not close+open ─────────────
+#
+# When a short-premium position is rolled (buy back the tested leg, sell a new
+# one), the realized P&L on the buy-back is not a *closed trade* — it is a
+# cost-basis adjustment to the same ongoing campaign. Fold that realized amount
+# into the entry cost and every downstream number (breakeven, effective credit)
+# stays correct with the *existing* payoff engine: just pass
+# ``entry_cost + roll_realized_pnl`` to structure_breakevens / expiry_payoff.
+# Both are in the storage convention where a credit is positive, so a roll gain
+# (+) widens the net credit and pushes the breakeven further away; a roll loss
+# (−) shrinks it and pulls the breakeven in — exactly the real economics.
+
+def roll_target_credit(buyback_cost: float, net_credit_basis: float) -> float:
+    """Credit ($) to collect on the new leg(s) so a short-premium campaign is at
+    least break-even after this roll — the number the user asks for when deciding
+    whether it's worth rolling again.
+
+    buyback_cost      $ paid now to buy back the tested short leg (current mid × 100 × qty).
+    net_credit_basis  effective net premium banked so far ($): the open leg's own entry
+                      credit **plus** cumulative roll-realized P&L (a prior loss shrinks it).
+
+    Best-case campaign P&L after the roll (new leg expires worthless) is
+        net_credit_basis − buyback_cost + new_credit,
+    so break-even needs  new_credit ≥ buyback_cost − net_credit_basis. A result ≤ 0 means
+    the cushion already covers the buy-back — any credit keeps the campaign green.
+    """
+    return round(buyback_cost - net_credit_basis, 2)
+
+
 # ── Quote staleness ─────────────────────────────────────────────────────
 
 def is_stale(ts: Optional[datetime], now: Optional[datetime] = None, max_age_seconds: int = 300) -> bool:

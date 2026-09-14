@@ -1200,6 +1200,7 @@ class DualDirectionBufferIn(BaseModel):
     downside_buffer_pct: float
     upside_cap_pct: float
     target_expiration: str | None = None
+    entry_cost_mode: str = "standard"   # standard | self_financing | non_negative | cheapest
 
 
 @router.post("/strategy/dual-direction-buffer")
@@ -1230,6 +1231,7 @@ async def compute_dual_direction_buffer_ibkr(
         downside_buffer_pct=body.downside_buffer_pct,
         upside_cap_pct=body.upside_cap_pct,
         target_expiration=body.target_expiration,
+        entry_cost_mode=body.entry_cost_mode,
     )
 
     if not result.get("success"):

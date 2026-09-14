@@ -26,6 +26,7 @@ from typing import Optional, TYPE_CHECKING
 
 from .lifecycle_service import (
     compute_pretrade_metrics, terminal_payoff_curve, horizon_payoff_curve, management_desk_score,
+    higher_order_greeks,
 )
 from .llm_service import call_llm
 from .derivative_income_service import (
@@ -185,6 +186,107 @@ def _robust_iv(opp: dict, hv: Optional[float]) -> float:
         if v and 0.05 <= v <= 3.0:
             return v
     return 0.30
+
+
+def _binding_short(pairs: list[tuple], is_put: bool) -> Optional[tuple]:
+    """The NEAREST-spot short (norm_leg, raw_leg) pair on one side — the leg that BINDS the
+    breach/moneyness read (highest short put / lowest short call). None if the side has no short."""
+    shorts = [p for p in pairs if (p[0].get("sign") or 0) < 0 and p[0].get("strike")]
+    if not shorts:
+        return None
+    return (max(shorts, key=lambda p: float(p[0]["strike"])) if is_put
+            else min(shorts, key=lambda p: float(p[0]["strike"])))
+
+
+def per_side_quant(opp: dict, spot: Optional[float], *, mu: float = 0.0,
+                   hv: Optional[float] = None) -> Optional[dict]:
+    """Per-SIDE (call / put) quant decomposition for the leg-level tabs.
+
+    The whole-trade RATIOS (Omega / Sortino / POP / EV / CVaR / desk_score) are NON-additive
+    functionals of the JOINT terminal payoff — they stay trade-level and are deliberately NOT
+    recomputed per side (a per-leg Sortino would look precise yet not reconcile to the trade).
+    This returns ONLY the quantities that decompose per side AND sum to the aggregate, so a leg
+    tab can never contradict the trade tab:
+      • greeks   — higher_order_greeks on that side's legs; the two sides' net_* SUM to the
+                   trade's option-leg net_* (a pure sum, so it reconciles by construction)
+      • premium  — Σ (−sign)·qty·100·price on that side (credit +, debit −; additive)
+      • breach   — P(touch) of that side's BINDING (nearest-spot) SHORT — the honest "does this
+                   side ever go ITM", reusing the same first-passage engine as the trade tab
+      • moneyness— that short's cushion %, σ-from-spot, |delta|, expiry-ITM proxy
+      • defend   — the roll direction that takes the tested short AWAY from spot
+
+    Returns None unless the trade has BOTH a call side and a put side (strangle / straddle /
+    iron condor / jade lizard / collar …). A single-type structure's leg view IS the trade tab,
+    so no side tabs are shown."""
+    if not spot or spot <= 0:
+        return None
+    raw = opp.get("legs") or []
+    norm = _opp_legs(opp)
+    if not norm or len(norm) != len(raw):
+        return None
+    pairs = list(zip(norm, raw))                                   # index-aligned (norm_leg, raw_leg)
+    call_pairs = [p for p in pairs if p[0].get("right") == "C"]
+    put_pairs = [p for p in pairs if p[0].get("right") == "P"]
+    if not call_pairs or not put_pairs:
+        return None                                               # need two sides to be worth tabbing
+
+    dte = int(opp.get("dte") or 0)
+    em_pct = _expected_move_pct(opp)                              # 1σ implied move to expiry (%)
+    net = higher_order_greeks(norm, spot)                        # whole-trade option-leg greeks (for reconciliation)
+
+    def _side(side_pairs: list[tuple], is_put: bool, key: str, label: str) -> dict:
+        slegs = [n for n, _ in side_pairs]
+        greeks = higher_order_greeks(slegs, spot)
+        premium = round(sum(-(n.get("sign") or 0) * float(n.get("qty") or 1) * 100.0
+                            * float(n.get("price") or 0.0) for n in slegs), 2)
+        binding = _binding_short(side_pairs, is_put)
+        breach: dict = {"prob_touch_pct": None, "sigma_pct": None}
+        money: dict = {"cushion_pct": None, "sigmas": None, "short_delta": None, "itm_prob_pct": None}
+        defend = None
+        sk = None
+        if binding is not None:
+            bn, br = binding
+            sk = float(bn["strike"])
+            _iv = bn.get("iv")
+            sigma = (_iv / 100.0 if _iv and _iv > 3 else float(_iv)) if _iv else (hv or None)
+            pt = _prob_touch(sk, spot, dte, sigma, mu) if sigma else None
+            breach = {"prob_touch_pct": round(pt * 100, 1) if pt is not None else None,
+                      "sigma_pct": round(sigma * 100, 1) if sigma else None}
+            cushion = round(abs(sk - spot) / spot * 100, 1)
+            sdelta = abs(br.get("delta") or 0.0) or None
+            money = {"cushion_pct": cushion,
+                     "sigmas": round(cushion / em_pct, 2) if em_pct else None,
+                     "short_delta": round(sdelta, 3) if sdelta else None,
+                     "itm_prob_pct": round(sdelta * 100, 1) if sdelta else None}
+            roll_dir, roll_to = ("down", "lower") if is_put else ("up", "higher")
+            defend = {"roll_dir": roll_dir, "roll_to": roll_to,
+                      "note": f"if this {label.lower()} is tested, roll {roll_dir} + out to a {roll_to} strike "
+                              f"to move the short away from spot"}
+        return {
+            "key": key, "label": label, "legs_n": len(slegs),
+            "strikes": [n.get("strike") for n in slegs],
+            "short_strike": sk, "has_short": sk is not None,
+            "greeks": greeks,
+            "premium": premium,                                   # + = net credit collected on this side
+            "breach": breach, "moneyness": money, "defend": defend,
+        }
+
+    sides = [_side(call_pairs, False, "call", "Call side"),
+             _side(put_pairs, True, "put", "Put side")]
+    return {
+        "sides": sides,
+        "expected_move_pct": em_pct,
+        # RECONCILIATION — the sides' greeks/premium SUM to the trade totals (option legs only; the
+        # trade tab additionally folds any stock leg into net_delta). Surfaced so the UI shows the
+        # invariant instead of asking the user to trust it.
+        "reconcile": {
+            "net_delta": net.get("net_delta"), "net_gamma": net.get("net_gamma"),
+            "net_vega": net.get("net_vega"), "net_theta": net.get("net_theta"),
+            "premium": round(sum(s["premium"] for s in sides), 2),
+        },
+        "note": ("Greeks & premium below are per-side and SUM to the trade totals. "
+                 "Omega / Sortino / POP / CVaR are whole-trade only — they do not decompose per leg."),
+    }
 
 
 def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[float] = None,
@@ -486,12 +588,9 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
         touches_used = []
 
     _touch_min = min(touches_used) if touches_used else None
-    # #4 FORTIFIED — the two touch-reducers TOGETHER: a deep cushion (low touch) AND behind a wall. The
-    #    combination is the lowest-breach placement — structure AND distance both have to fail — worth more
-    #    than either alone.
-    if struct_pts > 0 and _touch_min is not None and _touch_min <= 0.15:
-        add("Fortified", 2.0, f"deep cushion (P(touch) {round(_touch_min * 100)}% ≤ 15%) AND behind a wall — "
-            f"the lowest-breach placement: structure and distance both have to break")
+    # NOTE: the 'Fortified' bonus (+2 for Structure>0 AND low touch) was REMOVED as a hard duplicate — it
+    # re-scored the INTERSECTION of the Structure and Breach-risk factors, both of which already count on
+    # their own. `_touch_min` is retained for the Vol-expansion proximity check below.
 
     # #3 CALM TAPE — a range-bound / mean-reverting regime is touch-FRIENDLY: a probe of the strike tends to
     #    REVERT rather than persist into assignment (the GBM touch model can't see mean-reversion). Complements
@@ -1176,7 +1275,8 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
                 macd: Optional[dict] = None, overwrite: bool = False,
                 next_earnings: Optional[str] = None, today=None,
                 har_rv_pct: Optional[float] = None, earnings_aware: bool = False,
-                diffusion_hv: Optional[float] = None, days_since_earnings: Optional[int] = None) -> dict:
+                diffusion_hv: Optional[float] = None, days_since_earnings: Optional[int] = None,
+                term_structure: Optional[dict] = None) -> dict:
     pm = (dm or {}).get("pm") or {}
     # blocking = STRUCTURAL/quality hard-fails → grade F (avoid). timing_hold = a good trade held on TIMING
     # (momentum against a REACHABLE strike) → WAIT, distinct from F. Kept separate so a fortified trade is
@@ -1187,23 +1287,19 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     iv_hv = round((atm_iv_pct / 100.0) / hv, 2) if (atm_iv_pct and hv and hv > 0) else opp.get("iv_hv_ratio")
     # Itemized signed contributions (points) by factor — so the UI can show each adjustment as a bar
     # and the desk score is auditable: desk_score = base_quality + regime + Σ(these).
-    comp: dict[str, float] = {"expectation": 0.0, "vrp": 0.0, "moneyness": 0.0,
-                              "skew": 0.0, "liquidity": 0.0, "beta": 0.0, "event": 0.0,
+    comp: dict[str, float] = {"vrp": 0.0, "moneyness": 0.0,
+                              "skew": 0.0, "term_structure": 0.0, "liquidity": 0.0, "beta": 0.0, "event": 0.0,
                               "undefined_risk": 0.0}
     comp_baseline: dict[str, float] = {}   # per-key value WITHOUT the earnings-aware adjustment (for the with/without UI)
     if today is None:
         today = date.today()
     is_cal = opp.get("structure") == "calendar"   # LONG-vega, ATM-by-design → the short-vol penalties invert
 
-    # 1) Genuinely-bad EV — DEMOTE (never auto-reject). A negative risk-neutral bps is NORMAL for income
-    #    selling (fair pricing; the real edge is the VRP), so do NOT block on it. Only flag a trade that
-    #    truly LOSES in expectation under the model — a robust signal, not the annualized-bps artifact.
-    bps = _opp_bps(opp, dm, sofr_pct)
-    omega, ev = pm.get("omega"), pm.get("expected_value")
-    if omega is not None and omega < 0.9 and ev is not None and ev < 0:
-        demerits.append(f"loses in expectation (Omega {omega}, EV {ev})"); comp["expectation"] -= 12
-    elif bps is not None and 0 <= bps <= 3000:          # a sane positive edge (guard annualization blow-ups)
-        merits.append("positive risk-neutral edge"); comp["expectation"] += 3
+    # 1) EXPECTATION (Omega / EV) — REMOVED as a hard duplicate. Omega already drives the base-quality
+    #    'Edge' lens (and EV/CVaR the 'Tail' lens), so re-scoring it here double-counted the same
+    #    risk-neutral signal on one tab. A genuinely negative-edge trade is still reflected by a low base
+    #    Edge/Tail; if that ever proves too soft, the fix is to UP-WEIGHT the base Edge lens — not to
+    #    re-add this adjustment.
 
     # 2) Volatility Risk Premium — the REAL edge, and the negative-VRP TRAP. Rich implied vs realized
     #    rewards; cheap implied (implied << realized) is penalised IN PROPORTION to the gap and
@@ -1309,6 +1405,24 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
             demerits.append(f"selling the CHEAP wing — short-strike IV {round(sliv, 1)}% is {iv_edge_vp}vp UNDER "
                             f"ATM {round(atm_iv_pct, 1)}%: underpaid for the strike's distance")
 
+    # 4b) TERM STRUCTURE / roll-down — the IV curve's slope across expiries (from the scan's own tenors, so
+    #     NO extra chain fetch; None when only one expiry was scanned). CONTANGO (back IV > front) is the calm,
+    #     normal curve — a short rolls DOWN it as it ages (IV re-marks lower → favorable carry beyond theta).
+    #     BACKWARDATION (front > back) is an event/stress inversion: fat front premium, but the market is pricing
+    #     a near-term move — a caution for a seller (and it scales with how inverted the curve is).
+    ts = term_structure or {}
+    _ts_state, _ts_diff = ts.get("state"), ts.get("back_minus_front_pts")
+    if _ts_state == "contango" and _ts_diff is not None:
+        _tp = min(round(_ts_diff / 2.0) + 1, 3)          # +1..+3: favorable roll-down
+        comp["term_structure"] += _tp
+        merits.append(f"contango term structure (+{_ts_diff}vp front→back) — the short rolls DOWN the curve as it "
+                      f"ages (IV re-marks lower), favorable carry beyond theta")
+    elif _ts_state == "backwardation" and _ts_diff is not None:
+        _tp = min(round(abs(_ts_diff) / 2.0) + 1, 4)     # −1..−4: inverted = event/stress regime
+        comp["term_structure"] -= _tp
+        demerits.append(f"backwardation ({_ts_diff}vp front→back) — the IV curve is INVERTED (front > back): fat "
+                        f"front premium, but the market is pricing a near-term move; favor shorter DTE or wait it out")
+
     # 5) Execution / liquidity.
     spreads = [l.get("bid_ask_spread_pct") for l in (opp.get("legs") or []) if l.get("bid_ask_spread_pct") is not None]
     worst = max(spreads) if spreads else None
@@ -1324,16 +1438,14 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     # 6) (Tail is already scored by the base quant model; a CVaR-vs-CAPITAL demerit is structure-blind —
     #     a defined-risk spread's CVaR is ~100% of capital BY DEFINITION — so it is intentionally omitted.)
 
-    # 7) Systemic beta — a high-beta name is a LEVERAGED market bet, not idiosyncratic income. But on an
-    #    OVERWRITE (shares already held) the exposure is pre-existing and the short call REDUCES it, so
-    #    credit the overlay instead of penalising beta.
+    # 7) OVERWRITE overlay credit. The static high-beta PENALTY was REMOVED as a duplicate of the TA
+    #    'Systemic beta' factor (which already docks beta × ADVERSE market drift) — and a high-beta name's
+    #    wider cone is already priced into the σ-based Breach / Moneyness reads, so a flat beta penalty
+    #    triple-counted it. Only the OVERWRITE credit remains: on a covered-call overwrite the beta
+    #    exposure is pre-existing and the short call REDUCES it, so credit the overlay.
     if overwrite:
         merits.append("income overlay on held shares — no new capital; the short call caps existing downside")
         comp["beta"] += 3
-    elif beta is not None and beta >= 2.0:
-        demerits.append(f"high beta {beta} (leveraged market bet)"); comp["beta"] -= 6
-    elif beta is not None and beta >= 1.5:
-        demerits.append(f"elevated beta {beta}"); comp["beta"] -= 3
 
     # (Event density intentionally NOT a flat demerit — routine macro spans every multi-week trade, and an
     #  earnings print is DOUBLE-EDGED, not simply bad; event TIMING is a qualitative call for the desk.)
@@ -2466,11 +2578,127 @@ _ADJ_MATCH: dict[str, tuple] = {   # distinctive substrings — chosen so each m
     "VRP":             ("iv/hv", "iv/har", "rich vrp", "negative vrp", "cheap vs", "crushed vol"),
     "Moneyness":       ("near-atm", "atm short leg", "thin cushion", "deep cushion", "full-credit prob", "directional"),
     "Skew / IV-edge":  ("wing", "skew"),
+    "Term structure":  ("contango", "backwardation", "term structure", "roll", "front→back"),
     "Liquidity":       ("spread",),
     "Beta":            ("beta", "overlay on held"),
     "Earnings timing": ("earnings", "iv-crush", "vega-ramp", "clean window", "post-event", "harvest"),
     "Undefined risk":  ("undefined-risk", "unbounded loss"),
 }
+
+# ── Factor taxonomy — the ONE source of truth for (a) grouping factors by DIMENSION in the UI and (b) a
+#    per-SIDE score: a factor tagged 'leg' is recomputed for that side's binding leg, a 'trade' factor is
+#    inherited from the whole-trade grade unchanged. `dimension` is attached to every emitted factor so the
+#    frontend never hard-codes the mapping. Base-quality lenses (PoP/Edge/Sortino/Tail/Carry) are their own
+#    "Base quality" group, added on the frontend.
+_FACTOR_TAXONOMY: dict[str, tuple[str, str]] = {   # label → (dimension, scope)
+    "Breach risk":     ("Loss probability", "leg"),
+    "Moneyness":       ("Loss probability", "leg"),
+    "Skew / IV-edge":  ("Vol edge", "leg"),
+    "VRP":             ("Vol edge", "trade"),
+    "Term structure":  ("Vol edge", "trade"),
+    "Vol-expansion":   ("Vol edge", "leg"),
+    "Structure":       ("Structural defense", "leg"),
+    "LVN slip":        ("Structural defense", "leg"),
+    "Value area":      ("Structural defense", "leg"),
+    "Gamma regime":    ("Structural defense", "trade"),
+    "Trend drift":     ("Regime", "trade"),
+    "Range fit":       ("Regime", "trade"),
+    "Calm tape":       ("Regime", "trade"),
+    "Systemic beta":   ("Directional pressure", "leg"),
+    "Beta":            ("Directional pressure", "trade"),
+    "Tail":            ("Consequence", "trade"),
+    "Undefined risk":  ("Consequence", "leg"),
+    "Earnings timing": ("Event", "trade"),
+    "Earnings gap":    ("Event", "leg"),
+    "Liquidity":       ("Execution", "leg"),
+    "Defensibility":   ("Execution", "leg"),
+}
+# Display order for the dimension groups (most decision-relevant first).
+_DIMENSION_ORDER = ["Loss probability", "Vol edge", "Structural defense", "Regime",
+                    "Directional pressure", "Consequence", "Event", "Execution"]
+
+
+def _factor_dimension(label: str) -> Optional[str]:
+    """The dimension a factor belongs to (for UI grouping); None if unmapped (renders under 'Other')."""
+    t = _FACTOR_TAXONOMY.get(label)
+    return t[0] if t else None
+
+
+def _factor_scope(label: str) -> str:
+    """'leg' (recompute per side) or 'trade' (inherit whole-trade). Defaults to 'trade' for unmapped."""
+    t = _FACTOR_TAXONOMY.get(label)
+    return t[1] if t else "trade"
+
+
+# The MANAGE view relabels a few factors (VRP → "Vol decay"/"Vol premium") and adds holder-only ones
+# (Convexity, Naked risk) that aren't in the entry taxonomy — map those to a dimension, else fall back.
+_MGMT_LABEL_DIMENSION = {
+    "Vol decay": "Vol edge", "Vol premium": "Vol edge",
+    "Convexity (short Γ)": "Consequence", "Naked risk": "Consequence",
+}
+
+
+def _mgmt_factor_dimension(label: str) -> Optional[str]:
+    """Dimension of a MANAGEMENT contribution (handles the manage-view relabels), for UI grouping."""
+    return _MGMT_LABEL_DIMENSION.get(label) or _factor_dimension(label)
+
+
+# The option-math bars, in display order: (label, comp-key). ONE definition, reused by the whole-trade
+# assembly AND the per-side re-grade so both build identical, dimension-tagged adjustment rows.
+_ADJ_ROWS = (("VRP", "vrp"), ("Moneyness", "moneyness"), ("Skew / IV-edge", "skew"),
+             ("Term structure", "term_structure"), ("Liquidity", "liquidity"), ("Beta", "beta"),
+             ("Earnings timing", "event"), ("Undefined risk", "undefined_risk"))
+
+
+def _build_adjustments(g: dict) -> list[dict]:
+    """The itemized option-math adjustment bars from an `_algo_grade` result — each carries its points,
+    inline evidence, earnings with/without, and its dimension (for UI grouping)."""
+    c = g.get("components") or {}
+    cb = g.get("components_baseline") or {}
+    notes = (g.get("merits") or []) + (g.get("demerits") or [])
+    rows = []
+    for lbl, key in _ADJ_ROWS:
+        a = {"label": lbl, "points": round(c.get(key, 0.0), 1), "detail": _adj_detail(lbl, notes),
+             "dimension": _factor_dimension(lbl)}
+        if key in cb and round(cb[key], 1) != round(c.get(key, 0.0), 1):   # earnings-aware with/without
+            a["baseline_points"] = round(cb[key], 1)
+            a["earnings_impacted"] = True
+        rows.append(a)
+    return rows
+
+
+def _side_max_loss(side_legs: list[dict], is_put: bool):
+    """A single side's own max-loss FLAG for the per-side Undefined-risk read: None = UNBOUNDED (a naked
+    short with no protective long on its risk side), else a finite sentinel. Fixes the sub-opp inheriting
+    the WHOLE trade's max_loss (which would mislabel a jade lizard's defined call spread as unbounded)."""
+    shorts = [l for l in side_legs if str(l.get("action", "")).upper().startswith("S") and l.get("strike")]
+    if not shorts:
+        return 0.0                                             # long-only (protective) side → defined
+    longs = [float(l.get("strike")) for l in side_legs
+             if str(l.get("action", "")).upper().startswith("B") and l.get("strike")]
+    for s in shorts:
+        sk = float(s["strike"])
+        protected = any(l < sk for l in longs) if is_put else any(l > sk for l in longs)
+        if not protected:
+            return None                                        # a naked short on its risk side → unbounded
+    return -1.0                                                # every short has a protective wing → defined
+
+
+def _merge_scoped(whole_list: list[dict], side_list: list[dict]) -> list[dict]:
+    """Merge factor lists for a per-SIDE view: LEG-scoped factors come from the side re-grade, TRADE-scoped
+    factors are inherited from the whole-trade grade UNCHANGED (so they read identically across sides and
+    equal the common tab). Order follows the whole list, then any side-only leg factors."""
+    wb = {f["label"]: f for f in whole_list}
+    sb = {f["label"]: f for f in side_list}
+    out, seen = [], set()
+    for lbl in [*wb.keys(), *sb.keys()]:
+        if lbl in seen:
+            continue
+        seen.add(lbl)
+        src = sb if _factor_scope(lbl) == "leg" else wb
+        if lbl in src:
+            out.append(src[lbl])
+    return out
 
 
 def _adj_detail(label: str, notes: list[str]) -> Optional[str]:
@@ -2538,30 +2766,66 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
                         next_earnings=(ctx or {}).get("next_earnings"), today=date.today(),
                         har_rv_pct=vsx.get("har_rv_pct"), earnings_aware=earnings_aware,
                         diffusion_hv=((vsx.get("hv_diffusion_pct") or 0) / 100.0) or None,
-                        days_since_earnings=vsx.get("days_since_earnings"))
+                        days_since_earnings=vsx.get("days_since_earnings"),
+                        term_structure=vsx.get("term_structure"))
         desk_score = int(round(max(0, min(100, base + bonus + g["adj"]))))
         grade, approval = _grade_letter(desk_score, g["blocking"], g.get("timing_hold"))
         # Itemized breakdown so the explorer can show each contribution as a signed bar. TA/regime
         # factors are their OWN group (ta_factors), kept separate from the option-math adjustments:
         #   desk_score = base_quality + Σ(grade_adjustments) + Σ(ta_factors).
-        c = g["components"]
-        cb = g.get("components_baseline") or {}
-        _notes = (g["merits"] or []) + (g["demerits"] or [])   # attach each bar's own evidence line (symmetry w/ TA)
-        def _adj(lbl, key):
-            a = {"label": lbl, "points": round(c[key], 1), "detail": _adj_detail(lbl, _notes)}
-            if key in cb and round(cb[key], 1) != round(c[key], 1):   # earnings-aware with/without (same shape as ta_factors)
-                a["baseline_points"] = round(cb[key], 1)
-                a["earnings_impacted"] = True
-            return a
-        grade_adjustments = [
-            _adj(lbl, key)
-            for lbl, key in (("Expectation", "expectation"), ("VRP", "vrp"), ("Moneyness", "moneyness"),
-                             ("Skew / IV-edge", "skew"), ("Liquidity", "liquidity"), ("Beta", "beta"),
-                             ("Earnings timing", "event"), ("Undefined risk", "undefined_risk"))
-        ]
+        grade_adjustments = _build_adjustments(g)          # option-math bars (points · evidence · dimension)
+        for _f in ta_factors:                             # tag TA/regime factors with their dimension too
+            _f["dimension"] = _factor_dimension(_f.get("label"))
         risk_triggers = _risk_triggers(opp, spot, ta, phys_vol)   # WATCH→DEFEND→EXIT ladder (TA + geometry)
         ea_yield, ea_share = _event_adjusted_yield(opp, vsx, (ctx or {}).get("next_earnings"), date.today())
+        # Per-side (call/put) leg decomposition for the Quant Analysis leg tabs — None for single-type
+        # structures. Drift-aware breach reuses the same μ / realized-vol the scan grade used.
+        try:
+            _per_side = per_side_quant(opp, spot, mu=(mu or 0.0), hv=phys_vol)
+        except Exception as exc:  # noqa: BLE001 — the leg tabs must never sink a ranked trade
+            logger.debug("per_side_quant failed (%s): %s", opp.get("label"), exc)
+            _per_side = None
+
+        # PER-SIDE FULL GRADE — a comprehensive score for each side: WHOLE-TRADE base + inherited trade-scoped
+        # factors, but the LEG-scoped factors (Breach / Moneyness / Skew / Structure / Liquidity / Systemic
+        # beta / Undefined-risk / Defensibility) RE-COMPUTED for just that side (re-run the same grade on a
+        # sub-opp of the side's legs, then keep only its leg factors via `_factor_scope`). So a side's score
+        # differs from the trade's ONLY by its own leg risk — exactly "whole trade for whole-trade features,
+        # the leg for leg-specific factors". Cheap (arithmetic on already-fetched data), two-sided only.
+        def _grade_side(is_put: bool):
+            side_legs = [l for l in (opp.get("legs") or [])
+                         if str(l.get("type", "")).upper().startswith("P") == is_put]
+            if not side_legs:
+                return None
+            sub = {**opp, "legs": side_legs, "max_loss": _side_max_loss(side_legs, is_put)}
+            _sb, _sn, s_ta = _ta_alignment(sub, ta, gex, spot, hv=hv, beta=beta,
+                                           mkt_drift=(portfolio_fit or {}).get("market_drift"),
+                                           earnings_aware=earnings_aware)
+            for _f in s_ta:
+                _f["dimension"] = _factor_dimension(_f.get("label"))
+            s_g = _algo_grade(sub, dm, spot, sofr_pct, atm_iv_pct, iv_rank, beta,
+                              iv_percentile=vsx.get("iv_percentile"), hv=phys_vol, gex=gex, macd=macd_accel,
+                              overwrite=overwrite, next_earnings=(ctx or {}).get("next_earnings"), today=date.today(),
+                              har_rv_pct=vsx.get("har_rv_pct"), earnings_aware=earnings_aware,
+                              diffusion_hv=((vsx.get("hv_diffusion_pct") or 0) / 100.0) or None,
+                              days_since_earnings=vsx.get("days_since_earnings"), term_structure=vsx.get("term_structure"))
+            m_adj = _merge_scoped(grade_adjustments, _build_adjustments(s_g))
+            m_ta = _merge_scoped(ta_factors, s_ta)
+            side_net = sum(a["points"] for a in m_adj) + sum(f["points"] for f in m_ta)
+            side_score = int(round(max(0, min(100, base + side_net))))
+            s_grade, s_appr = _grade_letter(side_score, s_g["blocking"], s_g.get("timing_hold"))
+            return {"score": side_score, "base_quality": round(base, 1), "algo_grade": s_grade,
+                    "approval_odds": s_appr, "grade_adjustments": m_adj, "ta_factors": m_ta,
+                    "grade_blocking": s_g["blocking"], "grade_timing_hold": s_g.get("timing_hold") or []}
+        if _per_side and _per_side.get("sides"):
+            for _sd in _per_side["sides"]:
+                try:
+                    _sd["grade"] = _grade_side(_sd.get("key") == "put")
+                except Exception as exc:  # noqa: BLE001 — a side re-grade must never sink the row
+                    logger.debug("per-side grade failed (%s %s): %s", opp.get("label"), _sd.get("key"), exc)
+                    _sd["grade"] = None
         ranked.append({**opp, "desk_metrics": dm, "desk_score": desk_score, "ta_note": note,
+                       "per_side": _per_side,
                        "risk_triggers": risk_triggers, "iv_edge_vp": g.get("iv_edge_vp"),
                        "event_adjusted_yield_pct": ea_yield, "event_premium_share": ea_share,
                        "algo_grade": grade, "approval_odds": approval, "grade_merits": g["merits"],
@@ -3306,11 +3570,13 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
     _risk = _dm.get("risk") or {}      # VaR / CVaR / capital (the manageable-tail check)
     _trader = _dm.get("trader") or {}  # live greeks incl. the dynamic (vanna/charm/volga)
     qp = row.get("qp") or {}
-    mgmt = management_desk_score(
+    # Shared holder-context kwargs — everything the management (hold/close) algo needs EXCEPT the factor
+    # lists. The base (hold-quality: keep-prob, Omega/Sortino, CVaR tail, captured) is WHOLE-TRADE; only the
+    # re-signed FACTOR lists change when we run this per side. One dict → whole-trade + per-side stay identical.
+    _mgmt_kw = dict(
         keep_drift_pct=qp.get("keep_drift_pct"),
         keep_standard_pct=qp.get("keep_standard_pct") or row.get("prob_keep_pct"),
-        subscores=subscores, grade_adjustments=row.get("grade_adjustments"),
-        ta_factors=row.get("ta_factors"), captured_pct=a.get("captured_pct"), dte_days=dte,
+        subscores=subscores, captured_pct=a.get("captured_pct"), dte_days=dte,
         unrealized_pnl=pnl.get("unrealized_pnl"),
         max_profit=pnl.get("max_profit"), max_loss=pnl.get("max_loss"),
         cushion_pct=row.get("cushion_pct"), structure=structure,
@@ -3319,6 +3585,42 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
         net_gamma=_trader.get("net_gamma"), net_vega=_trader.get("net_vega"),
         net_theta=_trader.get("net_theta"),
     )
+    mgmt = management_desk_score(grade_adjustments=row.get("grade_adjustments"),
+                                ta_factors=row.get("ta_factors"), **_mgmt_kw)
+    for _c in mgmt.get("contributions", []):        # tag holder contributions with their dimension (UI grouping)
+        _c["dimension"] = _mgmt_factor_dimension(_c.get("label"))
+    # `row` came from _finalize_desk (via reprice_desk_focus), so it ALREADY carries per_side — the basic
+    # tiles AND the per-side full grade. Keep that richer version; only build a fallback if it is absent,
+    # and NEVER overwrite it (the old overwrite stripped the per-side grades on the My-Trades path). It rides
+    # inside the serialized `opp` — the UI (QuantExitCard / PaperTraderPanel) renders QuantAnalysisSection
+    # with t=opp.
+    if "per_side" not in row:
+        _spot = desk.get("spot") or (desk.get("context") or {}).get("spot")
+        _hv = ((desk.get("vol_stats") or {}).get("hv30_pct") or 0) / 100.0 or None
+        try:
+            row["per_side"] = per_side_quant(row, _spot, mu=0.0, hv=_hv)
+        except Exception:  # noqa: BLE001 — the leg tabs must never break the hold/close read
+            row["per_side"] = None
+
+    # PER-SIDE MANAGEMENT grade (flow B). The side's entry `grade` (from _finalize_desk) carries the merged
+    # per-side factor lists — leg-scoped factors for THIS side + inherited trade-scoped ones. Re-run the
+    # HOLDER algo (management_desk_score) on those, so the Manage side tabs grade MANAGING this leg (hold/
+    # close, re-signed), NOT entering it. Base/overrides stay whole-trade; only the leg factors differ.
+    for _sd in ((row.get("per_side") or {}).get("sides") or []):
+        _g = _sd.get("grade") or {}
+        if not _g.get("grade_adjustments") and not _g.get("ta_factors"):
+            _sd["mgmt_grade"] = None
+            continue
+        try:
+            _m = management_desk_score(grade_adjustments=_g.get("grade_adjustments"),
+                                       ta_factors=_g.get("ta_factors"), **_mgmt_kw)
+            for _c in _m.get("contributions", []):
+                _c["dimension"] = _mgmt_factor_dimension(_c.get("label"))
+            _sd["mgmt_grade"] = {"score": _m["score"], "signal": _m["signal"], "anchor": _m["anchor"],
+                                 "anchor_label": _m["anchor_label"], "contributions": _m["contributions"],
+                                 "factors_net": _m["factors_net"]}
+        except Exception:  # noqa: BLE001 — a side re-grade must never break the hold/close read
+            _sd["mgmt_grade"] = None
     return {
         "matched": True,
         "desk_score": row.get("desk_score"),

@@ -396,7 +396,7 @@ def _kelly_fraction(rets: np.ndarray, w: np.ndarray) -> Optional[float]:
 
 def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_loss,
                       max_profit, kelly, dte_days: int, sofr_pct: float = 5.0,
-                      income_mode: bool = False) -> dict:
+                      income_mode: bool = False, buffer_mode: bool = False) -> dict:
     """Deterministic entry recommendation from the whole payoff distribution.
 
     ``income_mode`` RE-ANCHORS the blend for premium-income selling — the goal there is a SAFE trade that
@@ -436,6 +436,18 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
         s_carry = (clamp((prem_ann - sofr_pct) / (sofr_pct + 10.0) + 0.4) if prem_ann is not None
                    else clamp(((exp_ret or 0) - hurdle) / (abs(hurdle) + 3.0) + 0.5))          # premium yield vs cash
         wts = {"edge": 0.12, "pop": 0.34, "sortino": 0.10, "tail": 0.14, "carry": 0.30}
+    elif buffer_mode:
+        # DEFENSIVE-PARTICIPATION anchoring — a dual-direction buffer / protective hedge is bought for
+        # PROTECTED equity participation, NOT to beat cash carry. So downside PROTECTION (contained tail)
+        # and a high probability of a good outcome DOMINATE; positive expected participation is rewarded
+        # against ZERO (not the SOFR hurdle), so a defensive structure that lags cash isn't punished for
+        # doing its job. This is the opposite anchoring from typical premium-selling / directional trades.
+        s_edge = clamp(((omega or 0) - 0.9) / (1.6 - 0.9)) if omega is not None else 0.5       # Omega ≥ ~1 = fine
+        s_pop = clamp(((pop or 0) - 55.0) / (90.0 - 55.0)) if pop is not None else 0.5         # decent odds of a gain
+        s_sortino = clamp((sortino or 0) / 1.5) if sortino is not None else 0.5
+        s_tail = clamp(1.0 - tail_frac / 0.50)                                                 # PROTECTION is the point
+        s_carry = clamp(((exp_ret or 0)) / 8.0 + 0.5)                                          # participation vs 0, not cash
+        wts = {"edge": 0.20, "pop": 0.28, "sortino": 0.15, "tail": 0.27, "carry": 0.10}
     else:
         s_edge = clamp(((omega or 0) - 0.8) / (2.0 - 0.8)) if omega is not None else 0.4
         s_pop = clamp(((pop or 0) - 50.0) / (90.0 - 50.0)) if pop is not None else 0.4
@@ -455,9 +467,12 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
     if sortino is not None:
         reasons.append(f"Sortino {sortino:.2f}")
     if capital and cvar95 is not None:
-        reasons.append(f"CVaR95 {tail_frac*100:.0f}% of capital (expected shortfall, not deep tail)")
+        label = "downside protection — CVaR" if buffer_mode else "CVaR95"
+        reasons.append(f"{label} {tail_frac*100:.0f}% of capital (expected shortfall, not deep tail)")
     if income_mode and prem_ann is not None:
         reasons.append(f"premium yield {prem_ann:.1f}%/yr vs {sofr_pct:.1f}% cash (the income alpha)")
+    elif buffer_mode and exp_ret is not None:
+        reasons.append(f"expected participation {exp_ret:+.1f}% (protected — judged vs 0, not the cash hurdle)")
     elif exp_ret is not None:
         reasons.append(f"exp. return {exp_ret:+.1f}% vs {hurdle:.1f}% hurdle")
     if kelly is not None:
@@ -786,6 +801,9 @@ _MGMT_FACTOR_POLICY: dict = {
     #       as-is), so re-adding the entry Beta demerit would double-count it.
     "Skew":         (0.0,  ""),
     "Beta":         (0.0,  ""),
+    # ── term structure — a holder still benefits from contango roll-down / is warned by an event-inverted
+    #    curve; kept same sign, lightly downweighted (you can still act once in). ──
+    "Term structure": (0.6, "contango = the short keeps rolling DOWN the curve (favorable carry); backwardation = an event-inverted curve, a caution to defend/close before the move"),
 }
 
 
@@ -935,7 +953,7 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
 
 def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_profit,
                              avg_iv, dte_days, stock_shares=0.0, r=0.05, sofr_pct=5.0,
-                             realized_vol=None) -> dict:
+                             realized_vol=None, strategy_type="") -> dict:
     """Full desk read for a PROPOSED trade: Trader Greeks + PM ratios + position
     VaR/CVaR + the algorithmic Quant recommendation. `avg_iv` (implied) is decimal (0 = unknown).
 
@@ -979,8 +997,15 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
     pop_val = pm.get("pop")
     tail_pctile = 99 if (pop_val is not None and pop_val > 95) else 95
     tail_cvar = cvar99 if (tail_pctile == 99 and cvar99 is not None) else cvar95
+    # Anchor the recommendation to the STRATEGY's use case, not one-size-fits-all:
+    #   buffer / dual-direction / hedge → defensive protected-participation (protection + odds dominate)
+    #   income (premium selling)        → safe-income (keep-prob + yield-vs-cash dominate)
+    #   otherwise                        → default risk-neutral blend
+    _st = (strategy_type or "").lower()
+    _buffer = ("buffer" in _st or "dual_direction" in _st or "hedge" in _st)
+    _income = ("income" in _st) or (not _st)   # blank = the income-desk default (back-compat)
     quant = algorithmic_quant(pm, tail_cvar, capital, max_loss, max_profit, kelly, dte_days, sofr_pct,
-                              income_mode=True)   # the desk path is premium income — re-anchor off risk-neutral alpha
+                              income_mode=(_income and not _buffer), buffer_mode=_buffer)
     vrp_ratio = (implied / realized) if (implied and realized) else None   # < 1 = negative VRP
     return {
         "trader": {**trader, "avg_iv_pct": round(avg_iv * 100, 1) if (avg_iv and avg_iv > 0) else None},

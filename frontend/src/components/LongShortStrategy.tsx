@@ -7,7 +7,8 @@ import {
   PieChart, Brain, AlertCircle, Layers,
 } from 'lucide-react';
 import { Line, Bar } from 'react-chartjs-2';
-import { computeSingleStockLongShort, computePairTrade, fetchPairSuggestions, build130_30Portfolio } from '../api';
+import { computeSingleStockLongShort, computePairTrade, fetchPairSuggestions, build130_30Portfolio, build130_30Insights } from '../api';
+import type { Build130_30Params } from '../api';
 import type {
   SingleStockLongShortResponse, PairTradeResponse,
   LongShortStrategy as LongShortStrategyType,
@@ -275,6 +276,11 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
   const [portLoading, setPortLoading] = useState(false);
   const [portError, setPortError] = useState<string | null>(null);
   const [portResult, setPortResult] = useState<Portfolio130_30Response | null>(null);
+  // AI narrative is a separate, opt-in action (not run during the quantitative build).
+  const [portParams, setPortParams] = useState<Build130_30Params | null>(null);
+  const [portInsights, setPortInsights] = useState<string | null>(null);
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [insightsError, setInsightsError] = useState<string | null>(null);
   const [portBookTab, setPortBookTab] = useState<'long' | 'short'>('long');
   const [expandedPosition, setExpandedPosition] = useState<string | null>(null);
   const [portScenarioTab, setPortScenarioTab] = useState<'chart' | 'table' | 'stress' | 'leverage' | 'impact'>('chart');
@@ -388,6 +394,8 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
     setPortLoading(true);
     setPortError(null);
     setPortResult(null);
+    setPortInsights(null);
+    setInsightsError(null);
     try {
       const longs = portLongRows.filter(r => r.ticker.trim()).map(r => ({
         ticker: r.ticker.trim(),
@@ -400,20 +408,36 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
       if (longs.length === 0) { setPortError('Add at least one long position'); return; }
       if (shorts.length === 0) { setPortError('Add at least one short position'); return; }
 
-      const data = await build130_30Portfolio({
+      const params: Build130_30Params = {
         long_positions: longs,
         short_positions: shorts,
         investment_amount: portInvestment,
         leverage_ratio: portLeverage,
         tax_rate_st: portTaxST / 100,
         tax_rate_lt: portTaxLT / 100,
-      });
+      };
+      const data = await build130_30Portfolio(params);
       if (data.error) setPortError(data.error);
-      else setPortResult(data);
+      else { setPortResult(data); setPortParams(params); }
     } catch (err: any) {
       setPortError(err?.message || 'Portfolio build failed');
     } finally {
       setPortLoading(false);
+    }
+  };
+
+  const handleGenerateInsights = async () => {
+    if (!portParams) return;
+    setInsightsLoading(true);
+    setInsightsError(null);
+    try {
+      const data = await build130_30Insights(portParams);
+      if (data.llm_insights) setPortInsights(data.llm_insights);
+      else setInsightsError('No analysis was returned. Try again.');
+    } catch (err: any) {
+      setInsightsError(err?.message || 'AI analysis failed');
+    } finally {
+      setInsightsLoading(false);
     }
   };
 
@@ -442,7 +466,18 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
               By going long on stocks you believe will outperform and short on related assets, you can
               isolate the alpha (stock-specific return) from the beta (market/sector return).
             </p>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-2">
+              <div className="bg-base-200/30 rounded-xl p-3 border border-white/[0.03]">
+                <p className="font-semibold text-xs mb-1 flex items-center gap-1">
+                  <Layers className="w-3.5 h-3.5 text-primary" />
+                  Long/Short Portfolio
+                </p>
+                <p className="text-xs text-base-content/60">
+                  Build a leveraged multi-name book — e.g. 130% long / 30% short (you pick the
+                  leverage) — for ~100% net market exposure plus extra alpha from your short picks.
+                  Includes scenario stress-tests, factor tilt and tax-loss projections.
+                </p>
+              </div>
               <div className="bg-base-200/30 rounded-xl p-3 border border-white/[0.03]">
                 <p className="font-semibold text-xs mb-1 flex items-center gap-1">
                   <TrendingUp className="w-3.5 h-3.5 text-success" />
@@ -475,7 +510,7 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
           onClick={() => setMode('portfolio')}
         >
           <Layers className="w-3.5 h-3.5 mr-1" />
-          130/30 Portfolio
+          Long/Short Portfolio
         </button>
         <button
           className={`tab tab-sm ${mode === 'single' ? 'tab-active' : ''}`}
@@ -587,7 +622,7 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
 
             <button type="submit" className="btn btn-primary btn-sm gap-2" disabled={portLoading}>
               {portLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Layers className="w-4 h-4" />}
-              {portLoading ? 'Building Portfolio...' : 'Build 130/30 Portfolio'}
+              {portLoading ? 'Building Portfolio...' : `Build ${portLeverage} Portfolio`}
             </button>
           </form>
 
@@ -912,9 +947,32 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
 
                 {/* Section 4: Factor Exposure */}
                 <div className="bg-base-200/40 rounded-xl border border-white/[0.03] p-3">
-                  <h4 className="text-sm font-semibold mb-3 flex items-center gap-2">
+                  <h4 className="text-sm font-semibold mb-2 flex items-center gap-2">
                     <Target className="w-4 h-4 text-info" /> Factor Exposure — Long vs Short
                   </h4>
+                  <p className="text-xs text-base-content/60 mb-3">
+                    Every holding is scored <strong>0–100</strong> on four classic AQR factors. Each bar
+                    is the dollar-weighted average score of your <span className="text-success font-medium">long book</span> (green)
+                    and your <span className="text-error font-medium">short book</span> (red). Higher = more of that trait.
+                  </p>
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mb-3 text-[10px] text-base-content/70">
+                    <div className="bg-base-200/50 rounded-lg p-2">
+                      <span className="font-semibold text-base-content">Value</span> — cheap vs fundamentals
+                      (low P/E, P/B, EV/EBITDA; high yield). High = bargain.
+                    </div>
+                    <div className="bg-base-200/50 rounded-lg p-2">
+                      <span className="font-semibold text-base-content">Momentum</span> — 12-1 month price
+                      trend. High = strong recent uptrend.
+                    </div>
+                    <div className="bg-base-200/50 rounded-lg p-2">
+                      <span className="font-semibold text-base-content">Quality</span> — profitability &
+                      balance-sheet strength (ROE, margins, low debt). High = well-run.
+                    </div>
+                    <div className="bg-base-200/50 rounded-lg p-2">
+                      <span className="font-semibold text-base-content">Defensive</span> — low
+                      volatility / low beta. High = steadier in drawdowns.
+                    </div>
+                  </div>
                   <div style={{ height: 220 }}>
                     <Bar
                       data={{
@@ -946,9 +1004,20 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
                       }}
                     />
                   </div>
-                  <p className="text-[9px] text-base-content/40 mt-2 text-center">
-                    Ideal: Long book scores higher across all factors. Short book scoring lower = good short candidates.
-                  </p>
+                  <div className="mt-3 bg-info/5 border border-info/20 rounded-lg p-2.5 text-[11px] text-base-content/70 space-y-1">
+                    <p className="flex items-start gap-1.5">
+                      <span className="text-success font-semibold shrink-0">What good looks like:</span>
+                      <span>green bars sit <strong>above</strong> red bars on each factor — you own cheap /
+                      strong / high-quality names and short the expensive, weak, low-quality ones. The wider
+                      the green-over-red gap, the cleaner the factor bet.</span>
+                    </p>
+                    <p className="flex items-start gap-1.5">
+                      <span className="text-error font-semibold shrink-0">Risk flag:</span>
+                      <span>if a red bar is <strong>higher</strong> than its green bar, you're shorting stocks
+                      that actually screen better than your longs on that factor — that leg fights you. A very
+                      high short-momentum bar is the classic trap: shorting winners can keep hurting.</span>
+                    </p>
+                  </div>
                 </div>
 
                 {/* Section 5: Sector Breakdown */}
@@ -990,9 +1059,31 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
 
                 {/* Section 6: Tax-Loss Harvesting Projection */}
                 <div className="bg-base-200/40 rounded-xl border border-white/[0.03] p-3">
-                  <h4 className="text-sm font-semibold mb-3 flex items-center gap-2">
+                  <h4 className="text-sm font-semibold mb-2 flex items-center gap-2">
                     <DollarSign className="w-4 h-4 text-success" /> Tax-Loss Harvesting Projection
                   </h4>
+                  <p className="text-xs text-base-content/60 mb-2">
+                    Tax-loss harvesting means selling a position that is <strong>underwater</strong> to
+                    realize (bank) a capital loss, then re-establishing similar exposure so your market
+                    view is unchanged. Those booked losses offset gains elsewhere and cut your tax bill —
+                    the extra after-tax return is called <em>tax alpha</em>.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3 text-[11px] text-base-content/70">
+                    <div className="bg-success/5 border border-success/20 rounded-lg p-2">
+                      <span className="text-success font-semibold">A long harvests a loss when it falls.</span> You
+                      sell the loser, book the loss, rebuy comparable exposure (wash-sale aware).
+                    </div>
+                    <div className="bg-error/5 border border-error/20 rounded-lg p-2">
+                      <span className="text-error font-semibold">A short harvests a loss when it rises.</span> Buying
+                      back a short above where you sold it is a realized loss you can bank too.
+                    </div>
+                  </div>
+                  <p className="text-xs text-base-content/60 mb-3">
+                    Because a long/short book holds <strong>both</strong> legs across more names (160%+ gross
+                    at {portLeverage}), something is usually moving against you in either direction — so it
+                    throws off far more harvestable losses than a long-only portfolio, without changing your
+                    net bet. The cards below quantify that edge; the chart compares cumulative tax savings.
+                  </p>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
                     <div className="bg-success/10 border border-success/20 rounded-lg p-2 text-center">
                       <p className="text-[10px] text-success">Annual Tax Alpha</p>
@@ -1051,23 +1142,63 @@ export function LongShortStrategy({ ticker: defaultTicker }: Props) {
                       }}
                     />
                   </div>
-                  <p className="text-[9px] text-base-content/40 mt-2 text-center">
-                    Based on AQR research: 130/30 generates ~2.7× more capital losses than long-only. Actual results will vary.
+                  <p className="text-[10px] text-base-content/45 mt-2 leading-relaxed">
+                    <span className="font-semibold">Solid line</span> = cumulative tax savings from your
+                    {' '}{portLeverage} book; <span className="font-semibold">dashed line</span> = a long-only book of
+                    the same size. Modeled on AQR research (130/30 realizes ~2.7× more harvestable losses than
+                    long-only) at your {portTaxST}% short-term / {portTaxLT}% long-term rates. Assumes you have
+                    capital gains to offset, wash-sale-compliant repurchases, and no change to your positions —
+                    illustrative only; actual results vary with volatility, dispersion and your tax situation.
                   </p>
                 </div>
 
-                {/* Section 7: AI Insights */}
-                {r.llm_insights && (
-                  <div className="bg-base-200/40 rounded-xl border border-white/[0.03] overflow-hidden">
-                    <div className="flex items-center gap-2 p-3 border-b border-white/[0.03]">
-                      <Brain className="w-4 h-4 text-secondary" />
-                      <span className="text-sm font-semibold">AI Portfolio Analysis</span>
-                    </div>
-                    <div className="p-4 prose prose-sm prose-invert max-w-none text-xs leading-relaxed"
-                      dangerouslySetInnerHTML={{ __html: r.llm_insights.replace(/\n/g, '<br/>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\*(.*?)\*/g, '<em>$1</em>') }}
-                    />
+                {/* Section 7: AI Insights (separate, opt-in LLM action) */}
+                <div className="bg-base-200/40 rounded-xl border border-white/[0.03] overflow-hidden">
+                  <div className="flex items-center gap-2 p-3 border-b border-white/[0.03]">
+                    <Brain className="w-4 h-4 text-secondary" />
+                    <span className="text-sm font-semibold">AI Portfolio Analysis</span>
+                    <span className="badge badge-ghost badge-xs ml-1">optional · uses your OpenAI key</span>
                   </div>
-                )}
+                  {!portInsights && (
+                    <div className="p-4">
+                      <p className="text-xs text-base-content/60 mb-3">
+                        The dashboard above is fully quantitative — no AI required. Generate an
+                        optional strategist narrative that interprets your factor tilt, concentration,
+                        scenario risk and tax profile in plain language.
+                      </p>
+                      <button
+                        className="btn btn-secondary btn-sm gap-2"
+                        onClick={handleGenerateInsights}
+                        disabled={insightsLoading}
+                      >
+                        {insightsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
+                        {insightsLoading ? 'Analyzing…' : 'Generate AI Analysis'}
+                      </button>
+                      {insightsError && (
+                        <div className="alert alert-error text-xs mt-3 py-2">
+                          <AlertTriangle className="w-3.5 h-3.5" /><span>{insightsError}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {portInsights && (
+                    <>
+                      <div className="p-4 prose prose-sm prose-invert max-w-none text-xs leading-relaxed"
+                        dangerouslySetInnerHTML={{ __html: portInsights.replace(/\n/g, '<br/>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\*(.*?)\*/g, '<em>$1</em>') }}
+                      />
+                      <div className="px-4 pb-3">
+                        <button
+                          className="btn btn-ghost btn-xs gap-1"
+                          onClick={handleGenerateInsights}
+                          disabled={insightsLoading}
+                        >
+                          {insightsLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Brain className="w-3 h-3" />}
+                          Regenerate
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
               </div>
             );
           })()}

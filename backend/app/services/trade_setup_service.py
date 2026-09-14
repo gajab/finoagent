@@ -408,6 +408,27 @@ def _sizing(entry, stop, target, spot, em_pct):
             "within_expected_move": bool(within), "note": note}
 
 
+_POS_MIN_FRAC = 0.15        # a position (long-term) target aims for a big move (≥15%)
+
+
+def _meaningful_target(direction, entry, base_target, spot, atr, em_pct, style="swing"):
+    """Keep the entry→target spread worth trading. Floors the reward at a style-appropriate minimum
+    move — swing ≈ max(1.2·ATR, 4%, ~1× the 30-day expected move); position ≈ 15% — and returns the
+    FURTHER (more reward) of the structural target and that floor, in the trade's direction. Fixes
+    'nearest-zone' targets that are too thin to bother trading."""
+    if not (entry and spot):
+        return base_target
+    if style == "position":
+        floor_move = max(_POS_MIN_FRAC * spot, 3.0 * (atr or 0))
+    else:
+        em_move = (em_pct / 100.0 * spot) if em_pct else 0.0
+        floor_move = max(1.2 * (atr or 0), 0.04 * spot, em_move)
+    floored = (entry + floor_move) if direction == "long" else (entry - floor_move)
+    if base_target is None:
+        return round(floored, 2)
+    return round(max(base_target, floored) if direction == "long" else min(base_target, floored), 2)
+
+
 def _strike_increment(price: float) -> float:
     """Fallback strike grid when the real chain isn't available (approximate)."""
     if price < 25:
@@ -531,16 +552,21 @@ def _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, st
     strong_resistance = max(ress, key=lambda z: z["score"])["center"] if ress else None
     expiry = _pick_expiry(dealer)
 
-    def mk(kind, direction, entry_zone, entry, stop, targets, base_score, thesis, extra_ev, fit):
+    def mk(kind, direction, entry_zone, entry, stop, targets, base_score, thesis, extra_ev, fit, style="swing"):
         tgt = [t for t in targets if t]
         if not tgt:
             return
+        # widen a too-thin first target to a meaningful, style-appropriate reward
+        bt = tgt[0].get("level")
+        mt = _meaningful_target(direction, entry, bt, spot, atr, em_pct, style)
+        if mt is not None and mt != bt:
+            tgt[0] = {**tgt[0], "level": _r(mt), "rr": _rr(entry, stop, mt)}
         rr = _rr(entry, stop, tgt[0]["level"])
         score = base_score + (entry_zone["score"] if entry_zone else 0) + min(rr or 0, 3)
         if fit == "counter_regime":
             score -= 3
         setups.append({
-            "type": kind, "direction": direction, "regime_fit": fit,
+            "type": kind, "direction": direction, "regime_fit": fit, "style": style,
             "confidence": _CONF(score), "score": round(score, 2),
             "entry": {"low": entry_zone["low"] if entry_zone else _r(entry),
                       "high": entry_zone["high"] if entry_zone else _r(entry),
@@ -570,6 +596,23 @@ def _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, st
            4, f"{'Downtrend' if reg == 'trending' else 'Bearish bias'} — sell the bounce into resistance ${res['low']}–${res['high']}, target support ${sup['center']}.",
            [f"regime: {reg}", bias["rationale"]], cont_fit)
 
+    # A2) MOMENTUM — trade NOW on strength, don't wait for a deep pullback. Enter near the current
+    # price, stop under the last swing (or ~1.2 ATR), ride to a measured move. Fires in a trend so
+    # the user always has an actionable "enter here" option alongside the patient pullback entry.
+    if reg != "mean_reverting" and trend_up:
+        # tight momentum stop: ~1.2 ATR under spot, or the last swing low if that's CLOSER
+        stop_m = max(spot - 1.2 * atr, sup["low"] - buf) if (sup and sup["center"] < spot) else spot - 1.2 * atr
+        mk("trend_momentum", "long", None, spot, stop_m,
+           [{"level": None, "label": "measured move", "rr": None}],
+           4.2, f"Uptrend with momentum — enter now near ${_r(spot)} and ride the trend; stop under the last swing at ${_r(stop_m)}.",
+           [f"regime: {reg}", bias["rationale"]], cont_fit)
+    if reg != "mean_reverting" and trend_dn:
+        stop_m = min(spot + 1.2 * atr, res["high"] + buf) if (res and res["center"] > spot) else spot + 1.2 * atr
+        mk("trend_momentum", "short", None, spot, stop_m,
+           [{"level": None, "label": "measured move", "rr": None}],
+           4.2, f"Downtrend with momentum — enter short now near ${_r(spot)}; stop above the last swing at ${_r(stop_m)}.",
+           [f"regime: {reg}", bias["rationale"]], cont_fit)
+
     # B) mean-reversion fade (mean-reverting regime, or a stretched z-score) — target the mean
     # A stretched z-score only justifies a FADE when we're NOT trending — in a trend (esp. a
     # short-gamma tape) stretched = momentum and support/resistance is made to break, not bought.
@@ -594,7 +637,7 @@ def _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, st
     if reg == "mean_reverting" and long_gamma and sup and res:
         credit_score = 4 + sup["score"] * 0.3 + res["score"] * 0.3
         setups.append({
-            "type": "range_income", "direction": "neutral", "regime_fit": "with_regime",
+            "type": "range_income", "direction": "neutral", "regime_fit": "with_regime", "style": "swing",
             "confidence": _CONF(credit_score), "score": round(credit_score, 2),
             "entry": {"low": sup["center"], "high": res["center"], "level": _r(spot), "label": "sell the range"},
             "stop": {"level": None, "label": "manage if either wall breaks / at ~2× credit"},
@@ -628,7 +671,7 @@ def _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, st
     if not setups and sup and res:
         rr_long = _rr(sup["center"], sup["low"] - buf, res["center"])
         setups.append({
-            "type": "range_bracket", "direction": "neutral", "regime_fit": "neutral",
+            "type": "range_bracket", "direction": "neutral", "regime_fit": "neutral", "style": "swing",
             "confidence": _CONF(sup["score"] + res["score"]), "score": round(sup["score"] + res["score"], 2),
             "entry": {"low": sup["center"], "high": res["center"], "level": _r(spot), "label": "trade the bracket"},
             "stop": {"level": None, "label": "outside the bracket"},
@@ -644,9 +687,51 @@ def _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, st
         })
 
     setups.sort(key=lambda s: -s["score"])
-    for i, s in enumerate(setups[:4]):
-        s["rank"] = i + 1
-    return setups[:4]
+    return setups[:6]
+
+
+def _position_setups(bias, zones, spot, atr, indicators, em_pct) -> list[dict]:
+    """POSITION / long-term accumulation: buy a strong name into a MAJOR value zone (strongest
+    support, ideally near the 200-day MA) with a WIDE stop and a BIG target — the 'entry with a stop
+    for long-term holding' style (weeks–months). Long-only (accumulate); needs a real value zone
+    below spot and ≥1.5:1 reward, else nothing."""
+    if not (spot and atr):
+        return []
+    sups = [z for z in zones if z["kind"] == "support"]
+    if not sups:
+        return []
+    ma = (indicators or {}).get("movingAverages") or {}
+    sma200 = ma.get("sma200")
+    value = max(sups, key=lambda z: z["score"])                       # strongest support = the value zone
+    if sma200 and sma200 < spot:                                      # prefer a support sitting on the 200-DMA
+        near200 = min(sups, key=lambda z: abs(z["center"] - sma200))
+        if abs(near200["center"] - sma200) / spot < 0.03:
+            value = near200
+    entry = value["center"]
+    stop = round(value["low"] - max(2.0 * atr, 0.06 * spot), 2)       # wide long-term stop below the value zone
+    ress = [z for z in zones if z["kind"] == "resistance" and z["center"] > spot]
+    prior_high = max(ress, key=lambda z: z["center"])["center"] if ress else None
+    target = _meaningful_target("long", entry, prior_high, spot, atr, em_pct, style="position")
+    rr = _rr(entry, stop, target)
+    if not rr or rr < 1.5:
+        return []
+    strong = bias.get("direction") == "bullish"
+    base = 6 + (2 if strong else 0)
+    return [{
+        "type": "position_accumulate", "direction": "long", "regime_fit": "with_regime" if strong else "neutral",
+        "style": "position", "confidence": _CONF(base + min(rr, 3)), "score": round(base + min(rr, 3), 2),
+        "entry": {"low": value["low"], "high": value["high"], "level": _r(entry),
+                  "label": value["sources"][0]["label"] if value.get("sources") else "value zone"},
+        "stop": {"level": stop, "label": "wide long-term stop below the value zone"},
+        "targets": [{"level": _r(target), "label": "prior high / measured", "rr": rr}],
+        "risk_reward": rr,
+        "sizing": _sizing(entry, stop, target, spot, em_pct),
+        "options": _option_play("trend_continuation", "long", spot, target, value["center"], prior_high, None, None, None),
+        "thesis": (f"Long-term accumulate — buy the pullback into the value zone ${value['low']}–${value['high']} "
+                   f"{'(near the 200-day MA) ' if (sma200 and abs(value['center']-sma200)/spot < 0.03) else ''}"
+                   f"with a wide stop at ${stop}; target ${_r(target)}. Scale in and hold while the trend holds."),
+        "evidence": _evidence(value, [f"200-DMA ${_r(sma200)}" if sma200 else "", bias.get("rationale", "")]),
+    }]
 
 
 # ---------------------------------------------------------------------------
@@ -966,11 +1051,16 @@ def _entry_style(direction, entry, spot, atr) -> dict:
                      f"down."), "distance_pct": dist}
 
 
-def _trade_horizon(entry, t1, atr) -> dict:
-    """Rough holding period. These setups are built from DAILY / 4H / 1H structure and 3-month /
-    15-day / 5-day volume profiles — i.e. **swing trades held days-to-weeks, not intraday scalps**
-    (the 5m/15m checks live only in the Trade Tracker's entry confirmation). Time-to-target is
-    estimated from how many daily ATRs away T1 is (price nets ~0.4 ATR/session in its favor)."""
+def _trade_horizon(entry, t1, atr, style=None) -> dict:
+    """Rough holding period. Swing setups are built from DAILY / 4H / 1H structure — held days-to-
+    weeks, not intraday scalps. A ``style`` of 'position' is a weeks-to-months hold; 'day' is intraday.
+    Otherwise the label is derived from how many daily ATRs away T1 is (price nets ~0.4 ATR/session)."""
+    if style == "position":
+        return {"label": "Position", "style": "position",
+                "note": "Long-term / position trade — accumulate and hold for weeks to months while the trend holds."}
+    if style == "day":
+        return {"label": "Day trade", "style": "day",
+                "note": "Intraday day-trade — entered and managed off 5m/15m structure; typically closed same day."}
     base = "Swing trade — normally held a few days to a couple of weeks, not an intraday day-trade."
     if not (entry and t1 and atr and atr > 0):
         return {"label": "Swing", "style": "swing", "note": base}
@@ -999,9 +1089,11 @@ def _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, n
             s["targets"] = tgts + [{"level": _r(t2), "label": "extended (T2)",
                                     "rr": _rr(entry, stop, t2) if stop is not None else None}]
 
-    # cap targets to a REALISTIC distance (≤1.5× the 30-day expected move) — no fantasy 43% targets
+    # cap targets to a REALISTIC distance vs the 30-day expected move — no fantasy 43% swing targets.
+    # A POSITION trade is held weeks–months, so it gets a much wider cap (its whole point is a big move).
     if em_pct and direction in ("long", "short"):
-        max_dist = spot * (em_pct / 100.0) * 1.5
+        cap_mult = 4.0 if s.get("style") == "position" else 1.5
+        max_dist = spot * (em_pct / 100.0) * cap_mult
         for t in s.get("targets", []):
             lvl = t.get("level")
             if lvl is None:
@@ -1056,7 +1148,7 @@ def _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, n
     # plus the distance from the CURRENT price to entry and to T1 so proximity is never a mystery.
     if direction in ("long", "short"):
         s["entry_style"] = _entry_style(direction, entry, spot, atr)
-        s["horizon"] = _trade_horizon(entry, t1c, atr)
+        s["horizon"] = _trade_horizon(entry, t1c, atr, s.get("style"))
         s["from_current"] = {"to_entry_pct": round((entry - spot) / spot * 100, 2) if (entry and spot) else None,
                              "to_t1_pct": round((t1c - spot) / spot * 100, 2) if (t1c and spot) else None}
 
@@ -1159,6 +1251,7 @@ def compute_trade_setups(stock) -> dict | None:
             mean_price = ((micro.get("timeframe_profiles") or {}).get("macro") or {}).get("poc")
         strikes = (dealer or {}).get("strikes") or None
         setups = _build_setups(bias, zones, spot, atr, dealer, regime, em_pct, mean_price, strikes)
+        setups += _position_setups(bias, zones, spot, atr, indicators, em_pct)   # long-term accumulate style
 
         # enrich each setup with an equity plan, T1/T2, a management plan, and a priced
         # options plan (real leg quotes + payoff). Fetch the one expiry chain we need.

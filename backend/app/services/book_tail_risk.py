@@ -82,15 +82,16 @@ def _bs_vec(S, K: float, T: float, r: float, sigma, right: str):
 # ── crash scenarios — FULL repricing (Taylor is invalid for large moves) ─────
 
 def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r: float,
-                     include_stock: bool = True) -> float:
+                     include_stock: bool = False) -> float:
     """Book P&L if the market instantly moves `move` (each name × its beta) and vol
-    jumps `vol_shock_pts`, by fully repricing every leg with Black-Scholes.
+    jumps `vol_shock_pts`, by fully repricing every OPTION leg with Black-Scholes.
 
-    `include_stock=True` also revalues the SHARES behind the position (the long stock of a
-    covered call / collar, or any held underlying) at the crashed spot — the true economic
-    exposure. Set False to isolate the option overlay. Excluding the shares is exactly what
-    made a −50% crash look milder than a −34% one: a covered call's short call *decays* in a
-    selloff (a paper gain) while the far larger stock loss was invisible."""
+    OPTION-OVERLAY ONLY by default: this desk manages the option-income overlay, so a covered
+    call's / collar's long SHARES are a separate core holding and their mark-to-market is NOT
+    counted here — the stock is used only to mark a short call "covered" and to size assignment
+    capital. (Pass include_stock=True to also revalue the shares, e.g. for an economic-exposure
+    view.) Consequence: a covered-call book can PROFIT in a crash — the short calls decay to
+    zero (you keep the premium) — so its real risk is the melt-up, not the selloff."""
     total = 0.0
     for p in positions:
         s_crash = p["spot"] * (1 + move * p.get("beta", 1.0))
@@ -144,8 +145,8 @@ def book_mc(positions: list[dict], r: float, mkt_vol: float, idx_spot: float,
             else:
                 v1 = np.maximum(0.0, lg["strike"] - s_sim)
             pnl += lg["sign"] * lg["qty"] * _MULT * (v1 - v0)
-        if p.get("shares"):                       # revalue held shares (covered call / collar / stock)
-            pnl += p["shares"] * (s_sim - p["spot"])
+        # Option-overlay only — the long shares behind a covered call/collar are a separate core
+        # holding, not part of the income overlay's risk (see reprice_scenario).
     idx_sim = idx_spot * np.exp(mkt)
     return {"pnl": pnl, "idx_sim": idx_sim, "horizon_years": dt, **_tail_stats(pnl)}
 
@@ -330,7 +331,8 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
                 if q:
                     shares += (-1 if any(k in str(l.get("action", "")).upper() for k in ("SELL", "SHORT")) else 1) * q
     has_stock = bool(shares)
-    return {"ticker": ticker, "name": strategy.name, "spot": spot, "iv": avg_iv,
+    return {"ticker": ticker, "name": strategy.name, "trade_id": getattr(strategy, "id", None),
+            "spot": spot, "iv": avg_iv,
             "n_short": n_short, "capital": round(capital, 0), "legs": life_legs, "shares": round(shares, 2),
             "strikes_by_exp": strikes_by_exp, "structure": structure, "has_stock": bool(has_stock), **g}
 
@@ -754,21 +756,16 @@ def _naked_assignment(positions: list[dict]) -> dict:
 
 
 def _loss_by_name(positions: list[dict], r: float, move: float, vshock: float) -> list[dict]:
-    """Per-underlying P&L contribution at one scenario (whole position — shares INCLUDED), the
-    'who is actually hurting me' waterfall institutions lead with. Splits the option overlay from
-    the stock leg so a covered name shows where the loss really comes from. Sorted worst-first."""
+    """Per-underlying OPTION-OVERLAY P&L at one scenario — the 'who is actually hurting me'
+    waterfall. Options only (the long shares behind covered names are a separate holding, not this
+    desk's P&L). Sorted worst-first. Sums EXACTLY to the same-scenario stress tile (same engine)."""
     agg: dict[str, dict] = {}
     for p in positions:
-        whole = reprice_scenario([p], move, vshock, r)
-        opt = reprice_scenario([p], move, vshock, r, include_stock=False)
-        a = agg.setdefault(p["ticker"], {"ticker": p["ticker"], "pnl": 0.0, "option_pnl": 0.0,
-                                         "stock_pnl": 0.0, "beta": round(p.get("beta", 1.0), 2)})
-        a["pnl"] += whole
-        a["option_pnl"] += opt
-        a["stock_pnl"] += (whole - opt)
+        pnl = reprice_scenario([p], move, vshock, r)
+        a = agg.setdefault(p["ticker"], {"ticker": p["ticker"], "pnl": 0.0, "beta": round(p.get("beta", 1.0), 2)})
+        a["pnl"] += pnl
     rows = sorted(agg.values(), key=lambda x: x["pnl"])
-    return [{**a, "pnl": round(a["pnl"], 0), "option_pnl": round(a["option_pnl"], 0),
-             "stock_pnl": round(a["stock_pnl"], 0)} for a in rows]
+    return [{**a, "pnl": round(a["pnl"], 0)} for a in rows]
 
 
 # Independent-axis risk array (SPAN/RiskMetrics style): spot shock × vol shock, full reprice.
@@ -979,7 +976,10 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
     opts.sort(key=_eff, reverse=True)
     best = opts[0]
     return {"tail_before": round(tail_before, 0), "recommended": best,
-            "alt": next((o for o in opts if o["action"] != best["action"]), None)}
+            "alt": next((o for o in opts if o["action"] != best["action"]), None),
+            # the targeted short leg — so the UI can ALWAYS render a "Close {K}{right}" action, even
+            # when no cap wing is available (e.g. an already-defined-risk spread → close is the only fix).
+            "short": {"strike": K, "right": right, "qty": int(qty)}}
 
 
 def _offender_targets(positions: list[dict], side: str, r: float, *, tickers=None, top: int = 2) -> list[dict]:
@@ -999,7 +999,7 @@ def _offender_targets(positions: list[dict], side: str, r: float, *, tickers=Non
         if not rem:
             continue
         out.append({
-            "ticker": p["ticker"], "name": p.get("name") or p["ticker"],
+            "ticker": p["ticker"], "name": p.get("name") or p["ticker"], "trade_id": p.get("trade_id"),
             "structure": p.get("structure"),
             "risk": round(m["tail"], 0), "premium_left": m["premium_left"],
             "why": f"{_usd0(m['tail'])} of the {'squeeze' if side == 'up' else '−20% crash'} loss"
@@ -1198,8 +1198,10 @@ def _risk_scorecard(*, positions, r, book_capital, annual_income, scenarios, cva
                  limit_str="≤ 35–45% per sector",
                  note="Sector-wide shocks hit every name in it at once.")
         if st != "pass":
-            c["fix"] = {"headline": f"Diversify out of {top['sector']} (or hedge the sector ETF)",
-                        "cost": "—", "effect": f"{top['sector']} {share*100:.0f}% → below limit"}
+            tks = set(top.get("tickers") or [])
+            c["fix"] = {"headline": f"Reduce {top['sector']} exposure (or hedge the sector ETF)",
+                        "cost": "each target priced below", "effect": f"{top['sector']} {share*100:.0f}% → below limit",
+                        "targets": _offender_targets(positions, _worse_side(tks), r, tickers=tks, top=3)}
         checks.append(c)
 
     # 8) NET DIRECTIONAL — a premium book should be ~market-neutral.
@@ -1278,15 +1280,13 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
     spy_price = idx / _SPY_DIV if idx > 0 else None
     beta_delta_spy = round(bw_delta_notional / spy_price, 0) if spy_price else None   # SPY-share equivalents
 
-    # #2 — FULL-REPRICE crash scenarios. Headline P&L now revalues the WHOLE position (shares
-    # included); the option overlay is split out so the user can see how much is the stock.
+    # #2 — FULL-REPRICE crash scenarios. OPTION-OVERLAY ONLY (long shares behind covered calls /
+    # collars are a separate core holding, not this income desk's P&L — see reprice_scenario).
     scenarios = []
     for label, move, vshock in _CRASH:
-        whole = reprice_scenario(positions, move, vshock, r)
-        opt = reprice_scenario(positions, move, vshock, r, include_stock=False)
-        scenarios.append({"label": label, "move_pct": move, "pnl": round(whole, 0),
-                          "overlay_pnl": round(opt, 0), "stock_pnl": round(whole - opt, 0),
-                          "pct_of_capital": round(whole / book_capital * 100, 1) if book_capital else None})
+        pnl = reprice_scenario(positions, move, vshock, r)
+        scenarios.append({"label": label, "move_pct": move, "pnl": round(pnl, 0),
+                          "pct_of_capital": round(pnl / book_capital * 100, 1) if book_capital else None})
     book_stock_notional = sum(abs(p.get("shares") or 0) * p["spot"] for p in positions)
 
     # #2 — full-reval MC VaR/CVaR at a 1-month horizon (fat tails + skew).

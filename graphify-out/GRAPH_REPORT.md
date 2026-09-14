@@ -1,16 +1,16 @@
-# Graph Report - stock-research-standalone  (2026-07-24)
+# Graph Report - stock-research-standalone  (2026-09-13)
 
 ## Corpus Check
-- 276 files · ~611,152 words
+- 348 files · ~817,168 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 5465 nodes · 11551 edges · 277 communities (237 shown, 40 thin omitted)
-- Extraction: 95% EXTRACTED · 5% INFERRED · 0% AMBIGUOUS · INFERRED: 602 edges (avg confidence: 0.62)
+- 7650 nodes · 16183 edges · 344 communities (296 shown, 48 thin omitted)
+- Extraction: 95% EXTRACTED · 5% INFERRED · 0% AMBIGUOUS · INFERRED: 860 edges (avg confidence: 0.67)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `cf8e3c1b`
+- Built from commit: `55334017`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -119,6 +119,7 @@
 - [[_COMMUNITY_Docker Prod Config|Docker Prod Config]]
 - [[_COMMUNITY_Frontend Build Config|Frontend Build Config]]
 - [[_COMMUNITY_OAuth Handler|OAuth Handler]]
+- [[_COMMUNITY_App Init|App Init]]
 - [[_COMMUNITY_Brand Logo Asset|Brand Logo Asset]]
 - [[_COMMUNITY_Logo Visual Design|Logo Visual Design]]
 - [[_COMMUNITY_Backend Dependencies|Backend Dependencies]]
@@ -272,26 +273,90 @@
 - [[_COMMUNITY_Community 274|Community 274]]
 - [[_COMMUNITY_Community 275|Community 275]]
 - [[_COMMUNITY_Community 276|Community 276]]
+- [[_COMMUNITY_Community 277|Community 277]]
+- [[_COMMUNITY_Community 278|Community 278]]
+- [[_COMMUNITY_Community 279|Community 279]]
+- [[_COMMUNITY_Community 280|Community 280]]
+- [[_COMMUNITY_Community 281|Community 281]]
+- [[_COMMUNITY_Community 282|Community 282]]
+- [[_COMMUNITY_Community 283|Community 283]]
+- [[_COMMUNITY_Community 284|Community 284]]
+- [[_COMMUNITY_Community 285|Community 285]]
+- [[_COMMUNITY_Community 286|Community 286]]
+- [[_COMMUNITY_Community 287|Community 287]]
+- [[_COMMUNITY_Community 288|Community 288]]
+- [[_COMMUNITY_Community 289|Community 289]]
+- [[_COMMUNITY_Community 290|Community 290]]
+- [[_COMMUNITY_Community 291|Community 291]]
+- [[_COMMUNITY_Community 292|Community 292]]
+- [[_COMMUNITY_Community 293|Community 293]]
+- [[_COMMUNITY_Community 294|Community 294]]
+- [[_COMMUNITY_Community 295|Community 295]]
+- [[_COMMUNITY_Community 296|Community 296]]
+- [[_COMMUNITY_Community 297|Community 297]]
+- [[_COMMUNITY_Community 298|Community 298]]
+- [[_COMMUNITY_Community 299|Community 299]]
+- [[_COMMUNITY_Community 300|Community 300]]
+- [[_COMMUNITY_Community 301|Community 301]]
+- [[_COMMUNITY_Community 302|Community 302]]
+- [[_COMMUNITY_Community 303|Community 303]]
+- [[_COMMUNITY_Community 304|Community 304]]
+- [[_COMMUNITY_Community 305|Community 305]]
+- [[_COMMUNITY_Community 306|Community 306]]
+- [[_COMMUNITY_Community 307|Community 307]]
+- [[_COMMUNITY_Community 308|Community 308]]
+- [[_COMMUNITY_Community 309|Community 309]]
+- [[_COMMUNITY_Community 310|Community 310]]
+- [[_COMMUNITY_Community 311|Community 311]]
+- [[_COMMUNITY_Community 312|Community 312]]
+- [[_COMMUNITY_Community 313|Community 313]]
+- [[_COMMUNITY_Community 314|Community 314]]
+- [[_COMMUNITY_Community 315|Community 315]]
+- [[_COMMUNITY_Community 316|Community 316]]
+- [[_COMMUNITY_Community 317|Community 317]]
+- [[_COMMUNITY_Community 318|Community 318]]
+- [[_COMMUNITY_Community 319|Community 319]]
+- [[_COMMUNITY_Community 320|Community 320]]
+- [[_COMMUNITY_Community 321|Community 321]]
+- [[_COMMUNITY_Community 322|Community 322]]
+- [[_COMMUNITY_Community 323|Community 323]]
+- [[_COMMUNITY_Community 324|Community 324]]
+- [[_COMMUNITY_Community 325|Community 325]]
+- [[_COMMUNITY_Community 326|Community 326]]
+- [[_COMMUNITY_Community 327|Community 327]]
+- [[_COMMUNITY_Community 328|Community 328]]
+- [[_COMMUNITY_Community 329|Community 329]]
+- [[_COMMUNITY_Community 330|Community 330]]
+- [[_COMMUNITY_Community 331|Community 331]]
+- [[_COMMUNITY_Community 332|Community 332]]
+- [[_COMMUNITY_Community 333|Community 333]]
+- [[_COMMUNITY_Community 334|Community 334]]
+- [[_COMMUNITY_Community 335|Community 335]]
+- [[_COMMUNITY_Community 336|Community 336]]
+- [[_COMMUNITY_Community 337|Community 337]]
+- [[_COMMUNITY_Community 338|Community 338]]
+- [[_COMMUNITY_Community 339|Community 339]]
+- [[_COMMUNITY_Community 342|Community 342]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `apiFetch()` - 145 edges
-2. `call_llm()` - 89 edges
-3. `get_user_api_key()` - 64 edges
-4. `User` - 59 edges
-5. `get_cached()` - 59 edges
-6. `set_cached()` - 58 edges
-7. `str` - 55 edges
-8. `AsyncSession` - 41 edges
-9. `User` - 37 edges
-10. `MarketDataProvider` - 36 edges
+1. `apiFetch()` - 176 edges
+2. `call_llm()` - 100 edges
+3. `get_cached()` - 81 edges
+4. `User` - 80 edges
+5. `set_cached()` - 79 edges
+6. `get_user_api_key()` - 75 edges
+7. `str` - 74 edges
+8. `AsyncSession` - 62 edges
+9. `_r()` - 47 edges
+10. `float` - 44 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `migrate()` --references--> `SQLite Database (users, keys, sessions)`  [INFERRED]
   backend/migrate_whatsapp.py → README.md
 - `Simplified Exit Analysis API (ticker-only, no position params)` --semantically_similar_to--> `PositionSummary Component Removal`  [INFERRED] [semantically similar]
   patch_exit_analysis.py → patch_exit_tab_3.py
-- `run_tests()` --calls--> `set_model()`  [INFERRED]
-  scratch/test_features.py → backend/app/routers/settings_router.py
+- `init_db()` --references--> `Alembic Migration Workflow`  [EXTRACTED]
+  backend/app/database.py → backend/MIGRATIONS.md
 - `run_tests()` --calls--> `_generate_ai_analysis()`  [INFERRED]
   scratch/test_features.py → backend/app/routers/stock_router.py
 - `main()` --calls--> `_build_evidence()`  [INFERRED]
@@ -320,79 +385,79 @@
 - **ExitTab Orchestrated Components** — components_exittab_exittab, components_exitsignalgauge_exitsignalgauge, components_technicalsignals_technicalsignals, components_riskdashboard_riskdashboard, components_optionsprotection_optionsprotection [EXTRACTED 0.95]
 - **Trade Position Management Flow** — trades_mytradesv2_mytradesv2, trades_updatepositionmodal_updatepositionmodal, trades_transactionhistorypanel_transactionhistorypanel, trades_createagentfromtrademodal_createagentfromtrademodal [EXTRACTED 0.95]
 
-## Communities (277 total, 40 thin omitted)
+## Communities (344 total, 48 thin omitted)
 
 ### Community 0 - "Stock Tracking UI"
 Cohesion: 0.01
-Nodes (170): Mode, PairAnalyticsPanel(), PositionRow, Props, QuantAnalyticsPanel(), scoreBg(), scoreColor(), signalBadge() (+162 more)
+Nodes (192): fetchSectorCalendarReturns(), AgentFromTrackingResponse, AgentRunStatus, AIFortressArchitecture, AIImpactDimension, AIStressTestAngle, BearRebuttal, BlindFactor (+184 more)
 
 ### Community 1 - "AI Analysis Components"
 Cohesion: 0.02
-Nodes (162): AgentDetailProps, Props, Props, Props, AllowlistManager(), WizardStep, Props, AlphaItem (+154 more)
+Nodes (159): Props, Props, Props, AllowlistManager(), WizardStep, BulkImportProps, Props, AlphaItem (+151 more)
 
 ### Community 2 - "Market Data Providers"
 Cohesion: 0.07
 Nodes (61): CompanyInfo, float, HistoricalBar, int, OptionsChain, StockQuote, str, CompanyInfo (+53 more)
 
 ### Community 3 - "Options Quote Service"
-Cohesion: 0.10
-Nodes (42): str, float, OptionChain, UnderlyingQuote, QuoteProvider, str, float, OptionChain (+34 more)
+Cohesion: 0.17
+Nodes (26): QuoteProvider, str, float, OptionChain, Ticker, UnderlyingQuote, IBKRProvider, _normalize_symbol (+18 more)
 
 ### Community 4 - "Trade Portfolio UI"
-Cohesion: 0.04
-Nodes (65): ManualLeg, Tab, TradePortfolio(), Trade Transaction Ledger Pattern, currencyFmt, fmtAnnualized(), fmtCredit(), fmtDate() (+57 more)
+Cohesion: 0.03
+Nodes (99): ManualLeg, Tab, TradePortfolio(), Trade Transaction Ledger Pattern, currencyFmt, fmtAnnualized(), fmtCredit(), fmtDate() (+91 more)
 
 ### Community 5 - "Tax Loss Harvesting"
-Cohesion: 0.26
-Nodes (16): DataFrame, Series, _build_factor_spreads(), _build_weighted_return_series(), _compute_cointegration(), _compute_dtw_distance(), _compute_factor_loadings(), _compute_quant_metrics() (+8 more)
+Cohesion: 0.19
+Nodes (20): DataFrame, Series, _build_portfolio_series(), _build_weighted_return_series(), _compute_cointegration(), _compute_dtw_distance(), _compute_quant_metrics(), _compute_quant_metrics_base() (+12 more)
 
 ### Community 6 - "Strategy Persistence"
-Cohesion: 0.03
-Nodes (114): AsyncSession, int, User, Portfolio, add_holding(), add_transaction(), analyze_exit(), AnalyzeExitIn (+106 more)
+Cohesion: 0.04
+Nodes (84): AsyncSession, int, User, Portfolio, add_holding(), analyze_exit(), AnalyzeExitIn, bulk_delete() (+76 more)
 
 ### Community 7 - "IBKR Broker Integration"
 Cohesion: 0.06
-Nodes (40): bool, date, float, str, analyze_holding(), _brief_mover(), _compute_brief_delta(), _fetch_5d_history_sync() (+32 more)
+Nodes (37): bool, str, analyze_holding(), _brief_mover(), fetch_5d_history(), _fetch_5d_history_sync(), _fetch_ticker_news(), _fetch_ticker_news_sync() (+29 more)
 
 ### Community 8 - "Frontend Components"
-Cohesion: 0.03
-Nodes (75): AddCompanyModal(), AIFortressAnalysis(), AIImpact(), AiNewsSummary(), AiNewsSummaryProps, SentimentIndicator(), THEME_COLORS, AIStressTest() (+67 more)
+Cohesion: 0.04
+Nodes (58): AddCompanyModal(), TIER_OPTIONS, AIFortressAnalysis(), AIImpact(), AiNewsSummary(), AiNewsSummaryProps, SentimentIndicator(), THEME_COLORS (+50 more)
 
 ### Community 9 - "Exit Analysis Engine"
-Cohesion: 0.08
-Nodes (54): DataFrame, float, int, str, Portfolio Pillar Replaced by Market Sentiment Pillar, PositionSummary Component Removal, Simplified Exit Analysis API (ticker-only, no position params), ExitTab.tsx — Exit Analysis UI Component (+46 more)
+Cohesion: 0.24
+Nodes (10): patch_exit_analysis_2.py — Exit Analysis Patcher v2, _compute_options_protection(), _compute_risk(), _find_closest_expiration(), _find_closest_option(), Quantitative Exit Analysis Service Computes data-driven metrics for all 7 instit, Compute protective put, zero-cost collar, and covered call pricing., Compute advanced portfolio risk metrics including Sortino, CVaR, Cornish-Fisher (+2 more)
 
 ### Community 10 - "Long-Short Strategy"
 Cohesion: 0.08
 Nodes (54): float, int, str, _allocate_unspecified_positions(), _batch_stock_data(), _build_130_30_portfolio(), _build_pair_trade(), _build_position_detail() (+46 more)
 
 ### Community 11 - "API Request Schemas"
-Cohesion: 0.05
-Nodes (44): AutocallableIn, BoxScanIn, compute_autocallable(), compute_concentration(), compute_derivative_income(), compute_derivative_income_portfolio(), compute_desk_review(), compute_desk_review_agents() (+36 more)
+Cohesion: 0.03
+Nodes (70): add_derivative_income_watchlist_item(), AutocallableIn, BoxScanIn, BoxSpreadIn, compute_autocallable(), compute_box_spread(), compute_concentration(), compute_derivative_income_portfolio() (+62 more)
 
 ### Community 12 - "Broker Connection API"
 Cohesion: 0.10
-Nodes (45): AsyncSession, int, str, User, BrokerConnection, IBKR OAuth Integration, Option Order Placement (Multi-Leg), RSA / DH Key Generation (+37 more)
+Nodes (44): AsyncSession, int, str, User, BrokerConnection, IBKR OAuth Integration, Option Order Placement (Multi-Leg), RSA / DH Key Generation (+36 more)
 
 ### Community 13 - "Options & Trading Signals"
 Cohesion: 0.04
 Nodes (38): CACHE, CATEGORIES, Category, clearStyleCalendarCache(), ETF_MAP, STYLE_COLORS, fmtPct(), fmtPrice() (+30 more)
 
 ### Community 14 - "Authentication Layer"
-Cohesion: 0.09
-Nodes (48): create_session(), get_admin_user(), get_current_user(), get_premium_user(), Google OAuth setup and authentication utilities., Dependency that extracts and validates the session cookie, returning the User., FastAPI dependency — raises 403 for non-premium users. Admin is always premium., FastAPI dependency — raises 403 for non-admin users. (+40 more)
+Cohesion: 0.07
+Nodes (56): create_session(), get_admin_user(), get_current_user(), get_premium_user(), Google OAuth setup and authentication utilities., Dependency that extracts and validates the session cookie, returning the User., FastAPI dependency — raises 403 for non-premium users. Admin is always premium., FastAPI dependency — raises 403 for non-admin users. (+48 more)
 
 ### Community 15 - "Infrastructure & Config"
 Cohesion: 0.05
-Nodes (55): Alembic env.py Configuration, _load_gcp_secrets(), Application configuration — loads from env vars, .env file, or GCP Secret Manage, Fetch secrets from GCP Secret Manager, return as {SECRET_NAME: value} dict., Settings, async SQLAlchemy engine, init_db(), _log_alembic_state() (+47 more)
+Nodes (56): init_db(), _log_alembic_state(), Log current vs head Alembic revision. Non-blocking: any failure     (including m, Initialize the database on application startup.      - Runs ``create_all`` (safe, FastAPI app (main.py), CacheControlledStaticFiles, debug_memory(), _finite() (+48 more)
 
 ### Community 16 - "Stock Research API"
-Cohesion: 0.10
-Nodes (43): AsyncSession, bool, str, User, clear_agent_debate(), continue_agent_debate(), debate_history(), debate_item() (+35 more)
+Cohesion: 0.04
+Nodes (88): AsyncSession, bool, int, str, User, analyze_ta(), check_hedging_market(), clear_agent_debate() (+80 more)
 
 ### Community 17 - "Agent Management UI"
-Cohesion: 0.06
-Nodes (44): date, float, Series, str, bool, float, int, object (+36 more)
+Cohesion: 0.11
+Nodes (26): date, float, Series, str, compute_annualized_return(), compute_position_from_transactions(), _fast_info_quote_sync(), _fetch_current_prices_sync() (+18 more)
 
 ### Community 18 - "ORM Data Models"
 Cohesion: 0.08
@@ -403,32 +468,32 @@ Cohesion: 0.11
 Nodes (38): Agent, AsyncSession, bool, int, str, User, Mini Agent Templates, _agent_to_dict() (+30 more)
 
 ### Community 20 - "Security & Settings"
-Cohesion: 0.07
-Nodes (46): date, OptionChain, _atm_iv(), _confidence(), _get_sofr(), _headline_call(), _headline_floor(), _headline_put() (+38 more)
+Cohesion: 0.04
+Nodes (79): float, OptionChain, _atm_iv(), _build_evaluate_opp(), _confidence(), _earnings_implied_move_pct(), _expected_intrinsic(), _grid_prob() (+71 more)
 
 ### Community 21 - "Portfolio Management"
-Cohesion: 0.07
-Nodes (53): str, bool, float, int, Response, str, str, analyze_exit_strategy() (+45 more)
+Cohesion: 0.08
+Nodes (41): bool, float, int, Response, str, _apply_token_floor(), call_llm_with_tools(), canonical_model() (+33 more)
 
 ### Community 22 - "Tax Loss Harvesting UI"
-Cohesion: 0.05
-Nodes (39): AlternateETF, BestETF, ChartData, CorrelationData, CostComparison, CostEntry, FactorDrift, HoldingInput (+31 more)
+Cohesion: 0.03
+Nodes (67): AgentCard(), AgentCardProps, formatDate(), AgentCreateModal(), AgentCreateModalProps, AgentDetail(), AgentDetailProps, formatDateTime() (+59 more)
 
 ### Community 23 - "Market Overview Service"
 Cohesion: 0.10
 Nodes (15): fmtAum(), FundFundamentals(), ManagerSection(), markdownToHtml(), OverviewSection(), PERIOD_COLS, Tab, TABS (+7 more)
 
 ### Community 24 - "Navigation & Branding"
-Cohesion: 0.09
-Nodes (24): Logo(), LogoProps, EVERYTHING_NAV, Navbar(), PRIMARY_NAV, ProtectedRoute(), ProtectedRouteProps, TickerInput() (+16 more)
+Cohesion: 0.03
+Nodes (61): ConcentrationResult, OptionLeg, Scenario, ErrorBoundary, Props, State, ChartData, EventImpactAnalyzer() (+53 more)
 
 ### Community 25 - "Options Strategy UI"
 Cohesion: 0.10
-Nodes (35): bool, int, str, main(), main(), test_ticker(), extract_relevant_sections(), fetch_filing_excerpt() (+27 more)
+Nodes (33): bool, int, str, main(), main(), test_ticker(), extract_relevant_sections(), fetch_filing_excerpt() (+25 more)
 
 ### Community 26 - "Market Router"
-Cohesion: 0.05
-Nodes (64): AsyncSession, User, DB-Backed Market Data Cache, Market Overview Dashboard, Pick and Shovel Thematic Research, Sector Rotation Analysis, AnchorCompany, business_cycle() (+56 more)
+Cohesion: 0.03
+Nodes (96): AsyncSession, int, str, User, DB-Backed Market Data Cache, Market Overview Dashboard, Pick and Shovel Thematic Research, Sector Rotation Analysis (+88 more)
 
 ### Community 27 - "Agent Router"
 Cohesion: 0.17
@@ -436,7 +501,7 @@ Nodes (30): Agent, AsyncSession, BackgroundTasks, bool, datetime, int, User, _ag
 
 ### Community 28 - "PMCC & Market Impact"
 Cohesion: 0.07
-Nodes (35): FireScenario, IncomeSource, MCResult, SequenceReturn, SMILE_DEFAULT, col(), colRatio(), housingRatio() (+27 more)
+Nodes (34): FireScenario, MCResult, SequenceReturn, YearRecord, col(), colRatio(), housingRatio(), LTC_CARE_LABELS (+26 more)
 
 ### Community 29 - "Frontend Dependencies"
 Cohesion: 0.06
@@ -447,32 +512,32 @@ Cohesion: 0.13
 Nodes (16): _assert_prod_override_if_needed, _assert_prod_override_if_needed(), do_run_migrations(), _looks_like_prod(), Alembic env.py — wired to the app's existing settings + models.  Design notes --, Online mode: connect using the async engine, then run migrations     synchronous, Heuristic: Cloud SQL private IPs, cloud-sql proxy sockets, or any     non-sqlite, Block destructive ops against prod unless explicitly allowed. (+8 more)
 
 ### Community 31 - "Exit Tab UI"
-Cohesion: 0.14
-Nodes (22): ExitSignalGauge, getConfig, ExitTab(), MetricRow, OptionsProtection, PillarCard, PillarFundamental, PillarGeopolitical (+14 more)
+Cohesion: 0.03
+Nodes (86): ExitSignalGauge, getConfig, DimensionCard(), ExitTab(), ExitTabProps, PillarHeatBar(), SignalSummaryCard(), MetricRow (+78 more)
 
 ### Community 32 - "Market Overview Core"
-Cohesion: 0.05
-Nodes (44): Props, TIER_OPTIONS, BulkImport(), BulkImportProps, AnalysisBasis, fmtMoney(), LegRow(), LogTradeModal() (+36 more)
+Cohesion: 0.08
+Nodes (24): Props, Props, AGENT_STATUS_CLS, AgentsSection Component, fmtPct(), fmtPrice(), NotesEditor(), ThemeGroup() (+16 more)
 
 ### Community 33 - "Pick & Shovel Service"
-Cohesion: 0.11
-Nodes (36): bool, int, str, analyze_pick_shovel(), _apply_verification(), _brief_to_block(), _build_company_card(), dig_deeper_pick_shovel() (+28 more)
+Cohesion: 0.09
+Nodes (42): bool, int, str, call_llm(), Call OpenAI or Gemini chat completions and return the assistant message content., Call OpenAI or Gemini chat completions and return the assistant message content., Call OpenAI or Gemini chat completions and return the assistant message content., Call OpenAI chat completions and return the assistant message content.      Rais (+34 more)
 
 ### Community 34 - "Long-Short UI"
-Cohesion: 0.12
-Nodes (19): str, _leg_higher_greeks(), Per-share first/second/third-order Greeks for one option by finite     differenc, _bs_d1_d2(), bs_gamma(), bs_theta(), bs_vega(), Shared d1/d2 computation for Black-Scholes functions. (+11 more)
+Cohesion: 0.09
+Nodes (23): _leg_higher_greeks(), Per-share first/second/third-order Greeks for one option by finite     differenc, _bs_d1_d2(), bs_delta(), bs_gamma(), bs_theta(), bs_vega(), Calculate Black-Scholes delta. (+15 more)
 
 ### Community 35 - "Tax Harvesting Models"
-Cohesion: 0.14
-Nodes (21): Saved TLH portfolio sets — named collections of holdings for tax-loss harvesting, Individual holding within a saved TLH portfolio., Saved TLH portfolio sets — named collections of holdings for tax-loss harvesting, Individual holding within a saved TLH portfolio., TLHSavedHolding, TLHSavedPortfolio, AsyncSession, int (+13 more)
+Cohesion: 0.15
+Nodes (19): Individual holding within a saved TLH portfolio., Individual holding within a saved TLH portfolio., Individual holding within a saved TLH portfolio., TLHSavedHolding, AsyncSession, int, User, Config (+11 more)
 
 ### Community 36 - "AI News Summary"
 Cohesion: 0.08
-Nodes (48): AsyncSession, bool, float, str, Exception, get_dividend_view(), Dividend data for all portfolio holdings. Cached 24 h per ticker., Dividend data for all portfolio holdings. Cached 24 h per ticker. (+40 more)
+Nodes (46): AsyncSession, bool, float, str, Exception, _dividend_yield_decimal(), _epoch_to_date(), _extract_dividend() (+38 more)
 
 ### Community 37 - "Strategy UI Components"
-Cohesion: 0.09
-Nodes (48): date, float, int, OptionChain, str, _atm_iv(), _bs_greeks(), _build_index_overlay() (+40 more)
+Cohesion: 0.08
+Nodes (68): bool, date, float, int, OptionQuote, str, _atm_iv(), _build_buffered_covered_call() (+60 more)
 
 ### Community 38 - "TypeScript Config"
 Cohesion: 0.10
@@ -487,8 +552,8 @@ Cohesion: 0.12
 Nodes (36): float, int, str, _call_json(), _company_website(), component_picks(), decompose_theme(), _dedupe_holdings() (+28 more)
 
 ### Community 41 - "Agent Execution Service"
-Cohesion: 0.19
-Nodes (21): ABC, int, BrokerAuthStatus, BrokerService, ContractInfo, OrderRequest, OrderResult, Abstract broker interface — extend for each broker (IB, Schwab, Fidelity, etc.). (+13 more)
+Cohesion: 0.16
+Nodes (25): ABC, int, BrokerAuthStatus, BrokerService, ContractInfo, OrderRequest, OrderResult, Abstract broker interface — extend for each broker (IB, Schwab, Fidelity, etc.). (+17 more)
 
 ### Community 42 - "Pick & Shovel UI"
 Cohesion: 0.11
@@ -503,56 +568,56 @@ Cohesion: 0.13
 Nodes (34): float, str, _add_flow(), assemble(), base_eps(), Drivers, _fold(), OperatingLeverage (+26 more)
 
 ### Community 45 - "Financial Charts"
-Cohesion: 0.06
-Nodes (70): DataFrame, float, int, Series, str, _annualized_vol(), _batch_history(), _beta_vs() (+62 more)
+Cohesion: 0.05
+Nodes (83): DataFrame, float, int, Series, str, _annualized_vol(), _batch_history(), _beta_vs() (+75 more)
 
 ### Community 46 - "Alembic Migrations"
-Cohesion: 0.12
-Nodes (44): bool, float, int, OptionQuote, str, _base_flags(), _best_credit_spread(), _collar() (+36 more)
+Cohesion: 0.09
+Nodes (62): bool, int, OptionQuote, str, _base_flags(), _best_credit_spread(), _build_focus_opp(), _calendar() (+54 more)
 
 ### Community 47 - "Analysis Service"
-Cohesion: 0.09
-Nodes (20): int, str, LegQuote, _make_box_legs(), Standard lend-box fixture: long 100 call + short 110 call + long 110 put + short, Standard lend-box fixture: long 100 call + short 110 call + long 110 put + short, Standard lend-box fixture: long 100 call + short 110 call + long 110 put + short, A realistic lend: net debit is LESS than the width — small positive carry. (+12 more)
+Cohesion: 0.07
+Nodes (24): int, str, LegQuote, _make_box_legs(), Standard lend-box fixture: long 100 call + short 110 call + long 110 put + short, Standard lend-box fixture: long 100 call + short 110 call + long 110 put + short, Standard lend-box fixture: long 100 call + short 110 call + long 110 put + short, Standard lend-box fixture: long 100 call + short 110 call + long 110 put + short (+16 more)
 
 ### Community 48 - "Box Math Tests"
-Cohesion: 0.07
-Nodes (28): BoxStrategy(), BrokerConnectionCard(), ConcentrationManager(), ConcentrationResult, OptionLeg, Scenario, CppiCharts, CppiResult (+20 more)
+Cohesion: 0.04
+Nodes (47): BoxStrategy(), BrokerConnectionCard(), ConcentrationManager(), CppiCharts, CppiResult, CppiStrategy(), PerformanceSummary, RiskAnalysis (+39 more)
 
 ### Community 49 - "Trade Import & Log"
-Cohesion: 0.03
-Nodes (61): ASSET_LABELS, ASSET_TYPES, OrderLogImport(), OrderLogImportProps, TXN_COLORS, TXN_LABELS, TXN_TYPES, AddMode (+53 more)
+Cohesion: 0.02
+Nodes (75): ASSET_LABELS, ASSET_TYPES, OrderLogImport(), OrderLogImportProps, TXN_COLORS, TXN_LABELS, TXN_TYPES, AddMode (+67 more)
 
 ### Community 50 - "Box Math Service"
-Cohesion: 0.13
-Nodes (42): AsyncSession, int, str, User, BaseModel, WebhookPayload, companies_validate(), component_picks() (+34 more)
+Cohesion: 0.07
+Nodes (61): AsyncSession, int, str, User, BaseModel, WebhookPayload, companies_validate(), component_picks() (+53 more)
 
 ### Community 51 - "Poor Mans Covered Call"
-Cohesion: 0.29
-Nodes (7): Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., refresh_ticker()
+Cohesion: 0.25
+Nodes (8): Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., Bust all enrichment caches for a single ticker and re-fetch., refresh_ticker()
 
 ### Community 52 - "Channel Router"
 Cohesion: 0.09
-Nodes (39): float, _algo_grade(), _bs_price(), _candidate_extra(), _candidate_json(), _dual_move_pct(), _expected_move_pct(), _instant_mtm() (+31 more)
+Nodes (25): _blind_facts(), _candidate_extra(), _candidate_json(), _earnings_timing_factor(), _expected_move_pct(), _nearest_short_sigmas(), IV (%) of the primary SHORT leg — for the strike-vs-ATM skew premium., The 1σ implied move to expiry (%) = ATM IV × √(dte/365) — pre-computed so the LL (+17 more)
 
 ### Community 53 - "Stock Notes API"
-Cohesion: 0.11
-Nodes (22): bool, float, int, str, CPPI Capital Protection Strategy, compute_cppi(), CppiIn, Run CPPI (Constant Proportion Portfolio Insurance) simulation on yfinance histor (+14 more)
+Cohesion: 0.18
+Nodes (15): bool, float, int, str, CPPI Capital Protection Strategy, Constant Proportion Portfolio Insurance (CPPI) Strategy Service.  Implements the, Recursively coerce a result tree into JSON-native Python types.      numpy scala, Synchronous core simulation of the CPPI / D-CPPI trading strategy.     Runs on a (+7 more)
 
 ### Community 54 - "CPPI Strategy"
-Cohesion: 0.14
-Nodes (16): float, str, _build_oauth_config(), _create_ib_client(), _expiry_to_ib_month(), IBService, Stop any background threads (tickler) started by ibind., Run a synchronous ibind call in an executor to avoid blocking the event loop. (+8 more)
+Cohesion: 0.16
+Nodes (12): float, str, _expiry_to_ib_month(), IBService, Stop any background threads (tickler) started by ibind., Run a synchronous ibind call in an executor to avoid blocking the event loop., Place multiple legs as a single multi-leg order submission.          IBKR Web AP, Round price to valid IBKR tick increment.          Index options (SPX/XSP/NDX) u (+4 more)
 
 ### Community 55 - "Dual Direction Service"
-Cohesion: 0.05
-Nodes (47): AgentCreateModal(), AgentCreateModalProps, AgentDetail(), formatDateTime(), AgentRunOutput(), AgentRunOutputProps, CreateStockAgent(), CreateStockAgentProps (+39 more)
+Cohesion: 0.06
+Nodes (37): describe(), EditLeg, fmtUSD(), genTerminalPrices(), geometryDescribe(), hedgePnL(), hedgeRisk(), HedgingStrategy() (+29 more)
 
 ### Community 56 - "Guru Analysis UI"
-Cohesion: 0.19
-Nodes (11): ExitSignalGauge(), getConfig(), Props, OptionsProtection(), Props, PillarCard(), Props, scoreBadge() (+3 more)
+Cohesion: 0.05
+Nodes (62): float, str, _atr_from_indicators(), _atr_from_structure(), _breakevens_from_curve(), _build_legs(), _candidate_plans(), _cluster_zones() (+54 more)
 
 ### Community 57 - "Exit Signal Gauge"
-Cohesion: 0.07
-Nodes (28): datetime, float, int, annualized_return(), _captured_pct(), expiry_payoff(), is_stale(), _norm_cdf() (+20 more)
+Cohesion: 0.08
+Nodes (27): datetime, float, int, annualized_return(), _captured_pct(), expiry_payoff(), is_stale(), _norm_cdf() (+19 more)
 
 ### Community 58 - "Exit Technical Signals"
 Cohesion: 0.21
@@ -560,23 +625,23 @@ Nodes (11): Props, scoreBadge(), scoreColor(), SignalRow(), TechnicalSignals(), 
 
 ### Community 59 - "LLM Service"
 Cohesion: 0.15
-Nodes (28): bool, float, int, ndarray, str, _bs_greeks(), _bs_price(), _calibrate_smile() (+20 more)
+Nodes (27): bool, float, int, ndarray, str, _bs_greeks(), _bs_price(), _calibrate_smile() (+19 more)
 
 ### Community 60 - "DCF Analysis UI"
 Cohesion: 0.08
 Nodes (21): DebtPriceHistory(), fmtDate(), RANGE_ORDER, ASSET_LABELS, DebtRadarPage(), EXAMPLES, FAMILY_ICONS, fmtNum() (+13 more)
 
 ### Community 61 - "Long-Short UI Detail"
-Cohesion: 0.06
-Nodes (54): DataCache, Generic key-value cache for external API responses (yfinance, etc.).      ``cach, Generic key-value cache for external API responses (yfinance, etc.).      ``cach, AsyncSession, int, str, bool, bytes (+46 more)
+Cohesion: 0.04
+Nodes (75): DataCache, Generic key-value cache for external API responses (yfinance, etc.).      ``cach, Generic key-value cache for external API responses (yfinance, etc.).      ``cach, Generic key-value cache for external API responses (yfinance, etc.).      ``cach, AsyncSession, int, str, bool (+67 more)
 
 ### Community 62 - "Trade Math Ledger"
-Cohesion: 0.04
-Nodes (88): AgentRun, Base, Agent, AgentRun, ApiMetric, BrokerConnection, BrokerOrder, GuruAnalysis (+80 more)
+Cohesion: 0.05
+Nodes (65): AgentRun, Agent, AsyncSession, float, int, str, int, str (+57 more)
 
 ### Community 63 - "Database Session"
-Cohesion: 0.26
-Nodes (21): bool, OptionQuote, _build_buffered_covered_call(), _build_collar(), _build_deep_itm_put(), _build_financed_floor(), _build_financed_floor_collar(), _build_giveup_funded_floor() (+13 more)
+Cohesion: 0.09
+Nodes (49): bool, bytes, float, int, str, _at(), _atr(), compute_chart_patterns() (+41 more)
 
 ### Community 64 - "Thematic Impact Service"
 Cohesion: 0.09
@@ -584,59 +649,59 @@ Nodes (27): CompanyCard(), CONNECTION_BADGES, DigDeeperSection(), DROP_REASONS, 
 
 ### Community 65 - "Proxy Router"
 Cohesion: 0.10
-Nodes (23): AdvisorMetric, PreTradeAdvisor(), PreTradeAdvisorProps, QuantSignal, Role, toneClass(), fetchPreTradeMetrics(), LifecycleAgentResult (+15 more)
+Nodes (25): AdvisorMetric, PreTradeAdvisor(), PreTradeAdvisorProps, QuantSignal, Role, toneClass(), QuantRecommendationCard(), QuantRecommendationCardProps (+17 more)
 
 ### Community 66 - "Mid Price Utilities"
-Cohesion: 0.18
-Nodes (25): bool, float, int, ndarray, _atr(), compute_institutional_ta(), _displacement(), _f() (+17 more)
+Cohesion: 0.09
+Nodes (42): bool, float, int, ndarray, float, int, str, _atr() (+34 more)
 
 ### Community 67 - "Concentration Service"
-Cohesion: 0.14
-Nodes (19): float, int, ndarray, algorithmic_quant(), compute_pretrade_metrics(), _kelly_fraction(), _lognormal_weights(), pm_ratios() (+11 more)
+Cohesion: 0.08
+Nodes (38): bool, float, int, ndarray, str, algorithmic_quant(), compute_pretrade_metrics(), _full_tail_var_cvar() (+30 more)
 
 ### Community 68 - "Event Impact Analyzer"
-Cohesion: 0.12
-Nodes (14): date, str, date, days_between(), dte_from_expiry(), Where the underlying sits relative to the structure's profit zone at expiry., Calendar days between two dates (or datetimes). Truncates to date part.     Retu, Calendar days between two dates (or datetimes). Truncates to date part.     Retu (+6 more)
+Cohesion: 0.19
+Nodes (10): date, str, date, days_between(), dte_from_expiry(), Calendar days between two dates (or datetimes). Truncates to date part.     Retu, Calendar days between two dates (or datetimes). Truncates to date part.     Retu, Days-to-expiry from an ISO 'YYYY-MM-DD' string or date, using calendar days. (+2 more)
 
 ### Community 69 - "Agent Run Service"
-Cohesion: 0.06
-Nodes (68): AsyncSession, str, User, bool, date, float, int, str (+60 more)
+Cohesion: 0.16
+Nodes (25): _avg(), _band(), _band_inv(), classify_instrument(), get_debt_entry(), _metric(), Return classification dict, including ``is_debt`` + ``reject_reason``., A — implied carry-spread z-score + cross-sector premium + real-yield + credit ch (+17 more)
 
 ### Community 70 - "Exit Fundamental Pillar"
-Cohesion: 0.12
-Nodes (16): PositionSnapshot, Current state of a position derived from walking the transaction ledger.      Us, Current state of a position derived from walking the transaction ledger.      Us, Walk a list of transactions (oldest first) and return current position state., Walk a list of transactions (oldest first) and return current position state., walk_ledger(), Single 'open' transaction leaves one open lot., Single 'open' transaction leaves one open lot. (+8 more)
+Cohesion: 0.09
+Nodes (21): PositionSnapshot, Current state of a position derived from walking the transaction ledger.      Us, Current state of a position derived from walking the transaction ledger.      Us, Walk a list of transactions (oldest first) and return current position state., Walk a list of transactions (oldest first) and return current position state., Current state of a position derived from walking the transaction ledger.      Us, Walk a list of transactions (oldest first) and return current position state., walk_ledger() (+13 more)
 
 ### Community 71 - "Exit Risk Dashboard"
-Cohesion: 0.07
-Nodes (55): decrypt_value(), encrypt_value(), Encrypt a plaintext string and return the Fernet token as a string., Decrypt a Fernet token and return the plaintext., AsyncSession, str, User, Allowlist Enforcement (+47 more)
+Cohesion: 0.06
+Nodes (56): decrypt_value(), encrypt_value(), Encrypt a plaintext string and return the Fernet token as a string., Decrypt a Fernet token and return the plaintext., AsyncSession, str, User, Allowlist Enforcement (+48 more)
 
 ### Community 72 - "Trade Math Tests"
 Cohesion: 0.33
 Nodes (7): chartOpts, directionBadge(), fmtRatio(), PillarFundamental(), Props, ExitFundamentalData, ExitPillarChartData
 
 ### Community 73 - "Portfolio Service"
-Cohesion: 0.36
-Nodes (7): fmt(), fmtVol(), Props, ratioColor(), RiskDashboard(), ExitLiquidityData, ExitRiskData
+Cohesion: 0.05
+Nodes (34): Layer, AiChip, IndicatorAIConsoleProps, MSBand, MSLayer, MSLine, TF_DEFS, buildLayers() (+26 more)
 
 ### Community 74 - "Search Service"
-Cohesion: 0.08
-Nodes (28): datetime, float, int, str, bool, Intent, analyze_box(), BoxAnalysis (+20 more)
+Cohesion: 0.11
+Nodes (24): datetime, float, int, str, bool, Intent, analyze_box(), BoxAnalysis (+16 more)
 
 ### Community 75 - "Trade Math Utilities"
 Cohesion: 0.11
 Nodes (18): FinancialCharts(), FinancialChartsProps, makeChartData(), makeChartOptions(), FinancialHealth(), fmt(), pctStr(), Props (+10 more)
 
 ### Community 76 - "Exit Sector Rotation"
-Cohesion: 0.14
-Nodes (24): bool, int, str, _bps_regime_of(), _events_in_window(), _extract_line(), _find_focus_index(), _grade_letter() (+16 more)
+Cohesion: 0.07
+Nodes (54): str, _norm_ticker(), _blind_divergence(), blind_read(), _bps_regime_of(), build_monitor_plan(), _cluster_side(), _desk_context() (+46 more)
 
 ### Community 77 - "Email Service"
-Cohesion: 0.36
-Nodes (5): PillarSectorRotation(), Props, signalBadge(), volBadge(), ExitSectorRotationData
+Cohesion: 0.09
+Nodes (46): bool, float, int, str, compute_day_trade_setups(), _day_setup(), _opening_range(), Intraday day-trade setups — the third trade style (alongside swing and position) (+38 more)
 
 ### Community 78 - "Trade Math DTE"
-Cohesion: 0.09
-Nodes (9): EventsBanner(), STRUCTURE_OPTIONS, Tab, DeskReview(), RatingsHelpButton(), runDerivativeIncome(), DerivativeIncomeOpportunity, DerivativeIncomeResult (+1 more)
+Cohesion: 0.07
+Nodes (16): _genuine_leg(), _mk(), Closed-tab monthly rollups — the pure partitioning/aggregation logic behind GET, A stand-in SavedStrategy row carrying just the fields the ledger helpers read., _roll_summary — the cost-basis overlay: effective breakeven folds roll-realized, _roll_leg(), TestCloseMonth, TestCostProceeds (+8 more)
 
 ### Community 79 - "WhatsApp Migration"
 Cohesion: 0.29
@@ -647,36 +712,36 @@ Cohesion: 0.29
 Nodes (6): browserHash, chunks, configHash, hash, lockfileHash, optimized
 
 ### Community 81 - "Exit Structural Pillar"
-Cohesion: 0.47
-Nodes (4): PillarGeopolitical(), Props, sentimentBadge(), ExitGeopoliticalData
+Cohesion: 0.10
+Nodes (40): float, int, str, _assignment(), _breakevens(), _build(), _classify(), _close_cash() (+32 more)
 
 ### Community 82 - "Thematic Impact Router"
-Cohesion: 0.11
-Nodes (19): float, compute_dcf(), DCFScenarioIn, generate_agent_debate(), get_guru_analyses(), get_stock_data(), Fetch comprehensive stock data for *ticker*., Fetch comprehensive stock data for *ticker*. (+11 more)
+Cohesion: 0.08
+Nodes (24): float, compute_dcf(), DCFScenarioIn, generate_agent_debate(), get_guru_analyses(), get_stock_data(), Fetch comprehensive stock data for *ticker*., Fetch comprehensive stock data for *ticker*. (+16 more)
 
 ### Community 83 - "Metrics Dashboard"
-Cohesion: 0.15
-Nodes (33): Any, bool, DataFrame, float, int, Series, str, _calc_obv() (+25 more)
+Cohesion: 0.13
+Nodes (36): Any, bool, DataFrame, float, int, Series, str, liquidity_narrative() (+28 more)
 
 ### Community 84 - "Exit Pillar Card"
-Cohesion: 0.17
-Nodes (12): bs_delta(), get_options_data(), Calculate Black-Scholes delta., Calculate Black-Scholes delta., Fetch options data: IV, HV, put/call ratio, and trading opportunities., Calculate Black-Scholes delta., Fetch options data: IV, HV, put/call ratio, and trading opportunities., Fetch options data: IV, HV, put/call ratio, and trading opportunities. (+4 more)
+Cohesion: 0.18
+Nodes (11): int, _collect_contracts(), Pull near-dated option contracts with usable OI & IV, within ±band of spot., get_options_data(), Fetch options data: IV, HV, put/call ratio, and trading opportunities., Fetch options data: IV, HV, put/call ratio, and trading opportunities., Fetch options data: IV, HV, put/call ratio, and trading opportunities., Safely convert to int, handling NaN. (+3 more)
 
 ### Community 85 - "Exit Geopolitical Pillar"
-Cohesion: 0.15
-Nodes (11): OptionLeg, PmccResult, PoorMansCovered(), Scenario, OptionLeg, STRUCTURE_META, StructuredResult, StructuredTrades() (+3 more)
+Cohesion: 0.08
+Nodes (40): int, str, float, int, str, compute_dealer_positioning(), _dollar_gex(), _expected_move() (+32 more)
 
 ### Community 86 - "Exit Macro Pillar"
-Cohesion: 0.53
-Nodes (5): cyclBadge(), PillarMacro(), Props, volBadge(), ExitMacroData
+Cohesion: 0.09
+Nodes (40): Any, float, str, _assess(), _book_driver_returns(), _candidate_legs(), compute_book_exposure(), _correlations() (+32 more)
 
 ### Community 87 - "Exit Sentiment Pillar"
 Cohesion: 0.53
 Nodes (5): fmtPct(), getProgressColor(), PillarSentiment(), Props, ExitSentimentData
 
 ### Community 88 - "Exit Valuation Pillar"
-Cohesion: 0.47
-Nodes (4): fmtPct(), PillarValuation(), Props, ExitValuationData
+Cohesion: 0.07
+Nodes (19): _build_setups(), _mean_zone(), _nearest(), Nearest zone of `kind` (optionally strictly above/below spot), by distance., The zone nearest the statistical mean (50-day VWAP / macro POC) — the fade targe, _NullStock, Tests for the trade-setup fusion engine (pure functions)., Multi-style setups (user: rarely 'trade now', spreads too thin, want day/swing/p (+11 more)
 
 ### Community 90 - "Hero Background Image"
 Cohesion: 0.40
@@ -699,8 +764,8 @@ Cohesion: 0.50
 Nodes (4): BrokerService (abstract broker interface), ContractInfo (dataclass), OrderRequest (dataclass), OrderResult (dataclass)
 
 ### Community 97 - "Community 97"
-Cohesion: 0.07
-Nodes (30): Persisted LLM-generated analyses (qualitative, macro, etc.) per user+ticker+type, Persisted LLM-generated analyses (qualitative, macro, etc.) per user+ticker+type, StockAnalysis, _build_stock_context(), compute_pair_trade(), generate_fund_manager_brief(), generate_macro_analysis(), generate_qualitative_analysis() (+22 more)
+Cohesion: 0.09
+Nodes (23): Persisted LLM-generated analyses (qualitative, macro, etc.) per user+ticker+type, Persisted LLM-generated analyses (qualitative, macro, etc.) per user+ticker+type, Persisted LLM-generated analyses (qualitative, macro, etc.) per user+ticker+type, StockAnalysis, _build_stock_context(), generate_macro_analysis(), generate_qualitative_analysis(), Generate industry & macro analysis using LLM with stock context. (+15 more)
 
 ### Community 98 - "App Logo Design"
 Cohesion: 0.67
@@ -709,6 +774,10 @@ Nodes (3): Logo Color Scheme: Purple to Teal Gradient on Dark Background, Logo V
 ### Community 101 - "Migration Versions"
 Cohesion: 0.67
 Nodes (3): Baseline Migration (a1dd97ff3617), Add tracking status + agent_link Migration (9f3c2b8e1a47), Add trade_transactions Migration (5be4b3386629)
+
+### Community 106 - "App Init"
+Cohesion: 0.10
+Nodes (34): float, int, str, compute_placed_desk_score(), focus_legs_from_legs(), Map a trade's stored legs → the FOCUS leg descriptors ``rank_desk`` prices exact, Re-price THIS exact income trade off a FRESH chain via an injected FOCUS built f, PURE assembly (no I/O): given a repriced focus ``row`` + the ``desk`` payload + (+26 more)
 
 ### Community 141 - "Services Init"
 Cohesion: 0.05
@@ -720,7 +789,7 @@ Nodes (33): DataFrame, float, int, ndarray, Series, str, _build_trades(), _downl
 
 ### Community 145 - "Community 145"
 Cohesion: 0.06
-Nodes (33): get_user_api_key(), Return the decrypted API key value or None if not set.      Two LLM-specific beh, Build130_30In, build_130_30(), compute_market_impact(), compute_portfolio_tax_loss_harvesting(), MarketImpactIn, PortfolioTLHIn (+25 more)
+Nodes (36): get_user_api_key(), Return the decrypted API key value or None if not set.      Two LLM-specific beh, Build130_30In, build_130_30(), build_130_30_insights(), compute_portfolio_tax_loss_harvesting(), continue_agent_debate(), DebateContinueIn (+28 more)
 
 ### Community 146 - "Community 146"
 Cohesion: 0.10
@@ -731,32 +800,32 @@ Cohesion: 0.11
 Nodes (17): 1. Set Up Google OAuth, 2. Configure Environment, 3. Run with Docker (Recommended), 4. Run for Development (Without Docker), Architecture, Deploy to a VPS, Deploy to Railway / Render / Fly.io, Deployment (+9 more)
 
 ### Community 148 - "Community 148"
-Cohesion: 0.08
-Nodes (48): float, int, str, Ticker, bool, datetime, float, int (+40 more)
+Cohesion: 0.11
+Nodes (34): bool, datetime, float, int, OptionChain, str, _box_discount(), box_market_timing() (+26 more)
 
 ### Community 149 - "Community 149"
-Cohesion: 0.26
-Nodes (11): AsyncSession, int, str, User, get_endpoints_summary(), get_metrics_summary(), get_metrics_timeseries(), API metrics and observability endpoints. (+3 more)
+Cohesion: 0.27
+Nodes (10): AsyncSession, int, str, User, get_endpoints_summary(), get_metrics_summary(), get_metrics_timeseries(), Get request distribution by endpoint destination. (+2 more)
 
 ### Community 150 - "Community 150"
-Cohesion: 0.12
-Nodes (29): float, int, ndarray, _bs_call(), calibrate_heston(), calibrate_svi(), _check_butterfly(), _forward_from_parity() (+21 more)
+Cohesion: 0.13
+Nodes (27): float, int, ndarray, _bs_call(), calibrate_heston(), calibrate_svi(), _check_butterfly(), _forward_from_parity() (+19 more)
 
 ### Community 151 - "Community 151"
 Cohesion: 0.17
 Nodes (16): asOf(), BenchmarkBadge(), BriefTab, DeltaPanel(), fallbackNarrative(), hasDelta(), money(), MoverChip() (+8 more)
 
 ### Community 152 - "Community 152"
-Cohesion: 0.10
-Nodes (11): AgentCard(), FinalDecisionCard(), gradeTextTone(), gradeTone(), GREEN, RED, SingleTradeDeskReview(), TradeExplorer() (+3 more)
+Cohesion: 0.04
+Nodes (47): AgentBubble(), ConsChip(), DeskDebate(), DeskDebatePanel(), dotTone(), GREEN, PmBubble(), RED (+39 more)
 
 ### Community 153 - "Community 153"
-Cohesion: 0.10
-Nodes (21): int, str, get_index_quote(), movers(), Sector ETF dashboard — returns, analytics, rotation classification.     No LLM c, Sector ETF dashboard — returns, analytics, rotation classification.     No LLM c, Fetch the latest price & returns for a single index directly from yfinance (bypa, Sector ETF dashboard — returns, analytics, rotation classification.     No LLM c (+13 more)
+Cohesion: 0.18
+Nodes (32): AsyncSession, int, User, ask_llm(), AskLLMIn, close_tracked_trade(), CloseIn, delete_tracked_trade() (+24 more)
 
 ### Community 154 - "Community 154"
-Cohesion: 0.12
-Nodes (21): AsyncSession, SavedStrategy, compute_portfolio_risk(), create_manual_trade(), delete_transaction(), ManualTradeIn, PortfolioRiskRequest, Re-walk the full transaction ledger for a stock strategy and sync     parameters (+13 more)
+Cohesion: 0.11
+Nodes (19): User-saved strategy configurations with leg prices at save time., User-saved strategy configurations with leg prices at save time., User-saved strategy configurations with leg prices at save time., Append-only ledger of buy/sell/adjust actions against a SavedStrategy position., Append-only ledger of buy/sell/adjust actions against a SavedStrategy position., Append-only ledger of buy/sell/adjust actions against a SavedStrategy position., SavedStrategy, TradeTransaction (+11 more)
 
 ### Community 155 - "Community 155"
 Cohesion: 0.22
@@ -767,40 +836,40 @@ Cohesion: 0.61
 Nodes (7): bool, str, _column_exists(), downgrade(), _index_exists(), _table_exists(), upgrade()
 
 ### Community 157 - "Community 157"
-Cohesion: 0.16
-Nodes (17): _coerce_date(), _fetch_fund_details_sync(), _fmt_aum(), fmt_large_num(), get_earnings_data(), Stock data fetching service — ported from fetch_stock.py.  All heavy computation, Expense ratio: convert decimal to % if < 1., Expense ratio: convert decimal to % if < 1. (+9 more)
+Cohesion: 0.05
+Nodes (61): float, int, str, analyze_volume_price(), _annualized_return(), _coerce_date(), compute_momentum_indicators(), _compute_period_return() (+53 more)
 
 ### Community 158 - "Community 158"
 Cohesion: 0.16
 Nodes (18): bool, str, _cache_key(), _earnings_context(), generate_earnings_insight(), get_cached_earnings_insight(), _is_quarterly(), Earnings-report insight — an LLM summary grounded in the latest SEC filing.  Rep (+10 more)
 
 ### Community 159 - "Community 159"
-Cohesion: 0.29
-Nodes (7): compute_dual_direction_buffer(), DualDirectionBufferIn, Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint.
+Cohesion: 0.25
+Nodes (8): compute_dual_direction_buffer(), DualDirectionBufferIn, Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint., Calculate a 4-leg options payload for Dual Direction Buffer constraint.
 
 ### Community 160 - "Community 160"
-Cohesion: 0.05
-Nodes (40): AgentDebate(), AnchorsPanel(), fmtConf(), fmtRet(), HistoryCard(), money0(), Props, RoundBlock() (+32 more)
+Cohesion: 0.09
+Nodes (25): AgentDebate(), AnchorsPanel(), fmtConf(), fmtRet(), HistoryCard(), money0(), RoundBlock(), signPct() (+17 more)
 
 ### Community 161 - "Community 161"
 Cohesion: 0.24
 Nodes (10): AsyncSession, BackgroundTasks, int, str, Helper to send a WhatsApp message via the internal Node.js service., Background task to run the agent and send the result back via WhatsApp., The internal webhook called by the Node.js WhatsApp companion service., run_agent_and_reply() (+2 more)
 
 ### Community 164 - "Community 164"
-Cohesion: 0.09
-Nodes (32): bracketTopFor(), irmaaAnnual(), k401ElectiveLimit(), rmdDivisor(), rmdStartAge(), AccountAllocation, AgePercentiles, assetLocationSuggestion() (+24 more)
+Cohesion: 0.08
+Nodes (41): bracketTopFor(), irmaaAnnual(), k401ElectiveLimit(), rmdDivisor(), rmdStartAge(), AccountAllocation, AgePercentiles, assetLocationSuggestion() (+33 more)
 
 ### Community 166 - "Community 166"
 Cohesion: 0.30
 Nodes (13): float, int, Series, str, _analyse(), get_cycle_sectors_ta(), _macd(), _pct() (+5 more)
 
 ### Community 167 - "Community 167"
-Cohesion: 0.14
-Nodes (14): int, check_hedging_market(), get_price_prediction(), hedging_price_history(), Daily close/volume + SMAs + fractal support/resistance for the hedge-context cha, Daily close/volume + SMAs + fractal support/resistance for the hedge-context cha, Lightweight market-conditions timing check — no hedge construction., Lightweight market-conditions timing check — no hedge construction. (+6 more)
+Cohesion: 0.33
+Nodes (6): get_price_prediction(), Run statistical price prediction for *ticker*., Run statistical price prediction for *ticker*., Run statistical price prediction for *ticker*., Run statistical price prediction for *ticker*., Run statistical price prediction for *ticker*.
 
 ### Community 168 - "Community 168"
-Cohesion: 0.14
-Nodes (14): SavedStrategy, compute_thematic_impact(), Compact, prompt-friendly summary of an active position., Compact, prompt-friendly summary of an active position., Institutional-style What-If scenario analysis.      Produces: executive thesis,, Institutional-style What-If scenario analysis.      Produces: executive thesis,, Compact, prompt-friendly summary of an active position., Compact, prompt-friendly summary of an active position. (+6 more)
+Cohesion: 0.12
+Nodes (16): SavedStrategy, compute_thematic_impact(), Compact, prompt-friendly summary of an active position., Compact, prompt-friendly summary of an active position., Institutional-style What-If scenario analysis.      Produces: executive thesis,, Institutional-style What-If scenario analysis.      Produces: executive thesis,, Compact, prompt-friendly summary of an active position., Compact, prompt-friendly summary of an active position. (+8 more)
 
 ### Community 169 - "Community 169"
 Cohesion: 0.08
@@ -811,12 +880,12 @@ Cohesion: 0.13
 Nodes (14): biasTone(), distLabel(), InstitutionalTA(), MarketStateBanner(), money(), VolumeProfileView(), ZoneRow(), FairValueGap (+6 more)
 
 ### Community 171 - "Community 171"
-Cohesion: 0.26
-Nodes (11): OptionQuote, str, OptionQuote, _expiry_to_ib_month(), _normalize_symbol(), Fast path: fetch bid/ask/mid for ONE specific option contract.          Only 3 I, Fast path: fetch bid/ask/mid for MULTIPLE option contracts in one batch., Strip yfinance-style prefixes (e.g. .XSP → XSP, ^SPX → SPX) for IBKR lookups. (+3 more)
+Cohesion: 0.13
+Nodes (22): float, int, OptionChain, OptionQuote, str, UnderlyingQuote, OptionQuote, _expiry_to_ib_month() (+14 more)
 
 ### Community 172 - "Community 172"
-Cohesion: 0.13
-Nodes (27): AsyncSession, int, str, User, int, str, ask_question(), AskIn (+19 more)
+Cohesion: 0.05
+Nodes (65): Base, Agent, AgentRun, ApiMetric, GuruAnalysis, PaperTrade, Portfolio, PortfolioHolding (+57 more)
 
 ### Community 173 - "Community 173"
 Cohesion: 0.16
@@ -835,196 +904,196 @@ Cohesion: 0.20
 Nodes (20): float, int, str, _build_oecd_urls(), _classify_from_gdp(), _classify_phase(), _fetch_imf_gdp(), _fetch_oecd_cli() (+12 more)
 
 ### Community 178 - "Community 178"
-Cohesion: 0.22
-Nodes (4): Exact max profit / max loss of the whole position at expiry, with the price, structure_payoff_extremes(), Exact whole-trade max profit / max loss from the payoff breakpoints., TestStructurePayoffExtremes
+Cohesion: 0.18
+Nodes (6): Exact max profit / max loss of the whole position at expiry, with the price, Exact max profit / max loss of the whole position at expiry, with the price, structure_payoff_extremes(), Exact whole-trade max profit / max loss from the payoff breakpoints., Exact whole-trade max profit / max loss from the payoff breakpoints., TestStructurePayoffExtremes
 
 ### Community 179 - "Community 179"
-Cohesion: 0.09
-Nodes (28): CategoryId, compositeAt(), compositeMean(), compositeStockForYear(), EXPENSE_CATEGORIES, FilingStatus, HISTORICAL, HistYear (+20 more)
+Cohesion: 0.08
+Nodes (31): CategoryId, compositeAt(), compositeMean(), compositeStockForYear(), EXPENSE_CATEGORIES, FilingStatus, HISTORICAL, historicalWindow() (+23 more)
 
 ### Community 180 - "Community 180"
-Cohesion: 0.15
-Nodes (15): datetime, int, agent_service module (referenced by scheduler), _execute_in_own_session(), Query due agents and trigger them.  Retries on transient DB connection errors., Execute an agent in its own DB session (for use in asyncio.create_task)., Long-running loop that checks for due agents every CHECK_INTERVAL_SECONDS., Execute an agent in its own DB session (for use in asyncio.create_task). (+7 more)
+Cohesion: 0.09
+Nodes (33): bool, int, _algo_grade(), _binding_short(), _collapse_adjacent_strikes(), _events_in_window(), _expected_move_band(), _finalize_desk() (+25 more)
 
 ### Community 181 - "Community 181"
 Cohesion: 0.19
 Nodes (11): lookupStateFromZip(), National529Plan, NATIONAL_529_PLANS, PlanDetails, State529Data, State529Rules, STATE_529_DATA, ZIP_STATE_RANGES (+3 more)
 
 ### Community 182 - "Community 182"
-Cohesion: 0.17
-Nodes (13): AgentBubble(), ConsChip(), DeskDebate(), DeskDebatePanel(), dotTone(), GREEN, PmBubble(), RED (+5 more)
+Cohesion: 0.08
+Nodes (32): float, _prob_touch(), Probability the underlying TOUCHES ``strike`` at ANY time before expiry (first-p, _clampf(), _dedup_signature(), _drift_adjusted_keep(), _gap_aware_vol(), _lvn_check() (+24 more)
 
 ### Community 183 - "Community 183"
-Cohesion: 0.09
-Nodes (29): annPct(), ConfidenceBadge(), confTone(), DerivativeIncome(), DiParams, dteFromExpiry(), Mode, money() (+21 more)
+Cohesion: 0.06
+Nodes (41): annPct(), ConfidenceBadge(), confTone(), DerivativeIncome(), detectStructure(), DiParams, dteFromExpiry(), EvaluateForm() (+33 more)
 
 ### Community 184 - "Community 184"
-Cohesion: 0.16
-Nodes (17): str, _call_llm_for_etfs(), _call_llm_for_replacements(), _call_llm_for_top_holder_etfs(), _discover_one_ticker_proxies(), _discover_top_holder_proxies(), _get_etf_holdings_overlap(), _get_ticker_info() (+9 more)
+Cohesion: 0.14
+Nodes (14): _call_llm_for_etfs(), _call_llm_for_replacements(), _get_price_safe(), _get_ticker_info(), Get current price for a ticker with 15-min TTL cache, returning 0 on failure., Get current price for a ticker with 15-min TTL cache, returning 0 on failure., Get current price for a ticker with 15-min TTL cache, returning 0 on failure., Call LLM to suggest replacement stocks + ETFs for harvested positions.      Retu (+6 more)
 
 ### Community 185 - "Community 185"
 Cohesion: 0.24
 Nodes (8): ACTION_CLS, MethodKey, money(), pct(), PortfolioOptimizer(), fetchPortfolioOptimization(), OptimizeOpts, PortfolioOptimization
 
 ### Community 186 - "Community 186"
-Cohesion: 0.16
-Nodes (15): int, _build_protective_collar_legs(), _build_synthetic_long_legs(), _find_closest_expiration(), _find_closest_option(), _get_sector_peers(), Return (expiration_str, actual_dte) closest to target_days from today., Find the option row closest to target_strike and return a clean dict. (+7 more)
+Cohesion: 0.11
+Nodes (21): int, _build_protective_collar_legs(), _build_synthetic_long_legs(), _compute_trade_trigger(), _find_closest_expiration(), _find_closest_option(), Return (expiration_str, actual_dte) closest to target_days from today., Find the option row closest to target_strike and return a clean dict. (+13 more)
 
 ### Community 187 - "Community 187"
-Cohesion: 0.15
-Nodes (11): CURRENCIES, ExpenseMode, fmtMoney(), MoneyLastCalculator(), NumberFieldProps, SimResult, yearsLabel(), useDocumentMetadata() (+3 more)
+Cohesion: 0.12
+Nodes (13): CURRENCIES, ExpenseMode, fmtMoney(), MoneyLastCalculator(), NumberFieldProps, SimResult, yearsLabel(), CollapsibleSidebar() (+5 more)
 
 ### Community 188 - "Community 188"
 Cohesion: 0.22
 Nodes (15): float, int, str, _leg(), _mid_of(), _pick_option(), Async wrapper wrapper for run_structured_trade, Mid price of an option row, falling back to last trade when no two-sided quote. (+7 more)
 
 ### Community 189 - "Community 189"
-Cohesion: 0.12
-Nodes (18): AsyncSession, User, str, test(), test_serp.py — SerpAPI Search Service Test, LLMRequest, proxy_llm(), proxy_search() (+10 more)
+Cohesion: 0.11
+Nodes (17): AsyncSession, User, str, test(), test_serp.py — SerpAPI Search Service Test, LLMRequest, proxy_llm(), proxy_search() (+9 more)
 
 ### Community 190 - "Community 190"
 Cohesion: 0.15
 Nodes (14): AVATAR_GRADIENTS, GURU_ACCENT, GURU_PHOTOS, GuruAnalysis(), GuruAnalysisProps, GuruAvatar(), GuruChatView(), INITIALS (+6 more)
 
 ### Community 191 - "Community 191"
-Cohesion: 0.17
-Nodes (9): Props, SmartMoneyChartOverlay(), TechnicalAnalysis(), TechnicalAnalysisProps, TIMEFRAME_GROUPS, TIMEFRAME_PRESETS, TimeframePreset, fetchTechnicalForTimeframe() (+1 more)
+Cohesion: 0.04
+Nodes (49): ChartPatternsPanel(), DirChip(), dirTone(), money(), MarketContextHero(), readout(), regimeText(), Props (+41 more)
 
 ### Community 192 - "Community 192"
-Cohesion: 0.13
-Nodes (15): compute_momentum_indicators(), _fetch_stock_data_sync(), fmt_market_cap(), generate_news_summary(), Generate a structured summary from news items., Generate a structured summary from news items., Generate a structured summary from news items., Compute MACD/Bollinger/SMA/EMA — always daily-based regardless of UI timeframe. (+7 more)
+Cohesion: 0.09
+Nodes (20): DefendCommittee, DefendFactor, fetchDefendCommittee(), fetchDefendMenu(), fetchTradeRepairMenu, RepairAlternative, RepairMenuResult, Assignment() (+12 more)
 
 ### Community 193 - "Community 193"
 Cohesion: 0.24
-Nodes (13): str, run_tests(), format_rupee_context(), get_rupee_metrics(), _get_rupee_metrics_sync(), _money(), _num(), _pct() (+5 more)
+Nodes (13): str, generate_rupee(), format_rupee_context(), get_rupee_metrics(), _get_rupee_metrics_sync(), _money(), _num(), _pct() (+5 more)
 
 ### Community 194 - "Community 194"
-Cohesion: 0.18
-Nodes (11): build_payoff(), get_live_pnl(), Fetch current quotes for an active trade and compute unrealized P&L with full an, Fetch current quotes for an active trade and compute unrealized P&L with full an, Payoff scenarios + exact structural extremes for ANY position type — pure     eq, bs_price(), Black-Scholes option price. Returns intrinsic value when T <= 0., Black-Scholes option price. Returns intrinsic value when T <= 0. (+3 more)
+Cohesion: 0.07
+Nodes (59): date, float, int, ndarray, str, OptionChain, book_mc(), _bs_vec() (+51 more)
 
 ### Community 195 - "Community 195"
-Cohesion: 0.23
-Nodes (5): classify_leg_action(), Deterministic close / hold / roll recommendation for ONE option leg.      Inputs, Deterministic close/hold/roll — the per-leg verdict rules., Deterministic close/hold/roll — the per-leg verdict rules., TestClassifyLegAction
+Cohesion: 0.19
+Nodes (7): classify_leg_action(), Deterministic close / hold / roll recommendation for ONE option leg.      Inputs, Deterministic close / hold / roll recommendation for ONE option leg.      Inputs, Deterministic close/hold/roll — the per-leg verdict rules., Deterministic close/hold/roll — the per-leg verdict rules., Deterministic close/hold/roll — the per-leg verdict rules., TestClassifyLegAction
 
 ### Community 196 - "Community 196"
-Cohesion: 0.22
-Nodes (10): float, int, _annualized_return(), _compute_period_return(), Return % price change over the last `days` calendar days., Return annualized % return over the last `years` years., Return % price change over the last `days` calendar days., Return annualized % return over the last `years` years. (+2 more)
+Cohesion: 0.14
+Nodes (30): Any, AsyncSession, float, int, str, _book_factor_exposure(), DETERMINISTIC factor decomposition of the book (no LLM, no invented links) — the, _discover_profile_sync() (+22 more)
 
 ### Community 197 - "Community 197"
-Cohesion: 0.20
-Nodes (12): ndarray, ndarray, _decompose_te(), _generate_optimization_suggestions(), Composite score: higher = better.     This version heavily factors in cointegrat, Quant-level portfolio optimisation engine (Advanced V2).     Generates ranked re, Composite replacement-quality score (higher = better).      Weighted toward what, Quant-level portfolio optimisation engine (Advanced V2).     Generates ranked re (+4 more)
+Cohesion: 0.14
+Nodes (16): ndarray, ndarray, _decompose_te(), _generate_optimization_suggestions(), Composite score: higher = better.     This version heavily factors in cointegrat, Quant-level portfolio optimisation engine (Advanced V2).     Generates ranked re, Composite replacement-quality score (higher = better).      Weighted toward what, Composite replacement-quality score (higher = better).      Weighted toward what (+8 more)
 
 ### Community 198 - "Community 198"
-Cohesion: 0.32
-Nodes (4): AgentCard(), AgentCardProps, formatDate(), Agent
+Cohesion: 0.08
+Nodes (21): fmt(), MarketChips(), pct(), ProgressLadder(), TABS, TrackCard(), Verdict, verdictStyle() (+13 more)
 
 ### Community 199 - "Community 199"
-Cohesion: 0.17
-Nodes (13): bool, User, _parse_verdict(), PortfolioRiskAgentRequest, PreTradeAgentRequest, PreTradeMetricsRequest, Pull the leading VERDICT token and decide whether action is required., Run a desk-role agent (Risk / PM / Trader) against a PROPOSED, not-yet-placed (+5 more)
+Cohesion: 0.18
+Nodes (11): _parse_verdict(), PortfolioRiskAgentRequest, PreTradeAgentRequest, Pull the leading VERDICT token and decide whether action is required., Run a desk-role agent (Risk / PM / Trader) against a PROPOSED, not-yet-placed, Run the Risk Desk agent over the WHOLE derivatives book (not a single trade)., Pull the leading VERDICT token and decide whether action is required., Run a desk-role agent (Risk / PM / Trader) against a PROPOSED, not-yet-placed (+3 more)
 
 ### Community 200 - "Community 200"
-Cohesion: 0.17
-Nodes (12): _compute_factor_drift(), _compute_portfolio_factor_profile(), _compute_trade_trigger(), Compute the factor drift between original and replacement portfolios.      Retur, Compute the factor drift between original and replacement portfolios.      Retur, Institutional trigger-based harvesting check.      Trade only if: Tax Benefit >, Compute weighted factor loadings for a portfolio of tickers.      Returns the po, Institutional trigger-based harvesting check.      Trade only if: Tax Benefit > (+4 more)
+Cohesion: 0.15
+Nodes (17): str, _build_factor_spreads(), _compute_factor_loadings(), _compute_portfolio_factor_profile(), _fetch_historical_data(), Compute Barra-style factor loadings for a single ticker.      Returns dict with, Build orthogonalized factor-mimicking daily-return series from price data., Build orthogonalized factor-mimicking daily-return series from price data. (+9 more)
 
 ### Community 201 - "Community 201"
-Cohesion: 0.15
-Nodes (13): int, close_trade(), CloseTradeIn, delete_saved_strategy(), LifecycleAgentRequest, Run one of the three desk-role agents (Risk / PM / Trader) against the     trade, Delete a saved strategy (ownership verified)., Delete a saved strategy (ownership verified). (+5 more)
+Cohesion: 0.07
+Nodes (46): AsyncSession, int, User, book_hedge_advice(), book_tail_risk(), _book_tr_key(), close_position(), compute_lifecycle_desk_score() (+38 more)
 
 ### Community 202 - "Community 202"
-Cohesion: 0.16
-Nodes (17): float, int, str, bool, float, int, str, Simulates a Concentration Management strategy using an Equity Collar.     For a (+9 more)
+Cohesion: 0.15
+Nodes (18): float, int, str, bool, float, int, str, Simulates a Concentration Management strategy using an Equity Collar.     For a (+10 more)
 
 ### Community 203 - "Community 203"
-Cohesion: 0.22
-Nodes (9): Greeks, Hedge, OptionsLeg, Risk, Scenario, usd(), Vol, ZebraResult (+1 more)
+Cohesion: 0.12
+Nodes (22): date, float, _anchored_vwap(), _avwap_entry(), _build_avwap_matrix(), _date_str(), _dist_pct(), _last_earnings_date() (+14 more)
 
 ### Community 204 - "Community 204"
-Cohesion: 0.20
-Nodes (10): _build_portfolio_series(), _fetch_historical_data_batch(), _get_price_safe(), _parse_yf_download(), Fetch historical daily close prices with module-level TTL cache (6 h).      Only, Get current price for a ticker with 15-min TTL cache, returning 0 on failure., Get current price for a ticker with 15-min TTL cache, returning 0 on failure., Value-weighted portfolio price path (fixed share counts) and per-ticker P&L deta (+2 more)
+Cohesion: 0.09
+Nodes (26): QpBoundary(), closePaperTrade(), deletePaperTrade(), fetchPaperTrade(), fetchPaperTrades(), ManagementAnalysis, ManagementContribution, ManagementLens (+18 more)
 
 ### Community 206 - "Community 206"
-Cohesion: 0.29
-Nodes (6): Fold the per-leg verdicts + structure metrics into one headline call.      `hold, Judge the *whole structure's* outcome, then translate into one headline.      `h, summarize_trade_actions(), Overall verdict — signal is preserved; per-leg moves are surfaced., Overall verdict — signal is preserved; per-leg moves are surfaced., TestSummarizeTradeActions
+Cohesion: 0.23
+Nodes (8): Fold the per-leg verdicts + structure metrics into one headline call.      `hold, Judge the *whole structure's* outcome, then translate into one headline.      `h, Judge the *whole structure's* outcome, then translate into one headline.      `h, summarize_trade_actions(), Overall verdict — signal is preserved; per-leg moves are surfaced., Overall verdict — signal is preserved; per-leg moves are surfaced., Overall verdict — signal is preserved; per-leg moves are surfaced., TestSummarizeTradeActions
 
 ### Community 207 - "Community 207"
-Cohesion: 0.29
-Nodes (11): historicalWindow(), worstReturnWindow(), effectiveStockShare(), horizonYears(), isDeterministic(), mulberry32(), percentile(), runMonteCarlo() (+3 more)
+Cohesion: 0.10
+Nodes (15): float, _gamma_flip(), _net_gex_at(), Spot where net GEX crosses zero — recompute gamma across a ±20% spot grid and, _c(), _Chain, _NoOptStock, _OptStock (+7 more)
 
 ### Community 208 - "Community 208"
-Cohesion: 0.28
-Nodes (9): float, _build_methodology_block(), _build_portfolio_replacement_strategies(), _calculate_tax_savings(), Analyze multiple holdings for tax loss harvesting opportunities.      Now uses a, Static description of the engine's methodology + research basis, surfaced     in, Analyze multiple holdings for tax loss harvesting opportunities.      Now uses a, Build execution strategies for replacing ALL harvestable holdings     with a sin (+1 more)
+Cohesion: 0.18
+Nodes (13): float, _build_methodology_block(), _build_portfolio_replacement_strategies(), _calculate_tax_savings(), _get_etf_holdings_overlap(), Try to fetch ETF holdings and compute overlap with portfolio.     Returns {etfNa, Analyze multiple holdings for tax loss harvesting opportunities.      Now uses a, Static description of the engine's methodology + research basis, surfaced     in (+5 more)
 
 ### Community 209 - "Community 209"
-Cohesion: 0.15
-Nodes (13): analyze_volume_price(), calculate_rsi(), compute_technical_block(), find_support_resistance(), Analyze volume-price relationship for accumulation/distribution., Find support and resistance using swing highs/lows., Find support and resistance using swing highs/lows., Analyze volume-price relationship for accumulation/distribution. (+5 more)
+Cohesion: 0.10
+Nodes (12): _low_volume_nodes(), LVNs = local *troughs* in the volume-by-price histogram that sit well below the, _tf_profile(), _EmptyStock, _FakeStock, Tests for the microstructure / multi-timeframe volume-profile pure math., Deterministic OHLCV with real structure (trend + cycle) for shape tests., Returns the same synthetic frame for any history() call + a past earnings date. (+4 more)
 
 ### Community 210 - "Community 210"
-Cohesion: 0.29
-Nodes (7): Annual sector returns ranked best→worst per calendar year (2006→present).     Ca, Annual sector returns ranked best→worst per calendar year (2006→present).     Ca, Annual sector returns ranked best→worst per calendar year (2006→present).     Ca, sector_calendar_returns(), get_sector_calendar_returns(), Async wrapper for calendar-year sector returns., Async wrapper for calendar-year sector returns.
+Cohesion: 0.18
+Nodes (25): AsyncSession, int, str, User, PaperTrade, close_paper_trade(), CloseIn, create_paper_trade() (+17 more)
 
 ### Community 211 - "Community 211"
-Cohesion: 0.18
-Nodes (11): LongShortStrategy Component, PairAnalyticsPanel Subcomponent, QuantAnalyticsPanel Subcomponent, LongShortStrategy(), OrderConfirmationModal Component, Props, STRATEGIES, Strategy (+3 more)
+Cohesion: 0.07
+Nodes (34): LongShortStrategy Component, PairAnalyticsPanel Subcomponent, QuantAnalyticsPanel Subcomponent, LongShortStrategy(), Mode, PairAnalyticsPanel(), PositionRow, Props (+26 more)
 
 ### Community 212 - "Community 212"
-Cohesion: 0.25
-Nodes (8): _find_best_portfolio_etf(), _metrics_for_portfolio_vs_etf(), _rank_score_for_etf(), Align portfolio vs ETF levels; return chart + correlation fields, or None if too, Align portfolio vs ETF levels; return chart + correlation fields, or None if too, Rank ETF candidates by return correlation to the portfolio series.      With an, Lightweight ranking score for a candidate ETF (higher = better).      Tracking-e, Rank ETF candidates against the portfolio by *tracking error* (primary),     the
+Cohesion: 0.18
+Nodes (11): _find_best_portfolio_etf(), _metrics_for_portfolio_vs_etf(), _rank_score_for_etf(), Align portfolio vs ETF levels; return chart + correlation fields, or None if too, Align portfolio vs ETF levels; return chart + correlation fields, or None if too, Align portfolio vs ETF levels; return chart + correlation fields, or None if too, Rank ETF candidates by return correlation to the portfolio series.      With an, Lightweight ranking score for a candidate ETF (higher = better).      Tracking-e (+3 more)
 
 ### Community 213 - "Community 213"
-Cohesion: 0.26
-Nodes (7): float, _leg_entry_premium(), option_legs_net_debit(), Per-share entry premium (always positive) for one option leg.      Tried in orde, Net entry debit for a set of option legs, from per-leg entry premiums.      Sign, The entry-cost fix — a short leg's credit must be SUBTRACTED, not added., TestOptionLegsNetDebit
+Cohesion: 0.09
+Nodes (22): build_payoff(), get_live_pnl(), _leg_entry_premium(), _leg_right(), option_legs_net_debit(), Fetch current quotes for an active trade and compute unrealized P&L with full an, Normalize an option type to 'C' or 'P'., Per-share entry premium (always positive) for one option leg.      Tried in orde (+14 more)
 
 ### Community 214 - "Community 214"
-Cohesion: 0.10
-Nodes (17): EndpointData, MetricsDashboard(), ProviderSummary, TimeseriesData, API Observability & Metrics Dashboard, AgentsPage, AIResearchPage, CalculatorsPage (+9 more)
+Cohesion: 0.09
+Nodes (14): BookTailRiskResult, fetchBookHedgeAdvice(), fetchBookTailRisk(), ago(), BookTailRisk(), FixTarget, GRADE, HedgeHero() (+6 more)
 
 ### Community 215 - "Community 215"
-Cohesion: 0.12
-Nodes (22): Box Spread Strategy, Live P&L with Greeks (Options), Config, create_saved_strategy(), mark_strategy_as_traded(), MarkTradedIn, PortfolioRiskPosition, Saved strategy routes: save, load, update, delete named strategy configurations. (+14 more)
+Cohesion: 0.06
+Nodes (36): Box Spread Strategy, Live P&L with Greeks (Options), ClosePositionIn, ClosePositionLegIn, compute_portfolio_risk(), Config, _defend_ta_context(), DefendPayloadIn (+28 more)
 
 ### Community 216 - "Community 216"
-Cohesion: 0.20
-Nodes (10): ChartData, EventImpactAnalyzer(), ImpactChart(), MarketImpactResult, PickAndShovelV2(), AIResearchPage(), Module, ModuleId (+2 more)
+Cohesion: 0.11
+Nodes (18): BulkImport(), AnalysisBasis, fmtMoney(), LegRow(), LogTradeModal(), newLeg(), OptionAction, OptionLeg (+10 more)
 
 ### Community 217 - "Community 217"
-Cohesion: 0.24
-Nodes (12): float, int, str, main(), Simulates a Dual Direction Buffer strategy using the 4-Layer construction.     L, Async wrapper for run_dual_direction_buffer, IBKR-optimized version: uses yfinance for strike/expiry identification,     roun, Async wrapper for run_dual_direction_buffer (+4 more)
+Cohesion: 0.17
+Nodes (17): float, int, str, main(), _consolidate_legs(), Simulates a Dual Direction Buffer strategy using the 4-Layer construction.     L, Simulates a Dual Direction Buffer strategy using the 4-Layer construction.     L, Async wrapper for run_dual_direction_buffer (+9 more)
 
 ### Community 218 - "Community 218"
-Cohesion: 0.17
-Nodes (12): add_transaction(), list_transactions(), Append a buy/sell/adjust action to a position's ledger., Append a buy/sell/adjust action to a position's ledger., Return the full transaction ledger for a position, oldest first.      If no ledg, Return the full transaction ledger for a position, oldest first.      If no ledg, Return the full transaction ledger for a position, oldest first.      If no ledg, Append a transaction to a position's ledger (add/reduce/close/adjust).      For (+4 more)
+Cohesion: 0.06
+Nodes (33): add_transaction(), delete_transaction(), edit_transaction(), list_transactions(), Append a buy/sell/adjust action to a position's ledger., Append a buy/sell/adjust action to a position's ledger., Append a buy/sell/adjust action to a position's ledger., Partial update for an existing transaction — all fields optional. (+25 more)
 
 ### Community 219 - "Community 219"
-Cohesion: 0.26
-Nodes (4): higher_order_greeks(), Position-level Greeks for a trade, summed across its option legs (+ any     stoc, Tests for lifecycle_service — the Risk / PM / Trader desk metrics., TestHigherOrderGreeks
+Cohesion: 0.33
+Nodes (3): higher_order_greeks(), Position-level Greeks for a trade, summed across its option legs (+ any     stoc, TestHigherOrderGreeks
 
 ### Community 220 - "Community 220"
-Cohesion: 0.29
-Nodes (7): compute_single_stock_long_short(), Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., SingleStockLongShortIn
+Cohesion: 0.25
+Nodes (8): compute_single_stock_long_short(), Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., Build a single-stock long/short strategy with sector ETF hedge., SingleStockLongShortIn
 
 ### Community 221 - "Community 221"
-Cohesion: 0.29
-Nodes (7): compute_structured_trade(), Calculate an interactive structured trade (principal protected note)., Calculate an interactive structured trade (principal protected / capped / yield-, Calculate an interactive structured trade (principal protected / capped / yield-, Calculate an interactive structured trade (principal protected / capped / yield-, Calculate an interactive structured trade (principal protected note)., StructuredTradeIn
+Cohesion: 0.15
+Nodes (13): compute_structured_trade(), get_fund_details(), Calculate an interactive structured trade (principal protected note)., Calculate an interactive structured trade (principal protected / capped / yield-, Calculate an interactive structured trade (principal protected / capped / yield-, Calculate an interactive structured trade (principal protected / capped / yield-, Holdings, sector weights, multi-period returns and benchmark comparison for an E, Holdings, sector weights, multi-period returns and benchmark comparison for an E (+5 more)
 
 ### Community 222 - "Community 222"
 Cohesion: 0.33
 Nodes (3): portfolio_risk(), Book-level VaR/CVaR + stress tests over the *derivative* portfolio.      positio, TestPortfolioRisk
 
 ### Community 223 - "Community 223"
-Cohesion: 0.18
-Nodes (11): str, _leg_right(), list_saved_strategies(), list_trades(), List saved strategies, optionally filtered by type., List saved strategies, optionally filtered by type., List saved strategies, optionally filtered by type., List strategies marked as trades (active or closed). (+3 more)
+Cohesion: 0.07
+Nodes (52): bool, float, SavedStrategy, str, calc_reg_t_margin(), _close_month_of(), _closed_cost_proceeds(), closed_ledger() (+44 more)
 
 ### Community 224 - "Community 224"
-Cohesion: 0.33
-Nodes (6): get_exit_analysis(), Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring.
+Cohesion: 0.29
+Nodes (7): get_exit_analysis(), Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring., Compute comprehensive quantitative exit analysis with 6-pillar scoring., Entry & Exit analysis: 10 pillars + the modern trade-setup engine + risk.      C
 
 ### Community 225 - "Community 225"
-Cohesion: 0.40
-Nodes (5): get_option_expirations(), Return available option expiration dates for a ticker (yfinance)., Return available option expiration dates for a ticker (yfinance)., Return available option expiration dates for a ticker (yfinance)., Return available option expiration dates for a ticker (yfinance).
+Cohesion: 0.33
+Nodes (6): get_option_expirations(), Return available option expiration dates for a ticker (yfinance)., Return available option expiration dates for a ticker (yfinance)., Return available option expiration dates for a ticker (yfinance)., Return available option expiration dates for a ticker (yfinance)., Return available option expiration dates for a ticker (yfinance).
 
 ### Community 226 - "Community 226"
-Cohesion: 0.50
-Nodes (4): bs_prob_otm(), Probability that option expires OTM (worthless)., Probability that option expires OTM (worthless)., Probability that option expires OTM (worthless).
+Cohesion: 0.14
+Nodes (9): _decide_entry(), _position_math(), _intraday_df(), Tests for the trade tracking & management engine (pure functions + verdict logic, _snap(), TestEntryVerdict, TestMisc, TestPositionMath (+1 more)
 
 ### Community 227 - "Community 227"
 Cohesion: 0.31
@@ -1035,28 +1104,28 @@ Cohesion: 0.24
 Nodes (10): bool, float, str, combine_persistence(), persistence_prior(), Empirical priors for the valuation engine — the reference-class constants and ta, Survival weight for a claim from its evidence tier; a landed-but-unanswered, P(the excess advantage largely persists over the horizon), 0..1.      ``start_le (+2 more)
 
 ### Community 229 - "Community 229"
-Cohesion: 0.20
-Nodes (10): _candidate_condensed(), _desk_payload(), Structured strikes so the model reads exact numbers (never invents one)., The full technical read as a structured object (all critical data points)., One line the desk can dismiss a lower-ranked trade on — the algo grade's blockin, Slim one-liner for lower-ranked candidates (beyond the top 5) — enough for the d, The structured input for the LLM desk — pricing, bid/ask, greeks, strategy legs,, _reject_reason() (+2 more)
+Cohesion: 0.17
+Nodes (12): _candidate_condensed(), _desk_payload(), One line the desk can dismiss a lower-ranked trade on — the algo grade's blockin, Slim one-liner for lower-ranked candidates (beyond the top 5) — enough for the d, The structured input for the LLM desk — pricing, bid/ask, greeks, strategy legs,, The full technical read as a structured object (all critical data points)., One line the desk can dismiss a lower-ranked trade on — the algo grade's blockin, Slim one-liner for lower-ranked candidates (beyond the top 5) — enough for the d (+4 more)
 
 ### Community 230 - "Community 230"
-Cohesion: 0.40
-Nodes (4): payoff_distribution_metrics(), PoP, expected value AND the PM ratios from ONE probability-weighted payoff., EV, Exp-Return, Omega and Sortino come from ONE weights array, so they can     N, TestDistributionMetricsConsistency
+Cohesion: 0.35
+Nodes (5): payoff_distribution_metrics(), PoP, expected value AND the PM ratios from ONE probability-weighted payoff., EV, Exp-Return, Omega and Sortino come from ONE weights array, so they can     N, EV, Exp-Return, Omega and Sortino come from ONE weights array, so they can     N, TestDistributionMetricsConsistency
 
 ### Community 231 - "Community 231"
-Cohesion: 0.29
-Nodes (7): BoxSpreadIn, compute_box_spread(), Find box spread combinations matching user criteria., Find box spread combinations matching user criteria., Find box spread combinations matching user criteria., Find box spread combinations matching user criteria., Find box spread combinations matching user criteria.
+Cohesion: 0.14
+Nodes (11): bool, Book P&L if the market instantly moves `move` (each name × its beta) and vol, reprice_scenario(), Tests for the institutional book tail-risk math (full-reprice + MC + Spitznagel, Manage Book is OPTION-income management: the long shares behind a covered call a, _short_put_book(), TestBookMC, TestOptionOverlayOnly (+3 more)
 
 ### Community 232 - "Community 232"
-Cohesion: 0.31
-Nodes (8): BEATS, DeskDebateModal(), Seat(), SeatKey, SEATS, TranscriptCard(), verdictTone(), DeskAgentsResult
+Cohesion: 0.15
+Nodes (7): _by(), _coarse_chain(), Tests for the institutional multi-leg trade-repair engine (BS-priced, greeks, de, A live chain on WIDELY-spaced strikes — the condition that used to collapse a sp, TestRepairMenu, TestStructuralRepairs, _wmt()
 
 ### Community 233 - "Community 233"
-Cohesion: 0.22
-Nodes (7): DimensionCard(), ExitTabProps, PillarHeatBar(), SignalSummaryCard(), fetchExitAnalysis(), ExitAnalysisData, ExitSignalSummary
+Cohesion: 0.10
+Nodes (16): _adj_detail(), _build_adjustments(), _factor_dimension(), _factor_scope(), _merge_scoped(), _mgmt_factor_dimension(), The dimension a factor belongs to (for UI grouping); None if unmapped (renders u, leg' (recompute per side) or 'trade' (inherit whole-trade). Defaults to 'trade' (+8 more)
 
 ### Community 234 - "Community 234"
-Cohesion: 0.22
-Nodes (9): LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, trade_advisor() (+1 more)
+Cohesion: 0.20
+Nodes (10): LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis, LLM-powered trade advisor: sends all trade data, greeks, scenarios, and analysis (+2 more)
 
 ### Community 236 - "Community 236"
 Cohesion: 0.22
@@ -1071,24 +1140,24 @@ Cohesion: 0.36
 Nodes (3): Fair forward P/E conditioned on the SCENARIO's fundamentals, not the stock's own, warranted_multiple(), TestWarrantedMultiple
 
 ### Community 239 - "Community 239"
-Cohesion: 0.25
-Nodes (8): ndarray, _context_sync(), _har_rv_forecast(), Realized vol (20/30d, annualized) and the next earnings date. Best-effort:     r, Does this underlying report earnings at all?      `quoteType` comes from `fast_i, HAR-RV (Corsi 2009) forward realized-vol forecast, as an annualized vol %., Realized vol (20/30d, annualized), 52-week high/low and the next earnings     da, _reports_earnings()
+Cohesion: 0.08
+Nodes (29): date, ndarray, _amc_bmo(), _context_sync(), _dedupe_earn_ts(), _diffusion_hv(), _har_rv_forecast(), _info_earnings_ts() (+21 more)
 
 ### Community 240 - "Community 240"
 Cohesion: 0.39
 Nodes (7): Chip(), chipClass(), fmt(), LadderEntry, LevelsLadder(), toneFor(), UnderlyingSummary()
 
 ### Community 241 - "Community 241"
-Cohesion: 0.25
-Nodes (8): _norm_ticker(), _fin(), _gex_sync(), _portfolio_fit_sync(), 1-year beta & correlation vs SPY — the PM's systemic-vs-idiosyncratic read (is t, Dealer Gamma-Exposure (GEX) proxy from the front option chain — a POSITIONING re, float(x) if it is finite, else None.      yfinance leaves NaN in openInterest (a, _ta_sync()
+Cohesion: 0.18
+Nodes (12): _opp_legs(), per_side_quant(), Combined leg dicts usable by BOTH the payoff curves and higher_order_greeks., Per-SIDE (call / put) quant decomposition for the leg-level tabs.      The whole, Combined leg dicts usable by BOTH terminal_payoff_curve and higher_order_greeks., _leg(), Tests for per_side_quant — the call/put leg-tab decomposition.  The load-bearing, A short strangle: SELL 110 call + SELL 90 put, 30 DTE, spot 100. (+4 more)
 
 ### Community 242 - "Community 242"
 Cohesion: 0.33
 Nodes (4): baseOpts(), UnderlyingCharts(), View, VIEWS
 
 ### Community 243 - "Community 243"
-Cohesion: 0.33
-Nodes (6): PortfolioTLHHoldingIn, Holding row for portfolio TLH — no purchase_date required (analysis uses cost vs, Holding row for portfolio TLH — no purchase_date required (analysis uses cost vs, Holding row for portfolio TLH — no purchase_date required (analysis uses cost vs, Holding row for portfolio TLH — no purchase_date required (analysis uses cost vs, Holding row for portfolio TLH — no purchase_date required (analysis uses cost vs
+Cohesion: 0.16
+Nodes (14): bool, float, int, object, _Breaker, breaker_open(), looks_rate_limited(), note_failure() (+6 more)
 
 ### Community 244 - "Community 244"
 Cohesion: 0.50
@@ -1099,76 +1168,76 @@ Cohesion: 0.50
 Nodes (3): get_clean_start(), int, str
 
 ### Community 246 - "Community 246"
-Cohesion: 0.29
-Nodes (7): Annual returns for investment-style ETFs ranked best→worst per year.     Pass ?c, Annual returns for investment-style ETFs ranked best→worst per year.     Pass ?c, Annual returns for investment-style ETFs ranked best→worst per year.     Pass ?c, style_calendar_returns(), get_style_calendar_returns(), Async wrapper — pass category to restrict to one group., Async wrapper — pass category to restrict to one group.
+Cohesion: 0.13
+Nodes (15): Props, DCFAnalysis(), DCFAnalysisProps, fmtLargeNum(), pegBadge(), pegColor(), PEGGauge(), PEGSection() (+7 more)
 
 ### Community 252 - "Community 252"
-Cohesion: 0.29
-Nodes (7): Identify the top 5 holdings that need review and return them with detailed techn, Bust all enrichment caches for every holding in the portfolio., Bust all enrichment caches for every holding in the portfolio., Bust all enrichment caches for every holding in the portfolio., Bust all enrichment caches for every holding in the portfolio., Bust all enrichment caches for every holding in the portfolio., refresh_all()
+Cohesion: 0.11
+Nodes (19): get_highlights(), HighlightFundamentalSignal, HighlightHistoricalPoint, HighlightHolding, HighlightNewsItem, HighlightResponse, HighlightTechnicalSignal, Identify the top 5 holdings that need review and return them with detailed techn (+11 more)
 
 ### Community 253 - "Community 253"
-Cohesion: 0.29
-Nodes (7): edit_transaction(), Partial update for an existing transaction — all fields optional., Partial update for an existing transaction — all fields optional., Edit an existing ledger transaction and re-sync the position state., Edit an existing ledger transaction and re-sync the position state., Edit an existing ledger transaction and re-sync the position state., TransactionUpdateIn
+Cohesion: 0.10
+Nodes (4): Unit tests for the DETERMINISTIC Book-Exposure engine.  Network paths (yfinance, _short_call_pos(), test_scenario_delta_is_marginal_contribution(), test_scenario_table_short_call_directionality()
 
 ### Community 254 - "Community 254"
-Cohesion: 0.29
-Nodes (7): compute_pmcc(), PmccIn, Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put.
+Cohesion: 0.25
+Nodes (8): compute_pmcc(), PmccIn, Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put., Calculate a Poor Man's Covered Call or Put.
 
 ### Community 257 - "Community 257"
-Cohesion: 0.29
-Nodes (7): _digest_sectors_for_llm(), Compact text dump of the current sector snapshot for LLM grounding., Compact text dump of the current sector snapshot for LLM grounding., Ask the LLM anything about the current sector landscape — grounded in     live s, Ask the LLM anything about the current sector landscape — grounded in     live s, _safe_float(), sector_chat()
+Cohesion: 0.14
+Nodes (13): float, str, import_order(), ImportOrderIn, Parse a pasted broker order (Fidelity label/value rows, single or multi-leg), _num(), _parse_one(), parse_pasted_orders() (+5 more)
 
 ### Community 258 - "Community 258"
 Cohesion: 0.33
 Nodes (4): float, str, Search for a contract and return matching results., Get the current status of an order.
 
 ### Community 259 - "Community 259"
-Cohesion: 0.33
-Nodes (6): get_pair_suggestions(), Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker.
+Cohesion: 0.29
+Nodes (7): get_pair_suggestions(), Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker., Suggest short-side candidates for a pair trade given a long ticker.
 
 ### Community 260 - "Community 260"
-Cohesion: 0.33
-Nodes (6): get_smart_price(), Compute AI-recommended fill prices for a multi-leg strategy.      Analyzes bid-a, Compute AI-recommended fill prices for a multi-leg strategy.      Analyzes bid-a, Compute AI-recommended fill prices for a multi-leg strategy.      Analyzes bid-a, Compute AI-recommended fill prices for a multi-leg strategy.      Analyzes bid-a, SmartPriceIn
+Cohesion: 0.17
+Nodes (18): Any, bool, float, int, str, analyze_derivative_income(), list_trade_structures(), Derivative Income — MCP tool definitions.  Exposes the platform's "Derivative In (+10 more)
 
 ### Community 261 - "Community 261"
-Cohesion: 0.50
-Nodes (5): AsyncSession, str, _distinct_holdings_tickers(), _normalize_ticker(), Map broker-style tickers to yfinance-compatible symbols.
+Cohesion: 0.13
+Nodes (10): int, str, _EmptyStock, _FakeStock, Tests for the market-regime pure math., _series(), _synth_daily(), TestClassify (+2 more)
 
 ### Community 262 - "Community 262"
-Cohesion: 0.40
-Nodes (5): str, fetch_fund_details(), Async wrapper for fund details fetch., Async wrapper for fund details fetch., Async wrapper for fund details fetch.
+Cohesion: 0.13
+Nodes (9): _mtf_bias(), Weighted alignment of the per-timeframe trends (Daily dominates)., _EmptyStock, _FakeStock, Tests for the multi-timeframe market-structure / liquidity pure math., _synth_hourly(), TestComputeMarketStructure, TestMtfBias (+1 more)
 
 ### Community 263 - "Community 263"
 Cohesion: 0.60
 Nodes (4): fmt(), PositionSummary(), Props, ExitPosition
 
 ### Community 264 - "Community 264"
-Cohesion: 0.40
-Nodes (5): NotesUpdateIn, Update the free-form notes on a position. Intended for inline autosave., Update the free-form notes on a position. Intended for inline autosave., Update the free-form notes on a position. Intended for inline autosave., update_notes()
+Cohesion: 0.33
+Nodes (6): NotesUpdateIn, Update the free-form notes on a position. Intended for inline autosave., Update the free-form notes on a position. Intended for inline autosave., Update the free-form notes on a position. Intended for inline autosave., Update the free-form notes on a position. Intended for inline autosave., update_notes()
 
 ### Community 265 - "Community 265"
-Cohesion: 0.40
-Nodes (5): compute_hedging(), HedgingIn, Build a menu of institutional option hedges for a long holding., Build a menu of institutional option hedges for a long holding., Build a menu of institutional option hedges for a long holding.
+Cohesion: 0.12
+Nodes (18): date, float, _build_highlight_catalysts(), _compute_brief_delta(), HighlightCatalyst, _hl_num(), _humanize_since(), Turn a baseline ISO date into a friendly 'since ...' phrase. (+10 more)
 
 ### Community 266 - "Community 266"
-Cohesion: 0.40
-Nodes (5): get_dcf_analysis(), Run DCF analysis with smart defaults based on company financials., Run DCF analysis with smart defaults based on company financials., Run DCF analysis with smart defaults based on company financials., Run DCF analysis with smart defaults based on company financials.
+Cohesion: 0.33
+Nodes (6): get_dcf_analysis(), Run DCF analysis with smart defaults based on company financials., Run DCF analysis with smart defaults based on company financials., Run DCF analysis with smart defaults based on company financials., Run DCF analysis with smart defaults based on company financials., Run DCF analysis with smart defaults based on company financials.
 
 ### Community 267 - "Community 267"
-Cohesion: 0.40
-Nodes (5): get_financial_health(), Comprehensive financial health metrics from yfinance data., Comprehensive financial health metrics from yfinance data., Comprehensive financial health metrics from yfinance data., Comprehensive financial health metrics from yfinance data.
+Cohesion: 0.33
+Nodes (6): get_financial_health(), Comprehensive financial health metrics from yfinance data., Comprehensive financial health metrics from yfinance data., Comprehensive financial health metrics from yfinance data., Comprehensive financial health metrics from yfinance data., Comprehensive financial health metrics from yfinance data.
 
 ### Community 268 - "Community 268"
-Cohesion: 0.40
-Nodes (5): get_macro_analysis(), Return stored industry/macro analysis for the ticker (if any)., Return stored industry/macro analysis for the ticker (if any)., Return stored industry/macro analysis for the ticker (if any)., Return stored industry/macro analysis for the ticker (if any).
+Cohesion: 0.20
+Nodes (17): float, int, ndarray, str, _clamp(), _grid_from_curve(), _pct_at_cdf(), Hedge Desk — institutional pre-trade analytics for a protective overlay.  The in (+9 more)
 
 ### Community 269 - "Community 269"
-Cohesion: 0.40
-Nodes (5): get_qualitative_analysis(), Return stored qualitative analysis for the ticker (if any)., Return stored qualitative analysis for the ticker (if any)., Return stored qualitative analysis for the ticker (if any)., Return stored qualitative analysis for the ticker (if any).
+Cohesion: 0.17
+Nodes (12): float, int, _crushed_strangle(), _grade(), _q(), Earnings timing + post-crush VRP baseline.  Two quant fixes:   1. The ex-earning, _series_with_gap(), test_crushed_vol_vetoes_without_post_earnings_context() (+4 more)
 
 ### Community 270 - "Community 270"
-Cohesion: 0.40
-Nodes (5): get_technical_for_timeframe(), Recompute the price/volume/RSI/support-resistance block for the requested     ti, Recompute the price/volume/RSI/support-resistance block for the requested     ti, Recompute the price/volume/RSI/support-resistance block for the requested     ti, Recompute the price/volume/RSI/support-resistance block for the requested     ti
+Cohesion: 0.33
+Nodes (6): get_technical_for_timeframe(), Recompute the price/volume/RSI/support-resistance block for the requested     ti, Recompute the price/volume/RSI/support-resistance block for the requested     ti, Recompute the price/volume/RSI/support-resistance block for the requested     ti, Recompute the price/volume/RSI/support-resistance block for the requested     ti, Recompute the price/volume/RSI/support-resistance block for the requested     ti
 
 ### Community 271 - "Community 271"
 Cohesion: 0.40
@@ -1183,36 +1252,260 @@ Cohesion: 0.67
 Nodes (3): _expiry_to_ib_month (ibkr_provider), get_multiple_option_quotes, get_single_option_quote
 
 ### Community 274 - "Community 274"
-Cohesion: 0.67
-Nodes (3): _build_calendar_returns_sync(), Return sector ETF annual returns ranked highest→lowest per year.      Fetches fu, Return sector ETF annual returns ranked highest→lowest per year.      Fetches fu
+Cohesion: 0.18
+Nodes (7): Realized P&L from closing a leg (or the stock) at ``exit_price``.      Single so, Credit ($) to collect on the new leg(s) so a short-premium campaign is at     le, realized_close_pnl(), roll_target_credit(), The 'what premium do I need on the next roll' number — target = buyback − net cu, TestRealizedClosePnl, TestRollTargetCredit
 
 ### Community 275 - "Community 275"
-Cohesion: 0.67
-Nodes (3): _build_style_calendar_returns_sync(), Annual returns for investment-style ETFs, ranked best→worst per year.      Pass, Annual returns for investment-style ETFs, ranked best→worst per year.      Pass
+Cohesion: 0.23
+Nodes (9): str, _normalize_ticker(), YFinance-backed quote provider.  Free delayed data — no authentication required., Normalize ticker for yfinance: .SPX → ^SPX, /ES → ES=F, etc., Fetches option quotes via the free yfinance library., Fetches option quotes via the free yfinance library., Fetches option quotes via the free yfinance library., _safe_float() (+1 more)
+
+### Community 276 - "Community 276"
+Cohesion: 0.18
+Nodes (12): Any, str, _BearerAuthASGI, mount_mcp_servers(), Mount the MCP servers into the FastAPI app over Streamable HTTP.  Each server is, Registry of (mount_path, MCPServer instance). Add future servers here.      Uses, Tiny ASGI gate: require a shared secret before the request reaches the MCP app., Mount every registered MCP server onto *app*. Returns the list of MCPServer (+4 more)
+
+### Community 277 - "Community 277"
+Cohesion: 0.18
+Nodes (13): bool, str, _fetch_tech_and_spread_sync(), get_price_history(), _is_fundlike(), _looks_like_cusip(), Technicals (50/200-DMA, 12-1 momentum, RSI) + reconstructed implied-spread     h, As-of (last value on/before date) lookup over a FRED series. (+5 more)
+
+### Community 278 - "Community 278"
+Cohesion: 0.18
+Nodes (8): Does capping the crash lift the book's COMPOUND growth (remove the volatility, VIX CALL-SPREAD black-swan hedges (multi-leg → cost-capped). VIX explodes in a c, spitznagel_cost_vs_drag(), _vix_hedge_candidates(), Minimal VIX call quote (only .mid is read)., TestSpitznagel, TestVixHedge, _VQ
+
+### Community 279 - "Community 279"
+Cohesion: 0.19
+Nodes (7): EXACT breakevens (underlying prices where the expiry P&L crosses 0).      The ex, structure_breakevens(), Tests for trade_math + box_math — the consistency guarantees.  Run from backend/, EXACT breakevens from the piecewise-linear payoff — no coarse-grid kink error., Cost-basis adjustment falls out of structure_breakevens by folding roll-realized, TestRollEffectiveBreakeven, TestStructureBreakevens
+
+### Community 281 - "Community 281"
+Cohesion: 0.19
+Nodes (11): OptionsVolatility(), Props, Props, SortDir, SortKey, TradeTable(), TradingOpportunities(), Options Volatility & Put/Call Ratio (+3 more)
+
+### Community 282 - "Community 282"
+Cohesion: 0.24
+Nodes (13): AsyncSession, str, User, debt_entry(), debt_entry_explain(), debt_history(), On-demand plain-English read of holdings + signal setup (uses the user's key)., Fetch the user's OpenAI key + preferred model (mirrors market_router). (+5 more)
+
+### Community 283 - "Community 283"
+Cohesion: 0.33
+Nodes (12): float, int, str, Ticker, _annualized_vol(), _bs_put(), _norm_cdf(), Async wrapper for _run_autocallable_sync. (+4 more)
+
+### Community 284 - "Community 284"
+Cohesion: 0.19
+Nodes (13): str, _compute_price_chart(), _health_label(), Convert a 0-100 score to a human-readable label., Compute price/volume chart data with 30/60/90 day trends and major events., Convert a 0-100 PRESSURE score (higher = more exit pressure) to a label., Convert a 0-100 HEALTH score (higher = healthier / stronger hold) to a label., Compute price/volume chart data with 30/60/90 day trends and major events. (+5 more)
+
+### Community 285 - "Community 285"
+Cohesion: 0.15
+Nodes (13): compute_pair_trade(), generate_fund_manager_brief(), PairTradeIn, Build a pair trade long/short strategy., Build a pair trade long/short strategy., Generate AI brief on fund manager(s) using LLM., Build a pair trade long/short strategy., Build a pair trade long/short strategy. (+5 more)
+
+### Community 286 - "Community 286"
+Cohesion: 0.22
+Nodes (7): prob_itm_lognormal(), Risk-neutral P(option finishes in the money) under Black-Scholes/GBM.      Fallb, Risk-neutral P(option finishes in the money) under Black-Scholes/GBM.      Fallb, Risk-neutral P(ITM) fallback — sanity of the N(d2) closed form., Risk-neutral P(ITM) fallback — sanity of the N(d2) closed form., Risk-neutral P(ITM) fallback — sanity of the N(d2) closed form., TestProbItmLognormal
+
+### Community 287 - "Community 287"
+Cohesion: 0.17
+Nodes (12): PortfolioHighlightDismissal, Tickers dismissed by the user in Portfolio Highlights., Tickers dismissed by the user in Portfolio Highlights., dismiss_highlight(), DismissHighlightIn, Record that a user dismissed a portfolio highlight suggestions card., Record that a user dismissed a portfolio highlight suggestions card., Record that a user dismissed a portfolio highlight suggestions card. (+4 more)
+
+### Community 288 - "Community 288"
+Cohesion: 0.24
+Nodes (11): float, _clamp(), _f(), _fetch_live_sync(), _fetch_stress_sync(), _fmt_aum(), _pct_rank(), Debt Radar — entry-timing engine for debt instruments.  Given a debt-instrument (+3 more)
+
+### Community 289 - "Community 289"
+Cohesion: 0.17
+Nodes (11): str, compute_market_impact(), MarketImpactIn, Analyze the impact of a given text event on sectors, stocks, and macro identifie, Analyze the impact of a given text event on sectors, stocks, and macro identifie, Analyze the impact of a given text event on sectors, stocks, and macro identifie, Analyze the impact of a given text event on sectors, stocks, and macro identifie, Analyze the impact of a given text event on sectors, stocks, and macro identifie (+3 more)
+
+### Community 290 - "Community 290"
+Cohesion: 0.17
+Nodes (11): A. HTTP — running in Docker as part of the web server (your setup), `analyze_derivative_income`, B. stdio — local dev (optional), Bulk workflow (e.g. 300 tickers), Connect Gemini CLI (remote → your server), Deploy, Derivative Income — MCP server, `list_trade_structures` (+3 more)
+
+### Community 291 - "Community 291"
+Cohesion: 0.15
+Nodes (12): close_trade(), CloseTradeIn, Close an active trade with exit details., Update an existing saved strategy (ownership verified)., Update an existing saved strategy (ownership verified)., Update an existing saved strategy (ownership verified)., Close an active trade with exit details., Close an active trade with exit details. (+4 more)
+
+### Community 292 - "Community 292"
+Cohesion: 0.24
+Nodes (6): Terminal VIX FUTURE level for a horizon SPX log-return, from the empirical crash, DYNAMIC VIXY sleeve — the (near) zero-COST hedge. Hold a cash sleeve and deploy, _vix_future(), _vixy_dynamic_candidate(), TestVixFuture, TestVixyDynamic
+
+### Community 293 - "Community 293"
+Cohesion: 0.18
+Nodes (12): _compute_catalyst_revisions(), _compute_modern_technical(), _compute_ownership_flow(), _compute_quality_capital(), Convert NaN/Inf/None to ``default``.      NOTE: ``safe_float`` defaults to 0.0,, Pillar 8: Ownership & Flow.      Short interest (level, days-to-cover, month-ove, Pillar 9: Catalyst & Analyst Revisions.      Analyst consensus & momentum, price, Share-count trend from the balance sheet: falling = buybacks, rising = dilution. (+4 more)
+
+### Community 294 - "Community 294"
+Cohesion: 0.24
+Nodes (11): int, _clamp(), _compute_entry_rating(), _compute_geopolitical(), _compute_risk_score(), _entry_label(), Entry Attractiveness (0-100, higher = better entry).      Anchored to the positi, Convert raw risk metrics into a composite 0–100 exit-risk score.     Low risk → (+3 more)
+
+### Community 295 - "Community 295"
+Cohesion: 0.29
+Nodes (9): int, str, _describe_trade(), _fetch_news_headlines(), market_sentiment(), Market-sentiment desk agent — recent NEWS + StockTwits crowd chatter distilled i, Recent headlines from yfinance. Handles both the new nested-`content` shape and, Fetch StockTwits + news and LLM-summarize the sentiment for the user's specific (+1 more)
+
+### Community 296 - "Community 296"
+Cohesion: 0.20
+Nodes (11): add_transaction(), get_transactions(), Add a transaction (BUY/SELL/OPTION_BUY/OPTION_SELL).     Automatically creates o, Add a transaction (BUY/SELL/OPTION_BUY/OPTION_SELL).     Automatically creates o, Add a transaction (BUY/SELL/OPTION_BUY/OPTION_SELL).     Automatically creates o, Get all transactions, optionally filtered by ticker., Add a transaction (BUY/SELL/OPTION_BUY/OPTION_SELL).     Automatically creates o, Get all transactions, optionally filtered by ticker. (+3 more)
+
+### Community 297 - "Community 297"
+Cohesion: 0.29
+Nodes (4): algorithmic_exit(), The *lifecycle* algorithmic recommendation for a PLACED trade — reliable and, Tier-2 scored exit engine — base quality + lifecycle adjustments + overrides., TestAlgorithmicExit
+
+### Community 298 - "Community 298"
+Cohesion: 0.20
+Nodes (10): DataFrame, _compute_macro(), _compute_sector_rotation(), _compute_technical_signals(), Compute swing trader and long-term investor technical exit signals.     Scoring:, Compute swing trader and long-term investor technical exit signals.     Scoring:, Pillar 2: Macroeconomic & Policy Shifts.     Baseline 22 — only truly high-beta, Pillar 2: Macroeconomic & Policy Shifts.     Baseline 22 — only truly high-beta (+2 more)
+
+### Community 299 - "Community 299"
+Cohesion: 0.20
+Nodes (10): float, _compute_liquidity(), _compute_sentiment(), _compute_valuation(), Volume and liquidity assessment., Volume and liquidity assessment., Pillar 5: Valuation Extremes.     Baseline 22 — uses sector-relative PE threshol, Pillar 5: Valuation Extremes.     Baseline 22 — uses sector-relative PE threshol (+2 more)
+
+### Community 300 - "Community 300"
+Cohesion: 0.29
+Nodes (5): bool, _passes_quality(), A directional setup is only worth showing if it has a valid, correctly-sided tar, A directional trade must have a correctly-sided target and clear the min R:R —, TestQualityGate
+
+### Community 301 - "Community 301"
+Cohesion: 0.29
+Nodes (9): biasCfg(), levelStr(), miniScoreColor(), Props, SetupCard(), TradeSetupPanel(), ExitModernSetup, ExitModernTechnical (+1 more)
+
+### Community 302 - "Community 302"
+Cohesion: 0.20
+Nodes (10): compute_cppi(), CppiIn, get_earnings_insights(), Return a previously generated earnings recap (cached), or nulls., Run CPPI (Constant Proportion Portfolio Insurance) simulation on yfinance histor, Run CPPI (Constant Proportion Portfolio Insurance) simulation on yfinance histor, Run CPPI (Constant Proportion Portfolio Insurance) simulation on yfinance histor, Run CPPI (Constant Proportion Portfolio Insurance) simulation on yfinance histor (+2 more)
+
+### Community 303 - "Community 303"
+Cohesion: 0.31
+Nodes (4): pm_ratios(), Omega, Sortino and Calmar from the option-implied terminal payoff.      scenario, Tests for lifecycle_service — the Risk / PM / Trader desk metrics., TestPmRatios
+
+### Community 304 - "Community 304"
+Cohesion: 0.31
+Nodes (4): exit_recommendation(), When is the best time to exit the WHOLE trade? Maps the hold/close signal     in, The whole-trade 4-level exit signal + lifecycle exit-timing rules., TestExitRecommendation
+
+### Community 305 - "Community 305"
+Cohesion: 0.33
+Nodes (3): _q(), Regression: the PLACED-trade focus for a short strangle must price the USER'S EX, TestFocusStrangle
+
+### Community 306 - "Community 306"
+Cohesion: 0.28
+Nodes (9): Portfolio Pillar Replaced by Market Sentiment Pillar, PositionSummary Component Removal, Simplified Exit Analysis API (ticker-only, no position params), ExitTab.tsx — Exit Analysis UI Component, types.ts — ExitAnalysisData TypeScript Interface, patch_exit_analysis.py — Exit Analysis Patcher, patch_exit_tab_3.py — ExitTab Component Patcher v3, patch_exit_tab.py — ExitTab Component Patcher (+1 more)
+
+### Community 307 - "Community 307"
+Cohesion: 0.33
+Nodes (4): A single side's own max-loss FLAG for the per-side Undefined-risk read: None = U, _side_max_loss(), The per-side Undefined-risk flag: naked side → None (unbounded), spread side → f, TestSideMaxLoss
+
+### Community 308 - "Community 308"
+Cohesion: 0.22
+Nodes (9): _compute_fundamental(), _compute_structural(), _direction(), Determine trend direction from a list of values (oldest first)., Determine trend direction from a list of values (oldest first)., Pillar 1: Fundamental Deterioration.     Baseline 22 — healthy company stays 15–, Pillar 1: Fundamental Deterioration.     Baseline 22 — healthy company stays 15–, Pillar 3: Structural Obsolescence.     Baseline 20 — declining R&D or slow growt (+1 more)
+
+### Community 309 - "Community 309"
+Cohesion: 0.22
+Nodes (9): _call_llm_for_top_holder_etfs(), _discover_one_ticker_proxies(), _discover_top_holder_proxies(), Nominate US-listed ETFs that hold ``ticker`` at the highest portfolio weight., Nominate US-listed ETFs that hold ``ticker`` at the highest portfolio weight., Find the ETFs that hold ``ticker`` at the highest weight (the user's manual, Find the ETFs that hold ``ticker`` at the highest weight (the user's manual, Run :func:`_discover_one_ticker_proxies` for the largest losers concurrently. (+1 more)
+
+### Community 310 - "Community 310"
+Cohesion: 0.33
+Nodes (4): mid_price(), Normalize a quote to a single price.      - Prefer mid = (bid + ask) / 2 when bo, Normalize a quote to a single price.      - Prefer mid = (bid + ask) / 2 when bo, TestMidPrice
+
+### Community 312 - "Community 312"
+Cohesion: 0.25
+Nodes (8): Alembic env.py Configuration, _load_gcp_secrets(), Fetch secrets from GCP Secret Manager, return as {SECRET_NAME: value} dict., Settings, async SQLAlchemy engine, str, Alembic Migration Workflow, BaseSettings
+
+### Community 313 - "Community 313"
+Cohesion: 0.25
+Nodes (8): BrokerConnection, BrokerOrder, User's broker connection configuration. Credentials stored as encrypted UserApiK, Audit trail for orders placed through broker integrations., User's broker connection configuration. Credentials stored as encrypted UserApiK, User's broker connection configuration. Credentials stored as encrypted UserApiK, Audit trail for orders placed through broker integrations., Audit trail for orders placed through broker integrations.
+
+### Community 314 - "Community 314"
+Cohesion: 0.25
+Nodes (8): Delete all highlights dismissals to let the user review them again., Delete all highlights dismissals to let the user review them again., Delete all highlights dismissals to let the user review them again., Delete all highlights dismissals to let the user review them again., Delete all highlights dismissals to let the user review them again., Delete all highlights dismissals to let the user review them again., Delete all highlights dismissals to let the user review them again., reset_highlights()
+
+### Community 315 - "Community 315"
+Cohesion: 0.36
+Nodes (4): Where the underlying sits relative to the structure's profit zone at expiry., Where the underlying sits relative to the structure's profit zone at expiry., _structure_standing(), TestStructureStanding
+
+### Community 317 - "Community 317"
+Cohesion: 0.29
+Nodes (4): str, Return the current price of the underlying., Return available option expiration dates (YYYY-MM-DD strings)., Return all option quotes for *symbol* at *expiration*.
+
+### Community 318 - "Community 318"
+Cohesion: 0.29
+Nodes (7): get_option_quote(), get_option_quotes_batch(), OptionQuoteIn, Fetch bid/ask/mid for a single option contract.      For IBKR: uses a fast singl, Fetch bid/ask/mid for MULTIPLE option contracts.      For IBKR: uses get_multipl, Fetch bid/ask/mid for MULTIPLE option contracts.      For IBKR: uses get_multipl, Fetch bid/ask/mid for a single option contract.      For IBKR: uses a fast singl
+
+### Community 319 - "Community 319"
+Cohesion: 0.29
+Nodes (7): EnhancedHolding, EnhancedPortfolioSummary, get_enhanced_portfolio_summary(), Returns all holdings with day change, annualised returns, realized P&L,     and, Returns all holdings with day change, annualised returns, realized P&L,     and, Returns all holdings with day change, annualised returns, realized P&L,     and, Returns all holdings with day change, annualised returns, realized P&L,     and
+
+### Community 320 - "Community 320"
+Cohesion: 0.52
+Nodes (3): _assignment_ladder(), What-if ASSIGNMENT / capital lab — 'what happens in various market scenarios'., TestAssignmentLadder
+
+### Community 322 - "Community 322"
+Cohesion: 0.40
+Nodes (5): _cache_dir(), configure(), One-time yfinance timezone-cache configuration (import for side effect).  The sy, A writable directory for the yfinance tz cache, stable across restarts.      Pre, str
+
+### Community 323 - "Community 323"
+Cohesion: 0.47
+Nodes (6): date, int, _fetch_history_sync(), _freq_label(), _range_block(), Build a downsampled {series, change_pct, change_abs} for a date window.
+
+### Community 324 - "Community 324"
+Cohesion: 0.33
+Nodes (6): create_saved_strategy(), Save a new strategy configuration., Save a new strategy configuration., Save a new strategy configuration., Save a new strategy configuration., SavedStrategyCreateIn
+
+### Community 325 - "Community 325"
+Cohesion: 0.33
+Nodes (6): get_fund_manager_brief(), Return stored AI fund-manager brief for the ticker (if any)., Return stored AI fund-manager brief for the ticker (if any)., Return stored AI fund-manager brief for the ticker (if any)., Return stored AI fund-manager brief for the ticker (if any)., Return stored AI fund-manager brief for the ticker (if any).
+
+### Community 326 - "Community 326"
+Cohesion: 0.47
+Nodes (3): _naked_assignment(), Worst-case capital if EVERY NAKED short is assigned at once — the aggregate obli, TestNakedAssignment
+
+### Community 327 - "Community 327"
+Cohesion: 0.33
+Nodes (6): _bs_price(), _instant_mtm(), Plain Black–Scholes price (stdlib normal CDF) — used to mark legs to market unde, Instantaneous mark-to-market P&L if spot GAPS by move_frac TOMORROW — full DTE s, Plain Black–Scholes price (stdlib normal CDF) — used to mark legs to market unde, Instantaneous mark-to-market P&L if spot GAPS by move_frac TOMORROW — full DTE s
+
+### Community 328 - "Community 328"
+Cohesion: 0.33
+Nodes (6): _dual_move_pct(), _physical_move_pct(), The 1σ PHYSICAL (realized-vol) move to expiry (%) = realized vol × √(dte/365). h, (dual, implied, physical) 1σ moves (%). The DUAL boundary is the WIDER of the im, The 1σ PHYSICAL (realized-vol) move to expiry (%) = realized vol × √(dte/365). h, (dual, implied, physical) 1σ moves (%). The DUAL boundary is the WIDER of the im
+
+### Community 331 - "Community 331"
+Cohesion: 0.40
+Nodes (4): str, patch_llm_service.py — LLM / Exit Strategy Service Patcher, analyze_exit_strategy(), Evaluates a specific holding against the 6-Pillar institutional framework     us
+
+### Community 332 - "Community 332"
+Cohesion: 0.50
+Nodes (4): AnalystRatings(), AnalystRatingsProps, PERIOD_LABELS, AnalystRating
+
+### Community 333 - "Community 333"
+Cohesion: 0.40
+Nodes (5): get_dividend_view(), Dividend data for all portfolio holdings. Cached 24 h per ticker., Dividend data for all portfolio holdings. Cached 24 h per ticker., Dividend data for all portfolio holdings. Cached 24 h per ticker., Dividend data for all portfolio holdings. Cached 24 h per ticker.
+
+### Community 334 - "Community 334"
+Cohesion: 0.50
+Nodes (4): _build_highlight_verdict(), HighlightVerdict, The Dashboard exit-analysis conclusion (10 pillars + technical + risk) distilled, Distil a cached exit-analysis payload into the compact Hold/Exit verdict badge.
+
+### Community 335 - "Community 335"
+Cohesion: 0.50
+Nodes (4): get_box_market_timing(), Is now a good time to send a box order? Mid-session fills cleanest., Is now a good time to send a box order? Mid-session fills cleanest., Is now a good time to send a box order? Mid-session fills cleanest.
+
+### Community 336 - "Community 336"
+Cohesion: 0.50
+Nodes (4): $ P&L on the short leg if IV jumps 10 vol points (short-vol → a loss)., $ P&L on the short leg if IV jumps 10 vol points (short-vol → a loss)., $ P&L on the short leg if IV jumps 10 vol points (short-vol → a loss)., _vol_spike_pnl()
+
+### Community 337 - "Community 337"
+Cohesion: 0.50
+Nodes (4): _compute_factor_drift(), Compute the factor drift between original and replacement portfolios.      Retur, Compute the factor drift between original and replacement portfolios.      Retur, Compute the factor drift between original and replacement portfolios.      Retur
 
 ## Ambiguous Edges - Review These
 - `MarketPage.tsx` → `SettingsPage.tsx`  [AMBIGUOUS]
   frontend/src/pages/SettingsPage.tsx · relation: conceptually_related_to
 
 ## Knowledge Gaps
-- **747 isolated node(s):** `version`, `configurations`, `allow`, `hash`, `configHash` (+742 more)
+- **868 isolated node(s):** `version`, `configurations`, `allow`, `hash`, `configHash` (+863 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **40 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **48 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
 - **What is the exact relationship between `MarketPage.tsx` and `SettingsPage.tsx`?**
   _Edge tagged AMBIGUOUS (relation: conceptually_related_to) - confidence is low._
-- **Why does `Trade Transaction Ledger Pattern` connect `Trade Portfolio UI` to `Trade Math Ledger`, `Community 215`?**
-  _High betweenness centrality (0.390) - this node is a cross-community bridge._
+- **Why does `Trade Transaction Ledger Pattern` connect `Trade Portfolio UI` to `Community 154`, `Community 215`?**
+  _High betweenness centrality (0.380) - this node is a cross-community bridge._
 - **Are the 2 inferred relationships involving `call_llm()` (e.g. with `run_tests()` and `_fetch_market_snapshot_sync()`) actually correct?**
   _`call_llm()` has 2 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `version`, `configurations`, `allow` to the rest of the system?**
-  _2216 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _2989 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Stock Tracking UI` be split into smaller, more focused modules?**
-  _Cohesion score 0.012727272727272728 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.010413396127681843 - nodes in this community are weakly interconnected._
 - **Should `AI Analysis Components` be split into smaller, more focused modules?**
-  _Cohesion score 0.01917883714521907 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.017505347292581335 - nodes in this community are weakly interconnected._
 - **Should `Market Data Providers` be split into smaller, more focused modules?**
   _Cohesion score 0.06593406593406594 - nodes in this community are weakly interconnected._

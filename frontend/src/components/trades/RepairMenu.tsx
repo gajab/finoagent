@@ -13,21 +13,31 @@ import { useNavigate } from 'react-router-dom';
 import { fetchTradeRepairMenu } from '../../api';
 import type { RepairMenuResult, RepairAlternative } from '../../api';
 
-const money = (v: number | null | undefined) =>
+export const money = (v: number | null | undefined) =>
   v == null ? '—' : `${v < 0 ? '−' : '+'}$${Math.abs(v).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
-const CAT: Record<string, { label: string; cls: string }> = {
+export const CAT: Record<string, { label: string; cls: string }> = {
   exit:         { label: 'Close',    cls: 'badge-ghost' },
+  hold:         { label: 'Hold',     cls: 'badge-ghost' },
   roll:         { label: 'Roll',     cls: 'badge-info' },
   overlay:      { label: 'Overlay',  cls: 'badge-secondary' },
   defined_risk: { label: 'Cap risk', cls: 'badge-success' },
+  calendar:     { label: 'Calendar', cls: 'badge-accent' },
   hedge:        { label: 'Hedge',    cls: 'badge-warning' },
   assignment:   { label: 'Wheel',    cls: 'badge-secondary' },
 };
 
+// Compact expiry label from an ISO date — TZ-safe (parses the string, no Date()).
+const _MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+export function fmtExp(iso?: string | null): string {
+  if (!iso) return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+  return m ? `${_MONTHS[+m[2] - 1]}${+m[3]}` : '';
+}
+
 // Rank repairs: defined-risk + risk-free + turns-profitable + PoP + credit-over-cost win.
-function score(a: RepairAlternative): number {
-  if (a.category === 'exit') return -Infinity;                 // the benchmark always sits first, unranked
+export function score(a: RepairAlternative): number {
+  if (a.category === 'exit' || a.category === 'hold') return -Infinity;   // benchmarks sit apart, unranked
   let s = 0;
   s += a.defined_risk ? 3 : -5;
   s += a.upside_risk_free ? 2 : 0;
@@ -40,7 +50,7 @@ function score(a: RepairAlternative): number {
 // A real PAYOFF DIAGRAM: P&L (y) vs underlying price (x). Green shading = profit, red = loss,
 // dashed zero line, a "now" marker at current spot, and dots at the breakevens.
 let _pgId = 0;
-function PayoffCurve({ alt, spot }: { alt: RepairAlternative; spot: number }) {
+export function PayoffCurve({ alt, spot }: { alt: RepairAlternative; spot: number }) {
   const W = 260, H = 60, pad = 3;
   const s = alt.scenarios;
   const xs = s.map(p => p.move_pct);
@@ -75,12 +85,13 @@ function PayoffCurve({ alt, spot }: { alt: RepairAlternative; spot: number }) {
   );
 }
 
-function legStr(l: { action: string; right: string; strike: number; qty: number }): string {
+export function legStr(l: { action: string; right: string; strike: number; qty: number; expiry?: string | null }): string {
   if (l.right === 'STK') return `${l.action} ${l.qty} sh`;
-  return `${l.action === 'SELL' ? '−' : '+'}${l.qty} ${l.right === 'P' ? 'P' : 'C'}$${l.strike}`;
+  const e = fmtExp(l.expiry);
+  return `${l.action === 'SELL' ? '−' : '+'}${l.qty} ${l.right === 'P' ? 'P' : 'C'}$${l.strike}${e ? ` ${e}` : ''}`;
 }
 
-function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best: boolean; spot: number; onEvaluate?: (a: RepairAlternative) => void }) {
+export function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best: boolean; spot: number; onEvaluate?: (a: RepairAlternative) => void }) {
   const [open, setOpen] = useState(false);
   const undef = a.category !== 'exit' && !a.defined_risk;
   const canEval = a.category !== 'exit' && (a.legs || []).some(l => l.right === 'P' || l.right === 'C');
@@ -110,8 +121,12 @@ function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best: boole
         <span>max loss <b className={a.max_loss == null ? 'text-error' : 'text-error/80'}>{a.max_loss == null ? 'undefined' : money(a.max_loss)}</b></span>
         <span>max gain <b className="text-success/80">{money(a.max_gain)}</b></span>
         <span>net <b>{money(a.net_cash)}</b></span>
+        {a.ev != null && <span title="Expected P&L under the lognormal law">E[P&amp;L] <b className={a.ev >= 0 ? 'text-success/80' : 'text-error/80'}>{money(a.ev)}</b></span>}
         <span>Θ/d <b className={a.theta_day >= 0 ? 'text-success/80' : 'text-error/80'}>{money(a.theta_day)}</b></span>
         <span>Δ <b>{a.greeks.delta}</b></span>
+        {a.d_pop != null && a.category !== 'exit' && a.category !== 'hold' && (
+          <span title="Change in recovery odds vs holding as-is">Δrecovery <b className={a.d_pop >= 0 ? 'text-success/80' : 'text-error/80'}>{a.d_pop >= 0 ? '+' : ''}{a.d_pop}%</b></span>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center gap-1 pt-0.5">
