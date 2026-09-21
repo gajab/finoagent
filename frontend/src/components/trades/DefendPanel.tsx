@@ -17,10 +17,10 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Loader2, AlertTriangle, ShieldAlert, Wrench, Activity, Clock, Users,
-  ArrowUpRight, TrendingDown, Layers, Check, X, Minus,
+  ArrowUpRight, TrendingDown, Layers, Check, X, Minus, Target,
 } from 'lucide-react';
-import { fetchDefendMenu, fetchDefendCommittee } from '../../api';
-import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor } from '../../api';
+import { fetchDefendMenu, fetchDefendCommittee, fetchRollOptimizer } from '../../api';
+import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor, RollOptimizerResult, RollCandidate } from '../../api';
 import { Card, money, score } from './RepairMenu';
 
 const num = (v: number | null | undefined, d = 0) =>
@@ -34,7 +34,7 @@ const SEV: Record<string, { label: string; cls: string }> = {
   assigned: { label: 'Assignment-like', cls: 'badge-error' },
 };
 const TILT: Record<string, { cls: string }> = {
-  favorable: { cls: 'badge-success' }, adverse: { cls: 'badge-error' }, balanced: { cls: 'badge-ghost' },
+  favorable: { cls: 'badge-success' }, adverse: { cls: 'badge-error' }, balanced: { cls: 'badge-ghost' }, watch: { cls: 'badge-warning' },
 };
 
 function Section({ icon, title, subtitle, children }: { icon: ReactNode; title: string; subtitle?: string; children: ReactNode }) {
@@ -76,39 +76,68 @@ function Recoverability({ d }: { d: RepairMenuResult }) {
   const r = d.recoverability;
   if (!r) return null;
   const sev = SEV[r.severity] || SEV.fresh;
+  const healthy = r.posture === 'healthy';
+  const marginal = r.posture === 'marginal';
+  const otm = healthy || marginal;                 // OTM (not tested) → "keep premium" / cushion framing
   const rs = r.recovery_score;
   const rsTone = rs == null ? 'text-base-content/50' : rs >= 60 ? 'text-success' : rs >= 35 ? 'text-warning' : 'text-error';
   const prob = (r.factors || []).filter(f => f.kind === 'prob');
   const ta = (r.factors || []).filter(f => f.kind === 'ta');
   const outlook = r.outlook;
   return (
-    <Section icon={<Activity className="w-3.5 h-3.5" />} title="Recoverability" subtitle="odds of getting back to breakeven — and why">
+    <Section icon={<Activity className="w-3.5 h-3.5" />}
+      title={marginal ? 'Risk read' : healthy ? 'Trade health' : 'Recoverability'}
+      subtitle={marginal ? 'not tested — but is it actually safe? (P-touch · VRP · trend)' : healthy ? 'this trade is safe — nothing to defend yet' : 'odds of getting back to breakeven — and why'}>
+      {healthy && (
+        <div className="flex items-start gap-1.5 rounded-md bg-success/10 border border-success/25 px-2 py-1.5 text-[10px] text-success">
+          <Check className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+          <span>{r.risk_read || `Healthy — ${rs != null ? `${rs}% chance it expires OTM and you keep the premium` : 'well clear of the strike'}. Nothing to defend; this panel is for monitoring.`}</span>
+        </div>
+      )}
+      {marginal && (
+        <div className="space-y-1.5 rounded-md bg-warning/10 border border-warning/30 px-2 py-1.5">
+          <div className="flex items-start gap-1.5 text-[10px] text-warning">
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+            <span><b>MARGINAL — not tested, but not safe.</b> {r.risk_read}</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[9px] text-base-content/60 pt-0.5 border-t border-warning/15">
+            {r.p_touch != null && <span>P(touch) <b className={r.p_touch >= 50 ? 'text-error/80' : 'text-warning/80'}>{r.p_touch}%</b></span>}
+            {r.vrp_pct != null && <span title="IV vs realized HV — negative = premium under-priced">VRP <b className={r.vrp_pct < 0 ? 'text-error/80' : 'text-success/80'}>{r.vrp_pct > 0 ? '+' : ''}{r.vrp_pct}%</b></span>}
+            {r.iv_pct != null && r.hv_pct != null && <span className="text-base-content/40">IV {r.iv_pct}% · HV {r.hv_pct}%</span>}
+            {r.trend_pct != null && <span title="annualized trend velocity (EMA slope)">trend <b className="text-base-content/70">{r.trend_pct > 0 ? '+' : ''}{r.trend_pct}%/yr</b></span>}
+          </div>
+        </div>
+      )}
       <div className="flex items-center gap-4">
         <div className="flex flex-col items-center justify-center rounded-lg border border-white/10 px-3 py-1.5 min-w-[74px]">
           <span className={`text-2xl font-bold leading-none ${rsTone}`}>{rs == null ? '—' : `${rs}%`}</span>
-          <span className="text-[8px] uppercase tracking-wide text-base-content/40 mt-0.5">recovery</span>
+          <span className="text-[8px] uppercase tracking-wide text-base-content/40 mt-0.5">{otm ? 'keep premium' : 'recovery'}</span>
         </div>
         <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 flex-1">
           <Stat label="breakeven" value={r.breakeven == null ? '—' : `$${num(r.breakeven, 2)}`} />
-          <Stat label="move needed" value={r.needed_move_pct == null ? '—' : `${r.needed_move_pct > 0 ? '+' : ''}${num(r.needed_move_pct, 1)}%`} />
+          {otm
+            ? <Stat label="cushion" value={r.cushion_pct == null ? '—' : `${num(r.cushion_pct, 1)}%`} tone={marginal ? 'text-warning' : 'text-success'} />
+            : <Stat label="move needed" value={r.needed_move_pct == null ? '—' : `${r.needed_move_pct > 0 ? '+' : ''}${num(r.needed_move_pct, 1)}%`} />}
           <Stat label="that's ≈" value={r.dist_to_be_sigma == null ? '—' : `${num(r.dist_to_be_sigma, 2)}σ`} tone="text-base-content/70" />
           <div className="flex flex-col">
-            <span className="text-[8px] uppercase tracking-wide text-base-content/40">severity</span>
-            <span className={`badge badge-xs ${sev.cls} badge-outline mt-0.5 w-fit`}>{sev.label} · Δ{num(r.tested_delta, 2)}</span>
+            <span className="text-[8px] uppercase tracking-wide text-base-content/40">P(touch) / severity</span>
+            {r.p_touch != null
+              ? <span className={`text-sm font-semibold ${r.p_touch >= 50 ? 'text-error' : r.p_touch >= 30 ? 'text-warning' : 'text-success'}`}>{r.p_touch}%<span className="text-[9px] text-base-content/40"> touch</span></span>
+              : <span className={`badge badge-xs ${sev.cls} badge-outline mt-0.5 w-fit`}>{sev.label} · Δ{num(r.tested_delta, 2)}</span>}
           </div>
         </div>
       </div>
       <p className="text-[9px] text-base-content/40 leading-snug">
-        <b>How it's computed:</b> recovery = the risk-neutral probability the position finishes at or above your breakeven
-        (${num(r.breakeven, 2)}) by expiry, from a lognormal model at σ≈implied vol{r.expected_move ? ` (±$${num(r.expected_move, 2)} expected move)` : ''}.
-        The factors below drive it; the technical read tilts it.
+        {otm
+          ? <><b>How it's computed:</b> the big number is the risk-neutral probability the short finishes OTM (past ${num(r.breakeven, 2)}) at expiry{r.expected_move ? ` — ±$${num(r.expected_move, 2)} expected move` : ''}; the <b>cushion</b> is the move it can absorb before breakeven. But <b>P(touch)</b> is the odds the strike is breached at ANY point before then (drift-aware) — the real risk a naive expiry-probability hides.</>
+          : <><b>How it's computed:</b> recovery = the risk-neutral probability the position finishes at or above your breakeven (${num(r.breakeven, 2)}) by expiry, from a lognormal model at σ≈implied vol{r.expected_move ? ` (±$${num(r.expected_move, 2)} expected move)` : ''}. The factors below drive it; the technical read tilts it.</>}
       </p>
 
-      {/* the build-up — probability drivers, then TA */}
+      {/* the build-up — probability / safety drivers, then TA */}
       <div className="space-y-1 pt-0.5">
         {prob.length > 0 && (
           <div className="space-y-0.5">
-            <div className="text-[8px] uppercase tracking-wider text-base-content/35">Probability drivers</div>
+            <div className="text-[8px] uppercase tracking-wider text-base-content/35">{otm ? 'Safety drivers' : 'Probability drivers'}</div>
             {prob.map((f, i) => <FactorRow key={i} f={f} />)}
           </div>
         )}
@@ -122,7 +151,7 @@ function Recoverability({ d }: { d: RepairMenuResult }) {
 
       {outlook && (
         <div className="flex items-start gap-2 rounded-md bg-base-100/40 px-2 py-1.5 mt-0.5">
-          <span className={`badge badge-xs ${TILT[outlook.tilt]?.cls || 'badge-ghost'} shrink-0`}>outlook: {outlook.tilt}</span>
+          <span className={`badge badge-xs ${TILT[outlook.tilt]?.cls || 'badge-ghost'} shrink-0`}>{otm ? 'read' : 'outlook'}: {outlook.tilt}</span>
           <span className="text-[10px] text-base-content/65 leading-snug">{outlook.note}</span>
         </div>
       )}
@@ -219,29 +248,44 @@ function CostOfWaiting({ d }: { d: RepairMenuResult }) {
   );
 }
 
-// ── Lens 5 — Action menu (priced repairs + Hold + Close) ───────────────────────────
+// ── Lens 5 — Action menu: FIX the current trade (primary) vs CLOSE & REDEPLOY (secondary) ──────────
 function ActionMenu({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a: RepairAlternative) => void }) {
   const [showAll, setShowAll] = useState(false);
+  const [showRedeploy, setShowRedeploy] = useState(false);
   const TOP = 4;
   const alts = d.alternatives || [];
-  const repairs = alts.filter(a => a.category !== 'exit' && a.category !== 'hold').sort((x, y) => score(y) - score(x));
+  const priced = alts.filter(a => a.category !== 'exit' && a.category !== 'hold');
+  // A "replace" closes the current trade and opens a new one — kept apart so the focus stays on fixing.
+  const fixes = priced.filter(a => a.group !== 'replace').sort((x, y) => score(y) - score(x));
+  const redeploys = priced.filter(a => a.group === 'replace').sort((x, y) => score(y) - score(x));
   const hold = alts.find(a => a.category === 'hold');
   const close = alts.find(a => a.category === 'exit');
-  const bestName = repairs[0]?.name;
-  const shown = showAll ? repairs : repairs.slice(0, TOP);
-  const hidden = repairs.length - shown.length;
+  const bestName = fixes[0]?.name;
+  const shown = showAll ? fixes : fixes.slice(0, TOP);
+  const hidden = fixes.length - shown.length;
   return (
-    <Section icon={<Wrench className="w-3.5 h-3.5" />} title="Defensive actions" subtitle={`${repairs.length} priced off the live chain · best-first · Δ vs holding`}>
+    <Section icon={<Wrench className="w-3.5 h-3.5" />} title="Fix the current trade" subtitle={`${fixes.length} adjustments · keep the position · best-first · Δ vs holding`}>
       <div className="grid gap-1.5 lg:grid-cols-2">
         {shown.map((a, i) => <Card key={i} a={a} best={a.name === bestName} spot={d.spot ?? 0} onEvaluate={onEvaluate} />)}
       </div>
-      {hidden > 0 && (
-        <button className="btn btn-ghost btn-xs w-full" onClick={() => setShowAll(true)}>Show {hidden} more (calendars · hedges · wheel…)</button>
+      {hidden > 0 && <button className="btn btn-ghost btn-xs w-full" onClick={() => setShowAll(true)}>Show {hidden} more adjustments (calendars · butterflies · hedge · wheel…)</button>}
+      {showAll && fixes.length > TOP && <button className="btn btn-ghost btn-xs w-full" onClick={() => setShowAll(false)}>Show fewer</button>}
+
+      {redeploys.length > 0 && (
+        <div className="pt-1 border-t border-white/[0.06]">
+          <button className="w-full flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-base-content/45 hover:text-base-content/70 py-1" onClick={() => setShowRedeploy(s => !s)}>
+            {showRedeploy ? '▾' : '▸'} Close &amp; redeploy — {redeploys.length} option{redeploys.length > 1 ? 's' : ''}
+            <span className="normal-case tracking-normal text-base-content/35">(closes this trade, opens a NEW position — not a fix)</span>
+          </button>
+          {showRedeploy && (
+            <div className="grid gap-1.5 lg:grid-cols-2 pt-0.5">
+              {redeploys.map((a, i) => <Card key={i} a={a} best={false} spot={d.spot ?? 0} onEvaluate={onEvaluate} />)}
+            </div>
+          )}
+        </div>
       )}
-      {showAll && repairs.length > TOP && (
-        <button className="btn btn-ghost btn-xs w-full" onClick={() => setShowAll(false)}>Show fewer</button>
-      )}
-      <div className="grid gap-1.5 lg:grid-cols-2 pt-0.5">
+
+      <div className="grid gap-1.5 lg:grid-cols-2 pt-1 border-t border-white/[0.06]">
         {hold && <Card a={hold} best={false} spot={d.spot ?? 0} />}
         {close && <Card a={close} best={false} spot={d.spot ?? 0} />}
       </div>
@@ -256,11 +300,18 @@ function ContextLens({ d }: { d: RepairMenuResult }) {
   if (!c) return null;
   const tv = c.loss_read?.time_value_recoverable;
   return (
-    <Section icon={<TrendingDown className="w-3.5 h-3.5" />} title="What broke & the setup" subtitle="recoverable value · vol · structure · sector · earnings">
+    <Section icon={<TrendingDown className="w-3.5 h-3.5" />} title="What broke & the setup" subtitle="pattern · range · vol · structure · sector · earnings">
       {tv != null && (
         <p className="text-[10px] text-base-content/70">💵 <b>{money(tv)}</b> of the mark is still <b>time value</b> — it decays back to you if the stock simply holds; the rest is directional and needs a move.</p>
       )}
-      {c.vol_note && <p className="text-[10px] text-base-content/65">📊 {c.vol_note}</p>}
+      {c.pattern && (
+        <p className="text-[10px] text-base-content/70">📈 <b className={c.pattern.direction === 'bullish' ? 'text-success/90' : 'text-error/90'}>{c.pattern.status} {c.pattern.direction} {c.pattern.type}</b>
+          {c.pattern.confidence != null && <span className="text-base-content/40"> ({c.pattern.confidence}% conf{c.pattern.window ? ` · ${c.pattern.window}` : ''})</span>}
+          {c.pattern.target != null && <span> · target <b>${num(c.pattern.target, 0)}</b></span>}
+          {c.pattern.breakout != null && <span className="text-base-content/40"> · trigger ${num(c.pattern.breakout, 0)}</span>}</p>
+      )}
+      {c.range?.note && <p className="text-[10px] text-base-content/65">📊 {c.range.note}</p>}
+      {c.vol_note && <p className="text-[10px] text-base-content/65">📉 {c.vol_note}</p>}
       {c.technical?.note && <p className="text-[10px] text-base-content/65">📐 {c.technical.note}</p>}
       {c.sector && (
         <p className="text-[10px] text-base-content/65">🧭 {c.sector.note}
@@ -344,8 +395,126 @@ function CommitteeLens({ tradeId, quoteSource, defend }: { tradeId: number; quot
   );
 }
 
+// ── Roll optimizer — deep-quant credit-only strike+expiry finder (lazy, heavy) ──────────────
+function RollLevel({ label, value }: { label: string; value: number | null | undefined }) {
+  if (value == null) return null;
+  return <span className="text-[9px] text-base-content/50">{label} <b className="text-base-content/70">${num(value, 2)}</b></span>;
+}
+
+function ScoreBar({ label, v }: { label: string; v: number }) {
+  return (
+    <div className="flex items-center gap-1">
+      <span className="text-[8px] text-base-content/40 w-16 shrink-0">{label}</span>
+      <div className="flex-1 h-1 rounded bg-base-content/10 overflow-hidden">
+        <div className="h-full bg-secondary/60" style={{ width: `${Math.max(0, Math.min(100, v))}%` }} />
+      </div>
+      <span className="text-[8px] text-base-content/50 w-6 text-right">{Math.round(v)}</span>
+    </div>
+  );
+}
+
+function RollCard({ c, best, onEvaluate }: { c: RollCandidate; best: boolean; onEvaluate: (c: RollCandidate) => void }) {
+  const cleared = Object.entries(c.structure).filter(([, v]) => v === true).map(([k]) => k);
+  return (
+    <div className={`rounded-lg border p-2 space-y-1.5 ${best ? 'border-secondary/50 bg-secondary/[0.05]' : 'border-white/10'}`}>
+      <div className="flex items-center gap-1.5">
+        <span className="badge badge-xs badge-accent badge-outline">Roll</span>
+        <span className="text-[11px] font-semibold">${num(c.strike, 0)} {c.right === 'P' ? 'put' : 'call'} · {c.expiry} ({c.dte}d)</span>
+        {best && <span className="badge badge-xs badge-secondary">best</span>}
+        {c.spans_earnings && <span className="badge badge-xs badge-warning gap-0.5" title="This roll spans the next earnings report — binary gap risk">⚠ earnings</span>}
+        <span className="ml-auto text-sm font-bold text-secondary">{Math.round(c.scores.composite)}<span className="text-[9px] text-base-content/40">/100</span></span>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[9px] text-base-content/55">
+        <span>credit <b className={c.roll_net_cash >= 0 ? 'text-success/80' : 'text-error/80'}>{money(c.roll_net_cash)}</b></span>
+        <span>P(OTM) <b className={c.p_otm >= 70 ? 'text-success/80' : 'text-warning/80'}>{c.p_otm}%</b> <span className="text-base-content/35">{c.p_otm_source}</span></span>
+        {c.scores.cushion_sigma != null && <span title="cushion in std-devs over this expiry's horizon — more days ⇒ fewer σ for the same distance">cushion <b>{c.scores.cushion_sigma.toFixed(1)}σ</b>/{c.dte}d</span>}
+        <span>new B/E <b>${num(c.new_breakeven, 2)}</b></span>
+        <span>capital <b>${c.new_capital.toLocaleString('en-US', { maximumFractionDigits: 0 })}</b></span>
+      </div>
+      {cleared.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {cleared.map((k, i) => <span key={i} className="badge badge-xs badge-success badge-outline text-[8px] gap-0.5"><Check className="w-2 h-2" />{k}</span>)}
+        </div>
+      )}
+      <div className="space-y-0.5 pt-0.5">
+        <ScoreBar label="probability" v={c.scores.probability} />
+        <ScoreBar label="structure" v={c.scores.structure} />
+        <ScoreBar label="credit" v={c.scores.credit} />
+        <ScoreBar label="cushion" v={c.scores.cushion} />
+      </div>
+      <div className="flex items-center gap-2 pt-0.5">
+        <p className="text-[9px] text-base-content/50 leading-snug flex-1">{c.why}</p>
+        <button className="text-[9px] text-secondary hover:text-secondary/80 font-medium flex items-center gap-0.5 shrink-0" onClick={() => onEvaluate(c)}>Evaluate <ArrowUpRight className="w-2.5 h-2.5" /></button>
+      </div>
+    </div>
+  );
+}
+
+function RollOptimizer({ tradeId, quoteSource, ticker }: { tradeId: number; quoteSource: string; ticker?: string }) {
+  const [data, setData] = useState<RollOptimizerResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const nav = useNavigate();
+  const run = async () => {
+    setLoading(true); setErr(null);
+    try { const r = await fetchRollOptimizer(tradeId, quoteSource); if (r.error) setErr(r.error); else setData(r); }
+    catch (e: any) { setErr(e?.message || 'Failed'); } finally { setLoading(false); }
+  };
+  // Send the RESULTING short (the SELL leg) to Evaluate — the roll's new position.
+  const toEvaluate = (c: RollCandidate) => {
+    const nl = c.legs.find(l => l.action === 'SELL');
+    if (!nl) return;
+    const legs = [{ action: 'SELL' as const, type: (nl.right === 'P' ? 'PUT' : 'CALL') as 'PUT' | 'CALL', strike: nl.strike, expiration: nl.expiry || '' }];
+    try { sessionStorage.setItem('evaluatePrefill', JSON.stringify({ ticker: ticker || data?.ticker, legs })); } catch { /* ignore */ }
+    nav('/strategies?mode=evaluate');
+  };
+  const s = data?.structure;
+  return (
+    <Section icon={<Target className="w-3.5 h-3.5" />} title="Optimize the roll" subtitle="credit-only · RND · gamma/GEX · volume · TA — where to roll">
+      {!data && !loading && !err && (
+        <div className="space-y-1">
+          <button className="btn btn-secondary btn-xs gap-1.5" onClick={run}><Target className="w-3 h-3" />Find the best roll (deep quant)</button>
+          <p className="text-[9px] text-base-content/40">Searches later expiries for a NET-CREDIT roll (no new money) and ranks each strike by the market RND probability + structure — support/resistance · gamma flip/wall · volume POC.</p>
+        </div>
+      )}
+      {loading && <div className="text-[11px] text-base-content/50 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Building RNDs across expiries, mapping gamma & volume structure…</div>}
+      {err && <div className="text-[11px] text-error flex items-start gap-1"><AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />{err}</div>}
+      {data && (
+        <div className="space-y-2">
+          {s && (
+            <div className="rounded-md bg-base-100/40 px-2 py-1.5 space-y-0.5">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                <span className="text-[8px] uppercase tracking-wide text-base-content/40" title={s.window || 'recent structure'}>structure · last ~15d</span>
+                <RollLevel label="support" value={s.support} /><RollLevel label="resist" value={s.resistance} />
+                <RollLevel label="POC" value={s.poc} /><RollLevel label="γ-flip" value={s.gamma_flip} />
+                <RollLevel label="γ-wall" value={s.gamma_wall} />
+                {s.gamma_regime && <span className="text-[9px] text-base-content/45">dealers {s.gamma_regime} γ</span>}
+                {s.next_earnings && <span className="text-[9px] text-warning/70" title="Rolling past this date spans earnings — binary gap risk">earnings {s.next_earnings}</span>}
+              </div>
+              {s.recent_5d && (s.recent_5d.support != null || s.recent_5d.resistance != null) && (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                  <span className="text-[8px] uppercase tracking-wide text-base-content/35">last ~5d</span>
+                  <RollLevel label="pivot lo" value={s.recent_5d.support} /><RollLevel label="pivot hi" value={s.recent_5d.resistance} />
+                  <RollLevel label="POC" value={s.recent_5d.poc} />
+                </div>
+              )}
+            </div>
+          )}
+          {(data.candidates || []).length === 0 && (
+            <p className="text-[10px] text-warning">No net-credit roll clears the quality bar right now — rolling would cost money or leave a coin-flip strike. Consider capping (defined-risk) or closing instead.</p>
+          )}
+          <div className="grid gap-1.5 lg:grid-cols-2">
+            {(data.candidates || []).map((c, i) => <RollCard key={i} c={c} best={i === 0} onEvaluate={toEvaluate} />)}
+          </div>
+          {data.note && <p className="text-[9px] text-base-content/40">{data.note} Considered {data.considered} credit rolls; weights — prob {Math.round((data.weights?.probability || 0) * 100)}% · structure {Math.round((data.weights?.structure || 0) * 100)}% · credit {Math.round((data.weights?.credit || 0) * 100)}% · cushion {Math.round((data.weights?.cushion || 0) * 100)}%.</p>}
+        </div>
+      )}
+    </Section>
+  );
+}
+
 // ── the panel ──────────────────────────────────────────────────────────────────
-export default function DefendPanel({ tradeId, quoteSource }: { tradeId: number; quoteSource: string; ticker?: string }) {
+export default function DefendPanel({ tradeId, quoteSource, ticker }: { tradeId: number; quoteSource: string; ticker?: string }) {
   const [data, setData] = useState<RepairMenuResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -384,12 +553,17 @@ export default function DefendPanel({ tradeId, quoteSource }: { tradeId: number;
   if (!data) return null;
 
   const sev = SEV[data.recoverability?.severity || 'fresh'] || SEV.fresh;
+  const posture = data.recoverability?.posture;
+  const postureBadge = posture === 'marginal'
+    ? { cls: 'badge-warning', label: 'MARGINAL' }
+    : posture === 'healthy' ? { cls: 'badge-success', label: 'Healthy' } : sev;
   return (
     <div className="space-y-2.5">
       {/* header — the trade at a glance */}
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[11px]">
-        <span className={`badge badge-xs ${sev.cls}`}>{sev.label}</span>
+        <span className={`badge badge-xs ${postureBadge.cls}`} title={posture === 'marginal' ? 'Not tested, but high breach probability / under-priced premium / adverse trend — de-risk' : undefined}>{postureBadge.label}</span>
         {data.structure && <span className="badge badge-xs badge-ghost">{data.structure.replace(/_/g, ' ')}</span>}
+        {data.covered && <span className="badge badge-xs badge-info badge-outline" title="Shares cover the short call — the risk is being called away (opportunity cost), not an unbounded loss">covered</span>}
         <span className="text-base-content/60">
           {data.ticker} · tested {data.short_right === 'P' ? 'put' : 'call'} ${num(data.short_strike, 0)} · spot ${num(data.spot, 2)} · {num(data.cushion_pct, 1)}% cushion · {data.dte_days}d
         </span>
@@ -400,6 +574,7 @@ export default function DefendPanel({ tradeId, quoteSource }: { tradeId: number;
       <Assignment d={data} />
       <Synthetic d={data} />
       <CostOfWaiting d={data} />
+      <RollOptimizer tradeId={tradeId} quoteSource={quoteSource} ticker={ticker} />
       <ActionMenu d={data} onEvaluate={toEvaluate} />
       <ContextLens d={data} />
       <CommitteeLens tradeId={tradeId} quoteSource={quoteSource} defend={data} />

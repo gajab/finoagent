@@ -133,7 +133,7 @@ def _collect_levels(micro, structure, regime, dealer, spot, indicators=None, pat
 
     # --- microstructure: MTF volume profile, naked POCs, AVWAP ---
     if micro:
-        tf_w = {"macro": 3.0, "swing": 2.0, "micro": 1.5}
+        tf_w = {"daily": 3.0, "h4": 2.0, "h1": 1.5}
         for key, prof in (micro.get("timeframe_profiles") or {}).items():
             if not prof:
                 continue

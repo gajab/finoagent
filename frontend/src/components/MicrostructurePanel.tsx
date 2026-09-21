@@ -1,17 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import {
-  Layers, Target, ChevronDown, ChevronUp, Loader2, RefreshCw, Eye,
-} from 'lucide-react';
-import {
-  Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement,
-  Filler, Tooltip, type ChartOptions,
-} from 'chart.js';
-import { Line } from 'react-chartjs-2';
+import { Layers, ChevronDown, ChevronUp, Loader2, RefreshCw, GitMerge } from 'lucide-react';
 import { fetchMicrostructure, analyzeTa } from '../api';
-import type { MicrostructureData, AnchoredVWAP } from '../types';
+import type { MicrostructureData, AnchoredVWAP, ConfluenceZone, CandleInterval } from '../types';
 import IndicatorAIConsole from './IndicatorAIConsole';
-
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip);
+import TAChart from './TAChart';
+import type { OverlayLine, OverlayBand } from './taOverlay';
+import { useLocalState, usePersistentSet, nearPrice, LevelProximity, LayerChips, confluenceBands, useTARegister, type ProxItem } from './taShared';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Indicator "layers" — one selectable unit that both draws on the chart and
@@ -38,15 +32,14 @@ const distTxt = (level: number, spot: number) => {
   const d = ((level - spot) / spot) * 100;
   return `${d >= 0 ? '+' : ''}${d.toFixed(1)}% vs spot`;
 };
-const toFill = (rgb: string, a: number) => rgb.replace('rgb(', 'rgba(').replace(')', `,${a})`);
 
 function buildLayers(data: MicrostructureData): Layer[] {
   const out: Layer[] = [];
   const spot = data.price ?? 0;
   const tfDefs = [
-    ['macro', data.timeframe_profiles.macro, 'rgb(139,92,246)', 'text-violet-400'],
-    ['swing', data.timeframe_profiles.swing, 'rgb(56,189,248)', 'text-sky-400'],
-    ['micro', data.timeframe_profiles.micro, 'rgb(251,191,36)', 'text-amber-400'],
+    ['daily', data.timeframe_profiles.daily, 'rgb(139,92,246)', 'text-violet-400'],
+    ['h4', data.timeframe_profiles.h4, 'rgb(56,189,248)', 'text-sky-400'],
+    ['h1', data.timeframe_profiles.h1, 'rgb(251,191,36)', 'text-amber-400'],
   ] as const;
 
   for (const [key, tf, color, tone] of tfDefs) {
@@ -101,60 +94,37 @@ function buildLayers(data: MicrostructureData): Layer[] {
   return out;
 }
 
-// Chart.js plugin: draw only the selected layers as horizontal levels / bands.
-function makeMicroPlugin(layers: Layer[]): any {
-  return {
-    id: 'microLevels',
-    afterDatasetsDraw(chart: any) {
-      const { ctx, chartArea, scales } = chart;
-      const y = scales?.y;
-      if (!y || !chartArea) return;
-      const L = chartArea.left, R = chartArea.right;
-      const inRange = (p: number) => p >= y.min && p <= y.max;
-      const py = (p: number) => Math.max(chartArea.top, Math.min(chartArea.bottom, y.getPixelForValue(p)));
+function toOverlays(sel: Layer[]): { lines: OverlayLine[]; bands: OverlayBand[] } {
+  const lines: OverlayLine[] = []; const bands: OverlayBand[] = [];
+  for (const l of sel) {
+    if (l.kind === 'va' && l.band) bands.push({ top: l.band[1], bottom: l.band[0], label: `${l.group} VA`, color: l.color });
+    else if (l.points?.length) l.points.forEach(p => lines.push({ price: p, label: l.kind === 'naked' ? `Naked $${p}` : 'LVN', color: l.color, dash: l.dash }));
+    else if (l.price != null) lines.push({ price: l.price, label: l.label, color: l.color, dash: l.dash });
+  }
+  return { lines, bands };
+}
 
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(L, chartArea.top, R - L, chartArea.bottom - chartArea.top);
-      ctx.clip();
-
-      const hline = (p: number, color: string, dash: number[] | undefined, label: string) => {
-        if (!inRange(p)) return;
-        const yy = py(p);
-        ctx.strokeStyle = color; ctx.lineWidth = 1.25; ctx.setLineDash(dash || []);
-        ctx.beginPath(); ctx.moveTo(L, yy); ctx.lineTo(R, yy); ctx.stroke(); ctx.setLineDash([]);
-        ctx.font = '9px sans-serif'; ctx.fillStyle = color;
-        ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
-        ctx.fillText(label, R - 3, yy - 1);
-      };
-      const band = (a: number, b: number, fill: string, color: string, label: string) => {
-        if (!inRange(a) && !inRange(b)) return;
-        const yt = py(Math.max(a, b)), yb = py(Math.min(a, b));
-        ctx.fillStyle = fill; ctx.fillRect(L, yt, R - L, Math.max(2, yb - yt));
-        ctx.font = '9px sans-serif'; ctx.fillStyle = color;
-        ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-        ctx.fillText(label, L + 3, yt + 1);
-      };
-
-      for (const l of layers) {
-        if (l.kind === 'va' && l.band) band(l.band[0], l.band[1], toFill(l.color, 0.09), l.color, 'VA');
-        else if (l.kind === 'lvn' && l.points) l.points.forEach(p => hline(p, l.color, [2, 2], 'LVN'));
-        else if (l.kind === 'naked' && l.points) l.points.forEach(p => hline(p, l.color, [6, 3], `Naked POC $${p}`));
-        else if (l.price != null) hline(l.price, l.color, l.dash, l.label);
-      }
-      ctx.restore();
-    },
-  };
+function proxItems(layers: Layer[]): ProxItem[] {
+  const items: ProxItem[] = [];
+  for (const l of layers) {
+    if (l.price != null) items.push({ id: l.id, price: l.price, label: l.label, color: l.color, json: l.json });
+    else if (l.points?.length) l.points.forEach(p => items.push({ id: l.id, price: p, label: `${l.label.split(' (')[0]} $${p}`, color: l.color, json: l.json }));
+    else if (l.band) items.push({ id: l.id, price: (l.band[0] + l.band[1]) / 2, label: l.label, color: l.color, json: l.json });
+  }
+  return items;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 
-export default function MicrostructurePanel({ ticker, price }: { ticker: string; price?: number }) {
+export default function MicrostructurePanel({ ticker, price, confluenceZones }: { ticker: string; price?: number; confluenceZones?: ConfluenceZone[] }) {
   const [expanded, setExpanded] = useState(false);
   const [data, setData] = useState<MicrostructureData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = usePersistentSet('ta:sel:micro');
+  const [interval, setInterval] = useLocalState<CandleInterval>('ta:iv:micro', '1d');
+  const [showConfluence, setShowConfluence] = useLocalState('ta:conf:micro', false);
+  const [chartSpot, setChartSpot] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -163,21 +133,22 @@ export default function MicrostructurePanel({ ticker, price }: { ticker: string;
       const r = await fetchMicrostructure(ticker);
       const md = r.microstructure;
       setData(md);
-      // sensible default: each timeframe POC + naked POCs + the YTD AVWAP
-      const def = new Set<string>();
-      (['macro', 'swing', 'micro'] as const).forEach(k => { if (md.timeframe_profiles[k]) def.add(`${k}_poc`); });
-      if (md.naked_pocs?.length) def.add('naked_pocs');
-      if (md.avwap.ytd) def.add('avwap_ytd');
-      setSelected(def);
+      setSelected(prev => {
+        if (prev.size) return prev;                       // keep the user's persisted choice
+        const def = new Set<string>();
+        (['daily', 'h4', 'h1'] as const).forEach(k => { if (md.timeframe_profiles[k]) def.add(`${k}_poc`); });
+        if (md.naked_pocs?.length) def.add('naked_pocs');
+        if (md.avwap.ytd) def.add('avwap_ytd');
+        return def;
+      });
     } catch (e: any) {
       setError(e?.message || 'Failed to load microstructure');
     } finally {
       setLoading(false);
     }
-  }, [ticker]);
+  }, [ticker, setSelected]);
 
-  // reset when the ticker changes so a re-expand refetches the new name
-  useEffect(() => { setData(null); setSelected(new Set()); setError(null); }, [ticker]);
+  useEffect(() => { setData(null); setError(null); }, [ticker]);   // keep persisted selection across tickers
   useEffect(() => { if (expanded && !data && !loading && !error) load(); }, [expanded, data, loading, error, load]);
 
   const layers = useMemo(() => (data ? buildLayers(data) : []), [data]);
@@ -188,44 +159,25 @@ export default function MicrostructurePanel({ ticker, price }: { ticker: string;
     return Array.from(m.entries());
   }, [layers]);
 
+  const spot = chartSpot ?? data?.price ?? price ?? null;
+  const overlays = useMemo(() => toOverlays(selectedLayers), [selectedLayers]);
+  const bands = useMemo(() => [...overlays.bands, ...(showConfluence ? confluenceBands(confluenceZones, spot) : [])], [overlays.bands, showConfluence, confluenceZones, spot]);
+  const near = useMemo(() => nearPrice(proxItems(layers), spot), [layers, spot]);
+
   const selectionJson = useMemo(() => ({
     ticker,
     spot: data?.price ?? price ?? null,
     as_of: data?.as_of,
     selected_indicators: selectedLayers.map(l => l.json),
   }), [ticker, data, price, selectedLayers]);
+  useTARegister('micro', 'Volume Profile', selectionJson, selectedLayers.length);
 
   const toggle = (id: string) => setSelected(prev => {
     const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n;
   });
-  const setGroup = (gLayers: Layer[], on: boolean) => setSelected(prev => {
+  const setGroup = (gLayers: { id: string }[], on: boolean) => setSelected(prev => {
     const n = new Set(prev); gLayers.forEach(l => on ? n.add(l.id) : n.delete(l.id)); return n;
   });
-
-  // chart -------------------------------------------------------------------
-  const chartData = useMemo(() => {
-    const s = data?.price_series;
-    if (!s?.closes?.length) return null;
-    const step = Math.max(1, Math.floor(s.timestamps.length / 12));
-    return {
-      labels: s.timestamps.map((t, i) => (i % step === 0 ? t.slice(5) : '')),
-      datasets: [{
-        label: 'Price', data: s.closes, borderColor: 'rgb(148,163,184)',
-        backgroundColor: 'rgba(148,163,184,0.08)', fill: true, borderWidth: 1.25,
-        pointRadius: 0, tension: 0.1,
-      }],
-    };
-  }, [data]);
-  const chartOptions: ChartOptions<'line'> = useMemo(() => ({
-    responsive: true, maintainAspectRatio: false, animation: false as const,
-    interaction: { mode: 'index', intersect: false },
-    plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `$${Number(c.parsed.y).toFixed(2)}` } } },
-    scales: {
-      x: { ticks: { color: '#999', maxRotation: 0, autoSkip: true, maxTicksLimit: 10 }, grid: { display: false } },
-      y: { position: 'right', ticks: { color: '#999', callback: (v) => `$${Number(v).toFixed(0)}` }, grid: { color: 'rgba(128,128,128,0.12)' } },
-    },
-  }), []);
-  const microPlugin = useMemo(() => makeMicroPlugin(selectedLayers), [selectedLayers]);
 
   // ── render ──
   return (
@@ -236,7 +188,7 @@ export default function MicrostructurePanel({ ticker, price }: { ticker: string;
           <Layers className="w-4 h-4 text-secondary" />
           <div>
             <h4 className="text-sm font-semibold text-base-content/90">Microstructure &amp; Multi-Timeframe Volume Profile</h4>
-            <p className="text-[10px] text-base-content/50">POC · Value Area · LVNs across 3 horizons, naked POCs &amp; anchored-VWAP matrix → AI trade read</p>
+            <p className="text-[10px] text-base-content/50">POC · Value Area · LVNs across 3 horizons, naked POCs &amp; anchored-VWAP matrix → candlestick chart + AI trade read</p>
           </div>
         </div>
         {expanded ? <ChevronUp className="w-4 h-4 shrink-0" /> : <ChevronDown className="w-4 h-4 shrink-0" />}
@@ -257,59 +209,28 @@ export default function MicrostructurePanel({ ticker, price }: { ticker: string;
           )}
 
           {data && !loading && (
-            <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">
-              {/* Left: indicator tray */}
-              <div className="lg:col-span-2 space-y-2">
-                <div className="flex items-center gap-1.5 text-[11px] text-base-content/50 uppercase tracking-wide">
-                  <Eye className="w-3.5 h-3.5" /> Indicators — shown on chart &amp; sent to AI
-                </div>
-                {groups.map(([g, gLayers]) => {
-                  const allOn = gLayers.every(l => selected.has(l.id));
-                  return (
-                    <div key={g} className="rounded-lg border border-white/[0.06] bg-base-200/30 p-2">
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-[11px] font-bold text-base-content/70">{g}</span>
-                        <button className="text-[10px] text-primary hover:underline"
-                          onClick={() => setGroup(gLayers, !allOn)}>{allOn ? 'clear' : 'all'}</button>
-                      </div>
-                      <div className="space-y-0.5">
-                        {gLayers.map(l => (
-                          <label key={l.id} className="flex items-start gap-2 cursor-pointer py-0.5 hover:bg-base-100/30 rounded px-1">
-                            <input type="checkbox" className="checkbox checkbox-xs mt-0.5" checked={selected.has(l.id)} onChange={() => toggle(l.id)} />
-                            <span className="min-w-0 flex-1">
-                              <span className={`text-[11px] font-semibold ${l.tone}`}>{l.label}</span>
-                              {l.sub && <span className="block text-[10px] text-base-content/40 leading-tight truncate">{l.sub}</span>}
-                            </span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Right: chart + AI */}
-              <div className="lg:col-span-3 space-y-3">
-                <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
-                  <div className="flex items-center justify-between mb-1 px-1">
-                    <span className="text-[11px] font-bold text-base-content/70 flex items-center gap-1"><Target className="w-3.5 h-3.5 text-secondary" /> Level map — last ~6 months</span>
-                    <span className="text-[10px] text-base-content/40">{selectedLayers.length} layer{selectedLayers.length === 1 ? '' : 's'} shown</span>
-                  </div>
-                  {chartData ? (
-                    <div className="h-64"><Line key={[...selected].sort().join('|')} data={chartData} options={chartOptions} plugins={[microPlugin]} /></div>
-                  ) : (
-                    <div className="text-center text-xs text-base-content/40 py-10">No price series available.</div>
-                  )}
-                </div>
-
-                {/* AI console (shared) */}
-                <IndicatorAIConsole
-                  selectionJson={selectionJson}
-                  chips={selectedLayers.map(l => ({ key: l.id, label: l.label, tone: l.tone, onRemove: () => toggle(l.id) }))}
-                  analyzeFn={(sel, msgs) => analyzeTa(ticker, sel, msgs)}
-                  emptyHint="Select indicators on the left to include them in the AI read."
-                />
-              </div>
+            <div className="space-y-2">
+              <LayerChips groups={groups.map(([name, ls]) => ({ name, layers: ls }))} selected={selected} onToggle={toggle} onGroupAll={setGroup} />
+              <TAChart
+                ticker={ticker} interval={interval} onInterval={setInterval}
+                lines={overlays.lines} bands={bands} height={400}
+                title={<>Volume-profile levels <span className="text-base-content/40 font-normal">· {selectedLayers.length} shown</span></>}
+                rightExtra={confluenceZones?.length ? (
+                  <button onClick={() => setShowConfluence(v => !v)}
+                    className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold transition ${showConfluence ? 'bg-secondary/20 text-secondary' : 'text-base-content/45 hover:text-base-content'}`}
+                    title="Overlay high-conviction confluence zones (where all TA methods agree)">
+                    <GitMerge className="w-3 h-3" /> Confluence
+                  </button>
+                ) : undefined}
+                onSpot={setChartSpot}
+              />
+              <LevelProximity levels={near} onAdd={(l) => toggle(l.id)} />
+              <IndicatorAIConsole
+                selectionJson={selectionJson}
+                chips={selectedLayers.map(l => ({ key: l.id, label: l.label, tone: l.tone, onRemove: () => toggle(l.id) }))}
+                analyzeFn={(sel, msgs) => analyzeTa(ticker, sel, msgs)}
+                emptyHint="Toggle layers below (or ＋a nearby level) to include them in the AI read."
+              />
             </div>
           )}
         </div>

@@ -1442,8 +1442,9 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
           )}
           {rev?.ta_timeframe && (
             <span className="text-[11px] px-2 py-1 rounded-lg border border-white/[0.08] bg-base-200/50 text-base-content/60 inline-flex items-center gap-1.5"
-              title="The technical read that scores every trade — a swing horizon (daily bars, ~6 months of context) matched to a multi-week option. Short/intraday would be noise; long/weekly would lag the trade.">
+              title="DTE-adaptive technical read. STRUCTURE (levels · volume profile · POC · breach) is matched to the trade's holding horizon; the TREND / regime factors read one timeframe higher. On a placed trade it keys off REMAINING days, so the read tightens as expiry nears.">
               <Activity className="w-3.5 h-3.5" /> TA · {rev.ta_timeframe}
+              {rev.ta_trend_timeframe && <span className="opacity-50"> · trend {rev.ta_trend_timeframe}</span>}
             </span>
           )}
         </div>

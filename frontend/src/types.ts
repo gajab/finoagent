@@ -105,6 +105,8 @@ export interface EMACrossoverData {
 }
 
 export interface TechnicalData {
+  timeframe?: string;
+  timeframeLabel?: string;
   timestamps: string[];
   prices: number[];
   volumes: number[];
@@ -201,9 +203,9 @@ export interface MicrostructureData {
   price: number | null;
   as_of: string;
   timeframe_profiles: {
-    macro: VolumeProfileTF | null;
-    swing: VolumeProfileTF | null;
-    micro: VolumeProfileTF | null;
+    daily: VolumeProfileTF | null;
+    h4: VolumeProfileTF | null;
+    h1: VolumeProfileTF | null;
   };
   naked_pocs: NakedPOC[];
   avwap: {
@@ -409,6 +411,60 @@ export interface DayTradeSetupsData {
   setups: TradeSetup[]; meta?: { has_vwap?: boolean; has_opening_range?: boolean };
 }
 export interface DayTradeSetupsResponse { ticker: string; day_trade_setups: DayTradeSetupsData; cached?: boolean }
+
+// Qullamäggie momentum-breakout — the 4th style (own lazy endpoint)
+export interface QullamaggieCheck {
+  key: string; label: string; status: 'pass' | 'warn' | 'fail' | string;
+  value: string; ideal: string; detail: string;
+}
+export interface QullamaggieBase { high: number; low: number; days: number; depth_pct: number; tightness: number; contracting: boolean }
+export interface QullamaggieQualification {
+  is_candidate: boolean; grade: 'A' | 'B' | 'C' | '—' | string; score: number;
+  checks: QullamaggieCheck[]; summary: string; passes: number;
+}
+export interface QullamaggieData {
+  price: number | null; as_of: string; adr_pct: number | null; atr: number | null;
+  qualification: QullamaggieQualification;
+  moving_averages: { ema10: number | null; ema20: number | null; sma50: number | null; sma200: number | null };
+  metrics: {
+    adr_pct: number | null;
+    moves: { move_1m: number | null; move_3m: number | null; move_6m: number | null; thrust_from_low_pct: number | null; best_pct: number | null };
+    pct_from_52w_high: number | null; high_52w: number | null; low_52w: number | null;
+    base: QullamaggieBase | null;
+    episodic_pivot: { gap_pct: number; vol_mult: number; gap_high: number; gap_low: number; bars_since: number; extended: boolean } | null;
+  };
+  opening_range?: { high: number; low: number; bars: number } | null;
+  setups: TradeSetup[];
+  meta?: { has_intraday?: boolean; has_daily?: boolean; note?: string };
+}
+export interface QullamaggieResponse { ticker: string; qullamaggie_setup: QullamaggieData; cached?: boolean }
+
+// Larry Connors' 2-Period RSI mean-reversion — a named strategy (own lazy endpoint)
+export interface ConnorsCheck { key: string; label: string; status: 'pass' | 'warn' | 'fail' | string; value: string; ideal: string; detail: string }
+export interface ConnorsSignal { state: string; tone: 'buy' | 'short' | 'watch' | 'flat' | string; armed: boolean; score: number; checks: ConnorsCheck[]; summary: string }
+export interface ConnorsBacktest {
+  trades: number; win_rate_pct?: number | null; avg_return_pct?: number | null; avg_win_pct?: number | null;
+  avg_loss_pct?: number | null; avg_hold_days?: number | null; payoff?: number | null; note: string;
+}
+export interface ConnorsVix { level: number; sma10: number; pct_above_sma10: number; rsi2: number; percentile_1y: number; fear_spike: boolean }
+export interface ConnorsExecution { signal_basis: string; recommended_order: string; overnight_risk: string; open_alternative: string; exit_basis: string; stops_note: string }
+export interface ConnorsData {
+  price: number | null; as_of: string; atr: number | null;
+  signal: ConnorsSignal;
+  indicators: { rsi2: number | null; rsi5: number | null; rsi10: number | null; cum_rsi2: number | null; sma5: number | null; sma10: number | null; sma200: number | null };
+  vix: ConnorsVix | null;
+  backtest: ConnorsBacktest | null;
+  execution: ConnorsExecution;
+  setups: TradeSetup[];
+  meta?: { has_vix?: boolean; has_200sma?: boolean; note?: string };
+}
+export interface ConnorsResponse { ticker: string; connors_setup: ConnorsData; cached?: boolean }
+
+// OHLC candles feed for the interactive Advanced-tab charts
+export interface Candle { t: string; o: number | null; h: number | null; l: number | null; c: number | null; v: number }
+export interface CandlesData { interval: string; candles: Candle[]; count: number; spot: number | null; as_of: string; range: { low: number; high: number } }
+export interface CandlesResponse { ticker: string; candles: CandlesData; cached?: boolean }
+export type CandleInterval = '15m' | '1h' | '1d' | '1wk';
 
 // ===== Chart patterns =====
 export interface PatternPoint { idx: number; date: string; price: number; label: string }
@@ -4120,8 +4176,10 @@ export interface DeskReviewResult {
     value_area?: (number | null)[] | null; trend?: string; bos?: string | null;
   };
   events?: DeskReviewEvent[];
-  /** Which technical read scores the trade (e.g. "Medium Term (6mo / 1d)"). */
+  /** DTE-adaptive STRUCTURE timeframe that scores the trade (levels · VP · POC · breach). */
   ta_timeframe?: string | null;
+  /** The TREND/regime timeframe (one rung up): Trend drift · Range fit · Calm tape. */
+  ta_trend_timeframe?: string | null;
   /** Set when a requested data source (e.g. IBKR) was unavailable and the scan fell back to Yahoo. */
   data_source_note?: string | null;
   /** Dealer gamma-exposure proxy — long gamma = vol-suppressed (good for selling), short = vol-expansion. */

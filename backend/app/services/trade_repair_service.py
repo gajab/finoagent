@@ -34,17 +34,36 @@ class _Pricer:
     """Prices legs from the LIVE chain first (mid + per-strike IV, snapped to listed strikes),
     BS-fallback otherwise. `chains` = {tenor_days: {strike: {'P': {'mid','iv'}, 'C': {...}}}}."""
 
-    def __init__(self, r: float, atm_iv: float, chains: dict, tenors: list[int]):
+    def __init__(self, r: float, atm_iv: float, chains: dict, tenors: list[int], spot: Optional[float] = None):
         self.r = r
         self.atm_iv = max(atm_iv or 0.05, 0.05)
         self.chains = chains or {}
         self.tenors = tenors
+        self.spot = spot
+        self._atm_cache: dict = {}
 
     def _chain(self, tenor: int) -> dict:
         if not self.chains:
             return {}
         key = min(self.chains.keys(), key=lambda t: abs(t - tenor))
         return self.chains[key]
+
+    def _tenor_atm_iv(self, tenor: int) -> float:
+        """ATM IV of THIS tenor's own chain (nearest-to-spot strike, P/C blended) — so an off-strike
+        far leg falls back to the FAR vol, not the near ATM. This is what preserves the term-structure
+        edge in a calendar / diagonal instead of flattening it to a single vol."""
+        key = min(self.chains.keys(), key=lambda t: abs(t - tenor)) if self.chains else None
+        if key is None:
+            return self.atm_iv
+        if key in self._atm_cache:
+            return self._atm_cache[key]
+        ch = self.chains[key]
+        s = self.spot if (self.spot and self.spot > 0) else sorted(ch.keys())[len(ch) // 2]
+        k = min(ch.keys(), key=lambda x: abs(x - s))
+        ivs = [float(v) for v in ((ch[k].get(rt) or {}).get("iv") for rt in ("P", "C")) if v and v > 0]
+        out = (sum(ivs) / len(ivs)) if ivs else self.atm_iv
+        self._atm_cache[key] = out
+        return out
 
     def snap(self, tenor: int, target: float) -> float:
         ch = self._chain(tenor)
@@ -53,7 +72,7 @@ class _Pricer:
     def iv(self, tenor: int, strike: float, right: str) -> float:
         q = (self._chain(tenor).get(strike) or {}).get(right)
         v = q.get("iv") if q else None
-        return float(v) if (v and v > 0) else self.atm_iv
+        return float(v) if (v and v > 0) else self._tenor_atm_iv(tenor)
 
     def entry(self, tenor: int, strike: float, right: str, spot: float) -> float:
         """Opening price TODAY (spot ≈ current): live mid if listed, else BS on the skew IV."""
@@ -169,7 +188,8 @@ def _pop(spot, iv, horizon_days, legs, realized, stock, r) -> Optional[int]:
     return _dist_metrics(spot, iv, horizon_days, legs, realized, stock, r)[0]
 
 
-def _build(*, name, category, mechanics, legs, realized, stock, establish_cash, spot, r, rationale, iv_ref) -> dict:
+def _build(*, name, category, mechanics, legs, realized, stock, establish_cash, spot, r, rationale, iv_ref,
+           group="adjust") -> dict:
     horizon = min((lg["dte_days"] for lg in legs), default=0) if legs else 0
     scn = [{"move_pct": round(m * 100), "spot": round(spot * (1 + m), 2),
             "pnl": round(_pnl_at(spot * (1 + m), legs, realized, stock, r, horizon), 0)} for m in _LADDER]
@@ -185,7 +205,8 @@ def _build(*, name, category, mechanics, legs, realized, stock, establish_cash, 
     gk = _greeks(spot, legs, r, stock)
     pop, ev = _dist_metrics(spot, iv_ref, horizon, legs, realized, stock, r)
     return {
-        "name": name, "category": category, "mechanics": mechanics, "rationale": rationale, "risk_note": rationale,
+        "name": name, "category": category, "group": group,
+        "mechanics": mechanics, "rationale": rationale, "risk_note": rationale,
         "net_cash": round(establish_cash, 0),
         "scenarios": scn,
         "max_loss": None if upside_undefined else max_loss, "max_gain": max_gain,
@@ -246,14 +267,14 @@ def _credit_spread(pr: "_Pricer", tenor: int, K_short: float, side: str, base_cr
     return None
 
 
-def _recoverability(*, spot, K, right, C, iv0, D, r, hold_legs, hold_pop) -> dict:
+def _recoverability(*, spot, K, right, C, iv0, D, r, hold_legs, hold_pop, stock=None) -> dict:
     """Lens 1 — RECOVERABILITY. Given you're already here: how likely is a return to breakeven
     (recovery_score = the do-nothing PoP), how far that breakeven is in σ, and how deep in trouble
     the tested short is — a fresh breach still full of time value vs one effectively already assigned."""
     T = max(D, 1) / 365.0
     otype = "put" if right == "P" else "call"
     tdelta = bs_delta(spot, K, T, r, max(iv0, 0.02), otype)
-    bes = _breakevens(spot, hold_legs, 0.0, None, r, D)
+    bes = _breakevens(spot, hold_legs, 0.0, stock, r, D)
     # the breakeven you must reclaim — on the tested side of spot (a put needs spot UP, a call DOWN).
     if right == "P":
         cands = [b for b in bes if b >= spot] or bes
@@ -261,34 +282,53 @@ def _recoverability(*, spot, K, right, C, iv0, D, r, hold_legs, hold_pop) -> dic
     else:
         cands = [b for b in bes if b <= spot] or bes
         be = max(cands) if cands else None
-    needed_move_pct = round((be / spot - 1.0) * 100.0, 1) if be else None
     sig = max(iv0, 0.02) * math.sqrt(T)
     dist_sigma = round(abs(math.log(be / spot)) / sig, 2) if (be and sig > 0 and be > 0) else None
     absd = abs(tdelta)
     severity = ("assigned" if absd >= 0.85 else "deep" if absd >= 0.65
                 else "fresh" if absd >= 0.45 else "healthy")
+    # POSTURE — is this trade actually in trouble? A far-OTM short (low Δ) is HEALTHY / winning; the
+    # "recovery" framing only makes sense once it's TESTED. Get this right or the whole lens contradicts
+    # itself (96% "recoverable" yet "needs a +36% bounce, outlook adverse").
+    posture = "tested" if severity != "healthy" else "healthy"
     exp_move = spot * max(iv0, 0.02) * math.sqrt(T)
+    # signed move from spot to breakeven: for a TESTED short it's the RECOVERY move needed; for a
+    # HEALTHY short it's the ADVERSE move the position can ABSORB before breakeven (the cushion).
+    move_to_be = round((be / spot - 1.0) * 100.0, 1) if be else None
+    needed_move_pct = move_to_be if posture == "tested" else None
+    cushion_pct = (abs(move_to_be) if move_to_be is not None else None) if posture == "healthy" else None
 
-    # ── the auditable build-up behind the score (same shape as the quant desk's factor list): the
-    #    PROBABILITY drivers. The router appends the TA factors (structure/momentum/VP/gamma) after.
     factors: list[dict] = []
-    if needed_move_pct is not None:
-        past = needed_move_pct <= 0
-        factors.append({"label": "Distance to breakeven", "kind": "prob", "favorable": bool(past or (dist_sigma is not None and dist_sigma <= 0.75)),
-                        "detail": (f"already {abs(needed_move_pct):.1f}% past breakeven — cushion, not a deficit" if past
-                                   else f"needs a {needed_move_pct:.1f}% bounce ({dist_sigma}σ) to reclaim ${round(be,2)} by expiry")})
-    factors.append({"label": "Time remaining", "kind": "prob", "favorable": bool(D and D >= 10),
-                    "detail": (f"{D} DTE — room for a bounce to develop" if (D and D >= 10)
-                               else f"{D} DTE — little runway left to recover")})
-    factors.append({"label": "Moneyness", "kind": "prob", "favorable": bool(absd < 0.55),
-                    "detail": f"tested short Δ {round(tdelta,2)} — {'right at' if absd < 0.6 else 'through'} the strike"})
+    if posture == "healthy":
+        factors.append({"label": "Cushion to breakeven", "kind": "prob", "favorable": True,
+                        "detail": (f"the stock can move {cushion_pct:.1f}% ({dist_sigma}σ) against you before "
+                                   f"${round(be,2)} — that's the cushion to breakeven at expiry"
+                                   if cushion_pct is not None else "well clear of the strike")})
+        factors.append({"label": "Time / theta", "kind": "prob", "favorable": True,
+                        "detail": f"{D} DTE of decay working FOR you (more time is also more chance to get tested)"})
+    else:
+        if needed_move_pct is not None:
+            past = needed_move_pct <= 0
+            factors.append({"label": "Distance to breakeven", "kind": "prob",
+                            "favorable": bool(past or (dist_sigma is not None and dist_sigma <= 0.75)),
+                            "detail": (f"already {abs(needed_move_pct):.1f}% past breakeven — cushion, not a deficit" if past
+                                       else f"needs a {needed_move_pct:.1f}% move ({dist_sigma}σ) to reclaim ${round(be,2)} by expiry")})
+        factors.append({"label": "Time remaining", "kind": "prob", "favorable": bool(D and D >= 10),
+                        "detail": (f"{D} DTE — room for a bounce to develop" if (D and D >= 10)
+                                   else f"{D} DTE — little runway left to recover")})
+    mny = ("far OTM, well clear of the strike" if absd < 0.20 else "moderately OTM" if absd < 0.38
+           else "approaching the strike" if absd < 0.60 else "right at the strike" if absd < 0.85 else "through the strike")
+    factors.append({"label": "Moneyness", "kind": "prob", "favorable": bool(absd < 0.30),
+                    "detail": f"short Δ {round(tdelta,2)} — {mny}"})
     factors.append({"label": "Implied vol", "kind": "prob", "favorable": None,
-                    "detail": f"σ ≈ {iv0*100:.0f}% → ±${exp_move:.2f} expected move by expiry (helps a bounce, but also the risk)"})
+                    "detail": f"σ ≈ {iv0*100:.0f}% → ±${exp_move:.2f} expected move by expiry"})
 
     return {
-        "recovery_score": hold_pop,                # P(finish at/above breakeven) holding as-is
+        "recovery_score": hold_pop,                # HEALTHY: P(keep the premium / expire OTM). TESTED: P(recover to breakeven).
+        "posture": posture,                        # healthy = safe/winning; tested = in trouble
         "breakeven": round(be, 2) if be else None,
-        "needed_move_pct": needed_move_pct,        # % spot move to reclaim breakeven
+        "needed_move_pct": needed_move_pct,        # % move to reclaim breakeven (TESTED only)
+        "cushion_pct": cushion_pct,                # adverse % move the position can absorb (HEALTHY only)
         "dist_to_be_sigma": dist_sigma,            # that move in std-devs to the horizon
         "expected_move": round(exp_move, 2),       # ±1σ $ move to expiry (the yardstick for the above)
         "tested_delta": round(tdelta, 2),
@@ -298,7 +338,7 @@ def _recoverability(*, spot, K, right, C, iv0, D, r, hold_legs, hold_pop) -> dic
     }
 
 
-def _assignment(*, now_val, spot, K, right, C, iv0, D, r, n, ex_div=None) -> dict:
+def _assignment(*, now_val, spot, K, right, C, iv0, D, r, n, ex_div=None, covered=False, stock_basis=None) -> dict:
     """Lens 2 — ASSIGNMENT (the real risk on a trapped short). Risk-neutral P(finish ITM), the
     extrinsic value left (→ early-exercise pressure), pin risk into expiry, and the DOLLAR
     consequence of being assigned (effective basis / capital tied up)."""
@@ -328,9 +368,15 @@ def _assignment(*, now_val, spot, K, right, C, iv0, D, r, n, ex_div=None) -> dic
     if right == "P":
         consequence = (f"Assignment ⇒ you BUY {int(100 * n)} sh at ${K:.0f} (effective ${basis:.2f} after the "
                        f"${C:.2f} credit) — ${cap:,.0f} of cash committed.")
+    elif covered:
+        basis = round(stock_basis if stock_basis else (K - C), 2)
+        gain = "a gain" if K >= basis else "a small loss"
+        consequence = (f"Called away ⇒ your {int(100 * n)} shares are SOLD at ${K:.0f}. This is a CAPPED outcome, not an "
+                       f"unbounded loss: you keep the ${C:.2f} premium plus {gain} from ${basis:.2f} to ${K:.0f}. Roll the "
+                       "call up/out ONLY to keep more upside — the downside is the stock's, not the option's.")
     else:
-        consequence = (f"Assignment ⇒ {int(100 * n)} sh CALLED AWAY at ${K:.0f} — covered: keep premium + gain to "
-                       "the strike but cap the upside; naked: left short the shares.")
+        consequence = (f"Assignment ⇒ {int(100 * n)} sh CALLED AWAY at ${K:.0f} — NAKED: you're left short {int(100 * n)} "
+                       "shares (unbounded upside risk). Cap it (buy a long call) or roll up/out.")
     return {
         "p_itm": p_itm, "extrinsic": extrinsic, "intrinsic": round(intrinsic, 2),
         "early_assignment_risk": early, "early_reason": early_reason,
@@ -357,7 +403,7 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
                         roll_days: int = 45, atm_iv: float = 0.30,
                         chains: Optional[dict] = None, ex_div: Optional[dict] = None,
                         near_expiry: Optional[str] = None, far_expiry: Optional[str] = None,
-                        base_date: Optional[str] = None) -> dict:
+                        base_date: Optional[str] = None, stock: Optional[dict] = None) -> dict:
     """Build the repair menu for the WHOLE position.
 
     legs: the trade's option legs [{strike, right('P'/'C'), sign(+1/−1), qty, entry}] (entry = the
@@ -371,7 +417,7 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
     import datetime as _dt
     D = int(dte_days)
     Dg = D + roll_days
-    pr = _Pricer(r, atm_iv, chains or {}, [D, Dg])
+    pr = _Pricer(r, atm_iv, chains or {}, [D, Dg], spot=spot)
 
     # normalize the held legs, tagging each with its live skew IV.
     hold: list[dict] = []
@@ -409,7 +455,7 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
     alts: list[dict] = []
     # 0) CLOSE ALL — the benchmark.
     alts.append({
-        "name": "Close the trade", "category": "exit",
+        "name": "Close the trade", "category": "exit", "group": "benchmark",
         "mechanics": "Unwind every leg at current prices and walk.",
         "rationale": "Realizes the current P&L with certainty — the bar every repair must clear.",
         "risk_note": "Certain outcome — the benchmark.",
@@ -442,11 +488,96 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
         else:
             realized = _close_realized([tested], now_val)
             est = _close_cash([tested], now_val) + _open_cash(cal)      # close the lost strike, open both legs
-        row = _build(name=name, category="calendar", mechanics=mechanics, legs=cal, realized=realized,
-                     stock=None, establish_cash=est, spot=spot, r=r, iv_ref=iv0, rationale=rationale)
-        # Only surface a calendar worth doing: it must be able to profit (keep) or beat closing AND
-        # have a real shot (re-center). Calendars only earn their keep with term-structure / skew edge.
-        if row["max_gain"] > (0 if keep else unreal) and (row.get("pop_pct") or 0) >= 5:
+        row = _build(name=name, category="calendar", group=("adjust" if keep else "replace"),
+                     mechanics=mechanics, legs=cal, realized=realized, stock=None, establish_cash=est,
+                     spot=spot, r=r, iv_ref=iv0, rationale=rationale)
+        # A KEEP calendar/diagonal is a fix worth SHOWING even when marginal (its numbers speak for it);
+        # a re-center (replace) must beat closing flat with a real shot before it earns a slot.
+        ok = (row.get("pop_pct") is not None) if keep else (row["max_gain"] > unreal and (row.get("pop_pct") or 0) >= 5)
+        if ok:
+            alts.append(row)
+
+    def _add_ratio(rc, mode):
+        """Directional RECOVERY structures that REPLACE the tested short (close it, redeploy) in the
+        recovery direction (rc='C' recovers a tested PUT on a bounce, rc='P' recovers a tested CALL on a
+        drop). Replacing — not overlaying — banks the loss, removes the assignment risk, and avoids
+        DOUBLING the delta a deep-ITM short already carries. 'zebra' = buy 2 ITM + sell 1 ATM (a
+        Zero-Extrinsic Back-Ratio ≈ ±100Δ stock replacement, ~no extrinsic to decay, DEFINED risk);
+        'backratio' = sell 1 near + buy 2 farther OTM (cheap convexity, big payoff on a strong move,
+        DEFINED risk). Gated to beat simply closing flat."""
+        up = (rc == "C")
+        if mode == "zebra":
+            K_atm = pr.snap(D, spot)
+            K_itm = pr.snap(D, spot * (0.85 if up else 1.15))
+            if (up and K_itm >= K_atm) or ((not up) and K_itm <= K_atm):
+                return
+            new = [L(K_itm, rc, 1, D, pr.entry(D, K_itm, rc, spot), qty=2 * n),
+                   L(K_atm, rc, -1, D, pr.entry(D, K_atm, rc, spot), qty=n)]
+            name = f"Replace with a {'call' if up else 'put'} ZEBRA (2×${K_itm:.0f} / −1×${K_atm:.0f})"
+            mech = (f"CLOSE the ${K:.0f} {'put' if right == 'P' else 'call'} and BUY 2× the ${K_itm:.0f} {'call' if up else 'put'} "
+                    f"& SELL 1× the ${K_atm:.0f} — a Zero-Extrinsic Back-Ratio ≈ {'+' if up else '−'}100Δ stock replacement "
+                    f"(almost no time premium to decay), so a {'bounce' if up else 'pullback'} claws the loss back; risk DEFINED at the debit.")
+            rat = (f"Bank the loss + remove assignment risk, then get a clean, capital-efficient ~{'+' if up else '−'}100 delta with a "
+                   f"DEFINED max loss (the debit) and no naked tail — the pro's stock-replacement recovery, without doubling a deep short's delta.")
+        else:  # backratio (1×2)
+            K_s = pr.snap(D, spot * (1.02 if up else 0.98))
+            K_l = pr.wing(D, K_s, "above" if up else "below", max(spot * 0.06, 0.7 * pr.sigma(spot, D, iv0)))
+            if (up and K_l <= K_s) or ((not up) and K_l >= K_s):
+                return
+            new = [L(K_s, rc, -1, D, pr.entry(D, K_s, rc, spot), qty=n),
+                   L(K_l, rc, 1, D, pr.entry(D, K_l, rc, spot), qty=2 * n)]
+            name = f"Replace with a {'call' if up else 'put'} back-ratio (−1×${K_s:.0f} / +2×${K_l:.0f})"
+            mech = (f"CLOSE the ${K:.0f} {'put' if right == 'P' else 'call'}; SELL 1× ${K_s:.0f} & BUY 2× ${K_l:.0f} {'calls' if up else 'puts'} "
+                    f"— cheap/credit convexity that pays off big on a strong {'rally' if up else 'drop'}; DEFINED risk (buy 2 > sell 1).")
+            rat = (f"Bank the loss, then finance {'upside' if up else 'downside'} convexity for near-zero cost — a sharp {'bounce' if up else 'pullback'} "
+                   f"recovers with leverage; worst case a KNOWN max loss near ${K_l:.0f}. Advanced when you expect a fast move back.")
+        row = _build(name=name, category="ratio", group="replace", mechanics=mech, legs=new,
+                     realized=_close_realized([tested], now_val), stock=None,
+                     establish_cash=_close_cash([tested], now_val) + _open_cash(new),
+                     spot=spot, r=r, iv_ref=iv0, rationale=rat)
+        if (row.get("pop_pct") or 0) >= 8 and row["max_gain"] > unreal:   # a replacement must beat closing flat
+            alts.append(row)
+
+    def _add_butterfly(rc, mode):
+        """Defined-risk recovery TENT kept ON TOP of the tested short (a FIX — a fly barely moves delta,
+        so it doesn't over-expose the way a ZEBRA would). rc='C' recovers a tested put on a bounce,
+        rc='P' a tested call on a drop. 'tent' = a near-dated fly centered a modest move toward recovery
+        (cheap bet the stock lands at the target); 'diagonal' = a calendarised fly (short body near D,
+        long wings far Dg) that ALSO harvests near theta with longer-dated protection."""
+        up = (rc == "C")
+        wg = max(spot * 0.04, 0.6 * pr.sigma(spot, D, iv0))
+        Kc = pr.snap(D, spot + (0.5 if up else -0.5) * pr.sigma(spot, D, iv0))     # recovery-target center
+        Klo = pr.wing(D, Kc, "below", wg)
+        Khi = pr.wing(D, Kc, "above", wg)
+        if not (Klo < Kc < Khi):
+            return
+        if mode == "tent":
+            fly = [L(Klo, rc, 1, D, pr.entry(D, Klo, rc, spot)),
+                   L(Kc, rc, -1, D, pr.entry(D, Kc, rc, spot), qty=2 * n),
+                   L(Khi, rc, 1, D, pr.entry(D, Khi, rc, spot))]
+            name = f"Add a {'call' if up else 'put'} butterfly tent (${Klo:.0f}/{Kc:.0f}/{Khi:.0f})"
+            mech = (f"Keep the tested short; add a {'call' if up else 'put'} fly +1 ${Klo:.0f} / −2 ${Kc:.0f} / +1 ${Khi:.0f} "
+                    f"~{D}d — a cheap DEFINED-risk tent that pays if the stock {'bounces' if up else 'pulls back'} to ~${Kc:.0f}.")
+            rat = (f"A low-cost, defined-risk bet on a {'bounce' if up else 'pullback'} to ~${Kc:.0f} — the surgeon's fix: keep the "
+                   f"trade, add a targeted recovery tent for a small known cost. Best when you have a specific target in mind.")
+        else:  # ASYMMETRIC BROKEN-WING FLY — widen the outer wing on the risky side so it leans to a
+               # CREDIT and reshapes the payoff into a defined-risk tent (transform the risk array).
+            Klo = pr.wing(D, Kc, "below", (wg if up else 2.2 * wg))
+            Khi = pr.wing(D, Kc, "above", (2.2 * wg if up else wg))
+            if not (Klo < Kc < Khi):
+                return
+            fly = [L(Klo, rc, 1, D, pr.entry(D, Klo, rc, spot)),
+                   L(Kc, rc, -1, D, pr.entry(D, Kc, rc, spot), qty=2 * n),
+                   L(Khi, rc, 1, D, pr.entry(D, Khi, rc, spot))]
+            name = f"Asymmetric broken-wing fly (${Klo:.0f}/{Kc:.0f}/${Khi:.0f})"
+            mech = (f"Keep the tested short; add a broken-wing {'call' if up else 'put'} fly +1 ${Klo:.0f} / −2 ${Kc:.0f} / "
+                    f"+1 ${Khi:.0f} ~{D}d — the {'upper' if up else 'lower'} wing is WIDENED so the fly leans to a CREDIT and "
+                    f"reshapes the P&L into a defined-risk tent centered ~${Kc:.0f}.")
+            rat = ("Transform the risk array — the broken (wider) wing tilts the fly to a credit and reshapes the payoff into a "
+                   "defined-risk profit tent for little/no cost. The quant's 'reshape the array, don't just roll' move.")
+        row = _build(name=name, category="butterfly", group="adjust", mechanics=mech, legs=[dict(tested)] + fly,
+                     realized=0.0, stock=None, establish_cash=_open_cash(fly), spot=spot, r=r, iv_ref=iv0, rationale=rat)
+        if row["max_gain"] > 0 and row.get("pop_pct") is not None:
             alts.append(row)
 
     if lone_short and right == "P":   # ── CSP: rich single-leg menu ─────────────────────────────
@@ -472,6 +603,22 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
                 establish_cash=_close_cash([tested], now_val) + _open_cash(sp_legs),
                 spot=spot, r=r, iv_ref=iv0,
                 rationale="Same downside relief as the naked roll, but the long wing turns the open put tail into a KNOWN max loss — roll AND cap in one move."))
+
+        # 1b2) ROLL UP + PROTECTION — raise the short TOWARD spot for a fatter credit and BUY a long put
+        #      below to CAP the (now larger) tail: a defined-risk, higher-income rangebound bet.
+        Kup = pr.snap(D, spot - 0.30 * pr.sigma(spot, D, iv0))                 # closer short = real premium
+        Kup_far = pr.wing(D, Kup, "below", max(spot * 0.05, 1.0 * pr.sigma(spot, D, iv0)))   # ~1σ protection wing
+        if Kup > K and Kup_far < Kup:                         # only if it genuinely rolls UP (closer to spot)
+            up_legs = [L(Kup, "P", -1, D, pr.entry(D, Kup, "P", spot)), L(Kup_far, "P", 1, D, pr.entry(D, Kup_far, "P", spot))]
+            _rowup = _build(
+                name=f"Roll up + protection (${Kup:.0f}/{Kup_far:.0f} spread)", category="defined_risk",
+                mechanics=f"Buy back the ${K:.0f} put; SELL the ${Kup:.0f} put (closer to spot = MORE premium) & BUY the ${Kup_far:.0f} put as protection ~{D}d — a DEFINED-risk credit spread that pulls in extra income and caps the tail at the ${abs(Kup-Kup_far):.0f} width.",
+                legs=up_legs, realized=_close_realized([tested], now_val), stock=None,
+                establish_cash=_close_cash([tested], now_val) + _open_cash(up_legs),
+                spot=spot, r=r, iv_ref=iv0,
+                rationale=f"Get PAID more AND cap the risk — raise the short to ${Kup:.0f} for a fatter credit, buy the ${Kup_far:.0f} wing so max loss is KNOWN. A rangebound income bet: profits if the stock holds over ${Kup:.0f}; the closer short raises breach odds, but the wing bounds it. The aggressive 'roll up + protection' play.")
+            if _rowup["max_gain"] > 0:
+                alts.append(_rowup)
 
         # 1c) WIDEN TO A STRANGLE — sell an untested-side call to pull in fresh credit that offsets the
         #     put loss. Adds an UPSIDE tail (undefined), so it's a rangebound-view play only.
@@ -533,7 +680,7 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
                    L(Kl, "P", 1, D, pr.entry(D, Kl, "P", spot))]
             fly_open = _open_cash(bwb)                    # the fly's OWN cost (excludes closing the loss)
             row = _build(
-                name=f"Re-center into a broken-wing fly (${Kl:.0f}/{Kb:.0f}/{Kh:.0f})", category="defined_risk",
+                name=f"Re-center into a broken-wing fly (${Kl:.0f}/{Kb:.0f}/{Kh:.0f})", category="butterfly", group="replace",
                 mechanics=f"Close the ${K:.0f} put; open a put fly +1 ${Kh:.0f} / −2 ${Kb:.0f} / +1 ${Kl:.0f} — profit TENT re-centers to ~${Kb:.0f} (spot), defined risk.",
                 legs=bwb, realized=_close_realized([tested], now_val), stock=None,
                 establish_cash=_close_cash([tested], now_val) + fly_open, spot=spot, r=r, iv_ref=iv0,
@@ -559,9 +706,9 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
         # lost strike and opens an at-the-money calendar (the play when the stock has run far away).
         far_kp = pr.entry(Dg, K, "P", spot)
         _add_calendar("P", K, K, keep=True,
-            name=f"Convert to a put calendar (buy the ${K:.0f} put ~{Dg}d)",
-            mechanics=f"Keep the near ${K:.0f} put; BUY the ${K:.0f} put ~{Dg}d (~${far_kp:.2f}) — harvest the rich near-term theta while the long far put DEFINES the downside; roll the near short down each cycle.",
-            rationale=f"Term-structure defense — own cheaper far vol, sell richer near vol, downside DEFINED. Profits most if the stock stabilizes near ${K:.0f}; best on a fresh breach.")
+            name=f"Calendarised gamma hedge (buy the ${K:.0f} put ~{Dg}d)",
+            mechanics=f"Keep the near ${K:.0f} put; BUY the ${K:.0f} put ~{Dg}d (~${far_kp:.2f}) — the long far put's gamma OFFSETS the near short's gamma at the strike, FLATTENING the curve so a breach whipsaws you far less, DEFINES the downside, and harvests the rich near vol; roll the near short down each cycle.",
+            rationale=f"Calendarised gamma hedge — flattens the short's gamma at ${K:.0f}, defines the downside, sells richer near vol vs cheaper far. Profits most if the stock stabilizes near ${K:.0f}; best on a fresh breach.")
         Kdl = pr.wing(Dg, K, "below", max(spot * 0.05, 0.6 * pr.sigma(spot, Dg, iv0)))
         if Kdl < K:
             _add_calendar("P", K, Kdl, keep=True,
@@ -573,6 +720,13 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
             name=f"Re-center into a put calendar (${Kspot:.0f}, at spot)",
             mechanics=f"CLOSE the ${K:.0f} put (bank the loss) and open a fresh ${Kspot:.0f} put calendar at the money (short ~{D}d / long ~{Dg}d) — stop defending the strike the stock left behind.",
             rationale=f"The re-center calendar: bank the loss on the abandoned strike and redeploy into an at-the-money calendar that makes money on stabilization near ${Kspot:.0f} + term-structure decay. The desk's 'trade where the stock IS', as a vol structure — the advanced move for a deep loss.")
+
+        # BUTTERFLY recovery tents (FIX — keep the short; a fly barely moves delta) + RATIO / BACK-RATIO
+        # REPLACEMENTS (tested put recovers on an UP move → CALL structures).
+        _add_butterfly("C", "tent")
+        _add_butterfly("C", "diagonal")
+        _add_ratio("C", "zebra")
+        _add_ratio("C", "backratio")
 
     elif lone_short and right == "C":  # ── naked/covered short call: mirror ───────────────────────
         K2 = pr.wing(Dg, K, "above", max(spot * 0.05, 0.5 * pr.sigma(spot, Dg, iv0)))
@@ -597,11 +751,27 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
                 spot=spot, r=r, iv_ref=iv0,
                 rationale="The roll every naked-call defense should prefer: raises the strike AND turns the unbounded upside tail into a known max loss."))
 
+        # 1b2) ROLL DOWN + PROTECTION — lower the short TOWARD spot for a fatter credit and BUY a long
+        #      call above to CAP the (now larger) tail: a defined-risk, higher-income rangebound bet.
+        Kdn = pr.snap(D, spot + 0.30 * pr.sigma(spot, D, iv0))                 # closer short = real premium
+        Kdn_far = pr.wing(D, Kdn, "above", max(spot * 0.05, 1.0 * pr.sigma(spot, D, iv0)))   # ~1σ protection wing
+        if Kdn < K and Kdn_far > Kdn:                          # only if it genuinely rolls DOWN (closer to spot)
+            dn_legs = [L(Kdn, "C", -1, D, pr.entry(D, Kdn, "C", spot)), L(Kdn_far, "C", 1, D, pr.entry(D, Kdn_far, "C", spot))]
+            _rowdn = _build(
+                name=f"Roll down + protection (${Kdn:.0f}/{Kdn_far:.0f} spread)", category="defined_risk",
+                mechanics=f"Buy back the ${K:.0f} call; SELL the ${Kdn:.0f} call (closer to spot = MORE premium) & BUY the ${Kdn_far:.0f} call as protection ~{D}d — a DEFINED-risk credit spread that pulls in extra income and caps the tail at the ${abs(Kdn_far-Kdn):.0f} width.",
+                legs=dn_legs, realized=_close_realized([tested], now_val), stock=None,
+                establish_cash=_close_cash([tested], now_val) + _open_cash(dn_legs),
+                spot=spot, r=r, iv_ref=iv0,
+                rationale=f"Get PAID more AND cap the risk — lower the short to ${Kdn:.0f} for a fatter credit, buy the ${Kdn_far:.0f} wing so max loss is KNOWN. A rangebound income bet: profits if the stock holds under ${Kdn:.0f}; the closer short raises breach odds, but the wing bounds it. The aggressive 'roll down + protection' play.")
+            if _rowdn["max_gain"] > 0:                         # only when it can actually profit (else it's a bad roll)
+                alts.append(_rowdn)
+
         # 1c) WIDEN TO A STRANGLE — sell an untested-side put to pull in fresh credit that offsets the
         #     call loss. Rangebound-view play; the short put adds a (bounded) downside exposure.
         Ksp = pr.snap(D, spot - 0.7 * pr.sigma(spot, D, iv0))
         csp3 = pr.entry(D, Ksp, "P", spot)
-        if csp3 >= 0.15 and 0 < Ksp < spot:
+        if csp3 >= 0.15 and 0 < Ksp < spot and not stock:   # NEVER bolt a naked put onto a COVERED call
             alts.append(_build(
                 name=f"Widen to a strangle (sell the ${Ksp:.0f} put)", category="overlay",
                 mechanics=f"Keep the ${K:.0f} call and SELL the ${Ksp:.0f} put (~${csp3:.2f}) — pulls in ${csp3*_MULT*n:.0f} of new credit that lowers your net breakeven and recovers part of the loss if the stock stays rangebound.",
@@ -625,14 +795,21 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
         # breach); (b) re-center closes the run-over strike and opens an at-the-money call calendar.
         far_kc = pr.entry(Dg, K, "C", spot)
         _add_calendar("C", K, K, keep=True,
-            name=f"Convert to a call calendar (buy the ${K:.0f} call ~{Dg}d)",
-            mechanics=f"Keep the near ${K:.0f} call; BUY the ${K:.0f} call ~{Dg}d (~${far_kc:.2f}) — turns the unbounded upside into a DEFINED-risk calendar (long far call caps it) and harvests the rich near vol; roll the near short up each cycle.",
-            rationale=f"The professional 'cap the tail AND keep selling' defense — long far call defines the upside, near short decays fastest, you own cheaper far vol. Best if the stock stalls near ${K:.0f}.")
+            name=f"Calendarised gamma hedge (buy the ${K:.0f} call ~{Dg}d)",
+            mechanics=f"Keep the near ${K:.0f} call; BUY the ${K:.0f} call ~{Dg}d (~${far_kc:.2f}) — the long far call's gamma OFFSETS the near short's gamma at the strike, FLATTENING the curve so a breach hurts far less, and turns the unbounded upside into DEFINED risk while harvesting the rich near vol; roll the near short up each cycle.",
+            rationale=f"Calendarised gamma hedge — long far call flattens the short's gamma at ${K:.0f} (a breach no longer whipsaws you), defines the upside, and you own cheaper far vol vs richer near. The 'cap the tail AND keep selling' defense; best if the stock stalls near ${K:.0f}.")
         Kspot = pr.snap(D, spot)
         _add_calendar("C", Kspot, Kspot, keep=False,
             name=f"Re-center into a call calendar (${Kspot:.0f}, at spot)",
             mechanics=f"CLOSE the ${K:.0f} call (bank the loss) and open a fresh ${Kspot:.0f} call calendar at the money (short ~{D}d / long ~{Dg}d) — stop defending the strike the stock ran through.",
             rationale=f"The re-center calendar: bank the loss on the run-over strike and redeploy into an at-the-money calendar that profits on stabilization near ${Kspot:.0f} + term-structure decay. The advanced move for a call the stock has left far below.")
+
+        # BUTTERFLY recovery tents (FIX — keep the short) + RATIO / BACK-RATIO REPLACEMENTS
+        # (tested call recovers on a DOWN move → PUT structures).
+        _add_butterfly("P", "tent")
+        _add_butterfly("P", "diagonal")
+        _add_ratio("P", "zebra")
+        _add_ratio("P", "backratio")
         _delta_hedge(alts, _build, tested, spot, D, r, iv0, C, n, "call")
 
     else:   # ── MULTI-LEG structure (vertical / condor / strangle): STRUCTURAL repairs ──────────
@@ -673,9 +850,9 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
 
     # ── HOLD-AS-IS baseline — the "do nothing" row every repair is judged against.
     hold_row = _build(
-        name="Hold as-is (do nothing)", category="hold",
+        name="Hold as-is (do nothing)", category="hold", group="benchmark",
         mechanics="Keep every leg unchanged and carry the position to expiry.",
-        legs=[dict(lg) for lg in hold], realized=0.0, stock=None, establish_cash=0.0,
+        legs=[dict(lg) for lg in hold], realized=0.0, stock=stock, establish_cash=0.0,
         spot=spot, r=r, iv_ref=iv0,
         rationale="The no-action baseline — the recovery odds and expected P&L if you simply sit. Every repair is measured against this.")
     hold_pop, hold_ev, hold_ml = hold_row.get("pop_pct"), hold_row.get("ev"), hold_row.get("max_loss")
@@ -706,17 +883,18 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
             if lg.get("right") in ("P", "C"):
                 lg["expiry"] = _expiry_for(lg.get("dte_days"))
 
+    _covered = bool(stock and (stock.get("shares") or 0) >= 100 * n and right == "C")
     return {
         "tested": bool(cushion_pct < 5.0), "cushion_pct": round(cushion_pct, 1),
         "short_right": right, "short_strike": K, "spot": round(spot, 2),
         "dte_days": D, "contracts": n, "unrealized_pnl": round(unreal, 0),
-        "structure": _classify(hold),
+        "structure": ("covered_call" if _covered else _classify(hold)), "covered": _covered,
         "pricing": ("live chain mid + skew IV (horizon marks BS-calibrated)" if chains else "model (Black-Scholes) — indicative"),
         # Lens 1/2 + the decision clock — all off the one chain fetch, no extra I/O.
         "recoverability": _recoverability(spot=spot, K=K, right=right, C=C, iv0=iv0, D=D, r=r,
-                                          hold_legs=hold, hold_pop=hold_pop),
+                                          hold_legs=hold, hold_pop=hold_pop, stock=stock),
         "assignment": _assignment(now_val=now_val, spot=spot, K=K, right=right, C=C, iv0=iv0, D=D, r=r,
-                                  n=n, ex_div=ex_div),
+                                  n=n, ex_div=ex_div, covered=_covered, stock_basis=(stock or {}).get("basis")),
         "cost_of_waiting": _cost_of_waiting(spot=spot, iv0=iv0, D=D, r=r, hold_legs=hold),
         "hold": {"pop_pct": hold_pop, "expected_pnl": hold_ev, "max_loss": hold_ml,
                  "greeks": hold_row.get("greeks"), "breakevens": hold_row.get("breakevens")},

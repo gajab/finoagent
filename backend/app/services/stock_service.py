@@ -763,7 +763,9 @@ TECHNICAL_TIMEFRAMES: dict[str, dict] = {
     # Multi-day / weekly swing
     "swing":        {"label": "Swing (3mo / 1h)",              "period": "3mo",  "interval": "1h"},
     # Position trading — weeks to months
+    "quarter_1d":   {"label": "Position (3mo / 1d)",           "period": "3mo",  "interval": "1d"},
     "medium_term":  {"label": "Medium Term (6mo / 1d)",        "period": "6mo",  "interval": "1d"},
+    "year_1d":      {"label": "Position (1y / 1d)",            "period": "1y",   "interval": "1d"},
     # Long-term investor view
     "long_term":    {"label": "Long Term (5y / 1wk)",          "period": "5y",   "interval": "1wk"},
 }
@@ -1084,8 +1086,13 @@ def _fetch_stock_data_sync(ticker: str) -> dict:
     except Exception:
         pass
 
-    # ======= TECHNICAL DATA (default: 15 days / 30-min) =======
-    technical = compute_technical_block(stock, _DEFAULT_TIMEFRAME)
+    # ======= TECHNICAL DATA =======
+    # Default to the DAILY swing view (medium_term, 6mo/1d) so the stock page's technical read —
+    # including the institutional regime/bias — is computed on the same daily structure the Setups
+    # and Advanced tabs use, and matches the frontend's default timeframe selector. (Previously this
+    # shipped a 15d/30-min intraday block while the UI selector said "Medium", so the label and the
+    # drawn chart/read disagreed — an intraday pullback could read "bearish" against a daily uptrend.)
+    technical = compute_technical_block(stock, "medium_term")
 
     # ======= MOMENTUM INDICATORS (always daily) =======
     technical.update(compute_momentum_indicators(stock))

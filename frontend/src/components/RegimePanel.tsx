@@ -1,18 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Gauge, ChevronDown, ChevronUp, Loader2, RefreshCw, Eye, TrendingUp, TrendingDown, Minus,
+  Gauge, ChevronDown, ChevronUp, Loader2, RefreshCw, TrendingUp, TrendingDown, Minus, GitMerge,
 } from 'lucide-react';
-import {
-  Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement,
-  Filler, Tooltip, type ChartOptions,
-} from 'chart.js';
-import { Line } from 'react-chartjs-2';
 import { fetchRegime, analyzeTa } from '../api';
-import type { RegimeData } from '../types';
+import type { RegimeData, ConfluenceZone, CandleInterval } from '../types';
 import IndicatorAIConsole from './IndicatorAIConsole';
-import { makeLevelPlugin, type OverlayLine } from './taOverlay';
-
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip);
+import TAChart from './TAChart';
+import type { OverlayLine } from './taOverlay';
+import { useLocalState, usePersistentSet, nearPrice, LevelProximity, LayerChips, confluenceBands, useTARegister, type ProxItem } from './taShared';
 
 interface Layer { id: string; group: string; label: string; sub?: string; tone: string; color: string; lines?: OverlayLine[]; json: Record<string, unknown> }
 
@@ -40,7 +35,7 @@ function buildLayers(d: RegimeData): Layer[] {
       id: 'zscore', group: 'Statistical extremes', tone: 'text-amber-400', color: 'rgb(251,191,36)',
       label: `50-day VWAP z-score ${z.z}`,
       sub: `${z.state}${z.vwap != null ? ` · VWAP $${z.vwap}` : ''}`,
-      lines: z.vwap != null ? [{ price: z.vwap, label: `50d VWAP $${z.vwap} (z ${z.z})`, dash: [6, 4] }] : undefined,
+      lines: z.vwap != null ? [{ price: z.vwap, label: `50d VWAP $${z.vwap} (z ${z.z})`, color: 'rgb(251,191,36)', dash: [6, 4] }] : undefined,
       json: { indicator: 'vwap_zscore', window: z.window, vwap: z.vwap, z: z.z, state: z.state, distance_pct: z.distance_pct },
     });
   }
@@ -73,29 +68,42 @@ function Banner({ d }: { d: RegimeData }) {
   );
 }
 
-export default function RegimePanel({ ticker }: { ticker: string; price?: number }) {
+function toLines(sel: Layer[]): OverlayLine[] {
+  return sel.flatMap(l => (l.lines || []).map(ln => ({ price: ln.price, label: ln.label, color: ln.color || l.color, dash: ln.dash })));
+}
+function proxItems(layers: Layer[]): ProxItem[] {
+  return layers.flatMap(l => (l.lines || []).map(ln => ({ id: l.id, price: ln.price, label: ln.label, color: ln.color || l.color, json: l.json })));
+}
+
+export default function RegimePanel({ ticker, price, confluenceZones }: { ticker: string; price?: number; confluenceZones?: ConfluenceZone[] }) {
   const [expanded, setExpanded] = useState(false);
   const [data, setData] = useState<RegimeData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = usePersistentSet('ta:sel:regime');
+  const [interval, setInterval] = useLocalState<CandleInterval>('ta:iv:regime', '1d');
+  const [showConfluence, setShowConfluence] = useLocalState('ta:conf:regime', false);
+  const [chartSpot, setChartSpot] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true); setError(null);
     try {
       const r = await fetchRegime(ticker);
       setData(r.regime);
-      const def = new Set<string>();
-      if (r.regime.timeframes.daily) def.add('regime_daily');
-      if (r.regime.timeframes.h4) def.add('regime_h4');
-      if (r.regime.zscore) def.add('zscore');
-      setSelected(def);
+      setSelected(prev => {
+        if (prev.size) return prev;
+        const def = new Set<string>();
+        if (r.regime.timeframes.daily) def.add('regime_daily');
+        if (r.regime.timeframes.h4) def.add('regime_h4');
+        if (r.regime.zscore) def.add('zscore');
+        return def;
+      });
     } catch (e: any) {
       setError(e?.message || 'Failed to load regime');
     } finally { setLoading(false); }
-  }, [ticker]);
+  }, [ticker, setSelected]);
 
-  useEffect(() => { setData(null); setSelected(new Set()); setError(null); }, [ticker]);
+  useEffect(() => { setData(null); setError(null); }, [ticker]);
   useEffect(() => { if (expanded && !data && !loading && !error) load(); }, [expanded, data, loading, error, load]);
 
   const layers = useMemo(() => (data ? buildLayers(data) : []), [data]);
@@ -106,26 +114,19 @@ export default function RegimePanel({ ticker }: { ticker: string; price?: number
     return Array.from(m.entries());
   }, [layers]);
 
+  const spot = chartSpot ?? data?.price ?? price ?? null;
+  const lines = useMemo(() => toLines(selectedLayers), [selectedLayers]);
+  const bands = useMemo(() => (showConfluence ? confluenceBands(confluenceZones, spot) : []), [showConfluence, confluenceZones, spot]);
+  const near = useMemo(() => nearPrice(proxItems(layers), spot), [layers, spot]);
+
   const selectionJson = useMemo(() => ({
-    ticker, spot: data?.price ?? null, as_of: data?.as_of,
+    ticker, spot: data?.price ?? price ?? null, as_of: data?.as_of,
     regime_overall: data?.regime.overall, favored: data?.regime.favored,
     selected_indicators: selectedLayers.map(l => l.json),
-  }), [ticker, data, selectedLayers]);
+  }), [ticker, data, price, selectedLayers]);
+  useTARegister('regime', 'Market Regime', selectionJson, selectedLayers.length);
 
   const toggle = (id: string) => setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
-
-  const chartData = useMemo(() => {
-    const s = data?.price_series;
-    if (!s?.closes?.length) return null;
-    const step = Math.max(1, Math.floor(s.timestamps.length / 12));
-    return { labels: s.timestamps.map((t, i) => (i % step === 0 ? t.slice(5) : '')), datasets: [{ label: 'Price', data: s.closes, borderColor: 'rgb(148,163,184)', backgroundColor: 'rgba(148,163,184,0.08)', fill: true, borderWidth: 1.25, pointRadius: 0, tension: 0.1 }] };
-  }, [data]);
-  const chartOptions: ChartOptions<'line'> = useMemo(() => ({
-    responsive: true, maintainAspectRatio: false, animation: false as const, interaction: { mode: 'index', intersect: false },
-    plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `$${Number(c.parsed.y).toFixed(2)}` } } },
-    scales: { x: { ticks: { color: '#999', maxRotation: 0, autoSkip: true, maxTicksLimit: 10 }, grid: { display: false } }, y: { position: 'right', ticks: { color: '#999', callback: (v) => `$${Number(v).toFixed(0)}` }, grid: { color: 'rgba(128,128,128,0.12)' } } },
-  }), []);
-  const plugin = useMemo(() => makeLevelPlugin(selectedLayers.filter(l => l.lines).map(l => ({ color: l.color, lines: l.lines }))), [selectedLayers]);
 
   return (
     <div className="bg-base-300 rounded-xl overflow-hidden shadow-xl border border-white/[0.05]">
@@ -134,7 +135,7 @@ export default function RegimePanel({ ticker }: { ticker: string; price?: number
           <Gauge className="w-4 h-4 text-secondary" />
           <div>
             <h4 className="text-sm font-semibold text-base-content/90">Market Regime &amp; Statistical Extremes</h4>
-            <p className="text-[10px] text-base-content/50">Hurst exponent + Efficiency Ratio (Daily/4H) &amp; 50-day VWAP z-score → trend-vs-mean-revert playbook</p>
+            <p className="text-[10px] text-base-content/50">Hurst + Efficiency Ratio (Daily/4H) &amp; 50-day VWAP z-score → trend-vs-mean-revert playbook + candlestick chart</p>
           </div>
         </div>
         {expanded ? <ChevronUp className="w-4 h-4 shrink-0" /> : <ChevronDown className="w-4 h-4 shrink-0" />}
@@ -154,44 +155,28 @@ export default function RegimePanel({ ticker }: { ticker: string; price?: number
                   {data.regime.favored.map((f, i) => <span key={i} className="badge badge-sm bg-base-100/50 border-base-content/10">{f.replace(/_/g, ' ')}</span>)}
                 </div>
               )}
-              <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">
-                <div className="lg:col-span-2 space-y-2">
-                  <div className="flex items-center gap-1.5 text-[11px] text-base-content/50 uppercase tracking-wide"><Eye className="w-3.5 h-3.5" /> Indicators — shown on chart &amp; sent to AI</div>
-                  {groups.map(([g, gLayers]) => (
-                    <div key={g} className="rounded-lg border border-white/[0.06] bg-base-200/30 p-2">
-                      <span className="text-[11px] font-bold text-base-content/70">{g}</span>
-                      <div className="space-y-0.5 mt-1">
-                        {gLayers.map(l => (
-                          <label key={l.id} className="flex items-start gap-2 cursor-pointer py-0.5 hover:bg-base-100/30 rounded px-1">
-                            <input type="checkbox" className="checkbox checkbox-xs mt-0.5" checked={selected.has(l.id)} onChange={() => toggle(l.id)} />
-                            <span className="min-w-0 flex-1">
-                              <span className={`text-[11px] font-semibold ${l.tone}`}>{l.label}</span>
-                              {l.sub && <span className="block text-[10px] text-base-content/40 leading-tight truncate">{l.sub}</span>}
-                            </span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="lg:col-span-3 space-y-3">
-                  <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
-                    <div className="flex items-center justify-between mb-1 px-1">
-                      <span className="text-[11px] font-bold text-base-content/70 flex items-center gap-1"><Gauge className="w-3.5 h-3.5 text-secondary" /> Price &amp; 50-day VWAP</span>
-                      <span className="text-[10px] text-base-content/40">{selectedLayers.filter(l => l.lines).length} on chart</span>
-                    </div>
-                    {chartData ? <div className="h-64"><Line key={[...selected].sort().join('|')} data={chartData} options={chartOptions} plugins={[plugin]} /></div>
-                      : <div className="text-center text-xs text-base-content/40 py-10">No price series available.</div>}
-                  </div>
-                  <IndicatorAIConsole
-                    selectionJson={selectionJson}
-                    chips={selectedLayers.map(l => ({ key: l.id, label: l.label, tone: l.tone, onRemove: () => toggle(l.id) }))}
-                    analyzeFn={(sel, msgs) => analyzeTa(ticker, sel, msgs)}
-                    emptyHint="Select the regime or z-score layers to include them in the AI read."
-                  />
-                </div>
-              </div>
+              <LayerChips groups={groups.map(([name, ls]) => ({ name, layers: ls }))} selected={selected} onToggle={toggle}
+                onGroupAll={(ls, on) => setSelected(prev => { const n = new Set(prev); ls.forEach(l => on ? n.add(l.id) : n.delete(l.id)); return n; })} />
+              <TAChart
+                ticker={ticker} interval={interval} onInterval={setInterval}
+                lines={lines} bands={bands} height={400}
+                title={<>Price &amp; 50-day VWAP <span className="text-base-content/40 font-normal">· {lines.length} on chart</span></>}
+                rightExtra={confluenceZones?.length ? (
+                  <button onClick={() => setShowConfluence(v => !v)}
+                    className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold transition ${showConfluence ? 'bg-secondary/20 text-secondary' : 'text-base-content/45 hover:text-base-content'}`}
+                    title="Overlay high-conviction confluence zones">
+                    <GitMerge className="w-3 h-3" /> Confluence
+                  </button>
+                ) : undefined}
+                onSpot={setChartSpot}
+              />
+              <LevelProximity levels={near} onAdd={(l) => toggle(l.id)} />
+              <IndicatorAIConsole
+                selectionJson={selectionJson}
+                chips={selectedLayers.map(l => ({ key: l.id, label: l.label, tone: l.tone, onRemove: () => toggle(l.id) }))}
+                analyzeFn={(sel, msgs) => analyzeTa(ticker, sel, msgs)}
+                emptyHint="Toggle the regime or z-score layers below to include them in the AI read."
+              />
             </>
           )}
         </div>

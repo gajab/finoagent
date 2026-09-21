@@ -1,17 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Boxes, ChevronDown, ChevronUp, Loader2, RefreshCw, Eye, Zap } from 'lucide-react';
-import {
-  Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement,
-  Filler, Tooltip, type ChartOptions,
-} from 'chart.js';
-import { Line } from 'react-chartjs-2';
+import { Boxes, ChevronDown, ChevronUp, Loader2, RefreshCw, Zap, GitMerge } from 'lucide-react';
 import { fetchDealerPositioning, analyzeTa } from '../api';
-import type { DealerPositioningData } from '../types';
+import type { DealerPositioningData, ConfluenceZone, CandleInterval } from '../types';
 import IndicatorAIConsole from './IndicatorAIConsole';
 import GexChart from './GexChart';
-import { makeLevelPlugin, type OverlayLine, type OverlayBand } from './taOverlay';
-
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip);
+import TAChart from './TAChart';
+import type { OverlayLine, OverlayBand } from './taOverlay';
+import { useLocalState, usePersistentSet, nearPrice, LevelProximity, LayerChips, confluenceBands, useTARegister, type ProxItem } from './taShared';
 
 const RED = 'rgb(239,68,68)';
 const GREEN = 'rgb(34,197,94)';
@@ -88,12 +83,15 @@ function Banner({ d }: { d: DealerPositioningData }) {
   );
 }
 
-export default function DealerPositioningPanel({ ticker }: { ticker: string; price?: number }) {
+export default function DealerPositioningPanel({ ticker, price, confluenceZones }: { ticker: string; price?: number; confluenceZones?: ConfluenceZone[] }) {
   const [expanded, setExpanded] = useState(false);
   const [data, setData] = useState<DealerPositioningData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = usePersistentSet('ta:sel:dealer');
+  const [interval, setInterval] = useLocalState<CandleInterval>('ta:iv:dealer', '1d');
+  const [showConfluence, setShowConfluence] = useLocalState('ta:conf:dealer', false);
+  const [chartSpot, setChartSpot] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true); setError(null);
@@ -101,19 +99,22 @@ export default function DealerPositioningPanel({ ticker }: { ticker: string; pri
       const r = await fetchDealerPositioning(ticker);
       const dp = r.dealer_positioning;
       setData(dp);
-      const def = new Set<string>(['net_gex']);
-      if (dp.gamma_flip?.level != null) def.add('gamma_flip');
-      if (dp.gamma_levels?.call_resistance || dp.walls.call_wall) def.add('call_resistance');
-      if (dp.gamma_levels?.put_support || dp.walls.put_wall) def.add('put_support');
-      if (dp.gamma_levels?.hvl) def.add('hvl');
-      if (dp.expected_move.em_30d) def.add('em_30d');
-      setSelected(def);
+      setSelected(prev => {
+        if (prev.size) return prev;
+        const def = new Set<string>(['net_gex']);
+        if (dp.gamma_flip?.level != null) def.add('gamma_flip');
+        if (dp.gamma_levels?.call_resistance || dp.walls.call_wall) def.add('call_resistance');
+        if (dp.gamma_levels?.put_support || dp.walls.put_wall) def.add('put_support');
+        if (dp.gamma_levels?.hvl) def.add('hvl');
+        if (dp.expected_move.em_30d) def.add('em_30d');
+        return def;
+      });
     } catch (e: any) {
       setError(e?.message || 'Failed to load dealer positioning');
     } finally { setLoading(false); }
-  }, [ticker]);
+  }, [ticker, setSelected]);
 
-  useEffect(() => { setData(null); setSelected(new Set()); setError(null); }, [ticker]);
+  useEffect(() => { setData(null); setError(null); }, [ticker]);
   useEffect(() => { if (expanded && !data && !loading && !error) load(); }, [expanded, data, loading, error, load]);
 
   const layers = useMemo(() => (data ? buildLayers(data) : []), [data]);
@@ -131,20 +132,19 @@ export default function DealerPositioningPanel({ ticker }: { ticker: string; pri
   }), [ticker, data, selectedLayers]);
 
   const toggle = (id: string) => setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
-  const setGroup = (gLayers: Layer[], on: boolean) => setSelected(prev => { const n = new Set(prev); gLayers.forEach(l => on ? n.add(l.id) : n.delete(l.id)); return n; });
+  const setGroup = (gLayers: { id: string }[], on: boolean) => setSelected(prev => { const n = new Set(prev); gLayers.forEach(l => on ? n.add(l.id) : n.delete(l.id)); return n; });
 
-  const chartData = useMemo(() => {
-    const s = data?.price_series;
-    if (!s?.closes?.length) return null;
-    const step = Math.max(1, Math.floor(s.timestamps.length / 12));
-    return { labels: s.timestamps.map((t, i) => (i % step === 0 ? t.slice(5) : '')), datasets: [{ label: 'Price', data: s.closes, borderColor: 'rgb(148,163,184)', backgroundColor: 'rgba(148,163,184,0.08)', fill: true, borderWidth: 1.25, pointRadius: 0, tension: 0.1 }] };
-  }, [data]);
-  const chartOptions: ChartOptions<'line'> = useMemo(() => ({
-    responsive: true, maintainAspectRatio: false, animation: false as const, interaction: { mode: 'index', intersect: false },
-    plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `$${Number(c.parsed.y).toFixed(2)}` } } },
-    scales: { x: { ticks: { color: '#999', maxRotation: 0, autoSkip: true, maxTicksLimit: 10 }, grid: { display: false } }, y: { position: 'right', ticks: { color: '#999', callback: (v) => `$${Number(v).toFixed(0)}` }, grid: { color: 'rgba(128,128,128,0.12)' } } },
-  }), []);
-  const plugin = useMemo(() => makeLevelPlugin(selectedLayers.filter(l => l.lines || l.bands).map(l => ({ color: l.color, lines: l.lines, bands: l.bands }))), [selectedLayers]);
+  const spot = chartSpot ?? data?.price ?? price ?? null;
+  const overlays = useMemo(() => ({
+    lines: selectedLayers.flatMap(l => (l.lines || []).map(ln => ({ price: ln.price, label: ln.label, color: ln.color || l.color, dash: ln.dash }) as OverlayLine)),
+    bands: selectedLayers.flatMap(l => (l.bands || []).map(b => ({ top: b.top, bottom: b.bottom, label: b.label, color: b.color }) as OverlayBand)),
+  }), [selectedLayers]);
+  const chartBands = useMemo(() => [...overlays.bands, ...(showConfluence ? confluenceBands(confluenceZones, spot) : [])], [overlays.bands, showConfluence, confluenceZones, spot]);
+  const near = useMemo(() => nearPrice(layers.flatMap(l => [
+    ...(l.lines || []).map(ln => ({ id: l.id, price: ln.price, label: ln.label, color: ln.color || l.color, json: l.json })),
+    ...(l.bands || []).map(b => ({ id: l.id, price: (b.top + b.bottom) / 2, label: b.label, color: b.color, json: l.json })),
+  ]) as ProxItem[], spot), [layers, spot]);
+  useTARegister('dealer', 'Dealer Gamma', selectionJson, selectedLayers.length);
 
   return (
     <div className="bg-base-300 rounded-xl overflow-hidden shadow-xl border border-white/[0.05]">
@@ -167,54 +167,31 @@ export default function DealerPositioningPanel({ ticker }: { ticker: string; pri
           {data && !loading && (
             <>
               <Banner d={data} />
-              <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">
-                <div className="lg:col-span-2 space-y-2">
-                  <div className="flex items-center gap-1.5 text-[11px] text-base-content/50 uppercase tracking-wide"><Eye className="w-3.5 h-3.5" /> Indicators — shown on chart &amp; sent to AI</div>
-                  {groups.map(([g, gLayers]) => {
-                    const allOn = gLayers.every(l => selected.has(l.id));
-                    return (
-                      <div key={g} className="rounded-lg border border-white/[0.06] bg-base-200/30 p-2">
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-[11px] font-bold text-base-content/70">{g}</span>
-                          <button className="text-[10px] text-primary hover:underline" onClick={() => setGroup(gLayers, !allOn)}>{allOn ? 'clear' : 'all'}</button>
-                        </div>
-                        <div className="space-y-0.5">
-                          {gLayers.map(l => (
-                            <label key={l.id} className="flex items-start gap-2 cursor-pointer py-0.5 hover:bg-base-100/30 rounded px-1">
-                              <input type="checkbox" className="checkbox checkbox-xs mt-0.5" checked={selected.has(l.id)} onChange={() => toggle(l.id)} />
-                              <span className="min-w-0 flex-1">
-                                <span className={`text-[11px] font-semibold ${l.tone}`}>{l.label}</span>
-                                {l.sub && <span className="block text-[10px] text-base-content/40 leading-tight truncate">{l.sub}</span>}
-                              </span>
-                            </label>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <div className="lg:col-span-3 space-y-3">
-                  {/* GEX-by-strike distribution — the hero chart */}
-                  <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
-                    <GexChart profile={data.gex_profile || []} levels={data.gamma_levels} spot={data.price || 0} netGexMM={data.net_gex.value_millions} />
-                  </div>
-                  <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
-                    <div className="flex items-center justify-between mb-1 px-1">
-                      <span className="text-[11px] font-bold text-base-content/70 flex items-center gap-1"><Boxes className="w-3.5 h-3.5 text-secondary" /> Price · gamma levels · expected move</span>
-                      <span className="text-[10px] text-base-content/40">{selectedLayers.filter(l => l.lines || l.bands).length} on chart</span>
-                    </div>
-                    {chartData ? <div className="h-64"><Line key={[...selected].sort().join('|')} data={chartData} options={chartOptions} plugins={[plugin]} /></div>
-                      : <div className="text-center text-xs text-base-content/40 py-10">No price series available.</div>}
-                  </div>
-                  <IndicatorAIConsole
-                    selectionJson={selectionJson}
-                    chips={selectedLayers.map(l => ({ key: l.id, label: l.label, tone: l.tone, onRemove: () => toggle(l.id) }))}
-                    analyzeFn={(sel, msgs) => analyzeTa(ticker, sel, msgs)}
-                    emptyHint="Select gamma or expected-move layers to include them in the AI read."
-                  />
-                </div>
+              {/* GEX-by-strike distribution — the hero chart */}
+              <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2">
+                <GexChart profile={data.gex_profile || []} levels={data.gamma_levels} spot={data.price || 0} netGexMM={data.net_gex.value_millions} />
               </div>
+              <LayerChips groups={groups.map(([name, ls]) => ({ name, layers: ls }))} selected={selected} onToggle={toggle} onGroupAll={setGroup} />
+              <TAChart
+                ticker={ticker} interval={interval} onInterval={setInterval}
+                lines={overlays.lines} bands={chartBands} height={340}
+                title={<>Price · gamma levels · expected move <span className="text-base-content/40 font-normal">· {selectedLayers.filter(l => l.lines || l.bands).length} shown</span></>}
+                rightExtra={confluenceZones?.length ? (
+                  <button onClick={() => setShowConfluence(v => !v)}
+                    className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold transition ${showConfluence ? 'bg-secondary/20 text-secondary' : 'text-base-content/45 hover:text-base-content'}`}
+                    title="Overlay high-conviction confluence zones">
+                    <GitMerge className="w-3 h-3" /> Confluence
+                  </button>
+                ) : undefined}
+                onSpot={setChartSpot}
+              />
+              <LevelProximity levels={near} onAdd={(l) => toggle(l.id)} />
+              <IndicatorAIConsole
+                selectionJson={selectionJson}
+                chips={selectedLayers.map(l => ({ key: l.id, label: l.label, tone: l.tone, onRemove: () => toggle(l.id) }))}
+                analyzeFn={(sel, msgs) => analyzeTa(ticker, sel, msgs)}
+                emptyHint="Toggle gamma or expected-move layers below to include them in the AI read."
+              />
             </>
           )}
         </div>

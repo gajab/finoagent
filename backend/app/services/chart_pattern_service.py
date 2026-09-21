@@ -773,11 +773,13 @@ _REVERSAL = [
 ]
 
 
-def compute_chart_patterns(stock) -> dict | None:
-    """Detect classical chart patterns on ~1y daily bars. Returns the drawable OHLC series plus a
-    ranked list of patterns (most recent / highest-confidence first). Best-effort; never raises."""
+def compute_chart_patterns(stock, period: str = "1y", interval: str = "1d") -> dict | None:
+    """Detect classical chart patterns. Default ~1y daily (the dedicated Patterns page); callers with a
+    shorter horizon (e.g. Defend on a 60–90 DTE trade) pass a matched window so patterns are RECENT and
+    relevant, not an 8-month-old double top. Returns the drawable OHLC series plus a ranked list of
+    patterns (most recent / highest-confidence first). Best-effort; never raises."""
     try:
-        df = _history(stock)
+        df = _history(stock, period, interval)
         if df is None:
             return None
         close = float(df["Close"].values[-1])

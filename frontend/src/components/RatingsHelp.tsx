@@ -122,28 +122,62 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                     bit of alpha — not risk-neutral profit (fairly-priced income has ~0 of that; the seller's vol edge is
                     the <b>VRP</b> factor below).</span></li>
                   <li>➋ <b>Option-math adjustments</b> (± on the base): <b>VRP</b>, <b>Moneyness</b> (how close the short
-                    strike sits), <b>Skew / IV-edge</b>, <b>Liquidity</b> (scales with the bid-ask — a very wide,
-                    hard-to-fill market is a heavy demerit, not a token dock), <b>Beta</b>, and <b>Undefined risk</b> — an
+                    strike sits), <b>Skew / IV-edge</b>, <b>Term structure</b> (the IV curve's slope across expiries —
+                    <i>contango</i> is a favorable roll-down, <i>backwardation</i> an event-inverted caution),
+                    <b>Liquidity</b> (scales with the bid-ask — a very wide, hard-to-fill market is a heavy demerit, not a
+                    token dock), and <b>Undefined risk</b> — an
                     explicit demerit for <b>unbounded-loss</b> structures (naked calls, short strangles): the base
                     score's tail term uses CVaR<sub>95</sub> and deliberately omits the deep worst case, so this prices
                     the <b>CVaR<sub>99</sub></b> tail, scaled by how <i>reachable</i> the strike is — a deep, low-touch
                     naked call takes a small hit, a near-money one a large one (it can push the grade to F). Exempt when
                     you own the shares (the call is then covered → bounded).</li>
-                  <li>➌ <b>TA factors</b> (± on the base) — the technical read on <b>6-month daily</b> bars, the swing
-                    horizon that governs a multi-week option (see the chips below).</li>
+                  <li>➌ <b>TA factors</b> (± on the base) — the technical read, on a timeframe <b>matched to your trade's
+                    holding horizon</b> (see <i>Timeframe</i> below): structure &amp; levels on the DTE-matched bars, the
+                    trend/regime one step higher (see the chips below).</li>
                 </ul>
                 <p className="text-[12px] text-base-content/55 leading-snug mt-1.5">
                   <span className="font-mono text-[11px]">base + Σ adjustments + Σ TA</span>, clamped to 0–100 → the letter.
-                  Two things sit <i>outside</i> the score, so <b>quality and timing never contradict</b>:
+                  In <i>Quant Analysis</i> the factors are <b>grouped by dimension</b> (Loss probability · Vol edge ·
+                  Structural defense · Regime · Directional · Consequence · Event · Execution) so all the evidence for one
+                  kind of risk reads together. For a two-sided trade (strangle / condor / jade), <b>Call-side / Put-side
+                  tabs</b> re-score it for each leg — whole-trade factors stay the same, only that leg's own risk (breach,
+                  moneyness, skew, structure, liquidity) changes. Two things sit <i>outside</i> the score, so <b>quality
+                  and timing never contradict</b>:
                 </p>
                 <ul className="text-[12px] text-base-content/65 leading-snug mt-1.5 space-y-1">
-                  <li><span className="text-error"><b>VETOED</b></span> — a <b>structurally</b> broken trade (loses in
-                    expectation, crushed vol, delta-neutral into short gamma) → grade <b>F</b>, avoid. The quality score is
-                    irrelevant here.</li>
+                  <li><span className="text-error"><b>VETOED</b></span> — a <b>structurally</b> broken trade (crushed vol
+                    below the negative-VRP floor, delta-neutral into short gamma) → grade <b>F</b>, avoid. The quality score
+                    is irrelevant here.</li>
                   <li><span className="text-warning"><b>WAIT · timing</b></span> — a <b>good</b> trade at the <b>wrong
                     moment</b>: momentum accelerating against a strike that's <i>actually reachable</i>. It <b>keeps its
                     quality grade</b> but the desk holds until momentum settles — <i>not</i> the same as a veto.</li>
                 </ul>
+              </div>
+
+              {/* Timeframe — DTE-adaptive dual read */}
+              <div>
+                <SectionLabel>Timeframe — matched to your trade's horizon</SectionLabel>
+                <p className="text-[12px] text-base-content/65 leading-snug">
+                  The technical read is <b>DTE-adaptive</b>: the bars scale to how long you'll hold, so the structure the
+                  trade will actually touch is resolved without drowning it in stale history. It's a <b>dual</b> read —
+                  <b> structure &amp; levels</b> (volume profile · POC · support/resistance · breach) on the DTE-matched
+                  rung, and the <b>trend / regime</b> factors one rung <b>higher</b>, so a short-DTE trade's trend isn't
+                  whipsawed by intraday noise. The chip under the header shows both
+                  (<span className="font-mono text-[11px]">TA · &lt;structure&gt; · trend &lt;trend&gt;</span>).
+                </p>
+                <div className="mt-1.5 grid grid-cols-[minmax(74px,96px)_1fr] gap-x-3 gap-y-1 text-[11.5px] text-base-content/65">
+                  <span className="font-mono text-base-content/50">0–2 DTE</span><span>5-day / 5-min · <span className="opacity-70">trend 1mo / 30-min</span></span>
+                  <span className="font-mono text-base-content/50">3–25 DTE</span><span>1-month / 30-min · <span className="opacity-70">trend 3mo / daily</span></span>
+                  <span className="font-mono text-base-content/50">26–90 DTE</span><span>3-month / daily · <span className="opacity-70">trend 6mo / daily</span> <span className="opacity-50">— the classic monthly-income read</span></span>
+                  <span className="font-mono text-base-content/50">90–180 DTE</span><span>6-month / daily · <span className="opacity-70">trend 1y / daily</span></span>
+                  <span className="font-mono text-base-content/50">180+ DTE</span><span>1-year / daily · <span className="opacity-70">trend 5y / weekly</span></span>
+                </div>
+                <p className="text-[12px] text-base-content/55 leading-snug mt-1.5">
+                  On a <b>placed trade</b> it keys off <b>remaining</b> days, so the read <b>tightens as expiry nears</b> — a
+                  45-DTE trade slides from 3mo/daily toward intraday by the final week (Manage &amp; Defend included).
+                  <span className="opacity-70"> Dealer gamma, the implied-move cone and the keep/breach probabilities are read
+                  straight from the live option chain, so they're already matched to your exact expiry.</span>
+                </p>
               </div>
 
               {/* Structure — walls, buffer, sigma */}
@@ -205,9 +239,8 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                 <ul className="text-[12px] text-base-content/65 leading-snug mt-1.5 space-y-1">
                   <li><b>Breach risk</b> — P(touch), computed <b>drift-aware</b> (a stock trending <i>toward</i> the strike
                     is correctly more likely to reach it). ≤ 25% is the comfort zone; above it the strike is penalized,
-                    steering selection to <b>deeper, harder-to-reach</b> strikes.</li>
-                  <li><b>Fortified</b> — the strike is <i>both</i> deep (low touch) <i>and</i> behind a wall: structure and
-                    distance both have to fail. The lowest-breach placement.</li>
+                    steering selection to <b>deeper, harder-to-reach</b> strikes. On a two-sided trade it's the
+                    <b> worse</b> of the two shorts (the leg more likely to be tested).</li>
                   <li><b>Calm tape / clean window</b> — a range-bound / mean-reverting regime (probes of the strike tend to
                     revert rather than persist into assignment), and the σ itself is <b>event-aware</b>, so a window with
                     <b> no earnings/events</b> keeps the breach cone narrow while an upcoming print widens it.</li>
@@ -250,9 +283,9 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                 </Chip>
 
                 <Chip icon={<Sparkles className="w-4 h-4 text-secondary" />}
-                  title={<>TA factors · 6-mo daily (± on base) — e.g. <span className="text-success">Trend drift +6</span>, <span className="text-error">Gamma regime −6</span></>}>
-                  Each signed bar is one technical factor's points on the base score, all computed on <b>6-month daily</b>
-                  bars (the swing horizon for a multi-week option). <b>Trend drift</b> — <b>momentum as one signal</b>: the
+                  title={<>TA factors · DTE-matched (± on base) — e.g. <span className="text-success">Trend drift +6</span>, <span className="text-error">Gamma regime −6</span></>}>
+                  Each signed bar is one technical factor's points on the base score, computed on the timeframe
+                  <b> matched to your trade's horizon</b> (see <i>Timeframe</i> below). <b>Trend drift</b> — <b>momentum as one signal</b>: the
                   annualized EMA-slope <i>velocity</i> (a tailwind + or headwind − for the short side) <i>modulated</i> by
                   MACD <i>acceleration</i> — a tailwind that's decelerating is faded, not paid in full. <b>Structure</b> — is
                   the strike behind a wall (see the section above). <b>Gamma regime</b> — the dealer-gamma chip above,
@@ -289,6 +322,7 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                 <Term name="Edge">The risk/reward tilt (derived from Omega): are the probability-weighted gains bigger than the losses?</Term>
                 <Term name="VRP">Volatility Risk Premium — implied vol usually runs <b>above</b> realized vol, so sellers are over-paid. The real source of income edge.</Term>
                 <Term name="Skew">How much more the market charges for downside puts than calls. <b>Extreme</b> skew can mean a disaster is already priced in.</Term>
+                <Term name="Term structure">The IV curve across expiries. <b>Contango</b> (far &gt; near — the calm norm) lets a short roll <i>down</i> to cheaper vol as it ages → favorable carry. <b>Backwardation</b> (near &gt; far) is an event/stress inversion — fat front premium, but a near-term move is being priced.</Term>
                 <Term name="GEX / flip">Dealer gamma exposure (a positioning proxy) and the price where it flips sign — see the Gamma chip above.</Term>
                 <Term name="Q vs P">Q = risk-neutral (option-implied) law you're paid on; P = physical (realized) law of how the stock moves.</Term>
                 <Term name="vs SOFR (bps)">Expected return minus the risk-free cash rate. Under option math this is ~0 for a fairly-priced trade — slightly negative is <b>normal</b>, not broken.</Term>

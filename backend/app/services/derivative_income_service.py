@@ -57,6 +57,8 @@ CONTRACT_MULTIPLIER = 100          # shares per US equity option contract
 DEFAULT_RISK_FREE = 0.045
 DEFAULT_MIN_PROB = 0.85            # target probability of NOT being assigned
 DEFAULT_MIN_INCOME = 20.0         # minimum premium ($/contract) to surface
+_BR_MAX_WIDTH_PCT = 0.18          # back-ratio: long strike within 18% of the short (a real convex backspread,
+                                  # not a degenerate far-OTM lotto ticket that merely maximizes the credit)
 MIN_DTE = 7
 MAX_DEFAULT_DTE = 45              # default-mode horizon (monthlies only)
 TARGET_DTE_BAND = 10             # ± window around a user-supplied target DTE
@@ -1363,6 +1365,119 @@ def _jade_lizard(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, 
     }
 
 
+def _back_ratio(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r: float,
+                atm_iv: Optional[float], iv_hv_ratio: Optional[float], richness: str,
+                min_prob: float, min_income: float, european: bool, ticker: str,
+                ta_levels: Optional[dict] = None, sig_frac: Optional[float] = None) -> Optional[dict]:
+    """Ratio backspread (1×2) for a NET CREDIT — SELL 1 near-money option + BUY 2 further-OTM.
+
+    A long-convexity, (mildly) long-vega PRE-EARNINGS vol-expansion play, NOT a classic short-premium
+    income trade: enter when IV is LOW, ride the pre-print IV ramp + any large move, and CLOSE BEFORE
+    EARNINGS so the expiry 'valley of death' (max loss at the long strike) never actually settles.
+    Defined max loss = (|K_short − K_long| − credit)×100 at the long strike. Builds put- and call-side
+    and keeps the best net-credit one (put skew usually makes the put side the credit side)."""
+    if rnd is None or spot <= 0:
+        return None
+    best = None  # (premium, is_put, k_short, k_long, credit, width)
+    max_w = _BR_MAX_WIDTH_PCT * spot                          # cap the long distance → a real backspread
+    put_strikes = sorted((k for k in puts if k < spot * 0.999), reverse=True)
+    call_strikes = sorted(k for k in calls if k > spot * 1.001)
+    for is_put, book, strikes in ((True, puts, put_strikes), (False, calls, call_strikes)):
+        # SHORT = a near-money OTM strike (1–8% OTM) that finances the two longs. Selected by MONEYNESS,
+        # not BS delta — weekend/stale IV makes the delta ~0 and would reject every strike.
+        shorts = [k for k in strikes if 0.005 <= abs(k - spot) / spot <= 0.08 and _executable(book[k])[0]][:6]
+        for k_short in shorts:
+            ms = book[k_short].mid
+            further = [k for k in strikes if (k < k_short if is_put else k > k_short)
+                       and abs(k_short - k) <= max_w and _executable(book[k])[0]]
+            # LONG = the NEAREST further-OTM strike (tightest width = most convexity) that still nets a
+            # real credit; keep it as this short's pick. (A credit backspread on normal skew pushes the
+            # longs OTM — the trade is a CSP-like credit WITH downside convexity + a DEFINED max loss.)
+            pick = None
+            for k_long in further:
+                credit = ms - 2.0 * book[k_long].mid
+                premium = credit * CONTRACT_MULTIPLIER
+                if credit > 0.02 and premium >= min_income:
+                    pick = (premium, k_long, credit)
+                    break                                     # nearest qualifying long → tightest width
+            if pick and (best is None or pick[0] > best[0]):
+                best = (pick[0], is_put, k_short, pick[1], pick[2], abs(k_short - pick[1]))
+    if best is None:
+        return None
+    premium, is_put, k_short, k_long, credit, width = best
+    right = "P" if is_put else "C"
+    premium = round(premium, 2)
+    max_loss = round(width * CONTRACT_MULTIPLIER - premium, 2)   # at K_long, EXPIRY — the valley of death
+    collateral = max_loss if max_loss > 0 else premium          # Reg-T: the short is spread by 1 long (defined)
+    book = puts if is_put else calls
+    # Net greeks = 2×LONG − 1×SHORT (the extra long is the convexity engine).
+    gs = _bs_greeks(spot, k_short, dte, (book[k_short].iv or atm_iv or 0.30), right)
+    gl = _bs_greeks(spot, k_long, dte, (book[k_long].iv or atm_iv or 0.30), right)
+    net = {k: 2.0 * gl[k] - gs[k] for k in ("delta", "gamma", "theta", "vega")}
+    # HONEST vega sign: a NET-CREDIT backspread is only LONG vega when skew lets the longs sit close
+    # enough; on a low-skew name the credit forces the longs far OTM → the near-money short dominates →
+    # net SHORT vega (a CSP-with-a-tail-kicker, NOT the vol-expansion play). The scoring keys off this.
+    is_long_vega = net["vega"] > 0
+    # P(keep the credit) ≈ P(the short is NOT breached at expiry) — a proxy; the trade is meant to be
+    # EXITED before the print, so this is context, not the edge.
+    p_keep, method = _prob_keep(rnd, k_short, right, spot, dte, r, book[k_short].iv or atm_iv)
+    premium_ann = annualized_return_pct(premium, collateral, dte) if collateral else 0.0
+    # Downside(put)/upside(call) is large on a big move; the SHORT side just keeps the credit.
+    max_profit = (round((2.0 * k_long - k_short) * CONTRACT_MULTIPLIER + premium, 2)
+                  if is_put else None)                         # put: bounded at S=0; call: unbounded upside
+    valley = round(k_long, 2)
+    flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
+    _vega_note = ("LONG vega — gains as IV ramps into the catalyst (the vol-expansion play; best entered in LOW IV)"
+                  if is_long_vega else
+                  "NET SHORT vega here (skew forced the longs far OTM) — a CSP/short-call with a crash kicker, "
+                  "NOT a vol-expansion play; needs steeper skew to turn long-vega")
+    flags.append({"level": "info",
+                  "text": f"Back ratio 1×2 — SELL 1 {right} ${round(k_short,2)} / BUY 2 {right} ${round(k_long,2)} "
+                          f"for a ${round(credit,2)} net credit. {_vega_note}."})
+    flags.append({"level": "warn",
+                  "text": f"Valley of death ${valley} — max loss ${abs(max_loss)} sits at the long strike AT "
+                          f"EXPIRY. Managed by CLOSING BEFORE EARNINGS (capture the IV ramp; never hold to expiry)."})
+    return {
+        "structure": "back_ratio",
+        "label": f"{'Put' if is_put else 'Call'} Back Ratio (1×2)",
+        "expiration": exp, "dte": dte,
+        "short_strike": round(k_short, 2), "short_strike_pct": round((k_short - spot) / spot * 100, 1),
+        "put_short": round(k_short, 2) if is_put else None,
+        "call_short": round(k_short, 2) if not is_put else None,
+        "long_strike": round(k_long, 2), "ratio": "1x2", "net_credit": round(credit, 2),
+        "short_delta": gs["delta"],
+        "prob_keep_pct": round(p_keep * 100, 1) if p_keep is not None else None,
+        "prob_method": method,
+        "premium": premium, "premium_per_share": round(credit, 2),
+        "collateral": round(collateral, 2),
+        "premium_annualized_pct": round(premium_ann, 2), "total_annualized_pct": round(premium_ann, 2),
+        "sofr_excess_pct": round(premium_ann - 0.0, 2), "beats_sofr": premium_ann > 0,
+        "static_return_pct": round(premium / collateral * 100, 2) if collateral else 0.0,
+        "breakeven": round(k_short - credit, 2) if is_put else round(k_short + credit, 2),
+        "cushion_pct": round(abs(k_short - spot) / spot * 100, 2),
+        "max_profit": max_profit, "max_loss": round(-abs(max_loss), 2), "expected_pnl": None,
+        "valley_of_death": {"price": valley, "max_loss": round(-abs(max_loss), 2),
+                            "note": "max loss is at the long strike AT EXPIRY — close before earnings; never held to expiry"},
+        "greeks": {"delta": round(net["delta"], 3), "gamma": round(net["gamma"], 4),
+                   "theta": round(net["theta"], 4), "vega": round(net["vega"], 4)},
+        "theta_per_day": round(net["theta"] * CONTRACT_MULTIPLIER, 2),      # − = net decay PAID (long options bleed)
+        "vega_exposure": round(net["vega"] * CONTRACT_MULTIPLIER, 2),       # + = LONG vega (rises with IV)
+        "long_vega": bool(is_long_vega),                                    # HONEST: only long-vol scoring when it truly is
+        "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
+        "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
+        "liquidity": {"oi": min(book[k_short].oi or 0, book[k_long].oi or 0),
+                      "volume": min(book[k_short].volume or 0, book[k_long].volume or 0),
+                      "spread_pct": max(_spread_pct(book[k_short]) or 0, _spread_pct(book[k_long]) or 0)},
+        "exercise_style": "European (cash-settled)" if european else "American",
+        "flags": flags,
+        # TWO separate long legs (not qty=2) — _opp_legs forces opp-level contracts per leg, so the ratio
+        # must be expressed as distinct legs for the payoff / greeks / breakeven engines to sum 1×2 correctly.
+        "legs": [_leg(book[k_short], "SELL", exp, spot, dte, atm_iv, rnd),
+                 _leg(book[k_long], "BUY", exp, spot, dte, atm_iv, rnd),
+                 _leg(book[k_long], "BUY", exp, spot, dte, atm_iv, rnd)],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Calendar / horizontal spread — the ONLY long-vega income structure (spans two expiries)
 # ---------------------------------------------------------------------------
@@ -2126,6 +2241,13 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     if "jade_lizard" in structures:
         o = _jade_lizard(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
                          richness, min_prob, min_income, european, ticker, ta_levels, sig_frac)
+        if o:
+            opps.append(o)
+
+    # ---- Back Ratio (1×2 net-credit backspread — LONG-convexity pre-earnings vol play) ----
+    if "back_ratio" in structures:
+        o = _back_ratio(calls, puts, spot, dte, exp, rnd, r, atm_iv, iv_hv_ratio,
+                        richness, min_prob, min_income, european, ticker, ta_levels, sig_frac)
         if o:
             opps.append(o)
 

@@ -16,8 +16,46 @@ from app.services.desk_review_service import per_side_quant
 from app.services.lifecycle_service import higher_order_greeks
 from app.services.desk_review_service import (
     _opp_legs, _factor_scope, _factor_dimension, _merge_scoped, _side_max_loss,
-    _FACTOR_TAXONOMY,
+    _FACTOR_TAXONOMY, _tf_for_dte, _tf_band,
 )
+
+
+class TestDteTimeframeLadder:
+    """DTE-adaptive dual-timeframe: structure matched to the hold, trend one rung up. Manage keys off
+    REMAINING DTE, so the same helper drives entry and management."""
+
+    def test_ladder_boundaries(self):
+        # (dte, structure_tf, trend_tf) — the locked ladder
+        cases = [
+            (1,   "day_5d",      "short_term"),
+            (2,   "day_5d",      "short_term"),
+            (3,   "short_term",  "quarter_1d"),
+            (25,  "short_term",  "quarter_1d"),
+            (26,  "quarter_1d",  "medium_term"),   # the monthly-income rung
+            (45,  "quarter_1d",  "medium_term"),
+            (90,  "quarter_1d",  "medium_term"),
+            (91,  "medium_term", "year_1d"),
+            (180, "medium_term", "year_1d"),
+            (181, "year_1d",     "long_term"),     # weekly trend for LEAPS
+            (500, "year_1d",     "long_term"),
+        ]
+        for dte, s, t in cases:
+            assert _tf_for_dte(dte) == (s, t), f"DTE {dte}"
+
+    def test_structure_is_never_slower_than_trend(self):
+        # the trend rung is always ≥ the structure rung (one up), never finer
+        order = ["day_5d", "short_term", "quarter_1d", "medium_term", "year_1d", "long_term"]
+        for dte in (1, 7, 20, 35, 45, 120, 400):
+            s, t = _tf_for_dte(dte)
+            assert order.index(t) >= order.index(s), f"DTE {dte}: trend {t} finer than structure {s}"
+
+    def test_unknown_dte_defaults_to_monthly_rung(self):
+        assert _tf_for_dte(None) == ("quarter_1d", "medium_term")
+        assert _tf_for_dte(0) == ("quarter_1d", "medium_term")
+
+    def test_band_key_stable_within_a_band(self):
+        assert _tf_band(30) == _tf_band(45) == _tf_band(90)   # same band → same cache key
+        assert _tf_band(7) != _tf_band(30)                    # different band → different key
 
 
 SPOT = 100.0

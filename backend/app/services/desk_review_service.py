@@ -376,7 +376,10 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     inside ~1.5× the isolated event move (#2). Impacted factors carry ``baseline_points`` (the value WITHOUT
     the earnings adjustment) so the UI can show a with/without comparison."""
     inst = (ta or {}).get("institutional") or {}
-    reg = inst.get("regime") or {}
+    # DUAL timeframe: the REGIME (trend vs range) reads one rung UP (Trend drift / Range fit / Calm tape),
+    # while VP / POC / levels below stay on the DTE-matched STRUCTURE rung. `_trend_regime` is the higher
+    # rung's regime; falls back to the structure rung's when they coincide.
+    reg = (ta or {}).get("_trend_regime") or inst.get("regime") or {}
     mode = reg.get("mode")
     s = opp.get("structure")
     vp = inst.get("volume_profile") or {}
@@ -689,12 +692,58 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
 # TA context helpers
 # ---------------------------------------------------------------------------
 
-def _ta_sync(ticker: str) -> dict:
+# ── DTE-ADAPTIVE, DUAL-timeframe TA ladder ──────────────────────────────────────────────────────────
+# Match the historical-bar TA (volume profile / POC / market structure / regime / drift μ / ATR) to the
+# trade's HOLDING horizon: too short a bar can't resolve the structure the trade will touch, too long
+# buries it in stale history. DUAL: STRUCTURE (levels · VP · POC · breach) reads the DTE-matched rung; the
+# TREND/REGIME factors read one rung UP (so a short-DTE trade's trend isn't whipsawed by intraday noise).
+# GEX walls / RND / expected-move are chain-snapshot (already expiry-matched) — they do NOT use this.
+# (hi_dte, structure_tf, trend_tf) — first band whose hi_dte ≥ dte wins.
+_DTE_TF_LADDER: list[tuple[int, str, str]] = [
+    (2,    "day_5d",      "short_term"),    # 0-2:   5d/5m   · trend 1mo/30m
+    (25,   "short_term",  "quarter_1d"),    # 3-25:  1mo/30m · trend 3mo/1d
+    (90,   "quarter_1d",  "medium_term"),   # 26-90: 3mo/1d  · trend 6mo/1d   (the classic monthly income rung)
+    (180,  "medium_term", "year_1d"),       # 90-180: 6mo/1d · trend 1y/1d
+    (10**9, "year_1d",    "long_term"),     # 180+:  1y/1d   · trend 5y/1wk (weekly trend)
+]
+
+
+def _tf_for_dte(dte: Optional[int]) -> tuple[str, str]:
+    """(structure_tf, trend_tf) for a DTE. Falls back to the monthly-income rung when DTE is unknown."""
+    d = int(dte) if dte and dte > 0 else 35
+    for hi, s, t in _DTE_TF_LADDER:
+        if d <= hi:
+            return s, t
+    return "quarter_1d", "medium_term"
+
+
+def _tf_band(dte: Optional[int]) -> str:
+    """A stable key for the DTE band (memoisation / cache), e.g. 'day_5d|short_term'."""
+    s, t = _tf_for_dte(dte)
+    return f"{s}|{t}"
+
+
+def _ta_sync(ticker: str, dte: Optional[int] = None) -> dict:
     try:
         import yfinance as yf
         from .stock_service import compute_technical_block, compute_momentum_indicators
         stock = yf.Ticker(_norm_ticker(ticker))
-        ta = compute_technical_block(stock, "medium_term") or {}
+        structure_tf, trend_tf = _tf_for_dte(dte)              # DTE-adaptive dual timeframe
+        ta = compute_technical_block(stock, structure_tf) or {}
+        ta["_structure_tf"] = structure_tf
+        ta["_trend_tf"] = trend_tf
+        # TREND/REGIME one rung up — the regime factors (Trend drift / Range fit / Calm tape) read THIS,
+        # while VP / POC / levels / breach stay on the structure rung above. Same-rung short-DTE ladders
+        # (day_5d→short_term …) still get a genuinely higher trend read.
+        if trend_tf != structure_tf:
+            try:
+                _tb = compute_technical_block(stock, trend_tf) or {}
+                ta["_trend_regime"] = (_tb.get("institutional") or {}).get("regime") or {}
+                ta["_trend_label"] = _tb.get("timeframeLabel")
+            except Exception:  # noqa: BLE001
+                ta["_trend_regime"] = (ta.get("institutional") or {}).get("regime") or {}
+        else:
+            ta["_trend_regime"] = (ta.get("institutional") or {}).get("regime") or {}
         try:
             ta.update(compute_momentum_indicators(stock))   # MACD / Bollinger / SMA-EMA (daily)
         except Exception:  # noqa: BLE001
@@ -1294,6 +1343,9 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     if today is None:
         today = date.today()
     is_cal = opp.get("structure") == "calendar"   # LONG-vega, ATM-by-design → the short-vol penalties invert
+    # A back ratio gets the same inversion ONLY when it is MEASURABLY long-vega (net vega > 0 — the builder
+    # sets `long_vega` honestly; a far-OTM-long credit backspread is net SHORT vega and must NOT get it).
+    is_long_vega = is_cal or bool(opp.get("long_vega"))
 
     # 1) EXPECTATION (Omega / EV) — REMOVED as a hard duplicate. Omega already drives the base-quality
     #    'Edge' lens (and EV/CVaR the 'Tail' lens), so re-scoring it here double-counted the same
@@ -1304,13 +1356,14 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     # 2) Volatility Risk Premium — the REAL edge, and the negative-VRP TRAP. Rich implied vs realized
     #    rewards; cheap implied (implied << realized) is penalised IN PROPORTION to the gap and
     #    HARD-BLOCKED past the floor — the crushed-vol case where selling premium has no edge.
-    if iv_hv is not None and is_cal:
-        # A calendar is LONG vega — CHEAP implied vol is an EDGE (own vol before it reprices up), the exact
-        # opposite of a premium seller. Never block it on "crushed vol".
+    if iv_hv is not None and is_long_vega:
+        # A calendar / back ratio is LONG vega — CHEAP implied vol is an EDGE (own vol before it reprices
+        # up), the exact opposite of a premium seller. Never block it on "crushed vol".
+        _lv = "back ratio" if opp.get("structure") == "back_ratio" else "calendar"
         if iv_hv < 0.95:
-            merits.append(f"long-vega calendar in cheap IV (IV/HV {iv_hv}) — own vol before it reprices"); comp["vrp"] += 5
+            merits.append(f"long-vega {_lv} in cheap IV (IV/HV {iv_hv}) — own vol before it reprices"); comp["vrp"] += 5
         elif iv_hv > 1.25:
-            demerits.append(f"paying up for vega (IV/HV {iv_hv}) — a calendar wants CHEAP, not rich, IV"); comp["vrp"] -= 4
+            demerits.append(f"paying up for vega (IV/HV {iv_hv}) — a {_lv} wants CHEAP, not rich, IV"); comp["vrp"] -= 4
     elif iv_hv is not None:
         if iv_hv >= 1.05:
             # CONTINUOUS rich-VRP reward — scales with BOTH how rich implied is vs realized AND the IV
@@ -1368,8 +1421,8 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     dual_em, imp_em, phys_em = _dual_move_pct(opp, hv)
     nss = _nearest_short_sigmas(opp, spot, dual_em)
     pmp = _prob_max_profit(opp)
-    if not is_cal:              # a calendar is ATM BY DESIGN (max profit at the strike) — the near-ATM
-                                # "directional" penalty and the full-credit-prob check don't apply to it
+    if not is_long_vega:        # a calendar / back ratio is ATM BY DESIGN (the near-money short finances the
+                                # longs) — the near-ATM "directional" penalty & full-credit-prob don't apply
         if nss is not None and nss < 0.5:
             demerits.append(f"near-ATM short leg ({nss}σ dual) — directional, not cushioned"); comp["moneyness"] -= 12
         elif nss is not None and nss < 1.0:
@@ -1389,7 +1442,7 @@ def _algo_grade(opp: dict, dm: dict, spot: float, sofr_pct: float, atm_iv_pct: O
     iv_edge_vp = None
     sliv = _short_leg_iv(opp)                            # the SHORT strike's OWN IV (per-strike, not ATM)
     ss_bps = round((sliv - atm_iv_pct) * 100) if (sliv is not None and atm_iv_pct is not None) else None
-    if ss_bps is not None and not is_cal:
+    if ss_bps is not None and not is_long_vega:
         iv_edge_vp = round(ss_bps / 100.0, 1)            # vol-pts the short strike is rich (+) / cheap (−) vs ATM
         if ss_bps >= _SKEW_EXTREME_BPS:
             comp["skew"] -= 5
@@ -2006,30 +2059,40 @@ def _release_memory() -> None:
 
 
 _CTX_TTL = 300.0                                     # 5 min — TA / dealer-GEX / portfolio-fit drift slowly intraday
-_CTX_MEMO: dict[str, tuple[float, tuple]] = {}
+_CTX_MEMO: dict[str, tuple[float, tuple]] = {}       # (portfolio_fit, gex) per ticker — DTE-independent
+_TA_MEMO: dict[tuple[str, str], tuple[float, dict]] = {}   # ta per (ticker, DTE-band) — the adaptive read
 
 
-async def _desk_context(ticker: str) -> tuple[dict, dict, dict]:
-    """(ta, portfolio_fit, gex) — the changing TA + dealer-positioning context the hold/close
-    recommendation is built on. Run SEQUENTIALLY (not a 3-way gather) so the per-read memory peaks
-    don't STACK on the 512 MiB instance — that stacking was the desk-score spike — and memoised ~5 min
-    per ticker so re-scoring a trade or a My-Trades refresh-all doesn't recompute them. Objects are
-    cached in-process (no JSON round-trip, so numpy-typed fields survive), bounded so it can't leak."""
+async def _desk_context(ticker: str, dte: Optional[int] = None) -> tuple[dict, dict, dict]:
+    """(ta, portfolio_fit, gex) — the changing context the hold/close recommendation is built on. Run
+    SEQUENTIALLY (not a 3-way gather) so the per-read memory peaks don't STACK on the 512 MiB instance,
+    and memoised ~5 min. The TA read is DTE-ADAPTIVE (its timeframe ladder depends on the trade's horizon),
+    so `ta` is memoised per (ticker, DTE-band); portfolio-fit + dealer-GEX are DTE-independent → per ticker.
+    Objects are cached in-process (numpy-typed fields survive), bounded so it can't leak."""
     import time
     tk = _norm_ticker(ticker)
+    band = _tf_band(dte)
     now = time.monotonic()
-    hit = _CTX_MEMO.get(tk)
-    if hit and hit[0] > now:
-        return hit[1]
-    ta = await asyncio.to_thread(_ta_sync, ticker)
-    portfolio_fit = await asyncio.to_thread(_portfolio_fit_sync, ticker)
-    gex = await asyncio.to_thread(_gex_sync, ticker)
-    ctx = (ta, portfolio_fit, gex)
-    if len(_CTX_MEMO) > 48:                          # prune expired entries so the memo stays bounded
-        for k in [k for k, (exp, _v) in _CTX_MEMO.items() if exp <= now]:
-            _CTX_MEMO.pop(k, None)
-    _CTX_MEMO[tk] = (now + _CTX_TTL, ctx)
-    return ctx
+    pg = _CTX_MEMO.get(tk)                            # portfolio_fit + gex (DTE-independent)
+    if pg and pg[0] > now:
+        portfolio_fit, gex = pg[1]
+    else:
+        portfolio_fit = await asyncio.to_thread(_portfolio_fit_sync, ticker)
+        gex = await asyncio.to_thread(_gex_sync, ticker)
+        if len(_CTX_MEMO) > 48:
+            for k in [k for k, (exp, _v) in _CTX_MEMO.items() if exp <= now]:
+                _CTX_MEMO.pop(k, None)
+        _CTX_MEMO[tk] = (now + _CTX_TTL, (portfolio_fit, gex))
+    ta_hit = _TA_MEMO.get((tk, band))                # DTE-band-adaptive TA
+    if ta_hit and ta_hit[0] > now:
+        ta = ta_hit[1]
+    else:
+        ta = await asyncio.to_thread(_ta_sync, ticker, dte)
+        if len(_TA_MEMO) > 96:
+            for k in [k for k, (exp, _v) in _TA_MEMO.items() if exp <= now]:
+                _TA_MEMO.pop(k, None)
+        _TA_MEMO[(tk, band)] = (now + _CTX_TTL, ta)
+    return ta, portfolio_fit, gex
 
 
 async def rank_desk(
@@ -2064,7 +2127,7 @@ async def rank_desk(
         # SEQUENTIALLY (was a 3-way asyncio.gather) so their per-read memory peaks don't STACK — that
         # stacking was the desk-score spike — and memoised ~5 min per ticker so re-scoring a trade / a
         # My-Trades refresh-all doesn't recompute them.
-        ta, portfolio_fit, gex = await _desk_context(ticker)
+        ta, portfolio_fit, gex = await _desk_context(ticker, target_dte)   # DTE-adaptive TA timeframe
         scan = await run_derivative_income(
             ticker, target_dte=target_dte, min_prob=min_prob, min_income=min_income,
             structures=structures, quote_source=quote_source, user=user, db=db,
@@ -2725,8 +2788,10 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
     sofr_pct = float(ctx.get("sofr_pct") or 5.0)
     hv = ((ctx.get("hv30_pct") or ctx.get("hv20_pct") or 0) / 100.0) or None
     if ta is None or portfolio_fit is None or gex is None:
+        # DTE-adaptive TA timeframe — key off the trade's DTE (evaluate: the opp's own DTE; else target_dte).
+        _rep_dte = target_dte or max((int(o.get("dte") or 0) for o in opportunities), default=45)
         ta, portfolio_fit, gex = await asyncio.gather(
-            asyncio.to_thread(_ta_sync, ticker),
+            asyncio.to_thread(_ta_sync, ticker, _rep_dte),
             asyncio.to_thread(_portfolio_fit_sync, ticker),
             asyncio.to_thread(_gex_sync, ticker),
         )
@@ -2904,7 +2969,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         "as_of": scan.get("as_of"),
         "ta": ta,
         "ta_summary": _ta_summary(ta),
-        "ta_timeframe": ta.get("timeframeLabel"),   # which TA read scores the trade (medium-term swing)
+        "ta_timeframe": ta.get("timeframeLabel"),   # STRUCTURE rung (DTE-adaptive): levels · VP · POC · breach
+        "ta_trend_timeframe": ta.get("_trend_label"),   # TREND/regime rung (one up): Trend drift · Range fit · Calm tape
         "vol_stats": vol_stats,
         "corporate_actions": corporate_actions,
         "portfolio_fit": portfolio_fit or None,

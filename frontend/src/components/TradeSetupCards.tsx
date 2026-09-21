@@ -3,8 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import {
   Target, Shield, Crosshair, Sparkles, ChevronDown, ChevronUp, Layers3, CalendarClock,
   LineChart, TrendingUp, ShieldCheck, Loader2, Code2, Eye, FlaskConical, Clock, LogIn,
+  CheckCircle2, AlertCircle, XCircle, Award, Rocket, Activity, Timer, History, ChevronsUpDown,
 } from 'lucide-react';
-import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg } from '../types';
+import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg, QullamaggieData, ConnorsData, ConnorsBacktest } from '../types';
 
 // Push an option structure's legs into the Income-Desk → Evaluate tab (sessionStorage handoff).
 function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: string, navigate: (to: string) => void) {
@@ -19,7 +20,7 @@ function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: strin
 import { DirectionBadge, ConfidencePill, InfoTip } from './taUi';
 import IndicatorAIConsole from './IndicatorAIConsole';
 import PayoffDiagram from './PayoffDiagram';
-import { analyzeTa, verifySetup, trackTrade, fetchDayTradeSetups } from '../api';
+import { analyzeTa, verifySetup, trackTrade, fetchDayTradeSetups, fetchQullamaggieSetups, fetchConnorsSetups } from '../api';
 
 const money = (n?: number | null) => (n == null ? '—' : `$${n.toFixed(2)}`);
 const pctFrom = (n?: number | null) => (n == null ? '—' : `${n > 0 ? '+' : ''}${n}%`);
@@ -28,6 +29,11 @@ const d0 = (n?: number | null) => (n == null ? '—' : `${n < 0 ? '-$' : '$'}${M
 const TYPE_LABEL: Record<string, string> = {
   trend_continuation: 'Trend Pullback', mean_reversion_fade: 'Mean-Reversion Fade',
   range_income: 'Range Income', range_bracket: 'Range Rotation', breakout: 'Breakout',
+  trend_momentum: 'Momentum (enter now)', position_accumulate: 'Position Accumulate',
+  vwap_hold_long: 'VWAP Hold', vwap_reject_short: 'VWAP Reject', vwap_pullback_long: 'VWAP Pullback',
+  vwap_pullback_short: 'VWAP Pullback', opening_range_break_long: 'Opening-Range Break',
+  opening_range_break_short: 'Opening-Range Break',
+  qm_breakout: 'Momentum Breakout', qm_episodic_pivot: 'Episodic Pivot', qm_parabolic_short: 'Parabolic Short',
 };
 
 function EdgeStats({ pop, ev, evLabel, extra }: { pop?: number | null; ev?: number | null; evLabel: string; extra?: React.ReactNode }) {
@@ -392,19 +398,187 @@ function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker
   );
 }
 
-const STYLE_TABS: { k: 'swing' | 'position' | 'day'; label: string; hint: string }[] = [
+// ── Generic strategy checklist panel (shared by named strategies: Qullamäggie, Connors, …) ──
+const STATUS_ICON: Record<string, { Icon: any; tone: string }> = {
+  pass: { Icon: CheckCircle2, tone: 'text-success' },
+  warn: { Icon: AlertCircle, tone: 'text-warning' },
+  fail: { Icon: XCircle, tone: 'text-error' },
+};
+const TONE_CLASS: Record<string, string> = {
+  good: 'text-success border-success/40 bg-success/10',
+  info: 'text-info border-info/40 bg-info/10',
+  warn: 'text-warning border-warning/40 bg-warning/10',
+  bad: 'text-error border-error/40 bg-error/10',
+  neutral: 'text-base-content/60 border-base-content/25 bg-base-content/5',
+};
+
+interface PanelCheck { key: string; label: string; status: string; value: string; ideal: string; detail: string }
+interface PanelData {
+  Icon: any;
+  title: string;
+  badge: string;          // "A" (grade) or "BUY ZONE" (signal state)
+  tone: string;           // good | info | warn | bad | neutral
+  score: number;          // /100
+  subBadge: string;       // "Candidate" / "Armed"
+  subBadgeGood: boolean;
+  summary: string;
+  stats: { label: string; value: string }[];
+  checks: PanelCheck[];
+  execution?: { label: string; text: string }[] | null;
+  backtest?: ConnorsBacktest | null;
+  footer: string;
+}
+
+function CheckRow({ c }: { c: PanelCheck }) {
+  const [open, setOpen] = useState(false);
+  const { Icon, tone } = STATUS_ICON[c.status] || STATUS_ICON.warn;
+  return (
+    <div className="border-t border-white/[0.05] first:border-0 py-1.5">
+      <button className="w-full flex items-center gap-2 text-left" onClick={() => setOpen(o => !o)}>
+        <Icon className={`w-4 h-4 shrink-0 ${tone}`} />
+        <span className="text-[11.5px] font-semibold text-base-content/80 flex-1">{c.label}</span>
+        <span className={`text-[11px] tabular-nums font-bold ${tone}`}>{c.value}</span>
+        {open ? <ChevronUp className="w-3 h-3 text-base-content/40" /> : <ChevronDown className="w-3 h-3 text-base-content/40" />}
+      </button>
+      {open && (
+        <div className="pl-6 pr-1 pt-1 text-[10.5px] text-base-content/55 leading-snug">
+          {c.detail} <span className="text-base-content/35">· ideal: {c.ideal}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Backtest({ bt }: { bt: ConnorsBacktest }) {
+  if (!bt || !bt.trades) return (
+    <div className="rounded-lg border border-white/[0.06] bg-base-200/20 px-3 py-2 text-[10.5px] text-base-content/50">
+      <History className="w-3 h-3 inline mr-1" /> No historical signals in the sample window to backtest.
+    </div>
+  );
+  const winTone = (bt.win_rate_pct ?? 0) >= 60 ? 'text-success' : (bt.win_rate_pct ?? 0) >= 45 ? 'text-warning' : 'text-error';
+  return (
+    <div className="rounded-lg border border-white/[0.06] bg-base-200/25 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wider text-base-content/45 mb-1 flex items-center gap-1"><History className="w-3 h-3" /> In-sample backtest (this name)</div>
+      <div className="flex items-center gap-x-4 gap-y-0.5 flex-wrap text-[11px] tabular-nums">
+        <span>Win rate <b className={winTone}>{bt.win_rate_pct}%</b></span>
+        <span className="text-base-content/50">{bt.trades} signals</span>
+        <span>avg <b className={(bt.avg_return_pct ?? 0) >= 0 ? 'text-success' : 'text-error'}>{(bt.avg_return_pct ?? 0) > 0 ? '+' : ''}{bt.avg_return_pct}%</b>/trade</span>
+        <span className="text-base-content/50">~{bt.avg_hold_days}d hold</span>
+        {bt.payoff != null && <span className="text-base-content/50">payoff {bt.payoff}</span>}
+      </div>
+      <p className="text-[9.5px] text-base-content/35 mt-0.5">{bt.note}</p>
+    </div>
+  );
+}
+
+function StrategyPanel({ p }: { p: PanelData }) {
+  return (
+    <div className="glass-card p-4 space-y-3">
+      <div className="flex items-start gap-3 flex-wrap">
+        <div className={`flex flex-col items-center justify-center rounded-xl border px-3 py-1.5 min-w-[64px] max-w-[130px] text-center ${TONE_CLASS[p.tone] || TONE_CLASS.neutral}`}>
+          <span className="text-[13px] font-black leading-tight">{p.badge}</span>
+          <span className="text-[9px] tabular-nums opacity-70 mt-0.5">{p.score}/100</span>
+        </div>
+        <div className="flex-1 min-w-[200px]">
+          <div className="flex items-center gap-1.5 text-sm font-bold text-base-content/85">
+            <p.Icon className="w-4 h-4 text-primary" /> {p.title}
+            <span className={`badge badge-xs ${p.subBadgeGood ? 'badge-success' : 'badge-ghost'} font-semibold`}>{p.subBadge}</span>
+          </div>
+          <p className="text-[11.5px] text-base-content/65 leading-snug mt-1">{p.summary}</p>
+          <div className="flex items-center gap-x-3 gap-y-0.5 flex-wrap text-[10px] text-base-content/50 tabular-nums mt-1.5">
+            {p.stats.map((s, i) => <span key={i}>{s.label} <b className="text-base-content/70">{s.value}</b></span>)}
+          </div>
+        </div>
+      </div>
+      <div className="rounded-lg border border-white/[0.06] bg-base-200/25 px-3 py-1">
+        {p.checks.map(c => <CheckRow key={c.key} c={c} />)}
+      </div>
+      {p.backtest !== undefined && p.backtest !== null && <Backtest bt={p.backtest} />}
+      {p.execution && p.execution.length > 0 && (
+        <div className="rounded-lg border border-primary/20 bg-primary/[0.04] px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wider text-primary/80 mb-1 flex items-center gap-1"><Timer className="w-3 h-3" /> Execution — how to actually get in &amp; out</div>
+          <div className="space-y-1">
+            {p.execution.map((e, i) => (
+              <div key={i} className="text-[11px] leading-snug"><b className="text-base-content/75">{e.label}:</b> <span className="text-base-content/60">{e.text}</span></div>
+            ))}
+          </div>
+        </div>
+      )}
+      <p className="text-[10px] text-base-content/40 leading-snug flex items-start gap-1">
+        <p.Icon className="w-3 h-3 mt-0.5 shrink-0" /> {p.footer}
+      </p>
+    </div>
+  );
+}
+
+// ── adapters: each named strategy's payload → the generic panel shape ──
+function qmPanel(d: QullamaggieData): PanelData {
+  const q = d.qualification, m = d.metrics, ma = d.moving_averages;
+  const tone = q.grade === 'A' ? 'good' : q.grade === 'B' ? 'info' : q.grade === 'C' ? 'warn' : 'neutral';
+  return {
+    Icon: Rocket, title: 'Qullamäggie screen', badge: `Grade ${q.grade}`, tone, score: q.score,
+    subBadge: q.is_candidate ? 'Candidate' : 'Not a candidate', subBadgeGood: q.is_candidate, summary: q.summary,
+    stats: [
+      { label: 'ADR', value: `${m.adr_pct ?? '—'}%` },
+      { label: 'from 52w-high', value: `${m.pct_from_52w_high ?? '—'}%` },
+      { label: 'best move', value: `+${m.moves?.best_pct ?? '—'}%` },
+      { label: '10/20/50', value: `${money(ma.ema10)}/${money(ma.ema20)}/${money(ma.sma50)}` },
+    ],
+    checks: q.checks, execution: null, backtest: null,
+    footer: "Kristjan Kullamägi's method: trade only the strongest leaders — a big prior move, high ADR%, price stacked above rising 10/20-EMA & 50-SMA near new highs — buying the break of a tight base (entry refined by the day's opening-range high), a tight stop, then a 10/20-day MA trail. Setups appear below only when the tape supports them.",
+  };
+}
+function connorsPanel(d: ConnorsData): PanelData {
+  const s = d.signal, i = d.indicators, v = d.vix, e = d.execution;
+  const tone = s.tone === 'buy' ? 'good' : s.tone === 'short' ? 'bad' : s.tone === 'watch' ? 'warn' : 'neutral';
+  return {
+    Icon: Activity, title: 'Connors RSI-2', badge: s.state, tone, score: s.score,
+    subBadge: s.armed ? 'Armed' : 'No signal', subBadgeGood: s.armed, summary: s.summary,
+    stats: [
+      { label: 'RSI(2)', value: `${i.rsi2 ?? '—'}` },
+      { label: 'RSI(5)', value: `${i.rsi5 ?? '—'}` },
+      { label: 'RSI(10)', value: `${i.rsi10 ?? '—'}` },
+      { label: '5-SMA', value: money(i.sma5) },
+      { label: '200-SMA', value: money(i.sma200) },
+      { label: 'VIX', value: v ? `${v.level} (${v.pct_above_sma10 > 0 ? '+' : ''}${v.pct_above_sma10}%${v.fear_spike ? ' fear' : ''})` : '—' },
+    ],
+    checks: s.checks, backtest: d.backtest,
+    execution: e ? [
+      { label: 'Order', text: e.recommended_order },
+      { label: 'Overnight', text: e.overnight_risk },
+      { label: 'Open alt', text: e.open_alternative },
+      { label: 'Exit', text: e.exit_basis },
+      { label: 'Stops', text: e.stops_note },
+    ] : null,
+    footer: "Larry Connors' 2-Period RSI is a MEAN-REVERSION system: buy short-term oversold dips (RSI-2 < 10) in an uptrend (above the 200-SMA), exit on the close back above the 5-day SMA — the mirror for shorts below the 200-SMA. High win-rate, small targets: the edge is frequency, not reward:risk (see the backtest). A stretched VIX (fear) marks the highest-probability windows.",
+}
+;
+}
+
+type StyleKey = 'swing' | 'position' | 'day';
+const STYLE_TABS: { k: StyleKey; label: string; hint: string }[] = [
   { k: 'swing', label: 'Swing', hint: 'days–weeks' },
   { k: 'position', label: 'Position', hint: 'weeks–months' },
   { k: 'day', label: 'Day trade', hint: 'intraday' },
 ];
 
+// named technical strategies live in the dropdown (extensible — add more here)
+interface NamedStrategy { key: string; label: string; hint: string; fetch: (t: string) => Promise<any>; toPanel: (d: any) => PanelData }
+const NAMED_STRATEGIES: NamedStrategy[] = [
+  { key: 'qullamaggie', label: 'Qullamäggie', hint: 'momentum breakout', fetch: (t) => fetchQullamaggieSetups(t).then(r => r.qullamaggie_setup), toPanel: qmPanel },
+  { key: 'connors_rsi2', label: 'Connors RSI-2', hint: 'mean reversion', fetch: (t) => fetchConnorsSetups(t).then(r => r.connors_setup), toPanel: connorsPanel },
+];
+
+interface StratState { data?: any; loading: boolean; err?: string; tried: boolean }
+
 export default function TradeSetupCards({ data, ticker }: { data: TradeSetupsData; ticker: string }) {
   const [showDossier, setShowDossier] = useState(false);
-  const [tab, setTab] = useState<'swing' | 'position' | 'day'>('swing');
+  const [tab, setTab] = useState<string>('swing');
   const [dayData, setDayData] = useState<TradeSetup[] | null>(null);
   const [dayLoading, setDayLoading] = useState(false);
   const [dayErr, setDayErr] = useState<string | null>(null);
   const [dayTried, setDayTried] = useState(false);
+  const [strat, setStrat] = useState<Record<string, StratState>>({});
 
   const setups = data.setups || [];
   const dossier = (data.dossier || {}) as Record<string, unknown>;
@@ -418,18 +592,35 @@ export default function TradeSetupCards({ data, ticker }: { data: TradeSetupsDat
       .catch((e: unknown) => setDayErr(e instanceof Error ? e.message : 'No intraday data available'))
       .finally(() => setDayLoading(false));
   };
-  const pick = (t: 'swing' | 'position' | 'day') => { setTab(t); if (t === 'day' && !dayTried) loadDay(); };
+  const loadStrat = (s: NamedStrategy) => {
+    setStrat(p => ({ ...p, [s.key]: { ...p[s.key], loading: true, err: undefined, tried: true } }));
+    s.fetch(ticker)
+      .then(d => setStrat(p => ({ ...p, [s.key]: { data: d, loading: false, tried: true } })))
+      .catch((e: unknown) => setStrat(p => ({ ...p, [s.key]: { loading: false, tried: true, err: e instanceof Error ? e.message : 'No daily history available' } })));
+  };
+  const pick = (t: string) => {
+    setTab(t);
+    if (t === 'day' && !dayTried) loadDay();
+    const ns = NAMED_STRATEGIES.find(s => s.key === t);
+    if (ns && !strat[ns.key]?.tried) loadStrat(ns);
+    (document.activeElement as HTMLElement | null)?.blur();   // close the dropdown after selecting
+  };
 
-  const count = (k: string) => k === 'swing' ? swing.length : k === 'position' ? position.length : (dayData?.length ?? null);
-  const active = tab === 'swing' ? swing : tab === 'position' ? position : (dayData || []);
+  const activeNamed = NAMED_STRATEGIES.find(s => s.key === tab);
+  const ns = activeNamed ? strat[activeNamed.key] : undefined;
+  const nsData = ns?.data;
+  const genCount = (k: string) => k === 'swing' ? swing.length : k === 'position' ? position.length : (dayData?.length ?? null);
+  const genActive = tab === 'swing' ? swing : tab === 'position' ? position : (dayData || []);
+  // named-strategy cards carry their own context (signal/metrics/backtest) as the Verify/Ask-AI dossier
+  const cardDossier = (activeNamed && nsData) ? { [activeNamed.key]: (({ setups: _s, ...rest }) => rest)(nsData) } : dossier;
 
   return (
     <div className="space-y-3">
-      {/* trade-style selector */}
+      {/* trade-style selector: generic styles as pills + named strategies in a dropdown */}
       <div className="flex items-center gap-1 flex-wrap">
         <div className="flex items-center gap-1 bg-base-200/40 p-1 rounded-xl">
           {STYLE_TABS.map(t => {
-            const n = count(t.k);
+            const n = genCount(t.k);
             return (
               <button key={t.k} onClick={() => pick(t.k)}
                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${tab === t.k ? 'bg-primary/15 text-primary shadow-sm' : 'text-base-content/50 hover:text-base-content hover:bg-base-100/40'}`}>
@@ -437,6 +628,23 @@ export default function TradeSetupCards({ data, ticker }: { data: TradeSetupsDat
               </button>
             );
           })}
+          <div className="dropdown">
+            <label tabIndex={0} className={`flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition ${activeNamed ? 'bg-primary/15 text-primary shadow-sm' : 'text-base-content/50 hover:text-base-content hover:bg-base-100/40'}`}>
+              {activeNamed ? activeNamed.label : 'Named strategies'}
+              {activeNamed && (strat[activeNamed.key]?.data?.setups?.length ?? null) != null ? ` (${strat[activeNamed.key]?.data?.setups?.length})` : ''}
+              <ChevronsUpDown className="w-3 h-3 opacity-70" />
+            </label>
+            <ul tabIndex={0} className="dropdown-content menu z-20 mt-1 w-60 p-1 shadow-lg bg-base-200 rounded-xl border border-white/10">
+              {NAMED_STRATEGIES.map(s => (
+                <li key={s.key}>
+                  <button onClick={() => pick(s.key)} className={`flex items-center justify-between gap-2 ${tab === s.key ? 'active' : ''}`}>
+                    <span className="font-semibold text-xs">{s.label}</span>
+                    <span className="text-[9px] text-base-content/40">{s.hint}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
         <button className="btn btn-ghost btn-xs gap-1 text-base-content/50 ml-auto" onClick={() => setShowDossier(s => !s)}>
           <Code2 className="w-3.5 h-3.5" /> {showDossier ? 'Hide' : 'View'} JSON
@@ -445,34 +653,57 @@ export default function TradeSetupCards({ data, ticker }: { data: TradeSetupsDat
 
       {showDossier && (
         <pre className="text-[10px] bg-base-300/60 rounded-lg p-2.5 overflow-auto max-h-72 text-base-content/70 border border-white/[0.05]">
-          {JSON.stringify(dossier, null, 2)}
+          {JSON.stringify(activeNamed && nsData ? nsData : dossier, null, 2)}
         </pre>
       )}
 
-      {tab === 'day' && dayLoading && (
-        <div className="glass-card p-6 flex items-center justify-center gap-2 text-sm text-base-content/60">
-          <Loader2 className="w-4 h-4 animate-spin" /> Scanning intraday 5m/15m structure, VWAP &amp; the opening range…
-        </div>
-      )}
-      {tab === 'day' && dayErr && !dayLoading && (
-        <div className="glass-card p-4 text-sm text-base-content/60">{dayErr} — intraday setups need live market-hours data.</div>
-      )}
-      {!(tab === 'day' && (dayLoading || dayErr)) && (
-        active.length === 0 ? (
-          <div className="glass-card p-6 text-center">
-            <Crosshair className="w-6 h-6 mx-auto text-base-content/30 mb-2" />
-            <p className="text-sm font-semibold text-base-content/70">
-              {tab === 'position' ? 'No long-term entry lined up' : tab === 'day' ? 'No clean intraday setup right now' : 'No high-conviction swing setup right now'}
-            </p>
-            <p className="text-xs text-base-content/50 mt-1">
-              {tab === 'position' ? 'No strong value zone to accumulate into with a worthwhile reward yet.'
-                : tab === 'day' ? 'Price is mid-range vs VWAP / the opening range — wait for a break or a VWAP reclaim.'
-                : "The signals don't line up into a clean trade yet — check the other styles or the Advanced levels."}
-            </p>
+      {activeNamed ? (
+        ns?.loading ? (
+          <div className="glass-card p-6 flex items-center justify-center gap-2 text-sm text-base-content/60">
+            <Loader2 className="w-4 h-4 animate-spin" /> Running the {activeNamed.label} screen on the daily history…
           </div>
-        ) : (
-          active.map((s, i) => <SetupCard key={`${tab}-${i}`} setup={s} ticker={ticker} spot={data.price} dossier={dossier} />)
-        )
+        ) : ns?.err ? (
+          <div className="glass-card p-4 text-sm text-base-content/60">{ns.err} — this strategy needs daily price history.</div>
+        ) : nsData ? (
+          <>
+            <StrategyPanel p={activeNamed.toPanel(nsData)} />
+            {(nsData.setups || []).length === 0 ? (
+              <div className="glass-card p-4 text-center text-xs text-base-content/50">
+                No actionable {activeNamed.label} trade right now — see the checklist above for the current signal state and what it's waiting for.
+              </div>
+            ) : (
+              (nsData.setups as TradeSetup[]).map((s, i) => <SetupCard key={`${activeNamed.key}-${i}`} setup={s} ticker={ticker} spot={nsData.price} dossier={cardDossier} />)
+            )}
+          </>
+        ) : null
+      ) : (
+        <>
+          {tab === 'day' && dayLoading && (
+            <div className="glass-card p-6 flex items-center justify-center gap-2 text-sm text-base-content/60">
+              <Loader2 className="w-4 h-4 animate-spin" /> Scanning intraday 5m/15m structure, VWAP &amp; the opening range…
+            </div>
+          )}
+          {tab === 'day' && dayErr && !dayLoading && (
+            <div className="glass-card p-4 text-sm text-base-content/60">{dayErr} — intraday setups need live market-hours data.</div>
+          )}
+          {!(tab === 'day' && (dayLoading || dayErr)) && (
+            genActive.length === 0 ? (
+              <div className="glass-card p-6 text-center">
+                <Crosshair className="w-6 h-6 mx-auto text-base-content/30 mb-2" />
+                <p className="text-sm font-semibold text-base-content/70">
+                  {tab === 'position' ? 'No long-term entry lined up' : tab === 'day' ? 'No clean intraday setup right now' : 'No high-conviction swing setup right now'}
+                </p>
+                <p className="text-xs text-base-content/50 mt-1">
+                  {tab === 'position' ? 'No strong value zone to accumulate into with a worthwhile reward yet.'
+                    : tab === 'day' ? 'Price is mid-range vs VWAP / the opening range — wait for a break or a VWAP reclaim.'
+                    : "The signals don't line up into a clean trade yet — check the other styles or the Advanced levels."}
+                </p>
+              </div>
+            ) : (
+              genActive.map((s, i) => <SetupCard key={`${tab}-${i}`} setup={s} ticker={ticker} spot={data.price} dossier={dossier} />)
+            )
+          )}
+        </>
       )}
     </div>
   );

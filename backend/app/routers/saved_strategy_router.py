@@ -2621,19 +2621,28 @@ async def get_repair_menu(
     entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
     roll_days = 45
 
-    # Build the FULL position: every option leg with its sign + per-share entry credit/debit.
+    # Build the FULL position: every option leg with its sign + per-share entry credit/debit. LONG
+    # stock legs are kept too, so a COVERED CALL is modeled covered (defined) — not as a naked short call.
     legs, near_exp = [], None
+    covered_shares, stock_basis = 0.0, None
     for i, l in enumerate(raw):
         typ = str(l.get("type", "")).lower()
-        if not l.get("strike") or ("call" not in typ and "put" not in typ):
-            continue
-        right = "P" if "put" in typ else "C"
-        sign = -1 if "SELL" in str(l.get("action", "")).upper() else 1
-        ep = entry_prices[i].get("price") if i < len(entry_prices) and isinstance(entry_prices[i], dict) else None
-        entry = abs(float(ep)) if ep else abs(float(l.get("premium") or l.get("mid") or 0.0))
-        legs.append({"strike": float(l["strike"]), "right": right, "sign": sign,
-                     "qty": int(l.get("qty") or l.get("contracts") or 1), "entry": entry})
-        near_exp = near_exp or str(l.get("expiration") or l.get("expiry") or "")[:10]
+        act = str(l.get("action", "")).upper()
+        if l.get("strike") and ("call" in typ or "put" in typ):
+            right = "P" if "put" in typ else "C"
+            sign = -1 if "SELL" in act else 1
+            ep = entry_prices[i].get("price") if i < len(entry_prices) and isinstance(entry_prices[i], dict) else None
+            entry = abs(float(ep)) if ep else abs(float(l.get("premium") or l.get("mid") or 0.0))
+            legs.append({"strike": float(l["strike"]), "right": right, "sign": sign,
+                         "qty": int(l.get("qty") or l.get("contracts") or 1), "entry": entry})
+            near_exp = near_exp or str(l.get("expiration") or l.get("expiry") or "")[:10]
+        elif ("stock" in typ or "share" in typ or "equity" in typ) and ("SELL" not in act):
+            covered_shares += abs(float(l.get("qty") or l.get("shares") or 0.0))
+            bp = entry_prices[i].get("price") if i < len(entry_prices) and isinstance(entry_prices[i], dict) else None
+            if bp:
+                stock_basis = float(bp)
+            elif l.get("premium") or l.get("mid") or l.get("price"):
+                stock_basis = float(l.get("premium") or l.get("mid") or l.get("price"))
     if not legs:
         return {"error": "No option legs to repair — the repair menu is for short-premium trades (CSPs / short calls / spreads / condors)."}
 
@@ -2707,10 +2716,11 @@ async def get_repair_menu(
         except Exception:  # noqa: BLE001 — best-effort; deep-ITM extrinsic heuristic still applies
             ex_div = None
 
+    stock = {"shares": covered_shares, "basis": stock_basis if stock_basis else spot} if covered_shares > 0 else None
     menu = repair_alternatives(legs=legs, spot=spot, dte_days=dte_days, roll_days=roll_days,
                                atm_iv=atm_iv, chains=chains or None, ex_div=ex_div,
                                near_expiry=(n_exp or near_exp), far_expiry=f_exp,
-                               base_date=dt.date.today().isoformat())
+                               base_date=dt.date.today().isoformat(), stock=stock)
     menu["ticker"] = strategy.ticker
 
     # TA + context enrichment: fold the technicals INTO the recoverability read (structure / momentum /
@@ -2721,20 +2731,43 @@ async def get_repair_menu(
         rec = menu.get("recoverability") or {}
         ta_factors, outlook, context = await asyncio.to_thread(
             _defend_ta_context, strategy.ticker, spot, dte_days, menu.get("short_right"),
-            rec.get("breakeven"), (menu.get("assignment") or {}).get("extrinsic"), menu.get("contracts") or 1)
+            rec.get("breakeven"), (menu.get("assignment") or {}).get("extrinsic"), menu.get("contracts") or 1,
+            rec.get("posture"), rec.get("cushion_pct"), menu.get("short_strike"), rec.get("expected_move"))
         if rec:
             rec.setdefault("factors", []).extend(ta_factors)
             rec["outlook"] = outlook
+            risk = (context or {}).get("risk") or {}
+            if risk:                                  # reconcile: P(touch)/VRP/trend can downgrade a naive 'healthy' → 'marginal'
+                rec["posture"] = risk.get("posture") or rec.get("posture")
+                for k in ("p_touch", "vrp_pct", "trend_pct", "iv_pct", "hv_pct"):
+                    rec[k] = risk.get(k)
+                rec["risk_read"] = risk.get("read")
         menu["context"] = context
     except Exception:  # noqa: BLE001 — TA is an overlay; the core recoverability/actions still stand
         pass
-    return menu
+    return _to_native(menu)
 
 
 class DefendPayloadIn(BaseModel):
     """The already-computed Defend payload the panel POSTs to the context / committee lenses, so the
     server reasons over the SAME numbers without re-pricing the chain (one heavy fetch per trade)."""
     defend: dict = Field(default_factory=dict)
+
+
+def _to_native(obj):
+    """Recursively coerce numpy scalars/arrays → native Python so FastAPI/pydantic can serialize the
+    response (find_support_resistance etc. return numpy.float64, and `x <= numpy_float` is numpy.bool_,
+    which the JSON encoder chokes on with 'numpy.bool object is not iterable')."""
+    import numpy as _np
+    if isinstance(obj, dict):
+        return {k: _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_native(v) for v in obj]
+    if isinstance(obj, _np.generic):
+        return obj.item()
+    if isinstance(obj, _np.ndarray):
+        return [_to_native(v) for v in obj.tolist()]
+    return obj
 
 
 # ── Defend TA / context helpers (deterministic; fold the technicals INTO the recoverability read) ──
@@ -2769,7 +2802,38 @@ def _poc(closes, volumes, bins: int = 30):
     return round(float((edges[b] + edges[b + 1]) / 2.0), 2)
 
 
-def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n):
+def _p_touch(S, K, iv, dte, mu, right):
+    """Drift-aware first-passage probability the short strike is BREACHED (touched) at ANY point before
+    expiry — the real 'will it get tested' risk, ~2× the terminal-ITM odds and higher with an adverse
+    trend (GBM reflection principle). Returns 0..1 or None. This is what makes a 'healthy' 82%-OTM short
+    honest: a 75% touch means it is NOT safe."""
+    import math
+    T = max(dte, 1) / 365.0
+    sig = max(iv or 0.0, 0.02)
+    if not S or not K or S <= 0 or K <= 0 or T <= 0:
+        return None
+    nu = mu - 0.5 * sig * sig
+    sq = sig * math.sqrt(T)
+    if sq <= 0:
+        return None
+    _N = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    a = math.log(K / S)
+    try:
+        if right == "C":                         # upper barrier K
+            if a <= 0:
+                return 0.99
+            p = _N((-a + nu * T) / sq) + math.exp(2 * nu * a / (sig * sig)) * _N((-a - nu * T) / sq)
+        else:                                    # lower barrier K
+            if a >= 0:
+                return 0.99
+            p = _N((a - nu * T) / sq) + math.exp(2 * nu * a / (sig * sig)) * _N((a + nu * T) / sq)
+    except (OverflowError, ValueError):
+        return None
+    return max(0.0, min(0.999, float(p)))
+
+
+def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n, posture=None, cushion_pct=None,
+                       short_strike=None, exp_move=None):
     """Best-effort DETERMINISTIC technicals that TILT the recovery odds (structure · breakeven-vs-level ·
     momentum · RSI · volume-profile · gamma regime) + the 'what broke & setup' context (recoverable time
     value · realized-vol state · sector cohort · earnings). Returns (ta_factors, outlook, context).
@@ -2784,16 +2848,29 @@ def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n):
     need_up = (right == "P")
     ta: list[dict] = []
     context: dict = {}
+    _closes_cap, _hv_cap = None, None          # captured for the quant risk read (trend / VRP)
     stock = yf.Ticker(ticker)
     px = float(spot) if spot else None
+    # DTE-ADAPTIVE timeframe. Recoverability is a MANAGEMENT read — it must match the trade's REMAINING
+    # horizon, the SAME ladder as the desk: a 3-DTE defended trade reads intraday structure, not 6-month
+    # daily. `dte` here is the trade's remaining DTE, so this auto-tightens as expiry nears.
+    from ..services.desk_review_service import _tf_for_dte
+    from ..services.stock_service import TECHNICAL_TIMEFRAMES
+    _stf, _ = _tf_for_dte(dte)
+    _cfg = TECHNICAL_TIMEFRAMES.get(_stf) or {"period": "6mo", "interval": "1d", "label": "Medium Term (6mo / 1d)"}
+    context["ta_timeframe"] = _cfg.get("label")
+    _bpy = {"1m": 252 * 390, "5m": 252 * 78, "15m": 252 * 26, "30m": 252 * 13,
+            "1h": int(252 * 6.5), "1d": 252, "1wk": 52}.get(_cfg["interval"], 252)   # bars/yr → correct HV annualization
 
     # history-derived: structure · breakeven-vs-level · momentum · RSI · POC · realized-vol state
     try:
-        hist = stock.history(period="6mo", interval="1d")
+        hist = stock.history(period=_cfg["period"], interval=_cfg["interval"])
         if hist is not None and not hist.empty:
             highs = hist["High"].tolist(); lows = hist["Low"].tolist()
             closes = hist["Close"].tolist(); vols = hist["Volume"].tolist()
             sup, res = find_support_resistance(highs, lows, closes)
+            sup = float(sup) if sup is not None else None
+            res = float(res) if res is not None else None
             px = px or (closes[-1] if closes else None)
             if px and sup and res:
                 context["technical"] = {"support": sup, "resistance": res,
@@ -2813,6 +2890,7 @@ def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n):
                         ta.append({"label": "Breakeven vs support", "kind": "ta", "favorable": False,
                                    "detail": f"breakeven ${be:.2f} is BELOW support ${sup:.2f} — a floor must break for you to recover"})
             c = np.asarray(closes, dtype=float)
+            _closes_cap = c
             if len(c) >= 26:
                 macd = _ema(c, 12) - _ema(c, 26); sigl = _ema(macd, 9)
                 bull = bool(macd[-1] > sigl[-1])
@@ -2834,7 +2912,8 @@ def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n):
                                       else f"POC ${poc:.2f} ({((poc-px)/px*100):+.1f}%) — the high-volume shelf is away from spot")})
             rets = np.diff(np.log(c)) if len(c) > 1 else np.array([])
             if len(rets) > 60:
-                hv20 = float(np.std(rets[-20:]) * (252 ** 0.5) * 100); hv60 = float(np.std(rets[-60:]) * (252 ** 0.5) * 100)
+                hv20 = float(np.std(rets[-20:]) * (_bpy ** 0.5) * 100); hv60 = float(np.std(rets[-60:]) * (_bpy ** 0.5) * 100)
+                _hv_cap = hv60
                 state = "spiking" if hv20 > hv60 * 1.3 else "cooling" if hv20 < hv60 * 0.8 else "steady"
                 context["vol_note"] = f"Realized vol {state} (HV20 {hv20:.0f}% vs HV60 {hv60:.0f}%)."
     except Exception:  # noqa: BLE001
@@ -2852,6 +2931,50 @@ def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n):
                 ta.append({"label": "Gamma regime", "kind": "ta", "favorable": bool(long_g),
                            "detail": (f"dealers LONG gamma (net GEX +{net/1e6:.0f}M{flip_txt}) — moves suppressed / mean-reverting, helps a bounce back" if long_g
                                       else f"dealers SHORT gamma (net GEX {net/1e6:.0f}M{flip_txt}) — moves amplified, works against a recovery")})
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── CHART PATTERN + RANGE — is a classical pattern setting up a move TOWARD the strike, and where
+    #    does spot sit in its range? A bullish break targeting a short call (or bearish a short put) is a
+    #    real, chartable threat the greeks alone miss. ──
+    try:
+        from ..services.chart_pattern_service import compute_chart_patterns
+        # Match the pattern window to the trade's horizon — a 60–90 DTE trade cares about the last ~quarter,
+        # not a year-old double top; and when it's gone wrong, it's the RECENT action that matters.
+        pat_period = "3mo" if (dte or 60) <= 90 else "6mo" if (dte or 60) <= 180 else "1y"
+        cp = compute_chart_patterns(stock, period=pat_period, interval="1d")
+        pats = (cp or {}).get("patterns") or []
+        if pats:
+            p = pats[0]
+            pdir = p.get("direction"); ptype = str(p.get("type", "")).replace("_", " ")
+            tgt = (p.get("target") or {}).get("price"); status = str(p.get("status", "")).replace("_", " ")
+            fav = bool((pdir == "bullish") == need_up)      # bullish helps a put-recovery / threatens a call
+            thr = ""
+            if short_strike and tgt:
+                ks = float(short_strike)
+                if right == "C" and pdir == "bullish":
+                    thr = f" — target {'PAST' if tgt >= ks else 'toward'} your ${ks:.0f} strike"
+                elif right == "P" and pdir == "bearish":
+                    thr = f" — target {'PAST' if tgt <= ks else 'toward'} your ${ks:.0f} strike"
+            ta.append({"label": "Chart pattern", "kind": "ta", "favorable": fav,
+                       "detail": f"{status} {pdir} {ptype} (conf {round((p.get('confidence') or 0)*100)}%), target ${tgt:.0f}{thr}"})
+            context["pattern"] = {"type": ptype, "direction": pdir, "status": status, "target": tgt,
+                                  "breakout": (p.get("breakout") or {}).get("level"),
+                                  "confidence": round((p.get("confidence") or 0) * 100), "window": pat_period}
+        tch = context.get("technical") or {}
+        sup_, res_ = tch.get("support"), tch.get("resistance")
+        if sup_ and res_ and px and res_ > sup_:
+            width = (res_ - sup_) / px * 100.0
+            where = ("ABOVE the range" if px > res_ else "BELOW the range" if px < sup_
+                     else f"mid-range ({(px - sup_) / (res_ - sup_) * 100:.0f}% up)")
+            ks_txt = ""
+            if short_strike:
+                ks = float(short_strike)
+                ks_txt = (f" Your ${ks:.0f} strike is {'ABOVE the range top — the stock must break out to threaten it' if ks > res_ else 'inside the range' if ks >= sup_ else 'below the range'}."
+                          if right == "C" else
+                          f" Your ${ks:.0f} strike is {'BELOW the range floor — a breakdown is needed to threaten it' if ks < sup_ else 'inside the range' if ks <= res_ else 'above the range'}.")
+            context["range"] = {"low": round(sup_, 2), "high": round(res_, 2), "width_pct": round(width, 1),
+                                "where": where, "note": f"Range ${sup_:.2f}–${res_:.2f} ({width:.0f}% wide); spot is {where}.{ks_txt}"}
     except Exception:  # noqa: BLE001
         pass
 
@@ -2876,17 +2999,79 @@ def _defend_ta_context(ticker, spot, dte, right, be, extrinsic, contracts_n):
     except Exception:  # noqa: BLE001
         pass
 
+    # ── QUANT RISK READ — reconcile with the management desk. Terminal-OTM alone is NAIVE: a Δ0.34 short
+    #    can be 82% "safe" at expiry yet have a 75% chance of being BREACHED along the way, in an uptrend,
+    #    with under-priced premium. Compute the drift-aware P(touch) + VRP + trend and DOWNGRADE a naive
+    #    'healthy' to MARGINAL when the position is OTM but genuinely at risk. This is what makes Defend
+    #    agree with the "STRONG CLOSE" the Manage panel already shows. ──
+    try:
+        T = max(dte, 1) / 365.0
+        iv = (float(exp_move) / (float(spot) * (T ** 0.5))) if (exp_move and spot and T > 0) else None
+        mu = None
+        if _closes_cap is not None and len(_closes_cap) >= 20:
+            e = _ema(_closes_cap, 20)
+            look = min(len(e) - 1, max(5, int(_bpy / 52)))                 # ~1 week of bars
+            if look > 0 and e[-1] > 0 and e[-1 - look] > 0:
+                mu = float(np.log(e[-1] / e[-1 - look]) * (_bpy / look))   # annualized EMA slope (trend velocity)
+        p_touch = _p_touch(float(spot), float(short_strike), iv, dte, mu if mu is not None else 0.0, right) if (short_strike and iv) else None
+        vrp = (iv / (_hv_cap / 100.0) - 1.0) if (iv and _hv_cap and _hv_cap > 0) else None
+        adverse_trend = bool(mu is not None and ((right == "C" and mu > 0.15) or (right == "P" and mu < -0.15)))
+        _pat = context.get("pattern") or {}
+        adverse_pattern = bool(_pat and _pat.get("status") != "broken out"
+                               and ((right == "C" and _pat.get("direction") == "bullish")
+                                    or (right == "P" and _pat.get("direction") == "bearish")))
+        base = posture or "healthy"
+        if base == "tested":
+            final = "tested"
+        else:
+            final = ("marginal" if ((p_touch is not None and p_touch >= 0.50) or (vrp is not None and vrp <= -0.20)
+                                     or adverse_trend or adverse_pattern) else "healthy")
+        read = None
+        if final == "marginal":
+            bits = []
+            if p_touch is not None:
+                bits.append(f"a {round(p_touch*100)}% chance the ${float(short_strike):.0f} strike is BREACHED before expiry (drift-aware, ~2× the expiry-ITM odds)")
+            if vrp is not None and vrp <= -0.10:
+                bits.append(f"premium {abs(vrp)*100:.0f}% UNDER-priced (IV {iv*100:.0f}% < HV {_hv_cap:.0f}%) — you're not paid for the risk")
+            if adverse_trend:
+                bits.append(f"trend {mu*100:+.0f}%/yr pushing {'toward' if right=='C' else 'against'} the strike")
+            if adverse_pattern:
+                _tgt = _pat.get("target")
+                bits.append(f"a {_pat.get('status')} {_pat.get('direction')} {_pat.get('type')}" + (f" targeting ${_tgt:.0f}" if _tgt else "") + " on the chart")
+            read = ("Not tested yet — but a MARGINAL short, not a safe one: " + "; ".join(bits) +
+                    ". A quant de-risks NOW: cap the tail (roll to a defined-risk spread / add a wing), transform the payoff "
+                    "(asymmetric broken-wing fly), flatten gamma (calendarised hedge), or bank the credit and close.")
+        elif final == "healthy":
+            read = (f"Genuinely healthy — only a {round((p_touch or 0)*100)}% chance the strike is even touched, cushion wide"
+                    + (f", premium fairly priced (VRP {vrp*100:+.0f}%)" if vrp is not None else "") + "; let theta work.")
+        context["risk"] = {"posture": final,
+                           "p_touch": (round(p_touch * 100, 1) if p_touch is not None else None),
+                           "iv_pct": (round(iv * 100, 1) if iv else None), "hv_pct": (round(_hv_cap, 1) if _hv_cap else None),
+                           "vrp_pct": (round(vrp * 100, 1) if vrp is not None else None),
+                           "trend_pct": (round(mu * 100, 1) if mu is not None else None), "read": read}
+    except Exception:  # noqa: BLE001
+        pass
+
     # outlook — net tilt from the TA factors that carry a direction.
+    _final_posture = ((context.get("risk") or {}).get("posture")) or posture
     dirn = [f for f in ta if f.get("favorable") is not None]
     favs = sum(1 for f in dirn if f["favorable"]); adv = sum(1 for f in dirn if not f["favorable"])
-    if dirn:
+    if not dirn:
+        tilt, note = "balanced", "Not enough technical data to read the setup."
+    elif _final_posture == "healthy":
+        # A far-OTM winner: adverse momentum is a THREAT to the cushion, not a recovery odds — and with a
+        # wide cushion it's context, not a call to action. Never tell a healthy trade its odds are optimistic.
+        tilt = "favorable" if favs > adv else "watch" if adv > favs else "balanced"
+        cush = f" You have a {cushion_pct:.0f}% cushion, so this is context, not a threat yet." if cushion_pct else ""
+        note = (f"This trade is HEALTHY — not tested. Technicals ({favs} favorable / {adv} pressuring the cushion) "
+                + ("are pushing toward your strike — worth watching." if adv > favs else "are benign.")
+                + cush)
+    else:
         tilt = "favorable" if favs > adv else "adverse" if adv > favs else "balanced"
         note = (f"Technicals lean {tilt.upper()} for a recovery ({favs} favorable / {adv} adverse) — "
                 + ("they back the model odds." if tilt == "favorable"
                    else "treat the raw recovery odds as OPTIMISTIC." if tilt == "adverse"
                    else "they neither help nor hurt the model odds."))
-    else:
-        tilt, note = "balanced", "Not enough technical data to tilt the recovery odds."
     return ta, {"tilt": tilt, "note": note}, context
 
 
@@ -2970,12 +3155,21 @@ async def run_defend_committee(
         "must BEAT hold (Δrecovery > 0 and/or a materially smaller or newly-defined max loss) to justify its cost, "
         "and CLOSE is always the honest fallback. Be DETAILED and METRIC-DENSE: every sentence cites specific "
         "numbers, and the roles must AGREE with the final verdict (no contradictions).\n"
+        "TAIL & RISK DISCIPLINE (do not violate): an UNDEFINED / unbounded max loss is THE risk — NEVER describe it "
+        "as 'no additional risk' or a comfort. When the current max loss is undefined, CAPPING it (a defined-risk "
+        "repair) is a FIRST-CLASS defensive objective and a valid reason to pick a repair even at some E[P&L] cost; "
+        "do NOT dismiss a defined-risk repair merely because it doesn't raise recovery odds. Always state the "
+        "assignment / called-away consequence explicitly and whether the trader can take it (capital, or keeping vs "
+        "losing shares) — if they can't, favour a repair that rolls or caps. 'Hold' is only valid when the tail is "
+        "bounded (or covered) AND its E[P&L] genuinely beats the alternatives; if the tail is open, say so and offer "
+        "the cap as the risk-managed alternate.\n"
         "THREE SEATS (each: a short stance, a 2–4 sentence rationale citing ≥3 specific numbers, and a `metrics` "
         "list of the exact figures leaned on):\n"
         "• QUANT — the odds: recovery %, needed move in σ, how the TA OUTLOOK tilts those odds, which repair moves "
         "Δrecovery most and at what E[P&L] vs hold.\n"
-        "• RISK — assignment P(ITM), early-exercise, capital at stake, max loss defined vs open, whether the repair "
-        "caps the tail and by how much, whether the trader can take assignment.\n"
+        "• RISK — assignment P(ITM), early-exercise, capital at stake, max loss DEFINED vs OPEN (and if open, which "
+        "repair caps it and by how much), whether the trader can take assignment. Flag an open tail as a concern, "
+        "never as a reassurance.\n"
         "• PM — weigh it and pick ONE path: hold, a NAMED repair, take-assignment-and-wheel, or close.\n"
         "Return STRICT JSON, nothing else:\n"
         '{"quant":{"stance":"<=6 words","rationale":"2-4 sentences, number-dense","metrics":["figure","figure","figure"]},'
@@ -3022,6 +3216,73 @@ async def run_defend_committee(
         verdict = None
     return {"quant": _role("quant", "Quant"), "risk": _role("risk", "Risk"), "pm": _role("pm", "PM"),
             "verdict": verdict, "data_sent": ctx}
+
+
+@router.post("/{strategy_id}/defend/optimize-roll")
+async def optimize_defend_roll(
+    strategy_id: int,
+    quote_source: str = "yfinance",
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deep-quant ROLL OPTIMIZER — the credit-only, market-structure-aware roll finder. Picks the
+    (strike, expiry) to roll the tested short into that best balances credit (no net new money),
+    capital, and the probability the NEXT short holds — judged by the market RND plus support/
+    resistance, gamma flip/wall (GEX) and the volume POC. Heavy (multi-expiry chains + RND), so lazy."""
+    import datetime as dt
+    from ..services.quote_providers import get_provider
+    from ..services.roll_optimizer_service import optimize_roll
+
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    raw = json.loads(strategy.legs_data) if strategy.legs_data else []
+    entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
+    shorts, covered_shares, near_exp = [], 0.0, None
+    for i, l in enumerate(raw):
+        typ = str(l.get("type", "")).lower()
+        act = str(l.get("action", "")).upper()
+        if l.get("strike") and ("call" in typ or "put" in typ):
+            right = "P" if "put" in typ else "C"
+            sign = -1 if "SELL" in act else 1
+            ep = entry_prices[i].get("price") if i < len(entry_prices) and isinstance(entry_prices[i], dict) else None
+            entry = abs(float(ep)) if ep else abs(float(l.get("premium") or l.get("mid") or 0.0))
+            if sign < 0:
+                shorts.append({"right": right, "strike": float(l["strike"]),
+                               "qty": int(l.get("qty") or l.get("contracts") or 1), "entry": entry})
+            near_exp = near_exp or str(l.get("expiration") or l.get("expiry") or "")[:10]
+        elif ("stock" in typ or "share" in typ or "equity" in typ) and "BUY" in act:
+            covered_shares += abs(float(l.get("qty") or l.get("shares") or 0.0))
+    if not shorts:
+        return {"error": "The roll optimizer is for a short-premium trade (CSP / covered call / short call)."}
+
+    provider = get_provider(quote_source, user=user, db=db)
+    try:
+        uq = await provider.get_underlying_price(strategy.ticker)
+        spot = float(getattr(uq, "price", None) or getattr(uq, "last", None) or 0.0)
+    except Exception:  # noqa: BLE001
+        spot = 0.0
+    if spot <= 0:
+        return {"error": "Couldn't fetch the underlying price to optimize the roll."}
+
+    try:
+        current_dte = max(1, (dt.date.fromisoformat(near_exp) - dt.date.today()).days)
+    except (ValueError, TypeError):
+        current_dte = 30
+
+    # the tested short = the one furthest into / nearest through the money.
+    tested = max(shorts, key=lambda s: (s["strike"] - spot) if s["right"] == "P" else (spot - s["strike"]))
+    covered = tested["right"] == "C" and covered_shares >= 100 * tested["qty"]
+
+    menu = await optimize_roll(
+        ticker=strategy.ticker, provider=provider, spot=spot,
+        tested_right=tested["right"], tested_strike=tested["strike"], tested_qty=tested["qty"],
+        tested_entry=tested["entry"], current_dte=current_dte, covered=covered)
+    menu["ticker"] = strategy.ticker
+    return _to_native(menu)
 
 
 @router.get("/{strategy_id}/live-pnl")

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowDown, ArrowUp, Minus, TrendingUp, TrendingDown, Loader2, Crosshair, Layers, Shapes } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Minus, TrendingUp, TrendingDown, Loader2, Crosshair, Layers, Shapes, ChevronRight } from 'lucide-react';
 import { fetchTechnicalForTimeframe, fetchTradeSetups } from '../api';
 import {
   Chart as ChartJS,
@@ -27,6 +27,7 @@ import MarketContextHero from './MarketContextHero';
 import TradeSetupCards from './TradeSetupCards';
 import ChartPatternsPanel from './ChartPatternsPanel';
 import { SectionIntro } from './taUi';
+import UnifiedTAWorkspace from './UnifiedTAWorkspace';
 import type { TradeSetupsData } from '../types';
 
 ChartJS.register(
@@ -152,7 +153,9 @@ function SignalBadge({ signal, label }: { signal: string; label?: string }) {
 }
 
 export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical: initialTechnical, ticker }) => {
-  const [timeframe, setTimeframe] = useState<string>(DEFAULT_TIMEFRAME);
+  // Init the selector from the timeframe the data was ACTUALLY computed at, so the dropdown always
+  // matches the drawn chart/read on open (never "Medium selected" while a Short/Swing chart shows).
+  const [timeframe, setTimeframe] = useState<string>(initialTechnical?.timeframe || DEFAULT_TIMEFRAME);
   const [technical, setTechnical] = useState<TechnicalData>(initialTechnical);
   const [loading, setLoading] = useState(false);
   const [tfError, setTfError] = useState<string | null>(null);
@@ -184,6 +187,15 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
   useEffect(() => {
     if (activeSection === 'setups' && setupsFetchedRef.current !== ticker) loadSetups();
   }, [activeSection, ticker, loadSetups]);
+
+  // A new search (ticker change) → adopt that stock's freshly-computed block and the timeframe it
+  // was computed at, so the selector, the chart and the institutional regime read stay in sync
+  // (keyed on ticker only, so a user's timeframe pick isn't clobbered by same-stock re-renders).
+  useEffect(() => {
+    setTechnical(initialTechnical);
+    setTimeframe(initialTechnical?.timeframe || DEFAULT_TIMEFRAME);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ticker]);
 
   const SECTIONS = [
     { key: 'setups' as const, label: 'Setups', Icon: Crosshair },
@@ -942,12 +954,21 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
         {activeSection === 'advanced' && (
           <div className="space-y-2 animate-fade-in">
             <SectionIntro icon={<Layers size={16} className="text-secondary" />} title="Advanced — the evidence">
-              The institutional reads the setups are built from. Expand any panel to drill into the data behind a signal.
+              The institutional reads the setups are built from, on one candlestick chart. Switch the timeframe (15m · 1H · 1D · 1W), open a method, and toggle its levels onto the chart — or use a preset. Open a single method below for its full read.
             </SectionIntro>
-            <MicrostructurePanel ticker={ticker} price={spot} />
-            <MarketStructurePanel ticker={ticker} price={spot} />
-            <RegimePanel ticker={ticker} price={spot} />
-            <DealerPositioningPanel ticker={ticker} price={spot} />
+            <UnifiedTAWorkspace ticker={ticker} spot={spot} confluenceZones={setups?.confluence_zones} />
+            <details className="group rounded-xl border border-white/[0.05] bg-base-300/40">
+              <summary className="cursor-pointer list-none px-4 py-2.5 flex items-center gap-2 text-sm font-semibold text-base-content/70 hover:text-base-content">
+                <ChevronRight className="w-4 h-4 shrink-0 transition-transform group-open:rotate-90" /> Study one method in depth
+                <span className="text-[10px] font-normal text-base-content/40 hidden sm:inline">volume profile · structure · regime · dealer — full per-method read, banners &amp; gamma-by-strike</span>
+              </summary>
+              <div className="p-2 pt-0 space-y-2">
+                <MicrostructurePanel ticker={ticker} price={spot} confluenceZones={setups?.confluence_zones} />
+                <MarketStructurePanel ticker={ticker} price={spot} confluenceZones={setups?.confluence_zones} />
+                <RegimePanel ticker={ticker} price={spot} confluenceZones={setups?.confluence_zones} />
+                <DealerPositioningPanel ticker={ticker} price={spot} confluenceZones={setups?.confluence_zones} />
+              </div>
+            </details>
           </div>
         )}
       </div>

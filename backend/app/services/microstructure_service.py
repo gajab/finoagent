@@ -248,34 +248,48 @@ def _tf_profile(hist, label: str, period: str, interval: str) -> dict | None:
 # public entry point
 # ---------------------------------------------------------------------------
 
+def _resample(df, rule: str = "4h"):
+    """Aggregate an intraday frame to a coarser bar (yfinance has no native 4H). Local copy —
+    market_structure_service imports from THIS module, so we can't import back (circular)."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    try:
+        agg = df.resample(rule).agg({"Open": "first", "High": "max", "Low": "min",
+                                     "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
+        return agg if not agg.empty else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def compute_microstructure(stock) -> dict | None:
     """Full microstructure map for a yfinance ``Ticker``. Returns ``None`` only if no
     usable price data exists at all; otherwise every section is best-effort and may be
-    empty. Fetches five histories (cached upstream by the router)."""
+    empty. Fetches a few histories (cached upstream by the router)."""
     try:
-        # NOTE: yfinance ``period`` only accepts fixed tokens (1d/5d/1mo/3mo/6mo/1y/…),
-        # so the 15-day and 60-day intraday windows must be dated with start/end.
-        macro = _safe_history(stock, "3mo", "1d")
-        swing = _safe_history_days(stock, 15, "30m")
-        micro = _safe_history(stock, "5d", "5m")
-        # 55d (not 60) — Yahoo requires the intraday start to be strictly inside the
-        # rolling 60-day window, and rejects a request anchored exactly at the edge.
-        naked_src = _safe_history_days(stock, 55, "30m")
+        # Volume profile is computed at the SAME timeframes as market structure — Daily · 4H · 1H
+        # (4H resampled from 1H; yfinance has no native 4H bar) — so every Advanced-tab method reads
+        # consistently. Each timeframe uses its own sensible lookback window. 55d (not 60) because
+        # Yahoo rejects an intraday start anchored exactly at the rolling 60-day edge.
         daily = _safe_history(stock, "1y", "1d")
+        h1 = _safe_history_days(stock, 58, "1h")
+        h4 = _resample(h1, "4h")
+        naked_src = _safe_history_days(stock, 55, "30m")
 
         # spot: prefer the freshest close available
         price = None
-        for df in (micro, swing, macro, naked_src, daily):
+        for df in (h1, h4, daily, naked_src):
             if df is not None and not df.empty:
                 price = float(df["Close"].values[-1])
                 break
         if price is None:
             return None
 
+        d_daily = daily.tail(126) if (daily is not None and not daily.empty) else daily   # ~6mo daily
+        d_h1 = h1.tail(140) if (h1 is not None and not h1.empty) else h1                   # ~1mo of 1H bars
         profiles = {
-            "macro": _tf_profile(macro, "Macro · 3-Month / Daily", "3mo", "1d"),
-            "swing": _tf_profile(swing, "Swing · 15-Day / 30-Min", "15d", "30m"),
-            "micro": _tf_profile(micro, "Micro · 5-Day / 5-Min", "5d", "5m"),
+            "daily": _tf_profile(d_daily, "Daily · 6-Month", "6mo", "1d"),
+            "h4": _tf_profile(h4, "4H · ~2-Month", "2mo", "4h"),
+            "h1": _tf_profile(d_h1, "1H · ~1-Month", "1mo", "1h"),
         }
 
         naked = []

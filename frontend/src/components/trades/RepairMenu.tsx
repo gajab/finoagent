@@ -23,6 +23,8 @@ export const CAT: Record<string, { label: string; cls: string }> = {
   overlay:      { label: 'Overlay',  cls: 'badge-secondary' },
   defined_risk: { label: 'Cap risk', cls: 'badge-success' },
   calendar:     { label: 'Calendar', cls: 'badge-accent' },
+  butterfly:    { label: 'Butterfly',cls: 'badge-accent' },
+  ratio:        { label: 'Ratio',    cls: 'badge-accent' },
   hedge:        { label: 'Hedge',    cls: 'badge-warning' },
   assignment:   { label: 'Wheel',    cls: 'badge-secondary' },
 };

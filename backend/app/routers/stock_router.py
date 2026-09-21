@@ -359,7 +359,7 @@ async def get_microstructure(
         ticker = "^" + ticker[1:]
     ticker = ticker.upper()
 
-    cache_key = f"micro:{ticker}:v1"
+    cache_key = f"micro:{ticker}:v2"          # v2: volume profile now Daily · 4H · 1H (keys daily/h4/h1)
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return {"ticker": ticker, "microstructure": cached, "cached": True}
@@ -502,7 +502,7 @@ async def get_trade_setups(
         ticker = "^" + ticker[1:]
     ticker = ticker.upper()
 
-    cache_key = f"setups:{ticker}:v2"          # v2: multi-style (swing momentum + position) + meaningful targets
+    cache_key = f"setups:{ticker}:v3"          # v3: VP levels now Daily·4H·1H (was macro/swing/micro); v2: multi-style + meaningful targets
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return {"ticker": ticker, "trade_setups": cached, "cached": True}
@@ -551,6 +551,114 @@ async def get_day_trade_setups(
 
     await set_cached(db, cache_key, result, ttl_seconds=300)
     return {"ticker": ticker, "day_trade_setups": result, "cached": False}
+
+
+@router.get("/{ticker}/qullamaggie-setup")
+async def get_qullamaggie_setup(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Qullamäggie (Kristjan Kullamägi) momentum-breakout read: a deterministic qualification
+    checklist (big prior move, ADR%, stacked/rising 10/20-EMA + 50-SMA, near 52-week highs, tight
+    base) plus setups — breakout (with a live opening-range-high entry), episodic pivot and
+    parabolic short. Lazy endpoint (own ~15-month daily + intraday fetch) so the main Setups load
+    doesn't pay for it."""
+    import asyncio
+    import yfinance as yf
+    from ..services.qullamaggie_service import compute_qullamaggie_setups
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"qm-setups:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "qullamaggie_setup": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_qullamaggie_setups(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Qullamäggie analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No daily history available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "qullamaggie_setup": result, "cached": False}
+
+
+@router.get("/{ticker}/connors-rsi-setup")
+async def get_connors_rsi_setup(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Larry Connors' 2-Period RSI mean-reversion read: the signal checklist (200-SMA trend filter,
+    RSI(2/5/10), 5-SMA pullback, cumulative RSI, VIX fear spike), the setup (close-based MOC entry,
+    5-SMA exit rule, catastrophe stop), an explicit execution plan (close vs open / overnight risk),
+    and an in-sample backtest. Lazy endpoint (own ~18-month daily + a small VIX fetch)."""
+    import asyncio
+    import yfinance as yf
+    from ..services.connors_rsi_service import compute_connors_setups
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"connors-setups:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "connors_setup": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_connors_setups(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Connors RSI-2 analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No daily history available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "connors_setup": result, "cached": False}
+
+
+@router.get("/{ticker}/candles")
+async def get_candles(
+    ticker: str,
+    interval: str = Query("1d", description="Candle interval: 15m · 1h · 1d · 1wk"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """OHLC candles at a chosen interval for the interactive Advanced-tab charts (a thin, cached
+    yfinance feed so the panels behave like a normal trading chart)."""
+    import asyncio
+    import yfinance as yf
+    from ..services.candles_service import compute_candles, supported_intervals
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+    if interval not in supported_intervals():
+        interval = "1d"
+
+    cache_key = f"candles:{ticker}:{interval}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "candles": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_candles(yf.Ticker(ticker), interval))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Candle fetch failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No candle data available for this ticker/interval.")
+
+    ttl = 300 if interval in ("15m", "1h") else 1800
+    await set_cached(db, cache_key, result, ttl_seconds=ttl)
+    return {"ticker": ticker, "candles": result, "cached": False}
 
 
 @router.get("/{ticker}/chart-patterns")
@@ -701,8 +809,11 @@ async def analyze_ta(
         raise HTTPException(400, "Select at least one indicator to analyze.")
 
     selection_json = json.dumps(body.selection, indent=2, default=str)
+    sel = body.selection if isinstance(body.selection, dict) else {}
+    primer = _strategy_primer(sel.get("setup") if isinstance(sel.get("setup"), dict) else {}, {})
+    base_system = f"{_TA_ANALYZE_SYSTEM}\n\n{primer}" if primer else _TA_ANALYZE_SYSTEM
     system_prompt = (
-        f"{_TA_ANALYZE_SYSTEM}\n\nTicker: {ticker}\n"
+        f"{base_system}\n\nTicker: {ticker}\n"
         f"Selected indicators (JSON):\n```json\n{selection_json}\n```"
     )
 
@@ -806,6 +917,55 @@ Return ONLY valid JSON, no prose outside it:
  "enrichment_read":{"sentiment":"","fundamental":"","analyst":""}}"""
 
 
+# Prepended to the verify/analyze system prompt when the trade is a Qullamäggie (style="qullamaggie")
+# momentum breakout, so the LLM reviews it BY THAT METHOD's rules, not generic swing-trade R:R.
+_QM_PRIMER = """IMPORTANT — this is a QULLAMÄGGIE (Kristjan Kullamägi) MOMENTUM-BREAKOUT trade. Judge it by \
+that method, not by generic swing-trade rules:
+- The edge is asymmetric. A TIGHT stop (a fraction of ADR / the breakout-day low / the base low) is a FEATURE \
+that lets the trader take large size for small risk — do NOT criticise the stop for being 'too tight'.
+- There is NO fixed profit target. Any T1/T2 shown are only R:R reference points. The REAL exit is: sell \
+1/3–1/2 into strength after the initial 3–5 day thrust, then TRAIL the rest under the 10-day (aggressive) or \
+20-day (looser) moving average and exit on a daily CLOSE below that MA. So 'no fixed target' and a modest \
+headline R:R are EXPECTED — evaluate the trade on this trailing-exit basis, not on whether T1 is far away.
+- The setup exists only because the name PASSED a strict screen (big prior move, high ADR%, price stacked \
+above rising 10/20-EMA & 50-SMA, near 52-week highs, a tight base) — see the qualification block in the JSON. \
+The single biggest reason to 'pass' is that the screen fails or the name is extended / has no tight base.
+- It is a SHARES trade (leverage = size on a tight stop); do NOT demand an options structure.
+- Episodic Pivot = a catalyst gap-up on huge volume out of a base. Parabolic Short = a counter-trend, \
+HIGH-RISK, small-size mean-reversion short back toward the 10/20-day MA — respect that it fights the trend."""
+
+
+# Prepended when the trade is a Larry Connors 2-Period RSI (style="connors_rsi2") mean-reversion trade.
+_CONNORS_PRIMER = """IMPORTANT — this is a LARRY CONNORS 2-PERIOD RSI trade, a MEAN-REVERSION system. Judge it by \
+that method, NOT by momentum/trend rules or a simple reward:risk test:
+- The edge is a HIGH WIN RATE with SMALL targets — reward:risk is often BELOW 1 by design, and that is EXPECTED. \
+Do NOT reject the trade for a low R:R; weigh it on win rate × average win vs loss (the in-sample backtest is in the \
+JSON), not on R:R alone.
+- Entry is CLOSE-BASED: the RSI(2) signal is only valid on the close, so the entry is market-on-close / a limit at \
+the close — never a market order into the open. The overnight hold is where the edge lives.
+- Trend filter = the 200-day SMA (longs above it, shorts below); trigger = RSI(2) < 10 (long) / > 90 (short); the \
+EXIT is a RULE, not a fixed target: the close back across the 5-day SMA (or RSI(2) reverting past ~65/35), plus a \
+~10-day time stop.
+- Connors' own research found FIXED STOPS REDUCE this system's returns — the stop shown is a wide catastrophe stop; \
+the real risk control is small size + the 200-SMA filter. Do NOT criticise the absence of a tight stop.
+- A stretched VIX (a fear spike well above its 10-day average) marks the HIGHEST-probability long windows. Caveat \
+honestly: in a true regime-change crash, mean-reversion can keep failing."""
+
+_STRATEGY_PRIMERS = {"qullamaggie": _QM_PRIMER, "connors_rsi2": _CONNORS_PRIMER}
+
+
+def _strategy_primer(setup: dict, dossier: dict) -> str:
+    """Pick the named-strategy methodology primer from the setup's style (or a dossier key), so the
+    AI review reasons by that method instead of generic swing-trade rules. '' when not a named strategy."""
+    style = (setup or {}).get("style")
+    if style in _STRATEGY_PRIMERS:
+        return _STRATEGY_PRIMERS[style]
+    for k in _STRATEGY_PRIMERS:
+        if k in (dossier or {}):
+            return _STRATEGY_PRIMERS[k]
+    return ""
+
+
 @router.post("/{ticker}/verify-setup")
 async def verify_setup(
     ticker: str,
@@ -834,9 +994,14 @@ async def verify_setup(
     user_msg = ("Review this quant trade and return the JSON verdict.\n```json\n"
                 + json.dumps(payload, default=str)[:60000] + "\n```")
 
+    # Named strategies (Qullamäggie / Connors) get their method primer so the risk review judges the
+    # trade by that method (trailing-exit / mean-reversion win-rate) instead of generic swing R:R.
+    primer = _strategy_primer(body.setup, body.dossier)
+    verify_system = f"{_VERIFY_SYSTEM}\n\n{primer}" if primer else _VERIFY_SYSTEM
+
     try:
         answer = await call_llm(api_key=openai_key, model=model,
-                                messages=[{"role": "system", "content": _VERIFY_SYSTEM},
+                                messages=[{"role": "system", "content": verify_system},
                                           {"role": "user", "content": user_msg}],
                                 max_tokens=2000, expect_json=True)
     except Exception as exc:

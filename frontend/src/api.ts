@@ -121,6 +121,34 @@ export async function fetchDayTradeSetups(
   );
 }
 
+// Qullamäggie momentum-breakout setups — lazy (fetched only when the Qullamäggie style is opened).
+export async function fetchQullamaggieSetups(
+  ticker: string,
+): Promise<import('./types').QullamaggieResponse> {
+  return apiFetch<import('./types').QullamaggieResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/qullamaggie-setup`,
+  );
+}
+
+// Connors 2-Period RSI mean-reversion setups — lazy (fetched when the Connors strategy is opened).
+export async function fetchConnorsSetups(
+  ticker: string,
+): Promise<import('./types').ConnorsResponse> {
+  return apiFetch<import('./types').ConnorsResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/connors-rsi-setup`,
+  );
+}
+
+// OHLC candles for the interactive Advanced-tab charts (interval: 15m · 1h · 1d · 1wk)
+export async function fetchCandles(
+  ticker: string,
+  interval: string = '1d',
+): Promise<import('./types').CandlesResponse> {
+  return apiFetch<import('./types').CandlesResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/candles?interval=${encodeURIComponent(interval)}`,
+  );
+}
+
 // LLM pre-trade review of a quant setup (+ optional sentiment/fundamental/analyst)
 export async function verifySetup(
   ticker: string,
@@ -1794,7 +1822,8 @@ export async function fetchBookHedgeAdvice(quoteSource = 'yfinance'): Promise<{ 
 }
 
 export interface RepairAlternative {
-  name: string; category: string; mechanics: string; rationale?: string; risk_note: string;
+  name: string; category: string; group?: 'adjust' | 'replace' | 'benchmark';  // adjust = fix the current trade; replace = close & redeploy
+  mechanics: string; rationale?: string; risk_note: string;
   net_cash: number;
   scenarios: { move_pct: number; spot: number; pnl: number }[];
   max_loss: number | null; max_gain: number; breakevens: number[];
@@ -1810,12 +1839,17 @@ export interface RepairAlternative {
 export interface DefendFactor { label: string; kind: 'prob' | 'ta'; favorable: boolean | null; detail: string }
 // Lens 1 — how recoverable the trade is from here, WITH the auditable build-up behind the score.
 export interface DefendRecoverability {
-  recovery_score: number | null;          // P(finish at/above breakeven) holding as-is — the anchor
-  breakeven: number | null; needed_move_pct: number | null; dist_to_be_sigma: number | null;
-  expected_move?: number | null;          // ±1σ $ move to expiry (the yardstick for the needed move)
+  recovery_score: number | null;          // healthy/marginal: P(keep premium / expire OTM); tested: P(recover to breakeven)
+  posture?: 'healthy' | 'marginal' | 'tested';   // healthy = safe; marginal = OTM but high breach/VRP/trend risk → de-risk; tested = in trouble
+  breakeven: number | null; needed_move_pct: number | null; cushion_pct?: number | null; dist_to_be_sigma: number | null;
+  expected_move?: number | null;          // ±1σ $ move to expiry (the yardstick for the needed move / cushion)
   tested_delta: number; severity: 'fresh' | 'deep' | 'assigned' | 'healthy';
+  // the quant risk read that reconciles with the Manage desk (why an 82%-OTM short can still be MARGINAL)
+  p_touch?: number | null;                // % chance the strike is BREACHED at any point before expiry (drift-aware)
+  vrp_pct?: number | null; trend_pct?: number | null; iv_pct?: number | null; hv_pct?: number | null;
+  risk_read?: string | null;
   factors?: DefendFactor[];               // prob drivers + TA factors that explain / tilt the score
-  outlook?: { tilt: 'favorable' | 'adverse' | 'balanced'; note: string } | null;   // net TA tilt on the odds
+  outlook?: { tilt: 'favorable' | 'adverse' | 'balanced' | 'watch'; note: string } | null;   // net TA read
 }
 // Lens 2 — assignment / exercise risk and its dollar consequence.
 export interface DefendAssignment {
@@ -1829,12 +1863,14 @@ export interface DefendCostOfWaiting { in_trading_days: number; dte_left: number
 export interface DefendContext {
   loss_read?: { time_value_recoverable: number };
   technical?: { support: number | null; resistance: number | null; note: string };
+  pattern?: { type: string; direction: string; status: string; target: number | null; breakout: number | null; confidence: number; window?: string } | null;
+  range?: { low: number; high: number; width_pct: number; where: string; note: string } | null;
   sector?: { themes: string[]; peers: string[]; note: string };
   earnings?: { before_expiry: boolean; date: string | null; days: number | null; note: string };
   vol_note?: string;
 }
 export interface RepairMenuResult {
-  error?: string; ticker?: string; tested?: boolean; cushion_pct?: number;
+  error?: string; ticker?: string; tested?: boolean; cushion_pct?: number; covered?: boolean;
   short_right?: 'P' | 'C'; short_strike?: number; spot?: number; dte_days?: number; contracts?: number;
   unrealized_pnl?: number; pricing?: string; structure?: string; alternatives?: RepairAlternative[];
   recoverability?: DefendRecoverability; assignment?: DefendAssignment;
@@ -1866,6 +1902,28 @@ export async function fetchDefendCommittee(id: number, defend: RepairMenuResult,
   return apiFetch(`/api/saved-strategies/${id}/defend/committee?quote_source=${encodeURIComponent(quoteSource)}`, {
     method: 'POST', body: JSON.stringify({ defend }),
   });
+}
+
+// Deep-quant ROLL OPTIMIZER — credit-only (no net new money) strike+expiry roll picked on the
+// confluence of RND probability, support/resistance, gamma flip/wall (GEX) and the volume POC.
+export interface RollCandidate {
+  expiry: string; dte: number; strike: number; right: 'P' | 'C';
+  roll_net_cash: number; credit_per_share: number; new_credit_total: number; new_breakeven: number; new_capital: number;
+  p_otm: number; p_otm_source: 'RND' | 'BS'; spans_earnings?: boolean;
+  structure: Record<string, boolean | number>;      // per-level flags + cleared_count + levels_available
+  scores: { composite: number; probability: number; structure: number; credit: number; cushion: number; cushion_sigma?: number; time_factor?: number };
+  legs: { action: string; right: string; strike: number; qty: number; dte_days: number | null; expiry?: string | null }[];
+  why: string;
+}
+export interface RollOptimizerResult {
+  error?: string; ticker?: string; spot?: number;
+  tested?: { right: 'P' | 'C'; strike: number; qty: number; entry: number; mark: number; dte: number; covered: boolean };
+  structure?: { support: number | null; resistance: number | null; poc: number | null; gamma_flip: number | null; gamma_wall: number | null; gamma_regime: string | null; recent_5d?: { support: number | null; resistance: number | null; poc: number | null } | null; next_earnings?: string | null; window?: string };
+  weights?: Record<string, number>;
+  considered?: number; candidates?: RollCandidate[]; note?: string;
+}
+export async function fetchRollOptimizer(id: number, quoteSource = 'yfinance'): Promise<RollOptimizerResult> {
+  return apiFetch(`/api/saved-strategies/${id}/defend/optimize-roll?quote_source=${encodeURIComponent(quoteSource)}`, { method: 'POST' });
 }
 
 export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance', marginMode?: string): Promise<LivePnlResponse> {
