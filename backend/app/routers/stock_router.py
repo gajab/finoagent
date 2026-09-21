@@ -148,7 +148,7 @@ _DI_DEFAULT_STRUCTURES = ["covered_call", "cash_secured_put", "collar", "credit_
 # by passing the name explicitly (the frontend shows the checkbox only to them). Kept out of the
 # free-tier scan both as product tiering AND to hold the 512 MiB instance's peak down: every extra
 # structure is more candidates for _finalize_desk to fine-grid.
-_PREMIUM_STRUCTURES = {"jade_lizard", "calendar"}
+_PREMIUM_STRUCTURES = {"jade_lizard", "calendar", "back_ratio"}
 
 
 def _gate_premium_structures(structures: list[str], user: User) -> list[str]:

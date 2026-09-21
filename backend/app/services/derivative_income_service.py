@@ -1378,62 +1378,73 @@ def _back_ratio(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r
     and keeps the best net-credit one (put skew usually makes the put side the credit side)."""
     if rnd is None or spot <= 0:
         return None
-    best = None  # (premium, is_put, k_short, k_long, credit, width)
+    best = None  # (net_vega, is_put, k_short, k_long, credit, width, premium)
     max_w = _BR_MAX_WIDTH_PCT * spot                          # cap the long distance → a real backspread
     put_strikes = sorted((k for k in puts if k < spot * 0.999), reverse=True)
     call_strikes = sorted(k for k in calls if k > spot * 1.001)
     for is_put, book, strikes in ((True, puts, put_strikes), (False, calls, call_strikes)):
+        right = "P" if is_put else "C"
         # SHORT = a near-money OTM strike (1–8% OTM) that finances the two longs. Selected by MONEYNESS,
         # not BS delta — weekend/stale IV makes the delta ~0 and would reject every strike.
         shorts = [k for k in strikes if 0.005 <= abs(k - spot) / spot <= 0.08 and _executable(book[k])[0]][:6]
         for k_short in shorts:
             ms = book[k_short].mid
+            vs = _bs_greeks(spot, k_short, dte, (book[k_short].iv or atm_iv or 0.30), right)["vega"]
             further = [k for k in strikes if (k < k_short if is_put else k > k_short)
                        and abs(k_short - k) <= max_w and _executable(book[k])[0]]
-            # LONG = the NEAREST further-OTM strike (tightest width = most convexity) that still nets a
-            # real credit; keep it as this short's pick. (A credit backspread on normal skew pushes the
-            # longs OTM — the trade is a CSP-like credit WITH downside convexity + a DEFINED max loss.)
-            pick = None
             for k_long in further:
                 credit = ms - 2.0 * book[k_long].mid
                 premium = credit * CONTRACT_MULTIPLIER
-                if credit > 0.02 and premium >= min_income:
-                    pick = (premium, k_long, credit)
-                    break                                     # nearest qualifying long → tightest width
-            if pick and (best is None or pick[0] > best[0]):
-                best = (pick[0], is_put, k_short, pick[1], pick[2], abs(k_short - pick[1]))
+                if credit <= 0.02 or premium < min_income:
+                    continue                                  # require a REAL net credit clearing the floor
+                vl = _bs_greeks(spot, k_long, dte, (book[k_long].iv or atm_iv or 0.30), right)["vega"]
+                net_vega = 2.0 * vl - vs                      # LONG-VEGA ONLY — the vol-expansion play the desk
+                if net_vega <= 0:                             # surfaces; a far-OTM-long credit backspread that
+                    continue                                  # nets short vega is a different animal, not this
+                if best is None or net_vega > best[0]:        # maximize the vol exposure you're buying cheap
+                    best = (net_vega, is_put, k_short, k_long, credit, abs(k_short - k_long), premium)
     if best is None:
-        return None
-    premium, is_put, k_short, k_long, credit, width = best
-    right = "P" if is_put else "C"
-    premium = round(premium, 2)
-    max_loss = round(width * CONTRACT_MULTIPLIER - premium, 2)   # at K_long, EXPIRY — the valley of death
-    collateral = max_loss if max_loss > 0 else premium          # Reg-T: the short is spread by 1 long (defined)
+        return None                                          # no net-credit AND long-vega backspread here
+    _nv, is_put, k_short, k_long, _credit, _w, _prem = best
     book = puts if is_put else calls
-    # Net greeks = 2×LONG − 1×SHORT (the extra long is the convexity engine).
-    gs = _bs_greeks(spot, k_short, dte, (book[k_short].iv or atm_iv or 0.30), right)
-    gl = _bs_greeks(spot, k_long, dte, (book[k_long].iv or atm_iv or 0.30), right)
+    return _back_ratio_opp(book[k_short], book[k_long], is_put, spot, dte, exp, rnd, r,
+                           atm_iv, iv_hv_ratio, richness, european)
+
+
+def _back_ratio_opp(short_q: OptionQuote, long_q: OptionQuote, is_put: bool, spot: float, dte: int,
+                    exp: str, rnd, r: float, atm_iv: Optional[float], iv_hv_ratio: Optional[float],
+                    richness: str, european: bool) -> Optional[dict]:
+    """Assemble the back-ratio opp dict from an EXACT (short, long×2) pair — shared by the scan builder
+    (which pre-selects the net-credit + long-vega pair) and the placed-trade focus reprice. The `long_vega`
+    flag is set HONESTLY from the measured net vega (a drifted placed trade may no longer be long-vega)."""
+    right = "P" if is_put else "C"
+    k_short, k_long = float(short_q.strike), float(long_q.strike)
+    credit = short_q.mid - 2.0 * long_q.mid
+    premium = round(credit * CONTRACT_MULTIPLIER, 2)
+    width = abs(k_short - k_long)
+    max_loss = round(width * CONTRACT_MULTIPLIER - premium, 2)   # at K_long, EXPIRY — the valley of death
+    collateral = max_loss if max_loss > 0 else abs(premium)      # Reg-T: the short is spread by 1 long (defined)
+    # Net greeks = 2×LONG − 1×SHORT (the extra long is the convexity + vega engine).
+    gs = _bs_greeks(spot, k_short, dte, (short_q.iv or atm_iv or 0.30), right)
+    gl = _bs_greeks(spot, k_long, dte, (long_q.iv or atm_iv or 0.30), right)
     net = {k: 2.0 * gl[k] - gs[k] for k in ("delta", "gamma", "theta", "vega")}
-    # HONEST vega sign: a NET-CREDIT backspread is only LONG vega when skew lets the longs sit close
-    # enough; on a low-skew name the credit forces the longs far OTM → the near-money short dominates →
-    # net SHORT vega (a CSP-with-a-tail-kicker, NOT the vol-expansion play). The scoring keys off this.
     is_long_vega = net["vega"] > 0
     # P(keep the credit) ≈ P(the short is NOT breached at expiry) — a proxy; the trade is meant to be
     # EXITED before the print, so this is context, not the edge.
-    p_keep, method = _prob_keep(rnd, k_short, right, spot, dte, r, book[k_short].iv or atm_iv)
+    p_keep, method = _prob_keep(rnd, k_short, right, spot, dte, r, short_q.iv or atm_iv)
     premium_ann = annualized_return_pct(premium, collateral, dte) if collateral else 0.0
     # Downside(put)/upside(call) is large on a big move; the SHORT side just keeps the credit.
     max_profit = (round((2.0 * k_long - k_short) * CONTRACT_MULTIPLIER + premium, 2)
                   if is_put else None)                         # put: bounded at S=0; call: unbounded upside
     valley = round(k_long, 2)
     flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
-    _vega_note = ("LONG vega — gains as IV ramps into the catalyst (the vol-expansion play; best entered in LOW IV)"
-                  if is_long_vega else
-                  "NET SHORT vega here (skew forced the longs far OTM) — a CSP/short-call with a crash kicker, "
-                  "NOT a vol-expansion play; needs steeper skew to turn long-vega")
+    _vega_bps = round(net["vega"] * CONTRACT_MULTIPLIER)
     flags.append({"level": "info",
                   "text": f"Back ratio 1×2 — SELL 1 {right} ${round(k_short,2)} / BUY 2 {right} ${round(k_long,2)} "
-                          f"for a ${round(credit,2)} net credit. {_vega_note}."})
+                          f"for a ${round(credit,2)} net credit. "
+                          + (f"LONG vega (${_vega_bps}/vol-pt) — gains as IV ramps into the catalyst; best entered "
+                             f"in LOW IV, exited before the print." if is_long_vega else
+                             f"NET SHORT vega (${_vega_bps}/vol-pt) here — a defended short, not the vol-expansion play.")})
     flags.append({"level": "warn",
                   "text": f"Valley of death ${valley} — max loss ${abs(max_loss)} sits at the long strike AT "
                           f"EXPIRY. Managed by CLOSING BEFORE EARNINGS (capture the IV ramp; never hold to expiry)."})
@@ -1451,7 +1462,7 @@ def _back_ratio(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r
         "premium": premium, "premium_per_share": round(credit, 2),
         "collateral": round(collateral, 2),
         "premium_annualized_pct": round(premium_ann, 2), "total_annualized_pct": round(premium_ann, 2),
-        "sofr_excess_pct": round(premium_ann - 0.0, 2), "beats_sofr": premium_ann > 0,
+        "sofr_excess_pct": round(premium_ann, 2), "beats_sofr": premium_ann > 0,
         "static_return_pct": round(premium / collateral * 100, 2) if collateral else 0.0,
         "breakeven": round(k_short - credit, 2) if is_put else round(k_short + credit, 2),
         "cushion_pct": round(abs(k_short - spot) / spot * 100, 2),
@@ -1465,17 +1476,27 @@ def _back_ratio(calls: dict, puts: dict, spot: float, dte: int, exp: str, rnd, r
         "long_vega": bool(is_long_vega),                                    # HONEST: only long-vol scoring when it truly is
         "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
         "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
-        "liquidity": {"oi": min(book[k_short].oi or 0, book[k_long].oi or 0),
-                      "volume": min(book[k_short].volume or 0, book[k_long].volume or 0),
-                      "spread_pct": max(_spread_pct(book[k_short]) or 0, _spread_pct(book[k_long]) or 0)},
+        "liquidity": {"oi": min(short_q.oi or 0, long_q.oi or 0),
+                      "volume": min(short_q.volume or 0, long_q.volume or 0),
+                      "spread_pct": max(_spread_pct(short_q) or 0, _spread_pct(long_q) or 0)},
         "exercise_style": "European (cash-settled)" if european else "American",
         "flags": flags,
         # TWO separate long legs (not qty=2) — _opp_legs forces opp-level contracts per leg, so the ratio
         # must be expressed as distinct legs for the payoff / greeks / breakeven engines to sum 1×2 correctly.
-        "legs": [_leg(book[k_short], "SELL", exp, spot, dte, atm_iv, rnd),
-                 _leg(book[k_long], "BUY", exp, spot, dte, atm_iv, rnd),
-                 _leg(book[k_long], "BUY", exp, spot, dte, atm_iv, rnd)],
+        "legs": [_leg(short_q, "SELL", exp, spot, dte, atm_iv, rnd),
+                 _leg(long_q, "BUY", exp, spot, dte, atm_iv, rnd),
+                 _leg(long_q, "BUY", exp, spot, dte, atm_iv, rnd)],
     }
+
+
+def _focus_back_ratio(short_q: OptionQuote, long_q: OptionQuote, is_put: bool, *, spot, dte, exp, rnd, r,
+                      atm_iv, iv_hv_ratio, richness, european, ticker) -> Optional[dict]:
+    """Reprice a PLACED back ratio at its EXACT legs (paper/real trade tracking). No selection or
+    long-vega gate — a held trade is scored as-is (its `long_vega` flag reflects the current net vega)."""
+    if short_q is None or long_q is None:
+        return None
+    return _back_ratio_opp(short_q, long_q, is_put, spot, dte, exp, rnd, r,
+                           atm_iv, iv_hv_ratio, richness, european)
 
 
 # ---------------------------------------------------------------------------
@@ -1805,6 +1826,19 @@ def _build_focus_opp(focus: dict, calls: dict, puts: dict, common: dict, sofr_pc
                                           atm_iv=common["atm_iv"], iv_hv_ratio=common["iv_hv_ratio"],
                                           richness=common["richness"], european=common["european"],
                                           ticker=common["ticker"])
+        if structure == "back_ratio":
+            # 1 short + 2 long (SAME strike) on one side; reprice the user's exact legs.
+            _kw = dict(spot=common["spot"], dte=common["dte"], exp=common["exp"], rnd=common["rnd"],
+                       r=common["r"], atm_iv=common["atm_iv"], iv_hv_ratio=common["iv_hv_ratio"],
+                       richness=common["richness"], european=common["european"], ticker=common["ticker"])
+            if sp and lp:
+                sq, lq = _q(sp[0]["strike"], puts), _q(lp[0]["strike"], puts)
+                if sq and lq:
+                    return _focus_back_ratio(sq, lq, True, **_kw)
+            if sc and lc:
+                sq, lq = _q(sc[0]["strike"], calls), _q(lc[0]["strike"], calls)
+                if sq and lq:
+                    return _focus_back_ratio(sq, lq, False, **_kw)
     except Exception as exc:  # noqa: BLE001 — a bad focus leg must not kill the scan
         logger.debug("focus opp build failed (%s): %s", structure, exc)
     return None
@@ -1820,7 +1854,8 @@ def _build_focus_opp(focus: dict, calls: dict, puts: dict, common: dict, sofr_pc
 # short_strangle is excluded on purpose — its focus builder re-derives strikes, so the Evaluate tab
 # builds it generically (exact) instead. collar / calendar / diagonal / custom → generic builder.
 _EXACT_FOCUS_STRUCTURES = {"cash_secured_put", "covered_call", "naked_call",
-                           "put_credit_spread", "call_credit_spread", "iron_condor", "jade_lizard"}
+                           "put_credit_spread", "call_credit_spread", "iron_condor", "jade_lizard",
+                           "back_ratio"}
 
 
 def _classify_structure(legs: list[dict], has_stock: bool) -> tuple[str, str, bool]:

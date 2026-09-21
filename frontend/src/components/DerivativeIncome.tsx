@@ -4,7 +4,7 @@ import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
   AlertCircle, ChevronDown, ChevronUp, Activity, Landmark,
-  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw, Crown
+  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw, Crown, GitFork
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations, fetchDerivativeIncomeWatchlist, addDerivativeIncomeWatchlist, deleteDerivativeIncomeWatchlist } from '../api';
@@ -48,6 +48,7 @@ const STRUCTURE_OPTIONS: { id: string; label: string; icon: React.ReactNode; pre
   // strips these for non-premium (_gate_premium_structures), so this is UX, not the enforcement boundary.
   { id: 'jade_lizard', label: 'Jade Lizard', icon: <Feather className="w-3.5 h-3.5" />, premiumOnly: true },
   { id: 'calendar', label: 'Calendar', icon: <Calendar className="w-3.5 h-3.5" />, premiumOnly: true },
+  { id: 'back_ratio', label: 'Back Ratio', icon: <GitFork className="w-3.5 h-3.5" />, premiumOnly: true },
 ];
 
 const money = (n: number | null | undefined, d = 0) =>
@@ -359,11 +360,13 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
   const isStrangle = opp.structure === 'short_strangle';
   const isCondor = opp.structure === 'iron_condor';
   const isJade = opp.structure === 'jade_lizard';
+  const isBackRatio = opp.structure === 'back_ratio';
   const strikeStr = isCondor ? `${opp.put_long}/${opp.put_short} – ${opp.call_short}/${opp.call_long}`
     : isJade ? `put ${opp.put_short} · call ${opp.call_short}/${opp.call_long}`
-      : isStrangle ? `put ${opp.put_short} · call ${opp.call_short}`
-        : isSpread ? `${opp.short_strike} / ${opp.long_strike}`
-          : `${opp.short_strike}`;
+      : isBackRatio ? `sell ${opp.short_strike} · buy 2× ${opp.long_strike}`
+        : isStrangle ? `put ${opp.put_short} · call ${opp.call_short}`
+          : isSpread ? `${opp.short_strike} / ${opp.long_strike}`
+            : `${opp.short_strike}`;
   return (
     <div className="space-y-3">
       {/* Header */}

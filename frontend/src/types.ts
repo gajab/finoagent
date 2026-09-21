@@ -3841,7 +3841,7 @@ export interface DerivativeIncomeGreeks {
 }
 
 export interface DerivativeIncomeOpportunity {
-  structure: 'covered_call' | 'cash_secured_put' | 'collar' | 'put_credit_spread' | 'call_credit_spread' | 'iron_condor' | 'jade_lizard' | string;
+  structure: 'covered_call' | 'cash_secured_put' | 'collar' | 'put_credit_spread' | 'call_credit_spread' | 'iron_condor' | 'jade_lizard' | 'calendar' | 'back_ratio' | string;
   label: string;
   expiration: string;
   dte: number;
@@ -3883,6 +3883,12 @@ export interface DerivativeIncomeOpportunity {
   expected_pnl: number | null;
   greeks: DerivativeIncomeGreeks;
   theta_per_day: number;
+  // back ratio (1×2 net-credit backspread) — long-vega pre-earnings vol play
+  net_credit?: number;
+  ratio?: string;
+  vega_exposure?: number;                 // + = long vega (calendars set this too)
+  long_vega?: boolean;
+  valley_of_death?: { price: number; max_loss: number; note?: string } | null;
   vol_spike_pnl?: number | null;
   atm_iv_pct: number | null;
   iv_hv_ratio: number | null;
