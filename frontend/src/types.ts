@@ -466,6 +466,69 @@ export interface CandlesData { interval: string; candles: Candle[]; count: numbe
 export interface CandlesResponse { ticker: string; candles: CandlesData; cached?: boolean }
 export type CandleInterval = '15m' | '1h' | '1d' | '1wk';
 
+// Volume analysis — deterministic RVOL / dry-up / climax / CVD / OBV read
+export interface VolumeClimaxBar { index: number; t: string; ratio: number; direction: 'up' | 'down' | string; price: number }
+export interface VolumeMetrics {
+  avg_volume: number | null; rvol: number | null;
+  rvol_multi?: { '10': number | null; '20': number | null; '50': number | null };
+  primary_lookback?: number; rvol_method?: string; rvol_basis?: string;
+  volume_trend: string;
+  dryup_ratio: number | null; dryup_state: string;
+  up_volume_pct: number | null; down_volume_pct: number | null;
+  cvd_trend: string; obv_trend: string; price_trend: string; divergence: string;
+}
+export interface VolumeAnalysisData {
+  interval: string; price: number | null; as_of: string;
+  bars: Candle[];
+  volume_ma: (number | null)[]; cvd: (number | null)[]; obv: (number | null)[];
+  climax_bars: VolumeClimaxBar[];
+  metrics: VolumeMetrics;
+  read: string[];
+  meta?: { bars?: number; note?: string };
+}
+export interface VolumeAnalysisResponse { ticker: string; volume_analysis: VolumeAnalysisData; cached?: boolean }
+
+// ===== Regime-conditional edge =====
+export type RegimeKey = 'trending' | 'transitional' | 'choppy';
+export type EdgeVerdict = 'confirmed' | 'weak' | 'negative' | 'insufficient';
+export interface RegimeEdgeStats {
+  n: number;
+  win_rate: number | null;
+  expectancy: number | null;      // in R
+  avg_win: number | null; avg_loss: number | null;
+  profit_factor: number | null;
+  t_stat: number | null;
+  avg_fwd_return: number | null;   // % over horizon
+  avg_hurst: number | null; avg_er: number | null;
+  low_confidence: boolean;
+}
+export interface RegimeSignalEdge {
+  key: string; label: string; direction: 'long' | 'short'; thesis: string;
+  overall: RegimeEdgeStats | null;
+  by_regime: Record<RegimeKey, RegimeEdgeStats | null>;
+  edge_by_regime: Record<RegimeKey, EdgeVerdict>;
+  firing_now: boolean;
+  current: RegimeEdgeStats | null;
+  current_edge: EdgeVerdict;
+}
+export interface CurrentRegime {
+  regime: RegimeKey; label: string;
+  hurst: number | null; efficiency_ratio: number | null;
+  er_terciles: { low: number | null; high: number | null };
+  absolute_regime: string; confidence: string;
+}
+export interface RegimeEdgeData {
+  as_of: string; price: number | null; history: string; horizon: number;
+  barrier: { target_atr: number; stop_atr: number; reward_risk: number | null };
+  current_regime: CurrentRegime;
+  regimes: RegimeKey[];
+  regime_labels: Record<RegimeKey, string>;
+  signals: RegimeSignalEdge[];
+  read: string[];
+  meta?: { bars?: number; evaluated_through?: number; note?: string };
+}
+export interface RegimeEdgeResponse { ticker: string; regime_edge: RegimeEdgeData; cached?: boolean }
+
 // ===== Chart patterns =====
 export interface PatternPoint { idx: number; date: string; price: number; label: string }
 export interface PatternLineEnd { idx: number; date: string; price: number }
@@ -2042,6 +2105,9 @@ export interface SuggestedPreferences {
   target_breach_pct: number;
   regime: string;
   needs_financing: boolean;
+  optimized?: boolean;
+  basis?: 'chain' | 'model' | 'regime';
+  net_benefit_pct?: number;
   why: string[];
 }
 
@@ -4441,4 +4507,670 @@ export interface AgentDebateResult {
     parse_error: boolean;
   };
   settings?: { max_rounds: number; confidence_target: number };
+}
+
+// ===== Income Screener (Income Desk → Screener tab) =====
+
+export interface IncomeScreenParams {
+  price_min?: number | null;
+  price_max?: number | null;
+  market_cap_min_b?: number | null;
+  avg_volume_min?: number | null;
+  beta_min?: number | null;
+  beta_max?: number | null;
+  change_min?: number | null;
+  change_max?: number | null;
+  week52_pos_min?: number | null;
+  week52_pos_max?: number | null;
+  sectors?: string[];
+  exclude_earnings_within_days?: number | null;
+  max_results?: number;
+}
+
+export interface IncomeScreenRow {
+  ticker: string;
+  name?: string | null;
+  current_price: number | null;
+  today_pct: number | null;
+  week52_low: number | null;
+  week52_high: number | null;
+  week52_pos_pct?: number | null;
+  market_cap?: number | null;
+  avg_volume?: number | null;
+  next_earnings?: string | null;
+  days_to_earnings?: number | null;
+}
+
+export interface IncomeScreenResult {
+  total_matches?: number | null;
+  rows: IncomeScreenRow[];
+  as_of?: string;
+  universe_note?: string;
+}
+
+export interface IncomeVolRow {
+  ticker: string;
+  atm_iv: number | null;          // ATM IV at a constant 30-day tenor (%)
+  hv30: number | null;            // 30-day realized vol (%)
+  iv_hv_ratio?: number | null;
+  iv_tenor?: string | null;
+  optionable?: boolean;
+  current_price?: number | null;  // present for manual adds (from the HV download)
+  today_pct?: number | null;
+  week52_high?: number | null;
+  week52_low?: number | null;
+}
+
+export interface IncomeEvalParams {
+  min_prob: number;
+  min_income: number;
+  min_dte: number;
+  max_dte: number;
+  earnings: 'include' | 'exclude';
+  earnings_aware?: boolean;
+  grades?: string[];
+  quote_source?: string;
+  next_earnings?: string | null;
+}
+
+export interface IncomeEvalTrade {
+  pick: 'nearest' | 'farthest';
+  side: 'call' | 'put';
+  structure: string;
+  label?: string;
+  expiration: string;
+  dte: number;
+  short_strike: number;
+  short_strike_pct?: number | null;
+  short_delta?: number | null;
+  premium?: number | null;
+  premium_per_share?: number | null;
+  prob_keep_pct?: number | null;
+  prob_touch_pct?: number | null;
+  premium_annualized_pct?: number | null;
+  collateral?: number | null;
+  capital_basis?: string | null;
+  breakeven?: number | null;
+  cushion_pct?: number | null;
+  theta_per_day?: number | null;
+  expected_pnl?: number | null;
+  implied_vol_pct?: number | null;
+  iv_hv_ratio?: number | null;
+  earnings_gap_pct?: number | null;
+  desk_score?: number | null;
+  algo_grade?: string | null;
+  approval_odds?: string | null;
+  grade_merits?: string[];
+  grade_demerits?: string[];
+  timing_hold?: boolean;
+}
+
+export interface IncomeEvalResult {
+  ticker: string;
+  spot?: number | null;
+  expiration?: string | null;
+  dte?: number | null;
+  next_earnings?: string | null;
+  n_candidates?: number;
+  n_qualified?: number;
+  trades: IncomeEvalTrade[];
+  skipped?: string | null;
+}
+
+// ===========================================================================
+// Bond Desk (/bonds) — mirrors backend bond_portfolio/ladder/market services.
+// Rates are PERCENT (4.25 = 4.25%) in every *_pct field.
+// ===========================================================================
+export type BondKind = 'treasury' | 'tips' | 'muni' | 'corporate' | 'agency' | 'cd' | 'etf' | 'mutual_fund';
+export type BondStatus = 'held' | 'watch' | 'matured' | 'sold';
+export type BondAccount = 'taxable' | 'ira' | 'roth' | '401k' | '403b' | 'hsa' | '529';
+
+export interface BondHoldingInput {
+  id?: number;
+  kind: BondKind;
+  status?: BondStatus;
+  label?: string | null;
+  issuer?: string | null;
+  cusip?: string | null;
+  ticker?: string | null;
+  face_value?: number | null;
+  quantity?: number | null;
+  coupon_rate?: number | null;
+  coupon_freq?: number;
+  day_count?: string | null;
+  issue_date?: string | null;
+  maturity_date?: string | null;
+  purchase_date?: string | null;
+  purchase_price?: number | null;
+  cost_basis?: number | null;
+  current_price?: number | null;
+  price_as_of?: string | null;
+  call_date?: string | null;
+  call_price?: number | null;
+  rating?: string | null;
+  state?: string | null;
+  federal_taxable?: boolean | null;
+  state_taxable?: boolean | null;
+  amt?: boolean;
+  tips_ref_cpi?: number | null;
+  account_type?: BondAccount | string;
+  account_name?: string | null;
+  ladder_id?: number | null;
+  notes?: string | null;
+}
+
+export interface BondTaxBlock {
+  fed_taxable: boolean;
+  state_taxable: boolean;
+  taxable_account: boolean;
+  rate_pct: number | null;
+  after_tax_yield_pct: number | null;
+  tey_pct: number | null;
+  after_tax_real_pct?: number | null;
+  notes: string[];
+}
+
+export interface BondRow {
+  id: number;
+  kind: BondKind;
+  kind_label: string;
+  label: string;
+  name?: string | null;
+  issuer?: string | null;
+  cusip?: string | null;
+  ticker?: string | null;
+  status: BondStatus;
+  account_type: string;
+  account_name?: string | null;
+  ladder_id?: number | null;
+  rating?: string | null;
+  rating_group: string;
+  state?: string | null;
+  face?: number | null;
+  quantity?: number | null;
+  coupon_pct?: number | null;
+  coupon_freq: number;
+  maturity?: string | null;
+  maturity_year?: number | null;
+  purchase_date?: string | null;
+  purchase_price?: number | null;
+  price?: number | null;
+  price_source?: string;
+  estimated_mark?: boolean;
+  accrued?: number;
+  accrued_usd?: number;
+  purchase_price_derived?: boolean;
+  dirty_price?: number;
+  market_value: number;
+  clean_value?: number;
+  cost_basis?: number | null;
+  unrealized_pnl?: number | null;
+  unrealized_pnl_pct?: number | null;
+  ytm_pct?: number | null;
+  ytw_pct?: number | null;
+  ytw_date?: string;
+  ytw_kind?: 'maturity' | 'call';
+  ytc_pct?: number | null;
+  yield_basis?: string;
+  current_yield_pct?: number | null;
+  book_yield_pct?: number | null;
+  mac_duration?: number | null;
+  mod_duration?: number | null;
+  eff_duration?: number | null;
+  convexity?: number | null;
+  cash_flow_duration?: number;
+  dv01: number;
+  annual_income: number;
+  value_at_maturity?: number;
+  next_coupon_date?: string | null;
+  next_coupon_amount?: number | null;
+  callable?: boolean;
+  likely_called?: boolean;
+  call_date?: string | null;
+  call_price?: number | null;
+  spread_bp?: number | null;
+  years_to_maturity?: number | null;
+  maturity_bucket?: string;
+  matured?: boolean;
+  no_mark_to_market?: boolean;
+  defined_maturity_year?: number | null;
+  total_yield_pct?: number | null;          // NOMINAL total: coupons/distributions + pull-to-par / accrual + TIPS inflation
+  yield_parts?: BondYieldParts | null;
+  annual_accrual?: number;                  // $/yr that builds up in the price (accumulating funds, NAV pull-to-par)
+  tax?: BondTaxBlock;
+  tips?: { index_ratio: number; ref_cpi: number | null; index_ratio_projected: boolean; adjusted_principal: number;
+           real_yield_pct: number | null; breakeven_pct: number | null; index_ratio_at_purchase?: number | null } | null;
+  fund?: { distribution_yield_pct: number | null; expense_ratio_pct: number | null; duration_source: string | null;
+           avg_maturity: number | null; category: string | null; family: string | null; credit_mix: Record<string, number>;
+           tax_class: string; est_ytm_pct?: number | null; est_basis?: string | null; user_yield_pct?: number | null;
+           payout?: BondFundPayout; payout_source?: string; cash_yield_pct?: number | null; accrual_pct?: number | null;
+           duration_confidence?: string | null };
+  krd?: Record<string, number>;
+  warnings: string[];
+}
+
+export interface BondAllocSlice { key: string; value: number; pct: number }
+
+export type BondFundPayout = 'distributes' | 'accumulates';
+// funds store how they pay in coupon_freq: 0 accumulates · 1 auto-detect · 12 distributes
+export const FUND_PAYOUT_FREQ = { accumulates: 0, auto: 1, distributes: 12 } as const;
+
+export interface BondYieldParts { total_pct: number | null; income_pct: number | null; price_gain_pct: number | null; inflation_pct: number | null }
+
+export interface BondRetiredTax { from_year: number; federal_pct: number; state_pct: number; ltcg_pct: number; niit_pct: number }
+
+export interface BondInflationFields { inflation_pct: number; inflation_long_pct?: number; inflation_10y_avg_pct?: number; inflation_source?: string }
+
+export interface BondRecommendation {
+  id: string;
+  severity: 'high' | 'medium' | 'low' | 'info';
+  category: 'tax' | 'risk' | 'income' | 'ladder' | 'cost' | 'market' | 'data';
+  title: string;
+  detail: string;
+  impact_usd: number | null;
+  holding_ids: number[];
+  action: string | null;
+}
+
+export interface BondCashEvent {
+  holding_id: number;
+  label: string;
+  kind: BondKind;
+  date: string;
+  type: 'coupon' | 'principal' | 'call' | 'distribution' | 'tax';
+  amount: number;
+  after_tax: number;
+  projected?: boolean;
+  // principal = capital (your cost returned) + gain; premium_loss = cost above what's returned
+  capital?: number;
+  gain?: number;
+  premium_loss?: number;
+  tax_on_gain?: number;
+  gain_known?: boolean;
+  phantom_income?: number;   // type 'tax': income taxed this year without cash (TIPS accretion / OID)
+}
+
+export interface BondCashYear {
+  year: number; coupon: number; principal: number; distribution: number; total: number;
+  after_tax: number; real_total: number; by_kind: Record<string, number>;
+  capital_returned: number; gain: number; premium_loss: number; tax_on_gains: number; phantom_tax: number;
+}
+
+export interface BondCashFlow {
+  as_of: string;
+  inflation_pct: number;
+  inflation_long_pct?: number;
+  assume_calls: boolean;
+  yearly: BondCashYear[];
+  monthly: { month: string; coupon: number; principal: number; distribution: number; total: number; after_tax: number;
+             capital_returned: number; gain: number }[];
+  next_12m: { income: number; income_after_tax: number; principal: number; gain?: number; events: BondCashEvent[] };
+  gains?: { total_gain: number; total_premium_loss: number; tax_on_gains: number; phantom_tax: number; unknown_cost: string[] };
+  events_count: number;
+  events?: BondCashEvent[];
+  notes: string[];
+}
+
+export interface BondProfile {
+  federal_rate: number;
+  state: string | null;
+  state_rate: number;
+  niit: boolean;
+  ltcg_rate: number;
+  filing_status: string | null;
+  inflation_assumption: number | null;
+  horizon_years: number | null;
+  goals: BondGoal[];
+  settings: Record<string, unknown>;
+}
+
+export interface BondGoal {
+  id?: string;
+  name: string;
+  year: number;
+  end_year?: number | null;
+  amount: number;
+  inflation_adjusted: boolean;
+}
+
+export interface BondScenario { shift_bp: number; pnl: number; pnl_pct: number; value: number }
+export interface BondNamedScenario { name: string; description: string; pnl: number; pnl_pct: number }
+
+export interface BondTaxYear {
+  year: number; fed_taxable_interest: number; state_taxable_interest: number; tax_exempt_interest: number;
+  sheltered_interest: number; phantom_income: number; tax_on_gains?: number; fed_tax: number; state_tax: number; total_tax: number;
+  effective_rate_pct: number; retired_rates?: boolean;
+}
+
+export interface BondPortfolio {
+  as_of: string;
+  fedinvest_as_of: string | null;
+  inflation_pct: number;
+  inflation_long_pct?: number;
+  inflation_source: string;
+  summary: {
+    market_value: number; cost_basis: number; unrealized_pnl: number; annual_income: number; annual_income_after_tax: number;
+    total_yield_pct?: number | null; yield_parts?: BondYieldParts; annual_total_return?: number; annual_accrual?: number;
+    ytw_pct: number | null; after_tax_yield_pct: number | null; tey_pct: number | null; eff_duration: number | null;
+    convexity: number | null; years_to_maturity: number | null; current_yield_pct: number | null; dv01: number;
+    positions: number; watchlist: number; estimated_marks_pct: number;
+  };
+  allocation: Record<'by_kind' | 'by_credit' | 'by_maturity' | 'by_account' | 'by_tax' | 'by_issuer' | 'by_state', BondAllocSlice[]>;
+  key_rate_dv01: { tenor: number; dv01: number; pct: number }[];
+  scenarios: { parallel: BondScenario[]; twists: BondNamedScenario[]; credit: BondNamedScenario[]; note: string };
+  holdings: BondRow[];
+  watchlist: BondRow[];
+  cash_flow: BondCashFlow;
+  tax: { years: BondTaxYear[]; rates: Record<string, number>; retired_rates?: BondRetiredTax | null; notes: string[] };
+  recommendations: BondRecommendation[];
+  profile: BondProfile;
+}
+
+export interface BondCurvePoint { tenor: number; yield_pct: number }
+
+export interface BondYieldMenuRow {
+  tenor: number;
+  treasury: number | null; cd: number | null; agency: number | null; muni: number | null;
+  corporate_aa: number | null; corporate_a: number | null; corporate_bbb: number | null; tips: number | null;
+}
+
+export interface BondMarket {
+  as_of: string | null;
+  nominal_curve: BondCurvePoint[];
+  nominal_curve_1m: BondCurvePoint[];
+  nominal_curve_1y: BondCurvePoint[];
+  nominal_curve_1m_date: string | null;
+  nominal_curve_1y_date: string | null;
+  real_curve: BondCurvePoint[];
+  real_curve_1y: BondCurvePoint[];
+  curve_shape: { '2s10s_bp'?: number; '3m10y_bp'?: number; '10s30s_bp'?: number; inverted_2s10s?: boolean; inverted_3m10y?: boolean };
+  breakevens: { tenor: number; breakeven_pct: number }[];
+  credit_spreads: {
+    by_rating: Record<string, { oas_bp: number | null; effective_yield_pct: number | null; as_of: string | null }>;
+    ig_buckets: { mid_years: number; oas_bp: number | null }[];
+    context: Record<string, { percentile_3y: number | null; min_3y_bp: number | null; max_3y_bp: number | null }>;
+    source: string;
+  } | null;
+  muni_ratio: { points: [number, number][]; source: string } | null;
+  deposit_rates: Record<string, { rate_pct: number; as_of: string } | null> | null;
+  rate_context: Record<string, { value_pct: number | null; as_of: string | null; percentile_20y: number | null; avg_20y_pct: number | null }>;
+  yield_menu: BondYieldMenuRow[];
+  recent_auctions: { cusip: string; type: string; original_term: string | null; maturity: string; coupon_pct: number;
+                     last_auction_date: string; last_auction_yield_pct: number | null; ytm_pct: number | null; price: number }[];
+  sources: Record<string, unknown>;
+}
+
+export interface BondCatalogueRow {
+  cusip: string; type: 'bill' | 'note' | 'bond' | 'tips' | 'frn'; coupon_pct: number; maturity: string; years: number;
+  tenor_label: string; price: number; buy: number | null; sell: number | null; dated_date: string | null;
+  original_term: string | null; ytm_pct: number | null; mod_duration: number | null; accrued?: number | null;
+  real_yield_pct?: number | null; ref_cpi?: number | null; index_ratio?: number | null; index_ratio_projected?: boolean;
+  adjusted_price?: number | null; breakeven_pct?: number | null; last_auction_date?: string | null;
+  last_auction_yield_pct?: number | null; note?: string;
+}
+
+export interface BondCatalogue {
+  as_of: string; settle: string; count: number; rows: BondCatalogueRow[]; source: string; inflation_assumption_pct: number;
+  maturity_years?: number[]; gap_years?: number[];
+}
+
+export interface BondLookup {
+  type: 'bond' | 'fund';
+  kind: BondKind;
+  cusip?: string;
+  issuer?: string;
+  name?: string;
+  ticker?: string;
+  coupon_pct?: number;
+  maturity?: string | null;
+  issue_date?: string | null;
+  price?: number | null;
+  ytm_pct?: number | null;
+  state?: string;
+  rating?: string;
+  day_count?: string;
+  coupon_freq?: number;
+  description?: string;
+  source?: string;
+  distribution_yield_pct?: number | null;
+  expense_ratio_pct?: number | null;
+  duration?: number | null;
+  category?: string | null;
+  federally_taxable_muni?: boolean;
+  tips_ref_cpi?: number | null;
+  index_ratio?: number | null;
+}
+
+export interface BondLadderParams {
+  amount: number;
+  start_years: number;
+  end_years: number;
+  frequency: 'annual' | 'semiannual' | 'quarterly' | 'monthly';
+  instrument: string;
+  weighting: 'equal' | 'level_income';
+  account_type: string;
+  allow_credit?: boolean;
+  corporate_rating?: string;
+}
+
+export interface BondMenuCandidate {
+  kind: string; rating: string | null; label: string; pre_tax_pct: number | null; real_yield_pct: number | null;
+  after_tax_pct: number | null; tey_pct: number | null; tax_rate_pct: number | null; basis: string; credit_risk: boolean;
+}
+
+export interface BondRung {
+  index: number;
+  target_date: string;
+  maturity: string | null;
+  years: number;
+  kind: string;
+  label: string;
+  basis: string;
+  cusip: string | null;
+  ticker: string | null;
+  yield_pct: number | null;
+  distribution_yield_pct?: number | null;
+  after_tax_pct: number | null;
+  tey_pct: number | null;
+  cost: number;
+  face: number | null;
+  quantity: number | null;
+  coupon_pct: number | null;
+  annual_income: number | null;
+  eff_duration: number | null;
+  alternatives: BondMenuCandidate[];
+  holding: BondHoldingInput;
+}
+
+export interface BondLadderResult {
+  params: BondLadderParams;
+  summary: {
+    amount: number; invested: number; cash_left: number; rungs: number; yield_pct: number | null;
+    after_tax_yield_pct: number | null; tey_pct: number | null; eff_duration: number | null; annual_income: number;
+    annual_income_after_tax: number; dv01: number; avg_years: number | null; first_maturity: string | null; last_maturity: string | null;
+  };
+  rungs: BondRung[];
+  cash_flow: BondCashFlow;
+  allocation: BondPortfolio['allocation'];
+  key_rate_dv01: BondPortfolio['key_rate_dv01'];
+  notes: string[];
+  as_of: string;
+  inflation_pct: number;
+}
+
+export interface TipsLadderRung {
+  year: number; cusip: string; maturity: string; coupon_pct: number; real_yield_pct: number | null; price: number;
+  index_ratio: number | null; face_to_buy: number; adjusted_principal: number; cost: number; income_principal: number;
+  gap_hedge: number; holding: BondHoldingInput;
+}
+
+export interface TipsLadderResult {
+  params: Record<string, unknown>;
+  summary: { rungs: number; invested: number; annual_real_income: number; real_yield_pct: number | null;
+             first_maturity: string | null; last_maturity: string | null };
+  as_of: string;
+  annual_real_income: number;
+  total_cost: number;
+  first_year: number;
+  last_year: number;
+  real_yield_pct: number | null;
+  inflation_pct: number;
+  inflation_long_pct?: number;
+  inflation_source: string;
+  rungs: TipsLadderRung[];
+  yearly: { year: number; real_income: number; nominal_income: number; gap_year: boolean }[];
+  gaps: { year: number; lower: number | null; upper: number | null; split: Record<string, number> | null }[];
+  notes: string[];
+}
+
+export interface BondSimulation {
+  scenarios: Record<'flat' | 'up100' | 'down100' | 'forwards', { year: number; income: number; income_after_tax: number; ladder_yield_pct: number }[]>;
+  ladder_length_years: number;
+  labels: Record<string, string>;
+}
+
+export interface BondLadderSaved {
+  id: number;
+  name: string;
+  ladder_type: 'nominal' | 'tips' | string;
+  status: 'plan' | 'active' | string;
+  notes: string | null;
+  params: Record<string, unknown>;
+  summary: Record<string, number | string | null> | null;
+  created_at: string | null;
+  updated_at: string | null;
+  plan?: (BondLadderResult | TipsLadderResult) & Record<string, unknown>;
+  status_detail?: {
+    rungs: { index: number; maturity: string | null; label: string | null; planned: number; held: number; on_watchlist: number;
+             funded_pct: number; status: 'funded' | 'partial' | 'planned' | 'missing' | 'matured'; holding_ids: number[];
+             maturing_soon: boolean }[];
+    funded_pct: number; missing: number;
+  };
+  actual?: { summary: BondPortfolio['summary']; cash_flow: BondCashFlow; recommendations: BondRecommendation[] } | null;
+  linked_holdings?: BondRow[];
+}
+
+export interface BondPlanMetrics {
+  funded_ratio_pct: number | null;
+  pv_needs: number;
+  pv_covered: number;
+  need_total?: number; covered_total?: number; shortfall_total?: number;
+  taxes_total?: number; taxes_pv?: number;
+  cost_to_fund_shortfalls: { treasury: number; tips: number; total: number; basis?: string; pre_tax_total?: number };
+  shortfall_years: number[];
+}
+
+export interface BondFundSale {
+  year: number; holding_id: number; label: string; ticker: string | null; account_type: string;
+  gross: number; tax: number; early_penalty?: number; net: number; duration: number; years_to_need: number; mismatch_years: number;
+  rate_impact_1pct: number; cost_pct: number; reason: string;
+}
+
+export interface BondReinvestment {
+  from_year: number; to_year: number; tenor: number; amount: number; rate_pct: number;
+  value_at_maturity: number; earned: number; vs_tbills: number;
+}
+
+export interface BondPlanReinvest {
+  enabled: boolean;
+  plan: BondReinvestment[];
+  total_set_aside: number;
+  total_arriving: number;
+  extra_vs_tbills: number;
+  before: BondPlanMetrics;
+  after: BondPlanMetrics;
+  rate_basis: string;
+  tbill_rate_pct: number;
+}
+
+export type BondWithdrawalMode = 'age' | 'before' | 'after';
+
+export interface BondPlanWithdrawal {
+  mode: BondWithdrawalMode;
+  birth_year: number | null;
+  early_until: number | null;
+  penalty_free_from: number | null;
+  applies: boolean;
+  early_cost_total: number;
+  early_years: number[];
+}
+
+export interface BondPlanFunds {
+  available: { id: number; label: string; ticker: string | null; account_type: string; value: number; duration: number;
+               duration_estimated: boolean; duration_source: string | null; gain_pct: number; cost_known: boolean;
+               expense_ratio_pct: number | null; yield_pct: number; cash_yield_pct?: number; accumulates?: boolean;
+               sale_tax_pct: number; early_extra_pct?: number;
+               remaining_end: number | null }[];
+  enabled: boolean;
+  method: string;
+  schedule: BondFundSale[];
+  total_sold: number;
+  tax_paid: number;
+  net_raised: number;
+  remaining_value_end: number;
+  rate_impact_1pct: number;
+  years_filled: number[];
+  before: BondPlanMetrics;
+  after: BondPlanMetrics;
+  lock_in: { years: number[]; treasury_cost_today: number; note: string } | null;
+}
+
+export interface BondPlan {
+  as_of: string;
+  inflation_pct: number;
+  inflation_long_pct?: number;
+  inflation_source: string;
+  retired_tax?: BondRetiredTax | null;
+  after_tax: boolean;
+  use_funds: boolean;
+  reinvest_surplus: boolean;
+  funds: BondPlanFunds | null;
+  reinvest: BondPlanReinvest;
+  withdrawal: BondPlanWithdrawal;
+  years: { year: number; need: number; inflow: number; covered: number; shortfall: number; surplus_carried: number; goals: string[];
+           bond_inflow?: number; fund_distributions?: number; fund_sales?: number; reinvest_in?: number; reinvest_out?: number;
+           early_cost?: number; early_withdrawal?: boolean }[];
+  funded_ratio_pct: number | null;
+  pv_needs: number;
+  pv_covered: number;
+  cost_to_fund_shortfalls: { treasury: number; tips: number; total: number; basis?: string; pre_tax_total?: number };
+  taxes_total?: number;
+  taxes_pv?: number;
+  book_value?: number;
+  shortfall_years: number[];
+  notes: string[];
+}
+
+export interface BondCalcResult {
+  settle: string; face_value: number; clean_price: number; dirty_price: number; accrued: number; accrued_usd: number;
+  cost_usd: number; ytm_pct: number | null; ytw_pct: number | null; ytw_date: string; ytw_kind: string; ytc_pct: number | null;
+  current_yield_pct: number | null; mac_duration: number | null; mod_duration: number | null; eff_duration: number | null;
+  convexity: number | null; eff_convexity: number | null; dv01_per_100: number; dv01_usd: number; years_to_maturity: number;
+  callable: boolean; likely_called: boolean; spread_to_treasury_bp: number | null; treasury_at_maturity_pct: number | null;
+  de_minimis_price: number | null; tax: BondTaxBlock;
+  scenarios: { shift_bp: number; price: number; pnl: number; pnl_pct: number; duration_estimate_pct: number }[];
+  horizon_1y: { shift_bp: number; total_return_pct: number }[];
+  krd: { tenor: number; duration: number }[];
+  cash_flows: { date: string; coupon: number; principal: number }[];
+  annual_income_usd: number;
+  inflation_pct: number;
+}
+
+export interface BondYieldMenu {
+  account_type: string;
+  inflation_pct: number;
+  inflation_long_pct?: number;
+  rows: { tenor: number; candidates: BondMenuCandidate[]; best: BondMenuCandidate | null; best_no_credit: BondMenuCandidate | null }[];
+}
+
+export interface BondPreview {
+  ready: boolean;
+  missing?: string;
+  row?: BondRow;
+  reconciliation?: { broker_value: number; our_value: number; diff: number; diff_pct: number; implied_price: number | null; basis: string } | null;
+}
+
+export interface BondFilters {
+  kinds: string[];          // BondKind values; empty = all
+  accountTypes: string[];   // taxable / ira / roth / 401k …; empty = all
 }

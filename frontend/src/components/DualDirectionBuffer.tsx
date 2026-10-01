@@ -2,13 +2,14 @@ import React, { useState, useEffect, useMemo } from 'react';
 import {
     Shield, ShieldAlert, AlertCircle, Percent, Timer, Briefcase, Calculator,
     TrendingUp, TrendingDown, Layers, Send, Database, Zap,
-    Sliders, Edit3, Loader2, Sparkles, Save, FolderOpen, Trash2, CheckCircle2,
+    Sliders, Edit3, Loader2, Sparkles, Save, FolderOpen, Trash2, CheckCircle2, Search,
 } from 'lucide-react';
 import {
     computeDualDirectionBuffer, computeDualDirectionBufferIBKR, fetchBrokerConnection, fetchOptionQuote, fetchOptionQuotesBatch,
     fetchSavedStrategies, saveStrategy, updateSavedStrategy, deleteSavedStrategy, markStrategyAsTraded, fetchOptionExpirations,
+    screenDualDirectionBuffer,
 } from '../api';
-import type { SavedStrategyItem } from '../api';
+import type { SavedStrategyItem, DualBufferScreenResult } from '../api';
 import { roundToTick } from '../utils/tickSize';
 import { OrderConfirmationModal } from './OrderConfirmationModal';
 import QuantRecommendationCard from './QuantRecommendationCard';
@@ -92,6 +93,9 @@ export function DualDirectionBuffer() {
     const [downsideBuffer, setDownsideBuffer] = useState<number>(15);
     const [upsideCap, setUpsideCap] = useState<number>(15);
     const [entryCostMode, setEntryCostMode] = useState<'standard' | 'self_financing' | 'non_negative' | 'cheapest'>('standard');
+    const [screenResult, setScreenResult] = useState<DualBufferScreenResult | null>(null);
+    const [screening, setScreening] = useState(false);
+    const [riskBudget, setRiskBudget] = useState<string>('');   // optional fixed-risk $ for sizing
 
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -341,7 +345,10 @@ export function DualDirectionBuffer() {
         const baseMargin = calcSpreadMargin(customLegs);
         const tradeCost = customLegs.reduce((sum, leg) =>
             sum + (leg.action === 'Buy' ? 1 : -1) * leg.price * leg.qty * 100, 0);
-        const totalDeployed = Math.max(0, tradeCost) + baseMargin;
+        // Capital at risk = the larger of the net debit paid and the spread margin —
+        // NOT their sum. For a net-debit defined-risk structure the margin is already
+        // covered by the debit; adding them double-counts capital and understates ROI.
+        const totalDeployed = Math.max(Math.max(0, tradeCost), baseMargin);
 
         const calcScenario = (change: number) => {
             const simPrice = currentPrice * (1 + change);
@@ -557,7 +564,7 @@ export function DualDirectionBuffer() {
     // Strategy calculation
     // ---------------------------------------------------------------------------
 
-    const calculateStrategy = async () => {
+    const calculateStrategy = async (expiryOverride?: string, durationOverride?: number) => {
         if (!ticker) { setError('Please enter a ticker symbol'); return; }
         if (amount <= 0) { setError('Amount must be positive'); return; }
 
@@ -569,14 +576,15 @@ export function DualDirectionBuffer() {
         setPayoffBounds(null);
         setPricingMode('mid');
 
+        const targetExp = expiryOverride ?? selectedExpiration;
         const params = {
             ticker,
             amount: Number(amount),
-            duration_days: Number(duration),
+            duration_days: Number(durationOverride ?? duration),
             downside_buffer_pct: Number(downsideBuffer),
             upside_cap_pct: Number(upsideCap),
             entry_cost_mode: entryCostMode,
-            ...(selectedExpiration ? { target_expiration: selectedExpiration } : {}),
+            ...(targetExp ? { target_expiration: targetExp } : {}),
         };
 
         try {
@@ -594,6 +602,39 @@ export function DualDirectionBuffer() {
         } finally {
             setLoading(false);
         }
+    };
+
+    // ---------------------------------------------------------------------------
+    // Screener — scan 90/120/180/365 for the best no-cost buffer
+    // ---------------------------------------------------------------------------
+
+    const runScreen = async () => {
+        if (!ticker) { setError('Please enter a ticker symbol'); return; }
+        if (amount <= 0) { setError('Amount must be positive'); return; }
+        setScreening(true); setError(null); setScreenResult(null);
+        try {
+            const res = await screenDualDirectionBuffer({
+                ticker,
+                amount: Number(amount),
+                downside_buffer_pct: Number(downsideBuffer),
+                upside_cap_pct: Number(upsideCap),
+                entry_cost_mode: entryCostMode,
+                risk_budget: riskBudget && !isNaN(Number(riskBudget)) ? Number(riskBudget) : null,
+            });
+            setScreenResult(res);
+        } catch (err: any) {
+            setError(err.message || 'Screen failed');
+        } finally {
+            setScreening(false);
+        }
+    };
+
+    /** Load a screener candidate into the builder (exact expiration) and simulate it. */
+    const useCandidate = (exp: string, dte: number) => {
+        setSelectedExpiration(exp);
+        setDuration(dte);
+        setScreenResult(null);
+        calculateStrategy(exp, dte);
     };
 
     // ---------------------------------------------------------------------------
@@ -668,7 +709,8 @@ export function DualDirectionBuffer() {
         customLegs.reduce((sum, leg) => sum + (leg.action === 'Buy' ? 1 : -1) * leg.price * leg.qty * 100, 0),
     [customLegs]);
 
-    const customTotalDeployed = Math.round((Math.max(0, customTradeCost) + customMargin) * 100) / 100;
+    // Capital at risk = max(net debit, spread margin), not their sum (see evaluateOutcomes).
+    const customTotalDeployed = Math.round(Math.max(Math.max(0, customTradeCost), customMargin) * 100) / 100;
 
     // ---------------------------------------------------------------------------
     // Order legs for modal
@@ -814,7 +856,18 @@ export function DualDirectionBuffer() {
                     </select>
                 </div>
 
-                <button className="btn btn-secondary ml-auto" onClick={calculateStrategy} disabled={loading}>
+                <div className="form-control ml-auto">
+                    <label className="label py-1"><span className="label-text text-xs font-medium">Max risk $ (optional)</span></label>
+                    <input type="number" className="input input-bordered input-sm w-32" value={riskBudget}
+                        onChange={(e) => setRiskBudget(e.target.value)} placeholder="e.g. 2000" min={0} step={100}
+                        title="Size the recommended trade so its max loss ≈ this amount" />
+                </div>
+                <button className="btn btn-outline btn-secondary" onClick={runScreen} disabled={screening || loading}
+                    title="Scan 90/120/180/365 days and pick the best no-cost buffer">
+                    {screening ? <Loader2 className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5 mr-2" />}
+                    Find Best Buffer
+                </button>
+                <button className="btn btn-secondary" onClick={() => calculateStrategy()} disabled={loading}>
                     {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Calculator className="w-5 h-5 mr-2" />}
                     Simulate Dual Direction
                 </button>
@@ -857,6 +910,71 @@ export function DualDirectionBuffer() {
             {error && (
                 <div className="alert alert-error text-sm">
                     <AlertCircle className="w-4 h-4" /> {error}
+                </div>
+            )}
+
+            {/* ════════════════════════ SCREENER RESULTS ════════════════════════ */}
+            {screenResult && screenResult.candidates.length > 0 && (
+                <div className="glass-card">
+                    <div className="p-5">
+                        <h3 className="font-bold text-sm mb-1 flex items-center gap-2">
+                            <Search className="w-5 h-5 text-secondary" /> Best buffer across tenors — {screenResult.ticker}
+                        </h3>
+                        {screenResult.note && (
+                            <p className="text-[11px] text-warning/90 mb-3 flex items-start gap-1.5">
+                                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-px" /> {screenResult.note}
+                            </p>
+                        )}
+                        <div className="overflow-x-auto">
+                            <table className="table table-pro w-full text-center text-sm">
+                                <thead>
+                                    <tr>
+                                        <th className="bg-base-200/60 text-left">Expiry / DTE</th>
+                                        <th className="bg-base-200/60">Buffer</th>
+                                        <th className="bg-base-200/60">Cap</th>
+                                        <th className="bg-base-200/60">If flat @0%</th>
+                                        <th className="bg-base-200/60">Max Gain</th>
+                                        <th className="bg-base-200/60">Max Loss</th>
+                                        <th className="bg-base-200/60">Quant</th>
+                                        <th className="bg-base-200/60"></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {screenResult.candidates.map((c, i) => {
+                                        const q = c.quant;
+                                        const qtone = q?.tone === 'good' ? 'text-success' : q?.tone === 'bad' ? 'text-error' : 'text-warning';
+                                        return (
+                                            <tr key={i} className={i === 0 ? 'bg-secondary/10 border-l-2 border-l-secondary' : ''}>
+                                                <td className="text-left">
+                                                    <span className="font-medium">{c.expiration}</span>
+                                                    <span className="text-[10px] opacity-50 ml-1">{c.dte}d</span>
+                                                    {i === 0 && <span className="badge badge-secondary badge-xs ml-1">best</span>}
+                                                </td>
+                                                <td className="text-error">{c.actual_buffer_pct}%</td>
+                                                <td className="text-success">{c.actual_cap_pct}%</td>
+                                                <td className={c.no_cost ? 'text-success' : 'text-warning'}>
+                                                    {c.pnl_if_flat >= 0 ? '+' : '−'}${Math.abs(c.pnl_if_flat).toLocaleString()}
+                                                </td>
+                                                <td className="text-success font-semibold">+{c.max_gain_pct}%</td>
+                                                <td className="text-error">{c.max_loss_pct}%</td>
+                                                <td className={`font-bold ${qtone}`}>{q?.verdict} <span className="opacity-60 font-normal">{q?.score}</span></td>
+                                                <td>
+                                                    <button className="btn btn-xs btn-secondary" onClick={() => useCandidate(c.expiration, c.dte)}>Use this</button>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                        {screenResult.candidates[0]?.sized && (
+                            <p className="text-[11px] text-base-content/60 mt-2">
+                                Fixed-risk size (best): {screenResult.candidates[0].sized!.contracts_base} base contract(s) ·
+                                capital ≈ ${screenResult.candidates[0].sized!.capital.toLocaleString()} ·
+                                max loss ≈ ${Math.abs(screenResult.candidates[0].sized!.max_loss).toLocaleString()}
+                            </p>
+                        )}
+                    </div>
                 </div>
             )}
 
@@ -1066,6 +1184,9 @@ export function DualDirectionBuffer() {
                                             <div>
                                                 Spread Margin (IBKR L3):{' '}
                                                 <span className="text-warning">${customMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                                {customTradeCost >= customMargin && (
+                                                    <span className="text-[10px] font-normal opacity-50 ml-1">(covered by the debit)</span>
+                                                )}
                                             </div>
                                         )}
                                         <div className="border-t border-white/[0.05] pt-1 mt-1">

@@ -39,6 +39,8 @@ class User(Base):
     tracked_trades: Mapped[list["TrackedTrade"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     paper_trades: Mapped[list["PaperTrade"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     highlight_dismissals: Mapped[list["PortfolioHighlightDismissal"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    bond_holdings: Mapped[list["BondHolding"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    bond_ladders: Mapped[list["BondLadder"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class AllowedUser(Base):
@@ -671,6 +673,117 @@ class PaperTrade(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="paper_trades")
+
+
+class BondLadder(Base):
+    """A bond ladder plan (nominal, TIPS or defined-maturity ETF) — Bond Desk.
+
+    ``params`` holds the builder inputs, ``plan`` the generated rungs snapshot (so the
+    ladder view is stable); holdings join a ladder via ``BondHolding.ladder_id``.
+    """
+    __tablename__ = "bond_ladders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False, default="My ladder")
+    ladder_type: Mapped[str] = mapped_column(String(20), nullable=False, default="nominal")  # nominal | tips | etf
+    params: Mapped[str] = mapped_column(Text, nullable=False, default="{}")   # JSON — builder inputs
+    plan: Mapped[str] = mapped_column(Text, nullable=False, default="{}")     # JSON — generated rungs
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="plan")  # plan | active
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship(back_populates="bond_ladders")
+
+
+class BondHolding(Base):
+    """One fixed-income position (or watchlist entry) on the Bond Desk.
+
+    Individual bonds (treasury / tips / muni / corporate / agency / cd) carry their
+    terms; bond ETFs and mutual funds (``etf`` / ``mutual_fund``) carry ``ticker`` +
+    ``quantity``. Rates are stored in PERCENT as entered (coupon 4.25), prices per 100
+    of face (per share for funds). Tax flags left NULL fall back to the kind's default.
+    """
+    __tablename__ = "bond_holdings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ladder_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("bond_ladders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="held")  # held | watch | matured | sold
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    issuer: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    cusip: Mapped[str | None] = mapped_column(String(12), nullable=True, index=True)
+    ticker: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    face_value: Mapped[float | None] = mapped_column(Float, nullable=True)       # par held (bonds)
+    quantity: Mapped[float | None] = mapped_column(Float, nullable=True)         # shares (funds)
+    coupon_rate: Mapped[float | None] = mapped_column(Float, nullable=True)      # % (APY for bank CDs)
+    coupon_freq: Mapped[int] = mapped_column(Integer, nullable=False, default=2)  # 0 = zero / at maturity
+    day_count: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    issue_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    maturity_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+
+    purchase_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    purchase_price: Mapped[float | None] = mapped_column(Float, nullable=True)   # clean % of par / per share
+    cost_basis: Mapped[float | None] = mapped_column(Float, nullable=True)       # $ total override
+    current_price: Mapped[float | None] = mapped_column(Float, nullable=True)    # manual mark
+    price_as_of: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+
+    call_date: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    call_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rating: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(2), nullable=True)          # muni issuer state
+    federal_taxable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    state_taxable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    amt: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    tips_ref_cpi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    account_type: Mapped[str] = mapped_column(String(16), nullable=False, default="taxable")
+    account_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship(back_populates="bond_holdings")
+
+
+class BondProfile(Base):
+    """Per-user tax + planning profile for the Bond Desk (one row per user)."""
+    __tablename__ = "bond_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    federal_rate: Mapped[float] = mapped_column(Float, nullable=False, default=24.0)    # %
+    state: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    state_rate: Mapped[float] = mapped_column(Float, nullable=False, default=5.0)       # %
+    niit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    ltcg_rate: Mapped[float] = mapped_column(Float, nullable=False, default=15.0)       # %
+    filing_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    inflation_assumption: Mapped[float | None] = mapped_column(Float, nullable=True)    # % (None → market breakeven)
+    horizon_years: Mapped[float | None] = mapped_column(Float, nullable=True)
+    goals: Mapped[str] = mapped_column(Text, nullable=False, default="[]")              # JSON list
+    settings: Mapped[str] = mapped_column(Text, nullable=False, default="{}")           # JSON
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class DataCache(Base):

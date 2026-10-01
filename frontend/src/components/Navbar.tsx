@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { apiBase } from '../api';
 import {
   Settings, LogOut, LayoutDashboard, Briefcase, Bot, Layers, Zap, Share2,
-  Menu, X, Crown, Lock, Globe, Bookmark, AlignJustify, ClipboardList, Sparkles, Landmark, Calculator, Crosshair,
+  Menu, X, Crown, Lock, Globe, Bookmark, AlignJustify, ClipboardList, Sparkles, Landmark, Calculator, Crosshair, ScrollText,
 } from 'lucide-react';
 import { TickerInput } from './TickerInput';
 
@@ -15,6 +15,7 @@ import { TickerInput } from './TickerInput';
 const PRIMARY_NAV = [
   { path: '/market',      icon: Globe,            label: 'Markets',     premiumOnly: false },
   { path: '/portfolio',   icon: Briefcase,        label: 'Portfolio',   premiumOnly: false },
+  { path: '/bonds',       icon: ScrollText,       label: 'Bonds',       premiumOnly: false },
   { path: '/tracking',    icon: Bookmark,         label: 'Tracking',    premiumOnly: false },
   { path: '/my-trades',   icon: ClipboardList,    label: 'Derivative Trades',      premiumOnly: false },
   { path: '/ai-research', icon: Sparkles,         label: 'AI Research', premiumOnly: false },
@@ -31,6 +32,7 @@ const EVERYTHING_NAV = [
   { path: '/trade-tracking', icon: Crosshair,     label: 'Trade Tracker', premiumOnly: false, desc: 'Track setups to entry, manage to exit', accent: true },
   { path: '/calculators', icon: Calculator,       label: 'Calculators', premiumOnly: false, desc: 'Financial planning calculators' },
   { path: '/strategies',  icon: Layers,           label: 'Strategies',  premiumOnly: true,  desc: 'Long/short & options strategies' },
+  { path: '/bonds',       icon: ScrollText,       label: 'Bond Desk',   premiumOnly: false, desc: 'Bonds, CDs, TIPS & ladders — cash flow, tax, risk', accent: true },
   { path: '/debt',        icon: Landmark,         label: 'Debt Radar',  premiumOnly: true,  desc: 'Bond/CLO entry-timing tracker' },
   { path: '/agents',      icon: Bot,              label: 'Agents',      premiumOnly: true,  desc: 'Automated monitoring agents' },
   { path: '/portfolio',   icon: Briefcase,        label: 'Portfolio',   premiumOnly: false, desc: 'Holdings & performance' },

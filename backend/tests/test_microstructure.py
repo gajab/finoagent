@@ -151,7 +151,7 @@ class TestComputeMicrostructure:
         out = compute_microstructure(_FakeStock(_synth_daily()))
         assert out is not None
         assert out["price"] is not None
-        assert set(out["timeframe_profiles"]) == {"macro", "swing", "micro"}
+        assert set(out["timeframe_profiles"]) == {"daily", "h4", "h1"}
         assert isinstance(out["naked_pocs"], list)
         avw = out["avwap"]
         # anchors that always exist from a 1y daily frame

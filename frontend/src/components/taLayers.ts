@@ -98,7 +98,8 @@ export function regimeLayers(d: RegimeData): TALayer[] {
   for (const [k, tag] of [['daily', 'Daily'], ['h4', '4H']] as const) {
     const tf = d.timeframes[k];
     if (!tf) continue;
-    out.push({ id: `regime_${k}`, group: 'Regime state', label: `${tag}: ${tf.regime.replace('_', '-')}`,
+    out.push({ id: `regime_${k}`, group: 'Regime state',
+      label: `${tag}: ${tf.regime.replace('_', '-')} · H ${tf.hurst ?? '—'} · ER ${tf.efficiency_ratio ?? '—'}`,
       tone: tf.regime === 'trending' ? 'text-success' : tf.regime === 'mean_reverting' ? 'text-info' : 'text-warning',
       color: 'rgb(148,163,184)', status: true, json: { indicator: 'regime', timeframe: k, regime: tf.regime, hurst: tf.hurst, efficiency_ratio: tf.efficiency_ratio, confidence: tf.confidence } });
   }

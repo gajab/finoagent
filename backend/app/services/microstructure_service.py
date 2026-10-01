@@ -381,5 +381,51 @@ def _safe_history_days(stock, days: int, interval: str):
         return None
 
 
+def append_live_daily_bar(stock, df):
+    """Reconstruct today's in-progress DAILY bar and append it when yfinance dropped it.
+
+    yfinance frequently returns the current session's *daily* bar with all-NaN OHLC (only Volume
+    populated) until the daily aggregate settles a few hours after the close — so
+    ``dropna(subset=["Close"])`` removes it and every daily-interval chart lags a full day behind
+    the intraday charts (the "1D/4H/1H don't show today, but 15m does" bug). This rebuilds today's
+    daily candle from today's 60-minute bars (O=first · H=max · L=min · C=last · V=sum) and appends it.
+
+    Guarded + cheap: only fires when the cleaned daily frame's last bar predates today's session and
+    it's a weekday — one small intraday fetch, a no-op (returns ``df`` unchanged) on any failure, on
+    weekends/holidays, or when there's no newer session. Daily interval only; never appends a NaN
+    close (source intraday is dropna'd first), so it can't reintroduce the null-close crash."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    try:
+        tz = df.index.tz
+        now = pd.Timestamp.now(tz=tz) if tz is not None else pd.Timestamp.now()
+        today = now.date()
+        last_date = df.index[-1].date()
+        if last_date >= today or today.weekday() >= 5:   # already have today, or no weekday session
+            return df
+        intr = stock.history(period="5d", interval="60m")
+        if intr is None or getattr(intr, "empty", True):
+            return df
+        intr = intr.dropna(subset=["Close"])
+        if intr.empty:
+            return df
+        newest = intr.index[-1].date()
+        if newest <= last_date:                          # no session newer than the last daily bar
+            return df
+        day = intr[np.array([t.date() == newest for t in intr.index])]
+        if day.empty:
+            return df
+        row = {col: np.nan for col in df.columns}
+        row["Open"] = float(day["Open"].iloc[0])
+        row["High"] = float(day["High"].max())
+        row["Low"] = float(day["Low"].min())
+        row["Close"] = float(day["Close"].iloc[-1])
+        row["Volume"] = float(day["Volume"].sum())
+        idx = pd.Timestamp(newest, tz=tz) if tz is not None else pd.Timestamp(newest)
+        return pd.concat([df, pd.DataFrame([row], index=[idx])])
+    except Exception:  # noqa: BLE001 — never break the price feed
+        return df
+
+
 def _now_str() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M")

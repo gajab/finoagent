@@ -56,6 +56,40 @@ def _poc(closes, volumes, bins: int = 30) -> Optional[float]:
     return round(float((edges[b] + edges[b + 1]) / 2.0), 2)
 
 
+def _is_monthly(iso: str) -> bool:
+    try:
+        d = dt.date.fromisoformat(iso)
+        return d.weekday() == 4 and 15 <= d.day <= 21          # the standard 3rd-Friday monthly
+    except (ValueError, TypeError):
+        return False
+
+
+def select_roll_expiries(inwin: list, *, earn_days: Optional[int] = None, max_expiries: int = 5) -> list:
+    """Which later expiries to search for a credit roll. `inwin` = [(iso, dte)] sorted by dte.
+
+    Prefer the liquid MONTHLIES (3rd Friday) traders actually roll to — EVERY monthly in the window plus the
+    nearest weekly (a fast/cheap roll); never drop a monthly for an arbitrary weekly (blind index-subsampling
+    used to). And when an earnings print is coming, ALSO include every listed expiry that lands BEFORE it (up to
+    3): the rolls that don't carry a short through the binary gap are exactly the defensible ones, and a
+    monthly-only search skipped them (on DDOG the only pre-print candidate was the nearest weekly). When the
+    cap bites, the pre-print expiries win — they are the ones that avoid the gap."""
+    monthlies = [x for x in inwin if _is_monthly(x[0])]
+    nearest_weekly = next((x for x in inwin if not _is_monthly(x[0])), None)
+    chosen = list(monthlies)
+    if nearest_weekly and nearest_weekly not in chosen:
+        chosen.insert(0, nearest_weekly)                           # keep a quick near-dated roll on the menu
+    if earn_days is not None:
+        for x in [y for y in inwin if y[1] < earn_days][:3]:
+            if x not in chosen:
+                chosen.append(x)
+    if not chosen:                                                 # (rare) no monthly in window → take what's there
+        chosen = list(inwin)
+    ordered = sorted(set(chosen), key=lambda x: x[1])
+    if earn_days is not None:
+        ordered = [x for x in ordered if x[1] < earn_days] + [x for x in ordered if x[1] >= earn_days]
+    return ordered[:max_expiries]
+
+
 async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str, tested_strike: float,
                         tested_qty: int, tested_entry: float, current_dte: int, covered: bool = False,
                         r: float = 0.045, max_expiries: int = 5, max_horizon: int = 130) -> dict:
@@ -80,28 +114,11 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
         except (ValueError, TypeError):
             return None
 
-    # ── candidate roll-OUT expiries. Prefer the liquid MONTHLIES (3rd Friday) traders actually roll to —
-    #    include EVERY monthly in the window plus the nearest weekly (a fast/cheap roll). Never drop a
-    #    monthly for an arbitrary weekly the way blind index-subsampling did (that skipped monthlies). ──
-    def _is_monthly(iso: str) -> bool:
-        try:
-            d = dt.date.fromisoformat(iso)
-            return d.weekday() == 4 and 15 <= d.day <= 21          # the standard 3rd-Friday monthly
-        except (ValueError, TypeError):
-            return False
-
+    # ── candidate roll-OUT expiries: chosen below by `select_roll_expiries`, once the next earnings date is known. ──
     inwin = sorted(((str(e)[:10], _dte(e)) for e in exps_raw if _dte(e) is not None
                     and current_dte + 3 <= _dte(e) <= max_horizon), key=lambda x: x[1])
     if not inwin:
         return {"error": "No later expirations available within the roll horizon — nothing to roll into."}
-    monthlies = [x for x in inwin if _is_monthly(x[0])]
-    nearest_weekly = next((x for x in inwin if not _is_monthly(x[0])), None)
-    chosen = list(monthlies)
-    if nearest_weekly and nearest_weekly not in chosen:
-        chosen.insert(0, nearest_weekly)                           # keep a quick near-dated roll on the menu
-    if not chosen:                                                 # (rare) no monthly in window → take what's there
-        chosen = inwin
-    cand_exps = sorted(set(chosen), key=lambda x: x[1])[:max_expiries]
 
     # ── structure levels (once). A short-premium trade gets into TROUBLE on the last ~5–15 days' move
     #    (a spike/crash), so read structure THERE — recent intraday pivots, not a stale 6-month daily
@@ -156,6 +173,8 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
         next_earn = dt.date.fromisoformat(str(_ne)[:10]) if _ne else None
     except (ValueError, TypeError):
         next_earn = None
+    earn_days = ((next_earn - today).days if (next_earn and next_earn >= today) else None)
+    cand_exps = select_roll_expiries(inwin, earn_days=earn_days, max_expiries=max_expiries)
 
     # ── buy-back mark of the tested short (current expiry) ──
     cur_exp = min(exps_raw, key=lambda e: abs((_dte(e) or 0) - current_dte)) if exps_raw else None
@@ -278,6 +297,10 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
 
             results.append({
                 "expiry": exp_iso, "dte": dte, "strike": round(K, 2), "right": tested_right,
+                # the NEW short's own price + skew IV — the merge into the desk's ranked menu re-prices this
+                # leg's payoff/greeks/PoP/E[P&L] with the shared engine (build_roll_alternatives)
+                "new_price": round(credit_new, 4),
+                "iv": (round(float(getattr(q, "iv", None)), 4) if getattr(q, "iv", None) else None),
                 "roll_net_cash": roll_net, "credit_per_share": round(credit_new - tested_mark, 2),
                 "new_credit_total": round(total_credit, 2), "new_breakeven": new_be, "new_capital": new_cap,
                 "p_otm": round(p_otm * 100, 1), "p_otm_source": src, "spans_earnings": spans_earn,
@@ -298,7 +321,7 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
     results.sort(key=lambda x: -x["scores"]["composite"])
     return {
         "tested": {"right": tested_right, "strike": round(float(tested_strike), 2), "qty": tested_qty,
-                   "entry": round(tested_entry, 2), "mark": round(tested_mark, 2), "dte": current_dte,
+                   "entry": round(tested_entry, 2), "mark": round(tested_mark, 4), "dte": current_dte,
                    "covered": bool(covered)},
         "spot": round(spot, 2),
         "structure": {"support": support, "resistance": resistance, "poc": poc,
@@ -309,6 +332,10 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
         "weights": weights,
         "considered": len(results),
         "candidates": results[:6],
-        "note": ("Covered call — the roll keeps your shares; 'capital' below is the called-away notional, not new cash."
-                 if covered else "Cash-secured short — a lower strike frees capital; every roll shown is a NET CREDIT."),
+        "note": ("Covered call — the roll keeps your shares; 'capital' is the called-away notional, not new cash. Every roll is a NET CREDIT."
+                 if covered else
+                 "Naked short call — every roll is a NET CREDIT (no new money), but a roll only RE-TIMES the same unbounded upside; "
+                 "it does not cap it."
+                 if not is_put else
+                 "Cash-secured put — a lower strike frees capital; every roll shown is a NET CREDIT."),
     }

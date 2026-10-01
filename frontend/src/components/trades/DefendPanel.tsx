@@ -1,7 +1,15 @@
 /**
  * DefendPanel — the trouble-trade desk. When a short-premium trade is tested (ITM / cushion gone),
  * the income score saturates at ~0 and stops being useful. Defend switches the question to "given
- * I'm already here, what's the least-bad path?" and lays out, on ONE click, seven lenses:
+ * I'm already here, what's the least-bad path?" and lays out, on ONE click, a DESK RECOMMENDATION
+ * (the one named pick a real desk would lead with — computed from the same composite that ranks
+ * every card below, and which may legitimately BE Hold or Close) followed by seven lenses.
+ *
+ * ONE recommendation, two phases: phase 1 (GET /repair-menu) paints the lenses immediately; for a tested/
+ * marginal lone short, phase 2 (POST /defend/refine) runs the live credit-only roll search and MERGES its
+ * candidates into the same ranked menu. The recommendation is held back until phase 2 lands, so the panel
+ * never shows a provisional pick that later changes — and there is no separate "Optimize the roll" section
+ * to contradict it (rolls are just more cards, scored on the same axes as everything else):
  *
  *   1  Recoverability  — P(return to breakeven) WITH the auditable build-up behind it (prob drivers)
  *   2  …tilted by TA   — structure · breakeven-vs-level · MACD · RSI · volume-profile · gamma regime
@@ -13,15 +21,15 @@
  *
  * Everything but the LLM war-room comes off ONE core fetch and renders immediately (no inner button).
  */
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Loader2, AlertTriangle, ShieldAlert, Wrench, Activity, Clock, Users,
   ArrowUpRight, TrendingDown, Layers, Check, X, Minus, Target,
 } from 'lucide-react';
-import { fetchDefendMenu, fetchDefendCommittee, fetchRollOptimizer } from '../../api';
-import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor, RollOptimizerResult, RollCandidate } from '../../api';
-import { Card, money, score } from './RepairMenu';
+import { fetchDefendMenu, fetchDefendCommittee, fetchDefendRefine } from '../../api';
+import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor } from '../../api';
+import { Card, money, rank, ScoreBar } from './RepairMenu';
 
 const num = (v: number | null | undefined, d = 0) =>
   v == null || !isFinite(v) ? '—' : v.toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -163,6 +171,7 @@ function Recoverability({ d }: { d: RepairMenuResult }) {
 function Assignment({ d }: { d: RepairMenuResult }) {
   const a = d.assignment;
   if (!a) return null;
+  const nakedCall = d.short_right === 'C' && !d.covered;      // called away = you SELL at K and keep the credit
   return (
     <Section icon={<ShieldAlert className="w-3.5 h-3.5" />} title="Assignment risk" subtitle="the real risk on a trapped short">
       {a.early_assignment_risk && (
@@ -175,7 +184,7 @@ function Assignment({ d }: { d: RepairMenuResult }) {
         <Stat label="P(finish ITM)" value={pct(a.p_itm)} tone={a.p_itm != null && a.p_itm >= 55 ? 'text-error' : 'text-warning'} />
         <Stat label="time value left" value={`$${num(a.extrinsic, 2)}`} tone={a.extrinsic <= 0.15 ? 'text-error' : 'text-base-content/80'} />
         <Stat label="pin ratio" value={a.pin_ratio == null ? '—' : num(a.pin_ratio, 2)} tone="text-base-content/70" />
-        <Stat label="effective basis" value={`$${num(a.effective_basis, 2)}`} />
+        <Stat label={nakedCall ? 'effective sale price' : 'effective basis'} value={`$${num(a.effective_basis, 2)}`} />
         <Stat label="capital at stake" value={`$${num(a.assignment_capital)}`} tone="text-base-content/80" />
       </div>
       <p className="text-[10px] text-base-content/60 leading-snug border-t border-white/[0.06] pt-1.5">{a.consequence}</p>
@@ -248,6 +257,74 @@ function CostOfWaiting({ d }: { d: RepairMenuResult }) {
   );
 }
 
+// ── Desk recommendation — the ONE named pick a real desk would lead with, computed (not LLM) from
+//    the same composite that ranks every card below. May legitimately BE Hold or Close. ──────────
+function DeskRecommendation({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a: RepairAlternative) => void }) {
+  const rec = d.desk_recommendation;
+  if (!rec) return null;
+  const winner = (d.alternatives || []).find(a => a.name === rec.name);
+  const actionable = !!winner && winner.category !== 'hold' && winner.category !== 'exit';
+  const b = rec.score_breakdown;
+  return (
+    <div className="rounded-lg border border-secondary/40 bg-secondary/[0.06] p-3 space-y-2">
+      <div className="flex items-center gap-2">
+        <Target className="w-4 h-4 text-secondary shrink-0" />
+        <span className="text-[10px] uppercase tracking-wider text-secondary/80 font-semibold">Desk recommendation</span>
+        <span className="ml-auto text-lg font-bold text-secondary leading-none">{rec.desk_score}<span className="text-[9px] text-base-content/40">/100</span></span>
+      </div>
+      <div className="text-sm font-semibold text-base-content/90">→ {rec.name}</div>
+      {b && (
+        <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 max-w-sm">
+          <ScoreBar label="edge/$risk" v={b.edge} />
+          <ScoreBar label="risk shape" v={b.risk} />
+          <ScoreBar label="recovery" v={b.recovery} />
+          <ScoreBar label="market fit" v={b.market_fit} />
+        </div>
+      )}
+      <ul className="space-y-0.5">
+        {rec.reasons.map((r, i) => (
+          <li key={i} className="text-[10px] text-base-content/70 flex gap-1.5"><span className="text-secondary/50 shrink-0">•</span><span>{r}</span></li>
+        ))}
+      </ul>
+      {rec.runner_up && (
+        <p className="text-[9px] text-base-content/45 border-t border-white/[0.06] pt-1">
+          {rec.runner_up.role === 'fix' ? 'To keep the trade alive:' : 'Runner-up:'} <b className="text-base-content/60">{rec.runner_up.name}</b> ({rec.runner_up.desk_score}/100){rec.runner_up.reasons.length > 0 ? ` — ${rec.runner_up.reasons.join('; ')}` : ''}
+        </p>
+      )}
+      {rec.avoid.length > 0 && (
+        <div className="text-[9px] text-warning/75 space-y-0.5">
+          {rec.avoid.map((a, i) => (
+            <p key={i} className="flex items-start gap-1"><AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" /><span><b>Avoid:</b> {a.name} — {a.why}</span></p>
+          ))}
+        </div>
+      )}
+      {actionable && winner && (
+        <button className="btn btn-secondary btn-xs gap-1" onClick={() => onEvaluate(winner)}>Evaluate this <ArrowUpRight className="w-3 h-3" /></button>
+      )}
+      <p className="text-[8px] text-base-content/35 leading-snug border-t border-white/[0.06] pt-1">
+        Computed, not model-invented: 0.35 E[P&amp;L]-per-$-of-capital vs holding + 0.30 defined-risk size vs full assignment + 0.20 Δrecovery-odds + 0.15 fit with the market read (P(touch)/trend/VRP/pattern/IV structure — and, for a roll, how many support/resistance/POC/gamma levels its strike clears). Every option below, rolls from the live credit-only search included, is scored on these same axes — expand "why" on any card to compare. Points are then DEDUCTED for any leg that outlives the next earnings print (a binary jump the model's diffusion vol doesn't price): −15 naked short call, −10 other naked short or a calendar's long far leg, −6 a wing-capped short.
+      </p>
+    </div>
+  );
+}
+
+// Held in the recommendation's place while phase 2 (the live roll search) runs — the panel never shows a
+// provisional pick that later changes; the risk read and every other lens below are already usable.
+function RefiningCard() {
+  return (
+    <div className="rounded-lg border border-secondary/30 bg-secondary/[0.04] p-3 space-y-1.5">
+      <div className="flex items-center gap-2">
+        <Loader2 className="w-4 h-4 animate-spin text-secondary shrink-0" />
+        <span className="text-[10px] uppercase tracking-wider text-secondary/80 font-semibold">Building the desk recommendation</span>
+      </div>
+      <p className="text-[10px] text-base-content/55 leading-snug">
+        Searching credit-only rolls across expiries — market-implied probability (RND), support/resistance, gamma flip/wall and volume —
+        and scoring them on the same axes as every other defense, so you get ONE ranked answer. The risk read below is ready now.
+      </p>
+    </div>
+  );
+}
+
 // ── Lens 5 — Action menu: FIX the current trade (primary) vs CLOSE & REDEPLOY (secondary) ──────────
 function ActionMenu({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a: RepairAlternative) => void }) {
   const [showAll, setShowAll] = useState(false);
@@ -256,19 +333,22 @@ function ActionMenu({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a: Re
   const alts = d.alternatives || [];
   const priced = alts.filter(a => a.category !== 'exit' && a.category !== 'hold');
   // A "replace" closes the current trade and opens a new one — kept apart so the focus stays on fixing.
-  const fixes = priced.filter(a => a.group !== 'replace').sort((x, y) => score(y) - score(x));
-  const redeploys = priced.filter(a => a.group === 'replace').sort((x, y) => score(y) - score(x));
+  const fixes = priced.filter(a => a.group !== 'replace').sort((x, y) => rank(y) - rank(x));
+  const redeploys = priced.filter(a => a.group === 'replace').sort((x, y) => rank(y) - rank(x));
   const hold = alts.find(a => a.category === 'hold');
   const close = alts.find(a => a.category === 'exit');
-  const bestName = fixes[0]?.name;
+  // The desk's actual pick (computed server-side — can legitimately BE Hold or Close, not just a
+  // structure) wins the "desk pick" badge; fall back to the top-ranked fix if it's somehow absent.
+  const bestName = d.desk_recommendation?.name || fixes[0]?.name;
   const shown = showAll ? fixes : fixes.slice(0, TOP);
   const hidden = fixes.length - shown.length;
+  const rollCount = fixes.filter(a => a.roll_meta).length;
   return (
-    <Section icon={<Wrench className="w-3.5 h-3.5" />} title="Fix the current trade" subtitle={`${fixes.length} adjustments · keep the position · best-first · Δ vs holding`}>
+    <Section icon={<Wrench className="w-3.5 h-3.5" />} title="Fix the current trade" subtitle={`${fixes.length} options · keep the position · ranked by desk score · Δ vs holding${rollCount ? ` · ${rollCount} from the live credit-only roll search` : ''}`}>
       <div className="grid gap-1.5 lg:grid-cols-2">
         {shown.map((a, i) => <Card key={i} a={a} best={a.name === bestName} spot={d.spot ?? 0} onEvaluate={onEvaluate} />)}
       </div>
-      {hidden > 0 && <button className="btn btn-ghost btn-xs w-full" onClick={() => setShowAll(true)}>Show {hidden} more adjustments (calendars · butterflies · hedge · wheel…)</button>}
+      {hidden > 0 && <button className="btn btn-ghost btn-xs w-full" onClick={() => setShowAll(true)}>Show {hidden} more ({rollCount > 0 ? 'credit rolls · ' : ''}calendars · butterflies · hedge · wheel…)</button>}
       {showAll && fixes.length > TOP && <button className="btn btn-ghost btn-xs w-full" onClick={() => setShowAll(false)}>Show fewer</button>}
 
       {redeploys.length > 0 && (
@@ -286,11 +366,30 @@ function ActionMenu({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a: Re
       )}
 
       <div className="grid gap-1.5 lg:grid-cols-2 pt-1 border-t border-white/[0.06]">
-        {hold && <Card a={hold} best={false} spot={d.spot ?? 0} />}
-        {close && <Card a={close} best={false} spot={d.spot ?? 0} />}
+        {hold && <Card a={hold} best={hold.name === bestName} spot={d.spot ?? 0} />}
+        {close && <Card a={close} best={close.name === bestName} spot={d.spot ?? 0} />}
       </div>
+      {d.roll_note && <p className={`text-[9px] ${rollCount === 0 && d.roll_search === 'done' ? 'text-warning/80' : 'text-base-content/40'}`}>🔁 Roll search: {d.roll_note}</p>}
       <p className="text-[9px] text-base-content/35">{d.pricing}. Legs show their real expiries; PoP is to each structure's own horizon; Δrecovery / Δmax-loss are vs holding as-is. <b>Evaluate →</b> opens the structure in the Income desk; confirm executable chain prices before acting.</p>
     </Section>
+  );
+}
+
+// Support / resistance / volume POC / gamma flip & wall the roll search read off the RECENT tape (the last ~5–15
+// days — where the trouble happened), so the levels behind a roll card's "clears N/M levels" are visible.
+function StructureMap({ s }: { s: NonNullable<RepairMenuResult['roll_structure']> }) {
+  const lv = (label: string, v: number | null | undefined) =>
+    v == null ? null : <span>{label} <b className="text-base-content/75">${num(v, 2)}</b></span>;
+  const r5 = s.recent_5d;
+  return (
+    <p className="text-[10px] text-base-content/65 flex flex-wrap items-center gap-x-2.5 gap-y-0.5" title={s.window}>
+      <span>🗺️ <b>Structure map</b> <span className="text-base-content/40">(last ~15d)</span></span>
+      {lv('support', s.support)}{lv('resist', s.resistance)}{lv('POC', s.poc)}{lv('γ-flip', s.gamma_flip)}{lv('γ-wall', s.gamma_wall)}
+      {s.gamma_regime && <span className="text-base-content/45">dealers {s.gamma_regime} γ</span>}
+      {r5 && (r5.support != null || r5.resistance != null) && (
+        <span className="text-base-content/45">· 5d pivots {r5.support != null ? `$${num(r5.support, 2)}` : '—'} – {r5.resistance != null ? `$${num(r5.resistance, 2)}` : '—'}</span>
+      )}
+    </p>
   );
 }
 
@@ -311,8 +410,10 @@ function ContextLens({ d }: { d: RepairMenuResult }) {
           {c.pattern.breakout != null && <span className="text-base-content/40"> · trigger ${num(c.pattern.breakout, 0)}</span>}</p>
       )}
       {c.range?.note && <p className="text-[10px] text-base-content/65">📊 {c.range.note}</p>}
+      {d.iv_structure?.note && <p className="text-[10px] text-base-content/65">🌡️ <b>IV structure:</b> {d.iv_structure.note}</p>}
       {c.vol_note && <p className="text-[10px] text-base-content/65">📉 {c.vol_note}</p>}
       {c.technical?.note && <p className="text-[10px] text-base-content/65">📐 {c.technical.note}</p>}
+      {d.roll_structure && <StructureMap s={d.roll_structure} />}
       {c.sector && (
         <p className="text-[10px] text-base-content/65">🧭 {c.sector.note}
           {c.sector.peers?.length > 0 && <span className="text-base-content/40"> · peers: {c.sector.peers.slice(0, 6).join(', ')}</span>}</p>
@@ -395,139 +496,44 @@ function CommitteeLens({ tradeId, quoteSource, defend }: { tradeId: number; quot
   );
 }
 
-// ── Roll optimizer — deep-quant credit-only strike+expiry finder (lazy, heavy) ──────────────
-function RollLevel({ label, value }: { label: string; value: number | null | undefined }) {
-  if (value == null) return null;
-  return <span className="text-[9px] text-base-content/50">{label} <b className="text-base-content/70">${num(value, 2)}</b></span>;
-}
-
-function ScoreBar({ label, v }: { label: string; v: number }) {
-  return (
-    <div className="flex items-center gap-1">
-      <span className="text-[8px] text-base-content/40 w-16 shrink-0">{label}</span>
-      <div className="flex-1 h-1 rounded bg-base-content/10 overflow-hidden">
-        <div className="h-full bg-secondary/60" style={{ width: `${Math.max(0, Math.min(100, v))}%` }} />
-      </div>
-      <span className="text-[8px] text-base-content/50 w-6 text-right">{Math.round(v)}</span>
-    </div>
-  );
-}
-
-function RollCard({ c, best, onEvaluate }: { c: RollCandidate; best: boolean; onEvaluate: (c: RollCandidate) => void }) {
-  const cleared = Object.entries(c.structure).filter(([, v]) => v === true).map(([k]) => k);
-  return (
-    <div className={`rounded-lg border p-2 space-y-1.5 ${best ? 'border-secondary/50 bg-secondary/[0.05]' : 'border-white/10'}`}>
-      <div className="flex items-center gap-1.5">
-        <span className="badge badge-xs badge-accent badge-outline">Roll</span>
-        <span className="text-[11px] font-semibold">${num(c.strike, 0)} {c.right === 'P' ? 'put' : 'call'} · {c.expiry} ({c.dte}d)</span>
-        {best && <span className="badge badge-xs badge-secondary">best</span>}
-        {c.spans_earnings && <span className="badge badge-xs badge-warning gap-0.5" title="This roll spans the next earnings report — binary gap risk">⚠ earnings</span>}
-        <span className="ml-auto text-sm font-bold text-secondary">{Math.round(c.scores.composite)}<span className="text-[9px] text-base-content/40">/100</span></span>
-      </div>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[9px] text-base-content/55">
-        <span>credit <b className={c.roll_net_cash >= 0 ? 'text-success/80' : 'text-error/80'}>{money(c.roll_net_cash)}</b></span>
-        <span>P(OTM) <b className={c.p_otm >= 70 ? 'text-success/80' : 'text-warning/80'}>{c.p_otm}%</b> <span className="text-base-content/35">{c.p_otm_source}</span></span>
-        {c.scores.cushion_sigma != null && <span title="cushion in std-devs over this expiry's horizon — more days ⇒ fewer σ for the same distance">cushion <b>{c.scores.cushion_sigma.toFixed(1)}σ</b>/{c.dte}d</span>}
-        <span>new B/E <b>${num(c.new_breakeven, 2)}</b></span>
-        <span>capital <b>${c.new_capital.toLocaleString('en-US', { maximumFractionDigits: 0 })}</b></span>
-      </div>
-      {cleared.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          {cleared.map((k, i) => <span key={i} className="badge badge-xs badge-success badge-outline text-[8px] gap-0.5"><Check className="w-2 h-2" />{k}</span>)}
-        </div>
-      )}
-      <div className="space-y-0.5 pt-0.5">
-        <ScoreBar label="probability" v={c.scores.probability} />
-        <ScoreBar label="structure" v={c.scores.structure} />
-        <ScoreBar label="credit" v={c.scores.credit} />
-        <ScoreBar label="cushion" v={c.scores.cushion} />
-      </div>
-      <div className="flex items-center gap-2 pt-0.5">
-        <p className="text-[9px] text-base-content/50 leading-snug flex-1">{c.why}</p>
-        <button className="text-[9px] text-secondary hover:text-secondary/80 font-medium flex items-center gap-0.5 shrink-0" onClick={() => onEvaluate(c)}>Evaluate <ArrowUpRight className="w-2.5 h-2.5" /></button>
-      </div>
-    </div>
-  );
-}
-
-function RollOptimizer({ tradeId, quoteSource, ticker }: { tradeId: number; quoteSource: string; ticker?: string }) {
-  const [data, setData] = useState<RollOptimizerResult | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const nav = useNavigate();
-  const run = async () => {
-    setLoading(true); setErr(null);
-    try { const r = await fetchRollOptimizer(tradeId, quoteSource); if (r.error) setErr(r.error); else setData(r); }
-    catch (e: any) { setErr(e?.message || 'Failed'); } finally { setLoading(false); }
-  };
-  // Send the RESULTING short (the SELL leg) to Evaluate — the roll's new position.
-  const toEvaluate = (c: RollCandidate) => {
-    const nl = c.legs.find(l => l.action === 'SELL');
-    if (!nl) return;
-    const legs = [{ action: 'SELL' as const, type: (nl.right === 'P' ? 'PUT' : 'CALL') as 'PUT' | 'CALL', strike: nl.strike, expiration: nl.expiry || '' }];
-    try { sessionStorage.setItem('evaluatePrefill', JSON.stringify({ ticker: ticker || data?.ticker, legs })); } catch { /* ignore */ }
-    nav('/strategies?mode=evaluate');
-  };
-  const s = data?.structure;
-  return (
-    <Section icon={<Target className="w-3.5 h-3.5" />} title="Optimize the roll" subtitle="credit-only · RND · gamma/GEX · volume · TA — where to roll">
-      {!data && !loading && !err && (
-        <div className="space-y-1">
-          <button className="btn btn-secondary btn-xs gap-1.5" onClick={run}><Target className="w-3 h-3" />Find the best roll (deep quant)</button>
-          <p className="text-[9px] text-base-content/40">Searches later expiries for a NET-CREDIT roll (no new money) and ranks each strike by the market RND probability + structure — support/resistance · gamma flip/wall · volume POC.</p>
-        </div>
-      )}
-      {loading && <div className="text-[11px] text-base-content/50 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Building RNDs across expiries, mapping gamma & volume structure…</div>}
-      {err && <div className="text-[11px] text-error flex items-start gap-1"><AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />{err}</div>}
-      {data && (
-        <div className="space-y-2">
-          {s && (
-            <div className="rounded-md bg-base-100/40 px-2 py-1.5 space-y-0.5">
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
-                <span className="text-[8px] uppercase tracking-wide text-base-content/40" title={s.window || 'recent structure'}>structure · last ~15d</span>
-                <RollLevel label="support" value={s.support} /><RollLevel label="resist" value={s.resistance} />
-                <RollLevel label="POC" value={s.poc} /><RollLevel label="γ-flip" value={s.gamma_flip} />
-                <RollLevel label="γ-wall" value={s.gamma_wall} />
-                {s.gamma_regime && <span className="text-[9px] text-base-content/45">dealers {s.gamma_regime} γ</span>}
-                {s.next_earnings && <span className="text-[9px] text-warning/70" title="Rolling past this date spans earnings — binary gap risk">earnings {s.next_earnings}</span>}
-              </div>
-              {s.recent_5d && (s.recent_5d.support != null || s.recent_5d.resistance != null) && (
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
-                  <span className="text-[8px] uppercase tracking-wide text-base-content/35">last ~5d</span>
-                  <RollLevel label="pivot lo" value={s.recent_5d.support} /><RollLevel label="pivot hi" value={s.recent_5d.resistance} />
-                  <RollLevel label="POC" value={s.recent_5d.poc} />
-                </div>
-              )}
-            </div>
-          )}
-          {(data.candidates || []).length === 0 && (
-            <p className="text-[10px] text-warning">No net-credit roll clears the quality bar right now — rolling would cost money or leave a coin-flip strike. Consider capping (defined-risk) or closing instead.</p>
-          )}
-          <div className="grid gap-1.5 lg:grid-cols-2">
-            {(data.candidates || []).map((c, i) => <RollCard key={i} c={c} best={i === 0} onEvaluate={toEvaluate} />)}
-          </div>
-          {data.note && <p className="text-[9px] text-base-content/40">{data.note} Considered {data.considered} credit rolls; weights — prob {Math.round((data.weights?.probability || 0) * 100)}% · structure {Math.round((data.weights?.structure || 0) * 100)}% · credit {Math.round((data.weights?.credit || 0) * 100)}% · cushion {Math.round((data.weights?.cushion || 0) * 100)}%.</p>}
-        </div>
-      )}
-    </Section>
-  );
-}
-
 // ── the panel ──────────────────────────────────────────────────────────────────
 export default function DefendPanel({ tradeId, quoteSource, ticker }: { tradeId: number; quoteSource: string; ticker?: string }) {
   const [data, setData] = useState<RepairMenuResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [refineErr, setRefineErr] = useState<string | null>(null);   // phase 2 couldn't run → standard menu only
   const nav = useNavigate();
 
-  const run = async () => {
-    setLoading(true); setErr(null);
-    try { const r = await fetchDefendMenu(tradeId, quoteSource); if (r.error) setErr(r.error); else setData(r); }
-    catch (e: any) { setErr(e?.message || 'Failed'); } finally { setLoading(false); }
+  // PHASE 2 — the live credit-only roll search, merged into the SAME ranked menu (one recommendation).
+  const refine = async (base: RepairMenuResult) => {
+    setRefineErr(null);
+    try {
+      const r = await fetchDefendRefine(tradeId, base, quoteSource);
+      if (r.error) { setRefineErr(r.error); return; }
+      setData(r);
+      if (r.roll_search === 'failed') setRefineErr(r.roll_note || 'The live roll search failed.');
+    } catch (e: any) { setRefineErr(e?.message || 'The live roll search failed.'); }
   };
 
-  // #4 — clicking "Defend this trade" (which mounts this panel) runs the analysis; no inner button.
-  useEffect(() => { run(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  const run = async () => {
+    setLoading(true); setErr(null); setRefineErr(null);
+    try {
+      const r = await fetchDefendMenu(tradeId, quoteSource);
+      if (r.error) { setErr(r.error); return; }
+      setData(r);
+      if (r.roll_search === 'pending') void refine(r);      // paint the lenses now; the recommendation follows
+    } catch (e: any) { setErr(e?.message || 'Failed'); } finally { setLoading(false); }
+  };
+
+  // #4 — clicking "Defend this trade" (which mounts this panel) runs the analysis; no inner button. Guarded so
+  // React StrictMode's dev double-invoke can't fire the (heavy) phase 2 twice and race two writes to `data`.
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    run();
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, []);
 
   // Hand a chosen repair to the Income desk's Evaluate tab (mirrors RepairMenu's bridge).
   const toEvaluate = (a: RepairAlternative) => {
@@ -536,10 +542,11 @@ export default function DefendPanel({ tradeId, quoteSource, ticker }: { tradeId:
     const unit = Math.max(1, Math.min(...opt.map(l => l.qty || 1)));
     const expFor = (dd: number | null) => (dd != null ? new Date(Date.now() + dd * 86400000).toISOString().slice(0, 10) : '');
     const legs = opt.flatMap(l => {
-      const el = { action: l.action as 'BUY' | 'SELL', type: (l.right === 'P' ? 'PUT' : 'CALL') as 'PUT' | 'CALL', strike: l.strike, expiration: expFor(l.dte_days) };
+      // the leg's REAL expiry when the engine stamped one (rolls from the live search always have it); else ~today+DTE
+      const el = { action: l.action as 'BUY' | 'SELL', type: (l.right === 'P' ? 'PUT' : 'CALL') as 'PUT' | 'CALL', strike: l.strike, expiration: l.expiry || expFor(l.dte_days) };
       return Array(Math.max(1, Math.round((l.qty || 1) / unit))).fill(el);
     });
-    try { sessionStorage.setItem('evaluatePrefill', JSON.stringify({ ticker: data?.ticker, legs })); } catch { /* ignore */ }
+    try { sessionStorage.setItem('evaluatePrefill', JSON.stringify({ ticker: data?.ticker || ticker, legs })); } catch { /* ignore */ }
     nav('/strategies?mode=evaluate');
   };
 
@@ -552,6 +559,8 @@ export default function DefendPanel({ tradeId, quoteSource, ticker }: { tradeId:
   );
   if (!data) return null;
 
+  // While the live roll search runs, the recommendation (and the ranked menu it summarizes) is held back.
+  const holdBack = data.roll_search === 'pending' && !refineErr;
   const sev = SEV[data.recoverability?.severity || 'fresh'] || SEV.fresh;
   const posture = data.recoverability?.posture;
   const postureBadge = posture === 'marginal'
@@ -570,14 +579,25 @@ export default function DefendPanel({ tradeId, quoteSource, ticker }: { tradeId:
         <span className="ml-auto text-base-content/60">mark <b className={(data.unrealized_pnl ?? 0) >= 0 ? 'text-success' : 'text-error'}>{money(data.unrealized_pnl)}</b> if closed</span>
       </div>
 
+      {holdBack ? <RefiningCard /> : (
+        <>
+          {refineErr && (
+            <div className="flex items-start gap-1.5 rounded-md bg-warning/10 border border-warning/25 px-2 py-1.5 text-[10px] text-warning">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <span className="flex-1">Live roll search unavailable ({refineErr}) — the recommendation below ranks the standard menu only.</span>
+              <button className="btn btn-ghost btn-xs h-auto min-h-0 py-0.5" onClick={() => void refine(data)}>Retry</button>
+            </div>
+          )}
+          <DeskRecommendation d={data} onEvaluate={toEvaluate} />
+        </>
+      )}
       <Recoverability d={data} />
       <Assignment d={data} />
       <Synthetic d={data} />
       <CostOfWaiting d={data} />
-      <RollOptimizer tradeId={tradeId} quoteSource={quoteSource} ticker={ticker} />
-      <ActionMenu d={data} onEvaluate={toEvaluate} />
+      {!holdBack && <ActionMenu d={data} onEvaluate={toEvaluate} />}
       <ContextLens d={data} />
-      <CommitteeLens tradeId={tradeId} quoteSource={quoteSource} defend={data} />
+      {!holdBack && <CommitteeLens tradeId={tradeId} quoteSource={quoteSource} defend={data} />}
     </div>
   );
 }

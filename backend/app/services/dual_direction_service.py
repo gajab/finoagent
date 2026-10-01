@@ -602,3 +602,175 @@ async def run_dual_direction_buffer_ibkr(
     result["quantities_rounded"] = True
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Dual-Buffer SCREENER — "give a ticker, get the single best no-cost buffer"
+# Scans multiple tenors, builds each to a zero/positive-at-0% objective, scores
+# each with the buffer-tuned algorithmic Quant, ranks, and sizes to a risk budget.
+# The anti-paralysis funnel: one call → one recommended trade.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ddb_pnl_at(legs: list[dict], price: float) -> float:
+    """Terminal P&L of the recommended legs at underlying `price` (intrinsic − mid)."""
+    total = 0.0
+    for l in legs:
+        t = str(l.get("type", "")).lower()
+        sign = 1 if l.get("action") == "Buy" else -1
+        qty = float(l.get("qty") or 0)
+        mid = float(l.get("midPrice") or 0)
+        if t.startswith("c"):
+            intr = max(0.0, price - float(l["strike"]))
+        elif t.startswith("p"):
+            intr = max(0.0, float(l["strike"]) - price)
+        else:  # equity
+            intr = price
+        total += sign * qty * 100.0 * (intr - mid)
+    return total
+
+
+def _ddb_curve(legs: list[dict]) -> list[dict]:
+    """Map recommended legs into terminal_payoff_curve leg format (options only)."""
+    out = []
+    for l in legs:
+        t = str(l.get("type", "")).lower()
+        right = "C" if t.startswith("c") else ("P" if t.startswith("p") else None)
+        if right is None:
+            continue
+        out.append({"strike": float(l["strike"]), "right": right,
+                    "sign": 1 if l.get("action") == "Buy" else -1,
+                    "qty": float(l.get("qty") or 0), "price": float(l.get("midPrice") or 0)})
+    return out
+
+
+async def screen_dual_direction_buffers(
+    ticker: str,
+    amount: float,
+    downside_buffer_pct: float,
+    upside_cap_pct: float,
+    entry_cost_mode: str = "non_negative",
+    tenors: tuple = (90, 120, 180, 365),
+    risk_budget: float | None = None,
+) -> dict:
+    """Scan several tenors and return the single best dual-direction buffer.
+
+    For each tenor we build the structure (defaulting to the no-cost objective —
+    non_negative if flat at 0%), compute the true max gain/loss and the P&L if the
+    stock is flat at expiry, score it with the buffer-tuned algorithmic Quant, and
+    (optionally) size it so the max loss ≈ the risk budget. Candidates are ranked:
+    no-cost first, then Quant score, then max upside.
+    """
+    from .lifecycle_service import terminal_payoff_curve, compute_pretrade_metrics
+
+    candidates: list[dict] = []
+    errors: list[dict] = []
+
+    for dte in tenors:
+        try:
+            r = await run_dual_direction_buffer(
+                ticker, amount, int(dte), downside_buffer_pct, upside_cap_pct,
+                entry_cost_mode=entry_cost_mode,
+            )
+        except Exception as exc:  # keep scanning the other tenors
+            errors.append({"requested_dte": int(dte), "error": str(exc)})
+            continue
+        if not r.get("success") or not r.get("legs"):
+            errors.append({"requested_dte": int(dte), "error": r.get("error", "no structure")})
+            continue
+
+        legs = r["legs"]
+        spot = float(r["currentPrice"])
+        debit = float(r.get("actualStructureCost") or 0)
+        # True extrema of a piecewise-linear payoff: only at strikes or the price bounds.
+        strikes = [float(l["strike"]) for l in legs if l.get("strike")]
+        probe = [0.0] + strikes + [spot * 3.0]
+        pnls = [_ddb_pnl_at(legs, p) for p in probe]
+        max_gain = max(pnls)
+        max_loss = min(pnls)
+        pnl_flat = _ddb_pnl_at(legs, spot)                 # if the stock is unchanged at expiry
+        capital = max(debit, abs(max_loss))                # capital at risk (debit ≈ covers margin)
+
+        # Algorithmic Quant (buffer-tuned) over the synthesized payoff curve.
+        curve = terminal_payoff_curve(_ddb_curve(legs), 0.0, spot, lo=-0.5, hi=0.5, step=0.025)
+        metrics = compute_pretrade_metrics(
+            [], spot, curve, capital, max_loss, max_gain,
+            0.0, int(r.get("actualDte") or dte), 0.0, 0.05, 5.0, None,
+            "dual_direction_buffer", r["parameters"]["actualUpsideCap"],
+        )
+        quant = metrics.get("quant", {})
+
+        # Fixed-risk sizing: scale off the Layer-1 (1× base) contract count.
+        base = next((float(l["qty"]) for l in legs
+                     if l.get("layer", "").startswith("Layer 1") and l.get("type", "").lower().startswith("c")), 1.0) or 1.0
+        sized = None
+        if risk_budget and max_loss < 0:
+            per_base_loss = abs(max_loss) / base
+            n = max(1, round(risk_budget / per_base_loss)) if per_base_loss > 0 else 1
+            scale = n / base
+            sized = {
+                "contracts_base": int(n),
+                "capital": round(capital * scale),
+                "max_loss": round(max_loss * scale),
+                "max_gain": round(max_gain * scale),
+            }
+
+        cap_pct = r["parameters"]["actualUpsideCap"]
+        no_cost = pnl_flat >= -max(1.0, capital * 0.001)     # zero/positive if flat at 0%
+        # A "no-cost" buffer is only worth it if it KEEPS real upside — funding the
+        # protection can collapse the cap toward 0 (free, but no participation).
+        cap_floor = max(2.0, upside_cap_pct * 0.3)
+        real_upside = (cap_pct or 0) >= cap_floor
+        note = None
+        if no_cost and not real_upside:
+            note = (f"No-cost, but the upside cap collapsed to {cap_pct}% (you'd give up almost all "
+                    f"participation to be free at 0%). Not a genuine dual-direction buffer.")
+
+        candidates.append({
+            "requested_dte": int(dte),
+            "dte": int(r.get("actualDte") or dte),
+            "expiration": r.get("expirationDate"),
+            "actual_buffer_pct": r["parameters"]["actualDownsideBuffer"],
+            "actual_cap_pct": cap_pct,
+            "structure_cost": round(debit),
+            "net_options_premium": r.get("netOptionsPremium"),
+            "pnl_if_flat": round(pnl_flat),
+            "no_cost": no_cost,
+            "real_upside": real_upside,
+            "capital": round(capital),
+            "max_gain": round(max_gain),
+            "max_loss": round(max_loss),
+            "max_gain_pct": round(max_gain / capital * 100, 2) if capital > 0 else None,
+            "max_loss_pct": round(max_loss / capital * 100, 2) if capital > 0 else None,
+            "quant": quant,
+            "sized": sized,
+            "note": note,
+            "warnings": r.get("bufferCapWarnings", []),
+            "legs": legs,
+        })
+
+    # Rank: genuinely no-cost WITH real upside first, then Quant score, then upside %.
+    # A collapsed-cap "no-cost" trade must NOT beat a strong buffer that costs a hair at flat.
+    candidates.sort(key=lambda c: (
+        0 if (c["no_cost"] and c["real_upside"]) else 1,
+        -(c["quant"].get("score") or 0),
+        -(c["max_gain_pct"] or 0),
+    ))
+
+    any_real_nocost = any(c["no_cost"] and c["real_upside"] for c in candidates)
+    top_note = None
+    if candidates and not any_real_nocost:
+        top_note = (f"No tenor gives a truly no-cost {upside_cap_pct}% buffer with real upside on "
+                    f"{ticker.upper()} — free-at-0% would collapse the cap. The pick below keeps real "
+                    f"upside for a small cost if flat; for genuinely no-cost, try a smaller buffer.")
+
+    return {
+        "success": bool(candidates),
+        "ticker": ticker.upper(),
+        "requested": {"downside_buffer_pct": downside_buffer_pct, "upside_cap_pct": upside_cap_pct,
+                      "amount": amount, "entry_cost_mode": entry_cost_mode, "risk_budget": risk_budget},
+        "best": candidates[0] if candidates else None,
+        "candidates": candidates,
+        "note": top_note,
+        "errors": errors,
+        "error": None if candidates else "No usable dual-direction buffer found across the scanned tenors.",
+    }

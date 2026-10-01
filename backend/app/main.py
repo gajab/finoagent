@@ -22,6 +22,7 @@ from .routers import tracking_router
 from .routers import trade_tracking_router
 from .routers import pick_shovel_v2_router
 from .routers import debt_entry_router
+from .routers import bond_router
 from .services.scheduler_service import scheduler_loop
 
 
@@ -168,6 +169,7 @@ app.include_router(tracking_router.router)
 app.include_router(trade_tracking_router.router)
 app.include_router(pick_shovel_v2_router.router)
 app.include_router(debt_entry_router.router)
+app.include_router(bond_router.router)
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +413,7 @@ _frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "d
 # 404 status so crawlers don't index junk URLs as duplicates of the homepage.
 _SPA_ROUTES = {
     "", "login", "market", "dashboard", "portfolio", "agents", "strategies",
-    "debt", "settings", "ai-research", "impact", "channels", "metrics",
+    "debt", "bonds", "settings", "ai-research", "impact", "channels", "metrics",
     "tracking", "trade-tracking", "my-trades", "calculators", "financial-calculators",
     "roth-ira-conversion", "college-529",
 }

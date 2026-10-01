@@ -3650,6 +3650,7 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
         cvar95=_risk.get("cvar_95"), capital=_risk.get("capital"),
         net_gamma=_trader.get("net_gamma"), net_vega=_trader.get("net_vega"),
         net_theta=_trader.get("net_theta"),
+        next_earnings=(desk.get("context") or {}).get("next_earnings"),
     )
     mgmt = management_desk_score(grade_adjustments=row.get("grade_adjustments"),
                                 ta_factors=row.get("ta_factors"), **_mgmt_kw)
@@ -3708,6 +3709,7 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
         "management_analysis": {
             "anchor": mgmt["anchor"],
             "anchor_label": mgmt["anchor_label"],
+            "base_lenses": mgmt["base_lenses"],       # the 5 computed lenses behind the base (auditable)
             "contributions": mgmt["contributions"],   # re-signed scan factors (holder view)
             "factors_net": mgmt["factors_net"],
             "overlay": mgmt["overlay"],               # take-profit / time-gamma

@@ -1,4 +1,5 @@
 import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, DeskReviewResult, DeskAgentsResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight } from './types';
+import type { BondMarket, BondCatalogue, BondLookup, BondProfile, BondHoldingInput, BondPortfolio, BondCashFlow, BondLadderParams, BondLadderResult, TipsLadderResult, BondSimulation, BondLadderSaved, BondPlan, BondCalcResult, BondYieldMenu, BondStatus, BondPreview, BondFilters, BondWithdrawalMode } from './types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -146,6 +147,27 @@ export async function fetchCandles(
 ): Promise<import('./types').CandlesResponse> {
   return apiFetch<import('./types').CandlesResponse>(
     `/api/stock/${encodeURIComponent(ticker)}/candles?interval=${encodeURIComponent(interval)}`,
+  );
+}
+
+// Deterministic volume analysis (RVOL / dry-up / climax / CVD / OBV) at a chosen interval — lazy.
+export async function fetchVolumeAnalysis(
+  ticker: string,
+  interval: string = '1d',
+  lookback: number = 20,
+): Promise<import('./types').VolumeAnalysisResponse> {
+  return apiFetch<import('./types').VolumeAnalysisResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/volume-analysis?interval=${encodeURIComponent(interval)}&lookback=${lookback}`,
+  );
+}
+
+// Regime-conditional edge — signal win rate / expectancy split by market regime (ER terciles)
+export async function fetchRegimeEdge(
+  ticker: string,
+  horizon: number = 10,
+): Promise<import('./types').RegimeEdgeResponse> {
+  return apiFetch<import('./types').RegimeEdgeResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/regime-edge?horizon=${horizon}`,
   );
 }
 
@@ -853,6 +875,21 @@ export async function deleteDerivativeIncomeWatchlist(ticker: string): Promise<v
   });
 }
 
+// ===== Income Screener =====
+
+export async function screenIncomeUniverse(params: import('./types').IncomeScreenParams): Promise<import('./types').IncomeScreenResult> {
+  return apiFetch('/api/stock/strategies/income-screener/screen', { method: 'POST', body: JSON.stringify(params) });
+}
+
+export async function fetchIncomeVolMetrics(items: { ticker: string; price?: number | null }[]): Promise<import('./types').IncomeVolRow[]> {
+  return apiFetch('/api/stock/strategies/income-screener/vol-metrics', { method: 'POST', body: JSON.stringify({ items }) });
+}
+
+export async function evaluateIncomeTicker(ticker: string, params: import('./types').IncomeEvalParams): Promise<import('./types').IncomeEvalResult> {
+  return apiFetch(`/api/stock/strategies/income-screener/evaluate/${encodeURIComponent(ticker)}`,
+    { method: 'POST', body: JSON.stringify(params) });
+}
+
 export async function runDerivativeIncomePortfolio(params: {
   offset?: number;
   limit?: number;
@@ -1112,6 +1149,34 @@ export async function computeDualDirectionBufferIBKR(params: {
     method: 'POST',
     body: JSON.stringify(params),
   });
+}
+
+// ── Dual-buffer screener: scan tenors, return the single best no-cost buffer ──
+export interface DualBufferCandidate {
+  requested_dte: number; dte: number; expiration: string;
+  actual_buffer_pct: number; actual_cap_pct: number;
+  structure_cost: number; net_options_premium: number | null;
+  pnl_if_flat: number; no_cost: boolean; real_upside: boolean;
+  capital: number; max_gain: number; max_loss: number;
+  max_gain_pct: number | null; max_loss_pct: number | null;
+  quant: QuantRecommendation;
+  sized: { contracts_base: number; capital: number; max_loss: number; max_gain: number } | null;
+  note: string | null;
+  warnings: string[];
+  legs: any[];
+}
+export interface DualBufferScreenResult {
+  success: boolean; ticker: string; best: DualBufferCandidate | null;
+  candidates: DualBufferCandidate[]; note: string | null; error: string | null;
+}
+export async function screenDualDirectionBuffer(params: {
+  ticker: string; amount: number; downside_buffer_pct: number; upside_cap_pct: number;
+  entry_cost_mode?: string; risk_budget?: number | null; tenors?: number[];
+}): Promise<DualBufferScreenResult> {
+  return apiFetch<DualBufferScreenResult>(
+    `/api/stock/${encodeURIComponent(params.ticker)}/strategies/dual-direction-buffer/screen`,
+    { method: 'POST', body: JSON.stringify(params) },
+  );
 }
 
 export async function fetchOptionQuote(params: {
@@ -1833,6 +1898,25 @@ export interface RepairAlternative {
   d_pop?: number | null; d_max_loss?: number | null; d_ev?: number | null;   // vs the Hold baseline
   turns_profitable: boolean;
   legs?: { action: string; right: string; strike: number; qty: number; dte_days: number | null; expiry?: string | null }[];
+  // institutional RANKING — one composite the desk actually decides on, folding in E[P&L]-per-$-
+  // of-capital, defined-risk size vs full assignment, Δrecovery, and fit with P(touch)/trend/
+  // pattern/IV structure. Present on every alt INCLUDING hold/close, so either can legitimately win.
+  desk_score?: number | null;
+  score_breakdown?: { edge: number; risk: number; recovery: number; market_fit: number } | null;
+  is_desk_pick?: boolean;
+  // Earnings risk: a leg that outlives the next print is exposed to a binary jump the diffusion-vol EV/PoP model
+  // does not price, so the desk_score already has these points DEDUCTED (shown as a ⚠ chip with the reason).
+  event_risk?: { points: number; note: string } | null;
+  // Present only on candidates from the live credit-only roll search (merged into this same ranked menu):
+  // the search's own read — RND probability, which structural levels the new strike clears, earnings.
+  roll_meta?: RollMeta | null;
+}
+export interface RollMeta {
+  expiry: string; dte: number; strike: number; credit_total: number;
+  p_otm: number | null; p_otm_source: 'RND' | 'BS' | null; spans_earnings: boolean;
+  structure: Record<string, boolean | number>;      // per-level 'clears …' flags + cleared_count + levels_available
+  scores: { composite?: number; probability?: number; structure?: number; credit?: number; cushion?: number; cushion_sigma?: number; time_factor?: number };
+  new_breakeven: number | null; new_capital: number | null;
 }
 // One factor in the recoverability build-up — a probability driver (kind 'prob') or a technical
 // read (kind 'ta'). favorable: true = helps a recovery, false = works against it, null = neutral/2-sided.
@@ -1875,8 +1959,27 @@ export interface RepairMenuResult {
   unrealized_pnl?: number; pricing?: string; structure?: string; alternatives?: RepairAlternative[];
   recoverability?: DefendRecoverability; assignment?: DefendAssignment;
   cost_of_waiting?: DefendCostOfWaiting[]; context?: DefendContext;
+  iv_structure?: { near_iv_pct: number; far_iv_pct: number | null; term_ratio: number | null; term_label: string | null; skew_pts: number | null; skew_label: string | null; note: string | null; far_spans_earnings?: boolean } | null;
   hold?: { pop_pct: number | null; expected_pnl: number | null; max_loss: number | null;
            greeks?: { delta: number; gamma: number; theta: number; vega: number }; breakevens?: number[] };
+  // The single named desk pick — computed (not LLM), may legitimately be Hold or Close.
+  desk_recommendation?: {
+    name: string; category: string; group?: string; desk_score: number;
+    score_breakdown: { edge: number; risk: number; recovery: number; market_fit: number };
+    reasons: string[];
+    // 'fix' = the best way to KEEP the trade alive when the pick is a benchmark (Close / stressed Hold);
+    // 'next' = simply the second-ranked alternative.
+    runner_up?: { name: string; desk_score: number; reasons: string[]; role?: 'fix' | 'next' } | null;
+    avoid: { name: string; why: string }[];
+  } | null;
+  // The live credit-only roll search is PHASE 2 of the same recommendation. 'pending' = run /defend/refine and
+  // hold the recommendation back until it returns; 'done' = its candidates are merged into `alternatives`;
+  // 'skipped' = healthy trade / spread (nothing to roll); 'failed' = fell back to the standard menu.
+  roll_search?: 'pending' | 'done' | 'skipped' | 'failed';
+  roll_note?: string;
+  roll_structure?: { support: number | null; resistance: number | null; poc: number | null; gamma_flip: number | null; gamma_wall: number | null;
+                     gamma_regime: string | null; recent_5d?: { support: number | null; resistance: number | null; poc: number | null } | null;
+                     next_earnings?: string | null; window?: string } | null;
 }
 // The Defend desk for a tested short-premium trade: recoverability (+TA outlook) + assignment + the
 // priced action menu (roll / spread / strangle / hedge / wheel / hold / close) + context — one fetch.
@@ -1904,26 +2007,14 @@ export async function fetchDefendCommittee(id: number, defend: RepairMenuResult,
   });
 }
 
-// Deep-quant ROLL OPTIMIZER — credit-only (no net new money) strike+expiry roll picked on the
-// confluence of RND probability, support/resistance, gamma flip/wall (GEX) and the volume POC.
-export interface RollCandidate {
-  expiry: string; dte: number; strike: number; right: 'P' | 'C';
-  roll_net_cash: number; credit_per_share: number; new_credit_total: number; new_breakeven: number; new_capital: number;
-  p_otm: number; p_otm_source: 'RND' | 'BS'; spans_earnings?: boolean;
-  structure: Record<string, boolean | number>;      // per-level flags + cleared_count + levels_available
-  scores: { composite: number; probability: number; structure: number; credit: number; cushion: number; cushion_sigma?: number; time_factor?: number };
-  legs: { action: string; right: string; strike: number; qty: number; dte_days: number | null; expiry?: string | null }[];
-  why: string;
-}
-export interface RollOptimizerResult {
-  error?: string; ticker?: string; spot?: number;
-  tested?: { right: 'P' | 'C'; strike: number; qty: number; entry: number; mark: number; dte: number; covered: boolean };
-  structure?: { support: number | null; resistance: number | null; poc: number | null; gamma_flip: number | null; gamma_wall: number | null; gamma_regime: string | null; recent_5d?: { support: number | null; resistance: number | null; poc: number | null } | null; next_earnings?: string | null; window?: string };
-  weights?: Record<string, number>;
-  considered?: number; candidates?: RollCandidate[]; note?: string;
-}
-export async function fetchRollOptimizer(id: number, quoteSource = 'yfinance'): Promise<RollOptimizerResult> {
-  return apiFetch(`/api/saved-strategies/${id}/defend/optimize-roll?quote_source=${encodeURIComponent(quoteSource)}`, { method: 'POST' });
+// PHASE 2 of the Defend desk — the deep, credit-only roll search (RND probability · support/resistance ·
+// gamma flip/wall · volume POC), MERGED into the same ranked menu so there is ONE recommendation. Takes the
+// phase-1 payload; returns it with roll candidates added as alternatives, plain fallback rolls dropped, and
+// desk_recommendation re-derived. Heavy (multi-expiry chains + RND) — hence a second request.
+export async function fetchDefendRefine(id: number, defend: RepairMenuResult, quoteSource = 'yfinance'): Promise<RepairMenuResult> {
+  return apiFetch(`/api/saved-strategies/${id}/defend/refine?quote_source=${encodeURIComponent(quoteSource)}`, {
+    method: 'POST', body: JSON.stringify({ defend }),
+  });
 }
 
 export async function fetchTradeLivePnl(id: number, quoteSource: string = 'yfinance', marginMode?: string): Promise<LivePnlResponse> {
@@ -2054,8 +2145,19 @@ export interface PaperTradePnl {
 }
 
 // The CURRENT desk read for a paper trade — the SAME shape as a placed trade's desk score
-// (opp + management_analysis + signal), plus the paper P&L block.
-export type PaperTradeCurrent = DeskScoreResult & { id?: number; pnl?: PaperTradePnl | null };
+// (opp + management_analysis + signal), plus the paper P&L block. For an EXPIRED trade there is
+// no live chain: instead it carries the intrinsic settlement (`settled`/`expired`/`itm`/…).
+export type PaperTradeCurrent = DeskScoreResult & {
+  id?: number;
+  pnl?: (PaperTradePnl & { realized_pnl?: number | null }) | null;
+  settled?: boolean;
+  expired?: boolean;
+  itm?: boolean;
+  close_price?: number | null;
+  settlement_cost?: number | null;
+  realized_pnl?: number | null;
+  legs_settlement?: { strike: number; right: string; action: string; intrinsic_per_share: number; itm: boolean }[];
+};
 
 // LIGHTWEIGHT list row — cached/denormalized columns only (the list never triggers compute).
 export interface PaperTradeListItem {
@@ -2066,7 +2168,8 @@ export interface PaperTradeListItem {
   expiration: string | null;
   dte: number | null;
   contracts: number;
-  status: 'open' | 'closed';
+  status: 'open' | 'closed' | 'expired';
+  expiry_outcome: 'itm' | 'otm' | null;   // set when status === 'expired'
   notes: string | null;
   created_at: string;
   updated_at: string;
@@ -2772,3 +2875,125 @@ export async function fetchDebtHistory(
   );
 }
 
+
+
+// ===== Bond Desk (/bonds) =====
+
+export async function fetchBondMarket(): Promise<BondMarket> {
+  return apiFetch<BondMarket>('/api/bonds/market');
+}
+
+export async function fetchBondTreasuries(): Promise<BondCatalogue> {
+  return apiFetch<BondCatalogue>('/api/bonds/treasuries');
+}
+
+export async function fetchBondTips(): Promise<BondCatalogue> {
+  return apiFetch<BondCatalogue>('/api/bonds/tips');
+}
+
+export async function lookupBond(query: string): Promise<BondLookup> {
+  return apiFetch<BondLookup>(`/api/bonds/lookup/${encodeURIComponent(query.trim())}`);
+}
+
+export async function fetchBondProfile(): Promise<BondProfile> {
+  return apiFetch<BondProfile>('/api/bonds/profile');
+}
+
+export async function saveBondProfile(profile: BondProfile): Promise<BondProfile> {
+  return apiFetch<BondProfile>('/api/bonds/profile', { method: 'PUT', body: JSON.stringify(profile) });
+}
+
+export async function createBondHolding(h: BondHoldingInput): Promise<BondHoldingInput> {
+  return apiFetch<BondHoldingInput>('/api/bonds/holdings', { method: 'POST', body: JSON.stringify(h) });
+}
+
+export async function previewBondHolding(holding: BondHoldingInput, brokerValue?: number | null): Promise<BondPreview> {
+  return apiFetch<BondPreview>('/api/bonds/holdings/preview', { method: 'POST', body: JSON.stringify({ holding, broker_value: brokerValue ?? null }) });
+}
+
+export async function fetchBondHoldings(): Promise<BondHoldingInput[]> {
+  return apiFetch<BondHoldingInput[]>('/api/bonds/holdings');
+}
+
+export async function updateBondHolding(id: number, h: BondHoldingInput): Promise<BondHoldingInput> {
+  return apiFetch<BondHoldingInput>(`/api/bonds/holdings/${id}`, { method: 'PUT', body: JSON.stringify(h) });
+}
+
+export async function setBondHoldingStatus(id: number, status: BondStatus): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(`/api/bonds/holdings/${id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) });
+}
+
+export async function deleteBondHolding(id: number): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(`/api/bonds/holdings/${id}`, { method: 'DELETE' });
+}
+
+export async function fetchBondPortfolio(assumeCalls = false): Promise<BondPortfolio> {
+  return apiFetch<BondPortfolio>(`/api/bonds/portfolio${assumeCalls ? '?assume_calls=true' : ''}`);
+}
+
+function appendBondFilters(q: URLSearchParams, f?: BondFilters | null): URLSearchParams {
+  f?.kinds.forEach(k => q.append('kind', k));
+  f?.accountTypes.forEach(a => q.append('account_type', a));
+  return q;
+}
+
+export async function fetchBondCashflow(opts: { years?: number; fundYears?: number; assumeCalls?: boolean; includeWatch?: boolean; filters?: BondFilters | null } = {}): Promise<BondCashFlow> {
+  const q = appendBondFilters(new URLSearchParams({
+    years: String(opts.years ?? 30), fund_years: String(opts.fundYears ?? 10),
+    assume_calls: String(!!opts.assumeCalls), include_watch: String(!!opts.includeWatch),
+  }), opts.filters);
+  return apiFetch<BondCashFlow>(`/api/bonds/cashflow?${q.toString()}`);
+}
+
+export async function buildBondLadder(params: BondLadderParams): Promise<BondLadderResult> {
+  return apiFetch<BondLadderResult>('/api/bonds/ladders/build', { method: 'POST', body: JSON.stringify(params) });
+}
+
+export async function buildTipsLadder(params: Record<string, unknown>): Promise<TipsLadderResult> {
+  return apiFetch<TipsLadderResult>('/api/bonds/tips-ladder', { method: 'POST', body: JSON.stringify(params) });
+}
+
+export async function simulateBondLadder(ladder: BondLadderResult, years = 15): Promise<BondSimulation> {
+  return apiFetch<BondSimulation>('/api/bonds/ladders/simulate', { method: 'POST', body: JSON.stringify({ ladder, years }) });
+}
+
+export async function fetchBondLadders(): Promise<BondLadderSaved[]> {
+  return apiFetch<BondLadderSaved[]>('/api/bonds/ladders');
+}
+
+export async function fetchBondLadder(id: number): Promise<BondLadderSaved> {
+  return apiFetch<BondLadderSaved>(`/api/bonds/ladders/${id}`);
+}
+
+export async function saveBondLadder(body: { name: string; ladder_type: string; params: unknown; plan: unknown; notes?: string | null }): Promise<BondLadderSaved> {
+  return apiFetch<BondLadderSaved>('/api/bonds/ladders', { method: 'POST', body: JSON.stringify(body) });
+}
+
+export async function deleteBondLadder(id: number, deletePlanned = false): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(`/api/bonds/ladders/${id}?delete_planned=${deletePlanned}`, { method: 'DELETE' });
+}
+
+export async function adoptBondLadder(id: number, status: 'held' | 'watch'): Promise<{ ok: boolean; created: number }> {
+  return apiFetch<{ ok: boolean; created: number }>(`/api/bonds/ladders/${id}/adopt`, { method: 'POST', body: JSON.stringify({ status }) });
+}
+
+export async function fetchBondPlan(opts: { afterTax?: boolean; useFunds?: boolean; reinvest?: boolean;
+  withdrawalMode?: BondWithdrawalMode | null; filters?: BondFilters | null } = {}): Promise<BondPlan> {
+  const q = appendBondFilters(new URLSearchParams({
+    after_tax: String(opts.afterTax ?? true), use_funds: String(opts.useFunds ?? true), reinvest: String(opts.reinvest ?? true),
+  }), opts.filters);
+  if (opts.withdrawalMode) q.set('withdrawal_mode', opts.withdrawalMode);
+  return apiFetch<BondPlan>(`/api/bonds/plan?${q.toString()}`);
+}
+
+export async function calcBond(terms: Record<string, unknown>): Promise<BondCalcResult> {
+  return apiFetch<BondCalcResult>('/api/bonds/calc', { method: 'POST', body: JSON.stringify(terms) });
+}
+
+export async function fetchYieldMenu(accountType = 'taxable', tenors?: number[]): Promise<BondYieldMenu> {
+  return apiFetch<BondYieldMenu>('/api/bonds/yield-menu', { method: 'POST', body: JSON.stringify({ account_type: accountType, ...(tenors ? { tenors } : {}) }) });
+}
+
+export async function askBondAdvisor(): Promise<{ markdown: string; model: string }> {
+  return apiFetch<{ markdown: string; model: string }>('/api/bonds/advisor', { method: 'POST' });
+}

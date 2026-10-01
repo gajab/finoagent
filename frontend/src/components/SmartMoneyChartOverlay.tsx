@@ -24,14 +24,15 @@ export const SmartMoneyChartOverlay: React.FC<Props> = ({ technical, timeframeSh
     });
 
     const dailyVolume = technical.volumes || [];
-    const currentPrice = technical.prices[technical.prices.length - 1];
+    // last FINITE close (a trailing null close would crash .toFixed — never assume a quote is non-null)
+    const currentPrice = [...technical.prices].reverse().find((p): p is number => p != null && Number.isFinite(p)) ?? null;
 
     // Smart Money Zones
     const markAreaZones: any[] = [];
     technical.institutional?.order_blocks?.forEach(ob => {
       markAreaZones.push([
         { 
-          name: `${ob.type === 'bullish' ? 'Demand' : 'Supply'} OB ($${ob.price.toFixed(2)})`, 
+          name: `${ob.type === 'bullish' ? 'Demand' : 'Supply'} OB${ob.price != null ? ` ($${ob.price.toFixed(2)})` : ''}`,
           yAxis: ob.bottom, 
           itemStyle: { 
             color: ob.type === 'bullish' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(244, 63, 94, 0.1)', 
@@ -47,7 +48,7 @@ export const SmartMoneyChartOverlay: React.FC<Props> = ({ technical, timeframeSh
     technical.institutional?.fair_value_gaps?.forEach(fvg => {
       markAreaZones.push([
         { 
-          name: `${fvg.type === 'bullish' ? 'Bullish' : 'Bearish'} FVG ($${fvg.mid.toFixed(2)})`, 
+          name: `${fvg.type === 'bullish' ? 'Bullish' : 'Bearish'} FVG${fvg.mid != null ? ` ($${fvg.mid.toFixed(2)})` : ''}`,
           yAxis: fvg.bottom, 
           itemStyle: { 
             color: fvg.type === 'bullish' ? 'rgba(99, 102, 241, 0.15)' : 'rgba(168, 85, 247, 0.15)', 
@@ -62,14 +63,15 @@ export const SmartMoneyChartOverlay: React.FC<Props> = ({ technical, timeframeSh
     });
 
     // Mark Lines (POC, Support, Resistance)
-    const markLineData: any[] = [
-      {
+    const markLineData: any[] = [];
+    if (currentPrice != null) {
+      markLineData.push({
         name: 'Current Price',
         yAxis: currentPrice,
         lineStyle: { color: '#f59e0b', type: 'dashed', width: 1 },
         label: { formatter: `NOW $${currentPrice.toFixed(2)}`, position: 'insideEndTop', color: '#fbbf24', fontSize: 11, backgroundColor: '#111', padding: 2 }
-      }
-    ];
+      });
+    }
 
     if (technical.institutional?.volume_profile?.poc) {
       markLineData.push({

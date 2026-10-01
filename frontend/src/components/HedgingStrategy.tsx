@@ -1122,6 +1122,12 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
                 {prefsTouched ? 'your overrides' : 'desk-derived'}
               </span>
             )}
+            {!prefsTouched && marketCheck?.suggested_preferences?.basis === 'model' && (
+              <span className="badge badge-xs badge-warning gap-1"
+                title="The live option chain was too thin (or its fitted density disagreed with ATM vol), so the floor was optimised on a lognormal model instead of market-implied probabilities.">
+                model estimate
+              </span>
+            )}
             {marketCheck?.suggested_preferences && prefsTouched && (
               <button type="button" className="btn btn-ghost btn-xs h-5 min-h-0 px-1.5 text-[10px] text-secondary border border-secondary/25"
                 onClick={() => { applySuggested(marketCheck.suggested_preferences!); setPrefsTouched(false); }}>
@@ -1129,6 +1135,13 @@ export function HedgingStrategy({ ticker: initialTicker }: { ticker?: string }) 
               </button>
             )}
           </div>
+          {ticker && !marketCheck?.suggested_preferences && !marketCheckLoading && (
+            <div className="mb-2 rounded-md bg-warning/5 border border-warning/20 p-2">
+              <p className="text-[10px] text-warning/90">
+                No desk read for {ticker.toUpperCase()} yet — the values below are generic starting defaults, not optimised for this name. They will update as soon as the timing check lands.
+              </p>
+            </div>
+          )}
           {marketCheck?.suggested_preferences && !prefsTouched && marketCheckFor === `${ticker.trim().toUpperCase()}:${horizon}` && (
             <div className="mb-2 rounded-md bg-base-100/40 border border-secondary/15 p-2 space-y-0.5">
               <p className="text-[10px] font-medium text-secondary/90">

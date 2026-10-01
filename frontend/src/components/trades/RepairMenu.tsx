@@ -3,9 +3,12 @@
  *
  * A desk weighs a menu of DEFINED repairs — roll away-&-out, jade-lizard overlay, iron-condor cap,
  * delta-hedge, take-assignment → wheel, roll the whole structure, or close — instead of hoping or
- * bailing. Lazy-loads that menu (live-chain priced), RANKS the repairs (defined-risk / risk-free /
- * PoP first), flags the top pick, and lays each out tightly: the exact legs to trade, a payoff
- * sparkline, the key numbers (max loss / gain, net, Θ, Δ), and a one-line rationale.
+ * bailing. Lazy-loads that menu (live-chain priced), RANKS the repairs by the backend's composite
+ * `desk_score` (edge-per-$-of-capital · risk shape vs full assignment · Δrecovery · market fit —
+ * see `rank_defenses` in trade_repair_service.py), flags the desk's actual pick (which may
+ * legitimately be Hold or Close, not just a fancy structure), and lays each out tightly: the exact
+ * legs to trade, a payoff sparkline, the key numbers (max loss / gain, net, Θ, Δ), the score
+ * breakdown, and a one-line rationale.
  */
 import { useState } from 'react';
 import { Loader2, AlertTriangle, Wrench, ShieldCheck, Infinity as InfinityIcon, Star, Info, ArrowRight } from 'lucide-react';
@@ -25,6 +28,7 @@ export const CAT: Record<string, { label: string; cls: string }> = {
   calendar:     { label: 'Calendar', cls: 'badge-accent' },
   butterfly:    { label: 'Butterfly',cls: 'badge-accent' },
   ratio:        { label: 'Ratio',    cls: 'badge-accent' },
+  cover:        { label: 'Own stock',cls: 'badge-info' },
   hedge:        { label: 'Hedge',    cls: 'badge-warning' },
   assignment:   { label: 'Wheel',    cls: 'badge-secondary' },
 };
@@ -37,9 +41,11 @@ export function fmtExp(iso?: string | null): string {
   return m ? `${_MONTHS[+m[2] - 1]}${+m[3]}` : '';
 }
 
-// Rank repairs: defined-risk + risk-free + turns-profitable + PoP + credit-over-cost win.
+// Legacy heuristic — fallback ONLY for a payload that predates desk_score (defined-risk + risk-free
+// + turns-profitable + PoP + credit-over-cost win). Benchmarks (hold/close) sit outside it because
+// this heuristic can't judge them; desk_score can, which is exactly why `rank` prefers it below.
 export function score(a: RepairAlternative): number {
-  if (a.category === 'exit' || a.category === 'hold') return -Infinity;   // benchmarks sit apart, unranked
+  if (a.category === 'exit' || a.category === 'hold') return -Infinity;
   let s = 0;
   s += a.defined_risk ? 3 : -5;
   s += a.upside_risk_free ? 2 : 0;
@@ -47,6 +53,25 @@ export function score(a: RepairAlternative): number {
   s += (a.pop_pct ?? 40) / 100;
   s += a.net_cash >= 0 ? 0.5 : 0;
   return s;
+}
+
+// The institutional composite — edge-per-$-of-capital + defined-risk size vs assignment +
+// Δrecovery + fit with P(touch)/trend/pattern/IV structure. Present on EVERY alt including
+// hold/close, so the desk's honest pick can legitimately be "do nothing" or "close it".
+export function rank(a: RepairAlternative): number {
+  return a.desk_score ?? score(a);
+}
+
+export function ScoreBar({ label, v }: { label: string; v: number }) {
+  return (
+    <div className="flex items-center gap-1">
+      <span className="text-[8px] text-base-content/40 w-16 shrink-0">{label}</span>
+      <div className="flex-1 h-1 rounded bg-base-content/10 overflow-hidden">
+        <div className="h-full bg-secondary/60" style={{ width: `${Math.max(0, Math.min(100, v))}%` }} />
+      </div>
+      <span className="text-[8px] text-base-content/50 w-6 text-right">{Math.round(v)}</span>
+    </div>
+  );
 }
 
 // A real PAYOFF DIAGRAM: P&L (y) vs underlying price (x). Green shading = profit, red = loss,
@@ -87,6 +112,32 @@ export function PayoffCurve({ alt, spot }: { alt: RepairAlternative; spot: numbe
   );
 }
 
+// The live roll search's own read of a candidate — RND probability, cushion in σ over ITS horizon, the
+// structural levels the new strike clears (support/resistance · POC · gamma flip/wall), and an earnings flag.
+function RollRead({ m }: { m: NonNullable<RepairAlternative['roll_meta']> }) {
+  const cleared = Object.entries(m.structure || {}).filter(([k, v]) => k.startsWith('clears ') && v === true).map(([k]) => k.replace('clears ', ''));
+  const total = Number(m.structure?.levels_available ?? 0);
+  return (
+    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[9px] text-base-content/55">
+      {m.p_otm != null && (
+        <span title="Probability the NEW short finishes out of the money — from the market-implied RND where the chain allows">
+          P(OTM) <b className={m.p_otm >= 70 ? 'text-success/80' : 'text-warning/80'}>{m.p_otm}%</b> <span className="text-base-content/35">{m.p_otm_source}</span>
+        </span>
+      )}
+      {m.scores?.cushion_sigma != null && (
+        <span title="Cushion in std-devs over this expiry's horizon — the same $ distance is fewer σ the longer out">
+          cushion <b>{m.scores.cushion_sigma.toFixed(1)}σ</b>/{m.dte}d
+        </span>
+      )}
+      {total > 0 && (
+        <span title={cleared.length ? `Clears: ${cleared.join(' · ')}` : 'Clears no structural level'} className={cleared.length === total ? 'text-success/80' : 'text-base-content/55'}>
+          ✓ clears <b>{cleared.length}/{total}</b> levels
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function legStr(l: { action: string; right: string; strike: number; qty: number; expiry?: string | null }): string {
   if (l.right === 'STK') return `${l.action} ${l.qty} sh`;
   const e = fmtExp(l.expiry);
@@ -102,8 +153,11 @@ export function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best
       <div className="flex items-center gap-1.5">
         <span className={`badge badge-xs ${CAT[a.category]?.cls || 'badge-ghost'} badge-outline`}>{CAT[a.category]?.label || a.category}</span>
         <span className="text-[11px] font-semibold truncate">{a.name}</span>
-        {best && <span className="badge badge-xs badge-success gap-0.5"><Star className="w-2.5 h-2.5" />best</span>}
-        <span className="ml-auto text-[10px] text-base-content/50">{a.pop_pct != null ? `PoP ${a.pop_pct}%` : ''}</span>
+        {best && <span className="badge badge-xs badge-success gap-0.5"><Star className="w-2.5 h-2.5" />desk pick</span>}
+        <span className="ml-auto flex items-center gap-2">
+          {a.pop_pct != null && <span className="text-[10px] text-base-content/50">PoP {a.pop_pct}%</span>}
+          {a.desk_score != null && <span className="text-sm font-bold text-secondary leading-none" title="Desk score — edge-per-$-of-capital, risk shape, Δrecovery & market fit">{a.desk_score}<span className="text-[8px] text-base-content/40">/100</span></span>}
+        </span>
       </div>
 
       {a.legs && a.legs.length > 0 && (
@@ -131,6 +185,13 @@ export function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best
         )}
       </div>
 
+      {a.roll_meta && <RollRead m={a.roll_meta} />}
+      {a.event_risk && (
+        <div className="flex items-start gap-1 text-[9px] text-warning/85 leading-snug" title={`Desk score already reduced by ${a.event_risk.points} points for this`}>
+          <AlertTriangle className="w-3 h-3 mt-px shrink-0" /><span><b>Earnings:</b> {a.event_risk.note}</span>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center gap-1 pt-0.5">
         {a.category !== 'exit' && (a.defined_risk
           ? <span className="badge badge-xs badge-success badge-outline gap-0.5"><ShieldCheck className="w-2.5 h-2.5" />defined</span>
@@ -148,7 +209,19 @@ export function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best
           )}
         </div>
       </div>
-      {open && <p className="text-[9px] text-base-content/55 leading-snug border-t border-white/[0.06] pt-1">{a.mechanics} — {a.rationale || a.risk_note}</p>}
+      {open && (
+        <div className="space-y-1 border-t border-white/[0.06] pt-1">
+          {a.score_breakdown && (
+            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
+              <ScoreBar label="edge/$risk" v={a.score_breakdown.edge} />
+              <ScoreBar label="risk shape" v={a.score_breakdown.risk} />
+              <ScoreBar label="recovery" v={a.score_breakdown.recovery} />
+              <ScoreBar label="market fit" v={a.score_breakdown.market_fit} />
+            </div>
+          )}
+          <p className="text-[9px] text-base-content/55 leading-snug">{a.mechanics} — {a.rationale || a.risk_note}</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -189,8 +262,8 @@ export default function RepairMenu({ tradeId, quoteSource }: { tradeId: number; 
   if (!data?.alternatives) return null;
 
   const close = data.alternatives.filter(a => a.category === 'exit');
-  const repairs = data.alternatives.filter(a => a.category !== 'exit').sort((x, y) => score(y) - score(x));
-  const bestName = repairs[0]?.name;
+  const repairs = data.alternatives.filter(a => a.category !== 'exit').sort((x, y) => rank(y) - rank(x));
+  const bestName = data.desk_recommendation?.name || repairs[0]?.name;
 
   return (
     <div className="space-y-2">
@@ -207,7 +280,7 @@ export default function RepairMenu({ tradeId, quoteSource }: { tradeId: number; 
       </div>
       {close.map((a, i) => <Card key={`c${i}`} a={a} best={false} spot={data.spot ?? 0} />)}
 
-      <p className="text-[9px] text-base-content/35">{data.pricing}. Payoffs at the nearest-expiry horizon (longer legs BS-marked), from your original entry. Ranked by defined-risk, risk-free wing, and PoP. <b>Evaluate →</b> opens the structure in the Income desk for a full-desk deep-dive; confirm executable prices on the chain before acting.</p>
+      <p className="text-[9px] text-base-content/35">{data.pricing}. Payoffs at the nearest-expiry horizon (longer legs BS-marked), from your original entry. Ranked by desk score (edge-per-$-of-capital, risk shape, Δrecovery, market fit). <b>Evaluate →</b> opens the structure in the Income desk for a full-desk deep-dive; confirm executable prices on the chain before acting.</p>
     </div>
   );
 }

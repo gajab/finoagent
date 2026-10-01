@@ -7,7 +7,7 @@ Native yfinance intervals only (no resampling) to keep it correct and cheap; the
 """
 from __future__ import annotations
 
-from .microstructure_service import _safe_history, _r, _now_str, _to_date
+from .microstructure_service import _safe_history, _r, _now_str, _to_date, append_live_daily_bar
 
 # interval → (yfinance interval, period). Native intervals only (yfinance has no 4h).
 # Intraday intervals respect yfinance's ~60d (15m) / ~730d (60m) availability limits.
@@ -40,6 +40,8 @@ def compute_candles(stock, interval: str = "1d") -> dict | None:
     yf_interval, period = _INTERVALS[interval]
     intraday = interval in ("15m", "1h")
     df = _safe_history(stock, period, yf_interval)
+    if interval == "1d":                      # yfinance drops today's unsettled daily bar → rebuild it
+        df = append_live_daily_bar(stock, df)
     if df is None or getattr(df, "empty", True):
         return None
     df = df.tail(_MAX_BARS)

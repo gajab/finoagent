@@ -63,8 +63,17 @@ def _list_dict(pt: PaperTrade) -> dict:
     """LIGHTWEIGHT row — denormalized/cached columns only (no snapshot/eval blobs). Zero compute:
     the whole list renders from this without touching the network."""
     contracts = pt.contracts or 1
+    # For an OPEN trade last_value_per_share is the current structure mid; for an EXPIRED one it's
+    # the net intrinsic liability at settlement — in both cases × 100 × contracts is the $ value.
     last_value = (pt.last_value_per_share * paper_trade_service.CONTRACT_MULTIPLIER * contracts
                   if pt.last_value_per_share is not None else None)
+    # ITM/OTM outcome for an expired trade (cheap parse of the cached settlement, expired rows only).
+    expiry_outcome = None
+    if pt.status == "expired" and pt.last_eval:
+        try:
+            expiry_outcome = "itm" if json.loads(pt.last_eval).get("itm") else "otm"
+        except Exception:
+            pass
     return {
         "id": pt.id,
         "ticker": pt.ticker,
@@ -73,7 +82,8 @@ def _list_dict(pt: PaperTrade) -> dict:
         "expiration": pt.expiration,
         "dte": paper_trade_service.dte_remaining(pt.expiration),
         "contracts": contracts,
-        "status": pt.status,
+        "status": pt.status,                # open | closed | expired
+        "expiry_outcome": expiry_outcome,   # itm | otm | null (expired only)
         "notes": pt.notes,
         "created_at": pt.created_at.isoformat(),
         "updated_at": pt.updated_at.isoformat(),
@@ -142,24 +152,56 @@ async def create_paper_trade(
     return _list_dict(row)
 
 
+def _is_terminal(s: str) -> bool:
+    return s in ("closed", "expired")
+
+
 @router.get("")
 async def list_paper_trades(
     status: str = "all",
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """All paper trades (newest first). LIGHTWEIGHT — cached columns only, no yfinance/scan.
-    ``status`` = open | closed | all."""
-    stmt = select(PaperTrade).where(PaperTrade.user_id == user.id)
-    if status in ("open", "closed"):
-        stmt = stmt.where(PaperTrade.status == status)
-    rows = (await db.execute(stmt.order_by(PaperTrade.created_at.desc()))).scalars().all()
-    items = [_list_dict(r) for r in rows]
+    """All paper trades (newest first). LIGHTWEIGHT — cached columns only.
+
+    Before serializing, auto-settle any OPEN trades that have expired: this is the only place a
+    list touches the network, and it's self-limiting (a trade expires once, then is cached
+    'expired' forever; only past-expiry open trades trigger a single close-price fetch). ``status``
+    = open | closed (incl. expired) | all."""
+    rows = (await db.execute(
+        select(PaperTrade).where(PaperTrade.user_id == user.id).order_by(PaperTrade.created_at.desc())
+    )).scalars().all()
+
+    # Settle expired-open trades (sequential DB writes on this one session; close price memoized
+    # per ticker+expiry so many same-underlying trades share one fetch). Best-effort per trade.
+    close_memo: dict = {}
+    settled_any = False
+    for r in rows:
+        if r.status == "open" and paper_trade_service.is_expired(r):
+            try:
+                await paper_trade_service.settle_expiry(r, db, close_memo=close_memo, commit=False)
+                settled_any = True
+            except Exception as exc:  # noqa: BLE001 — leave open, retry next load
+                logger.info("expiry settle skipped for paper trade %s (%s): %s", r.id, r.ticker, exc)
+    if settled_any:
+        await db.commit()
+        # Re-load: the settlement UPDATE expires server-onupdate columns (updated_at), and reading
+        # them during serialization would fire a SYNC lazy-load inside the async request → error.
+        rows = (await db.execute(
+            select(PaperTrade).where(PaperTrade.user_id == user.id).order_by(PaperTrade.created_at.desc())
+        )).scalars().all()
+
+    if status == "open":
+        shown = [r for r in rows if r.status == "open"]
+    elif status == "closed":
+        shown = [r for r in rows if _is_terminal(r.status)]
+    else:
+        shown = rows
     return {
-        "items": items,
+        "items": [_list_dict(r) for r in shown],
         "counts": {
             "open": sum(1 for r in rows if r.status == "open"),
-            "closed": sum(1 for r in rows if r.status == "closed"),
+            "closed": sum(1 for r in rows if _is_terminal(r.status)),
             "total": len(rows),
         },
     }
@@ -187,6 +229,18 @@ async def refresh_paper_trade(
     management read, compute live P&L, and cache it. Returns the fresh DeskScoreResult + ``pnl``
     (``matched: False`` with an ``error`` when the structure/legs can't be priced now)."""
     row = await _get_row(db, user, trade_id)
+    # Terminal trades (closed/expired) have no live chain to re-price — return the cached read.
+    if _is_terminal(row.status):
+        cached = _loads(row.last_eval, None) or {"matched": False, "error": f"Trade is {row.status}."}
+        return {"id": row.id, **cached}
+    # An open trade past expiry settles to intrinsic instead of re-pricing.
+    if paper_trade_service.is_expired(row):
+        try:
+            result = await paper_trade_service.settle_expiry(row, db, commit=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("expiry settle failed for %s (%s): %s", row.id, row.ticker, exc)
+            raise HTTPException(status_code=502, detail=f"Expiry settlement failed: {exc}")
+        return {"id": row.id, **result}
     try:
         result = await paper_trade_service.recompute(row, user, db, quote_source)
     except Exception as exc:  # noqa: BLE001
@@ -206,8 +260,15 @@ async def close_paper_trade(
     fresh recompute first so the banked number is current; falls back to the last cached P&L."""
     import datetime as dt
     row = await _get_row(db, user, trade_id)
-    if row.status == "closed":
-        raise HTTPException(400, "Paper trade already closed")
+    if _is_terminal(row.status):
+        raise HTTPException(400, f"Paper trade already {row.status}")
+    # If it has already expired, settle to intrinsic rather than a live re-price.
+    if paper_trade_service.is_expired(row):
+        try:
+            await paper_trade_service.settle_expiry(row, db, commit=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("close: expiry settle failed for %s: %s", row.id, exc)
+        return _detail_dict(row)
     try:
         await paper_trade_service.recompute(row, user, db, body.quote_source)
     except Exception as exc:  # noqa: BLE001

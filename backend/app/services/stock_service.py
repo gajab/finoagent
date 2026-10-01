@@ -788,6 +788,12 @@ def compute_technical_block(stock, timeframe: str = _DEFAULT_TIMEFRAME) -> dict:
         hist = stock.history(period=period, interval=interval)
         if hist is None or hist.empty:
             return {**technical, "error": "No price history available for this timeframe."}
+        # Drop rows with a NaN close — yfinance often returns a trailing in-progress/gap bar whose
+        # close is NaN, which leaks a null into `prices` (crashed SmartMoneyChartOverlay's currentPrice
+        # .toFixed, and skews any last-bar read). Never let a null quote reach the payload.
+        hist = hist.dropna(subset=["Close"])
+        if hist.empty:
+            return {**technical, "error": "No price history available for this timeframe."}
 
         # Use date-only labels for daily/weekly intervals; include time for intraday
         is_intraday = interval.endswith("m") or interval.endswith("h")

@@ -230,3 +230,135 @@ async def _flow():
 
 def test_paper_trade_router_flow_and_laziness():
     asyncio.run(_flow())
+
+
+# ---------------------------------------------------------------------------
+# Expiry settlement — intrinsic value at expiry. OTM ⇒ keep the whole premium;
+# ITM ⇒ premium − intrinsic. Generalizes to spreads/condors (short − long, capped).
+# ---------------------------------------------------------------------------
+
+from app.services.paper_trade_service import intrinsic_settlement, is_expired, settle_expiry
+
+PAST = (date.today() - timedelta(days=3)).isoformat()
+
+
+def test_intrinsic_otm_keeps_full_premium():
+    # short put K=95, close 100 → OTM → nothing owed
+    st = intrinsic_settlement([{"action": "SELL", "type": "PUT", "strike": 95.0}], 1, 100.0)
+    assert st["settlement_cost"] == 0.0 and st["itm"] is False
+
+
+def test_intrinsic_itm_short_put():
+    # short put K=95, close 90 → intrinsic 5/sh → owe $500
+    st = intrinsic_settlement([{"action": "SELL", "type": "PUT", "strike": 95.0}], 1, 90.0)
+    assert st["settlement_cost"] == 500.0 and st["itm"] is True
+
+
+def test_intrinsic_itm_short_call():
+    # covered/short call K=105, close 110 → intrinsic 5/sh → owe $500
+    st = intrinsic_settlement([{"action": "SELL", "type": "CALL", "strike": 105.0}], 1, 110.0)
+    assert st["settlement_cost"] == 500.0 and st["itm"] is True
+
+
+def test_intrinsic_credit_spread_nets_and_caps():
+    legs = [{"action": "SELL", "type": "PUT", "strike": 95.0},
+            {"action": "BUY", "type": "PUT", "strike": 90.0}]
+    # close 92 → short 3, long 0 → net 3/sh → $300
+    assert intrinsic_settlement(legs, 1, 92.0)["settlement_cost"] == 300.0
+    # close 85 → short 10, long 5 → net 5/sh (capped at width) → $500
+    assert intrinsic_settlement(legs, 1, 85.0)["settlement_cost"] == 500.0
+    # close 100 → both OTM → 0
+    assert intrinsic_settlement(legs, 1, 100.0)["settlement_cost"] == 0.0
+
+
+def test_is_expired():
+    class PT:
+        expiration = PAST
+    assert is_expired(PT()) is True
+    PT.expiration = FUTURE
+    assert is_expired(PT()) is False
+    PT.expiration = date.today().isoformat()   # expiry day itself → still live
+    assert is_expired(PT()) is False
+
+
+async def _settle(pt, close_price):
+    import app.services.paper_trade_service as m
+    orig = m._fetch_expiry_close
+    async def fake(_t, _e): return close_price
+    m._fetch_expiry_close = fake
+    try:
+        return await settle_expiry(pt, db=None, commit=False)
+    finally:
+        m._fetch_expiry_close = orig
+
+
+def _settle_pt():
+    return SimpleNamespace(
+        id=1, ticker="TSLA", expiration=PAST,
+        legs=json.dumps([{"action": "SELL", "type": "PUT", "strike": 95.0}]),
+        contracts=1, entry_premium_per_share=2.50, entry_credit=250.0, entry_spot=100.0,
+    )
+
+
+def test_settle_expiry_itm_realizes_premium_minus_intrinsic():
+    pt = _settle_pt()
+    summary = asyncio.run(_settle(pt, 90.0))   # ITM put: intrinsic 5 → cost 500
+    assert summary["itm"] is True and summary["realized_pnl"] == -250.0   # 250 credit − 500
+    assert pt.status == "expired" and pt.close_pnl == -250.0
+    assert "in-the-money" in pt.close_note
+
+
+def test_settle_expiry_otm_realizes_full_premium():
+    pt = _settle_pt()
+    summary = asyncio.run(_settle(pt, 100.0))  # OTM put → keep it all
+    assert summary["itm"] is False and summary["realized_pnl"] == 250.0
+    assert pt.status == "expired" and pt.close_pnl == 250.0
+    assert "out-of-the-money" in pt.close_note
+
+
+async def _expiry_list_flow():
+    """A trade placed with a PAST expiration auto-settles on the next list load."""
+    import app.services.paper_trade_service as m
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with Session() as s:
+        u = User(google_id="g-exp", email="exp@example.com", name="Exp")
+        s.add(u); await s.commit(); await s.refresh(u)
+        uid = u.id
+
+    orig = m._fetch_expiry_close
+    async def fake(_t, _e): return 90.0   # ITM for a 95 put
+    m._fetch_expiry_close = fake
+    try:
+        opp = {**_opp_full(), "expiration": PAST}
+        async with Session() as s:
+            u = await s.get(User, uid)
+            created = await R.create_paper_trade(R.PaperTradeIn(ticker="tsla", opp=opp, spot=100.0), u, s)
+        assert created["status"] == "open"
+
+        # LIST auto-settles the expired trade
+        async with Session() as s:
+            u = await s.get(User, uid)
+            listed = await R.list_paper_trades("all", u, s)
+        row = listed["items"][0]
+        assert row["status"] == "expired"
+        assert row["expiry_outcome"] == "itm"
+        assert row["close_pnl"] == -250.0          # 250 credit − 500 intrinsic
+        # terminal → shows under Closed, not Open
+        assert listed["counts"]["open"] == 0 and listed["counts"]["closed"] == 1
+        async with Session() as s:
+            u = await s.get(User, uid)
+            openonly = await R.list_paper_trades("open", u, s)
+        assert len(openonly["items"]) == 0
+    finally:
+        m._fetch_expiry_close = orig
+        await engine.dispose()
+        os.unlink(path)
+
+
+def test_expiry_auto_settles_on_list():
+    asyncio.run(_expiry_list_flow())

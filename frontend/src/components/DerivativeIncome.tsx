@@ -1,11 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   Coins, Loader2, AlertTriangle, Info, Search, Briefcase, Shield,
   TrendingUp, Gauge, DollarSign, Calendar, Clock, CheckCircle2, ShieldCheck,
   AlertCircle, ChevronDown, ChevronUp, Activity, Landmark,
-  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw, Crown, GitFork
+  BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw, Crown, GitFork, ScanSearch
 } from 'lucide-react';
+import { IncomeScreener } from './IncomeScreener';
 import { useAuth } from '../contexts/AuthContext';
 import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations, fetchDerivativeIncomeWatchlist, addDerivativeIncomeWatchlist, deleteDerivativeIncomeWatchlist } from '../api';
 import type { DerivativeIncomeWatchlistItem } from '../api';
@@ -21,7 +22,7 @@ import { TechnicalAnalysis } from './TechnicalAnalysis';
 import PreTradeAdvisor, { type AdvisorMetric, type QuantSignal } from './PreTradeAdvisor';
 import { DeskReview, SingleTradeDeskReview } from './DeskReview';
 
-type Mode = 'single' | 'portfolio' | 'evaluate' | 'watchlist';
+type Mode = 'single' | 'portfolio' | 'evaluate' | 'watchlist' | 'screener';
 
 /** Build the pricing-confidence signals (RND/SVI/chain/expected move/Heston) that
  * now live inside each opportunity's Quant desk card. */
@@ -1069,7 +1070,7 @@ export function DerivativeIncome() {
   const [searchParams] = useSearchParams();
   useEffect(() => {                                   // deep-link: ?mode=evaluate (from a TA setup card)
     const m = searchParams.get('mode');
-    if (m === 'single' || m === 'portfolio' || m === 'evaluate') setMode(m);
+    if (m === 'single' || m === 'portfolio' || m === 'evaluate' || m === 'screener') setMode(m);
   }, [searchParams]);
   const [selectedExpiry, setSelectedExpiry] = useState('');   // '' = auto (monthlies ≤45d)
   const [expiries, setExpiries] = useState<string[]>([]);
@@ -1156,8 +1157,7 @@ export function DerivativeIncome() {
     (ticker.trim().toUpperCase() !== deskResult.ticker ||
       JSON.stringify(commonParams()) !== JSON.stringify(scanParams));
 
-  const handleSingle = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const runSingle = async () => {
     const frozen = commonParams();
     setScanParams(frozen);
     setLoading(true); setError(null); setDeskResult(null);
@@ -1168,6 +1168,21 @@ export function DerivativeIncome() {
     } catch (err: any) { setError(err?.message || 'Failed to scan opportunities'); }
     finally { setLoading(false); }
   };
+  const handleSingle = (e: React.FormEvent) => { e.preventDefault(); runSingle(); };
+
+  // Screener → "Desk": open the full single-ticker desk on that ticker + expiry and scan straight away.
+  const [screenerVisited, setScreenerVisited] = useState(false);
+  useEffect(() => { if (mode === 'screener') setScreenerVisited(true); }, [mode]);
+  const pendingScan = useRef(false);
+  const openFromScreener = (t: string, o: { expiry?: string | null; minProb: number; minIncome: number }) => {
+    setTicker(t); setSelectedExpiry(o.expiry || ''); setMinProb(o.minProb); setMinIncome(o.minIncome);
+    setOwnsShares(false); setMode('single');
+    pendingScan.current = true;
+  };
+  useEffect(() => {
+    if (mode === 'single' && pendingScan.current) { pendingScan.current = false; runSingle(); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, ticker, selectedExpiry, minProb, minIncome]);
 
   const handlePortfolio = async (offset = 0) => {
     setPfLoading(true); setPfError(null);
@@ -1211,13 +1226,18 @@ export function DerivativeIncome() {
         <button type="button" className={`btn btn-sm gap-1.5 ${mode === 'watchlist' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('watchlist')}>
           <List className="w-3.5 h-3.5" /> WatchList
         </button>
+        <button type="button" className={`btn btn-sm gap-1.5 ${mode === 'screener' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setMode('screener')}>
+          <ScanSearch className="w-3.5 h-3.5" /> Screener
+        </button>
       </div>
 
       {mode === 'evaluate' && <EvaluateForm defaultQuoteSource={quoteSource} />}
       {mode === 'watchlist' && <WatchList onSelect={(t) => { setTicker(t); setMode('single'); }} />}
+      {/* Kept mounted once opened so a long screen / evaluation survives switching tabs. */}
+      {screenerVisited && <div hidden={mode !== 'screener'}><IncomeScreener onOpenTicker={openFromScreener} /></div>}
 
       {/* Form */}
-      {mode !== 'evaluate' && mode !== 'watchlist' && (<>
+      {mode !== 'evaluate' && mode !== 'watchlist' && mode !== 'screener' && (<>
       <form onSubmit={mode === 'single' ? handleSingle : (e) => { e.preventDefault(); handlePortfolio(0); }}
         className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         {mode === 'single' && (

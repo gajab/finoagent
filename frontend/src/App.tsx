@@ -24,6 +24,7 @@ const TrackingPage = lazy(() => import('./pages/TrackingPage'));
 const TradeTrackingPage = lazy(() => import('./pages/TradeTrackingPage'));
 const MyTradesPage = lazy(() => import('./pages/MyTradesPage'));
 const CalculatorsPage = lazy(() => import('./pages/CalculatorsPage'));
+const BondsPage = lazy(() => import('./pages/BondsPage'));
 const MetricsDashboard = lazy(() => import('./components/MetricsDashboard').then(m => ({ default: m.MetricsDashboard })));
 
 function RouteFallback() {
@@ -98,6 +99,14 @@ export default function App() {
             }
           />
           <Route path="/debt" element={<Navigate to="/market?section=debt" replace />} />
+          <Route
+            path="/bonds"
+            element={
+              <ProtectedRoute>
+                <BondsPage />
+              </ProtectedRoute>
+            }
+          />
           <Route
             path="/settings"
             element={

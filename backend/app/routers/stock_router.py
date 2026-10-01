@@ -211,6 +211,87 @@ async def remove_derivative_income_watchlist_item(
         await set_user_watchlist_tickers(db, user.id, tickers)
     return {"status": "ok"}
 
+# =========================================================================
+# Income Screener — find names worth selling premium on, then grade A/B calls & puts
+# =========================================================================
+
+class IncomeScreenIn(BaseModel):
+    price_min: float | None = Field(default=20, ge=0)
+    price_max: float | None = Field(default=500, ge=0)
+    market_cap_min_b: float | None = Field(default=2, ge=0, description="Min market cap ($B)")
+    avg_volume_min: float | None = Field(default=1_000_000, ge=0, description="Min 3-month avg daily share volume")
+    beta_min: float | None = None
+    beta_max: float | None = None
+    change_min: float | None = Field(default=None, description="Today's % change ≥")
+    change_max: float | None = Field(default=None, description="Today's % change ≤")
+    week52_pos_min: float | None = Field(default=None, ge=0, le=100, description="Position in 52W range ≥ (0=low, 100=high)")
+    week52_pos_max: float | None = Field(default=None, ge=0, le=100)
+    sectors: list[str] = Field(default_factory=list)
+    exclude_earnings_within_days: int | None = Field(default=None, ge=0, le=120)
+    max_results: int = Field(default=100, ge=10, le=250)
+
+
+class IncomeVolIn(BaseModel):
+    items: list[dict] = Field(default_factory=list, description="[{ticker, price?}] — ≤25 per call")
+
+
+class IncomeEvalIn(BaseModel):
+    min_prob: float = Field(default=0.85, ge=0.5, le=0.99)
+    min_income: float = Field(default=20.0, ge=0)
+    min_dte: int = Field(default=14, ge=1, le=365)
+    max_dte: int = Field(default=45, ge=1, le=365)
+    earnings: str = Field(default="exclude", pattern="^(include|exclude)$")
+    earnings_aware: bool = True
+    grades: list[str] = Field(default_factory=lambda: ["A", "B"])
+    quote_source: str = "yfinance"
+    next_earnings: str | None = Field(default=None, description="Screener hint (YYYY-MM-DD); computed when absent")
+
+
+@router.post("/strategies/income-screener/screen")
+async def income_screener_screen(
+    body: IncomeScreenIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..services.income_screener_service import screen_universe
+    try:
+        return await screen_universe(body.model_dump(), db=db)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Screener failed: {exc}")
+
+
+@router.post("/strategies/income-screener/vol-metrics")
+async def income_screener_vol(
+    body: IncomeVolIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..services.income_screener_service import vol_metrics
+    items = [i for i in body.items if isinstance(i, dict) and i.get("ticker")]
+    try:
+        return await vol_metrics(items, db=db)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Vol metrics failed: {exc}")
+
+
+@router.post("/strategies/income-screener/evaluate/{ticker}")
+async def income_screener_evaluate(
+    ticker: str,
+    body: IncomeEvalIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..services.income_screener_service import evaluate_ticker
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    if body.min_dte > body.max_dte:
+        raise HTTPException(400, "min_dte must be ≤ max_dte")
+    try:
+        return await evaluate_ticker(ticker, body.model_dump(), user=user, db=db)
+    except Exception as exc:
+        return {"ticker": ticker.upper(), "trades": [], "skipped": f"Evaluation failed: {exc}"}
+
+
 class DerivativeIncomePortfolioIn(BaseModel):
     offset: int = Field(default=0, ge=0, description="Pagination offset into top holdings by value")
     limit: int = Field(default=10, ge=1, le=10, description="Holdings analyzed per page (≤10 to spare the quote API)")
@@ -624,6 +705,44 @@ async def get_connors_rsi_setup(
     return {"ticker": ticker, "connors_setup": result, "cached": False}
 
 
+@router.get("/{ticker}/regime-edge")
+async def get_regime_edge(
+    ticker: str,
+    horizon: int = Query(10, description="Bars held per backtested trade (triple-barrier horizon)"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Regime-conditional edge: for each canonical signal (breakout / breakdown / mean-reversion dip /
+    trend pullback) on this name, the historical win rate, expectancy (R), profit factor, sample size
+    and t-stat — split by the market regime (ER terciles: Trending / Transitional / Choppy) in force
+    when the signal fired. Answers 'does this breakout only work when we're trending?' Deterministic,
+    in-sample, educational — not advice. Lazy + cached."""
+    import asyncio
+    import yfinance as yf
+    from ..services.regime_edge_service import compute_regime_edge
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+    horizon = horizon if 3 <= horizon <= 40 else 10
+
+    cache_key = f"regime-edge:{ticker}:h{horizon}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "regime_edge": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_regime_edge(yf.Ticker(ticker), horizon=horizon))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Regime-edge analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="Not enough daily history to compute regime-conditional edge.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=3600)   # historical stats drift ~daily; regime shifts slowly
+    return {"ticker": ticker, "regime_edge": result, "cached": False}
+
+
 @router.get("/{ticker}/candles")
 async def get_candles(
     ticker: str,
@@ -643,7 +762,7 @@ async def get_candles(
     if interval not in supported_intervals():
         interval = "1d"
 
-    cache_key = f"candles:{ticker}:{interval}:v1"
+    cache_key = f"candles:{ticker}:{interval}:v2"   # v2: rebuild today's unsettled daily bar
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return {"ticker": ticker, "candles": cached, "cached": True}
@@ -659,6 +778,48 @@ async def get_candles(
     ttl = 300 if interval in ("15m", "1h") else 1800
     await set_cached(db, cache_key, result, ttl_seconds=ttl)
     return {"ticker": ticker, "candles": result, "cached": False}
+
+
+@router.get("/{ticker}/volume-analysis")
+async def get_volume_analysis(
+    ticker: str,
+    interval: str = Query("1d", description="Candle interval: 15m · 1h · 1d · 1wk"),
+    lookback: int = Query(20, description="Primary RVOL lookback (bars/days): 10, 20 or 50"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deterministic volume read at a chosen interval — RVOL, rising/falling trend, dry-up vs
+    expansion, climax/spike bars, up/down split, CVD (delta) and OBV divergence — plus the bars for
+    a price+volume chart. Reuses the cached candle feed, so no extra market-data load."""
+    import asyncio
+    import yfinance as yf
+    from ..services.volume_service import compute_volume_analysis
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+    from ..services.candles_service import supported_intervals
+    if interval not in supported_intervals():
+        interval = "1d"
+    if lookback not in (10, 20, 50):
+        lookback = 20
+
+    cache_key = f"vol-analysis:{ticker}:{interval}:{lookback}:v3"   # v3: rebuild today's unsettled daily bar
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "volume_analysis": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_volume_analysis(yf.Ticker(ticker), interval, lookback))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Volume analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No volume data available for this ticker/interval.")
+
+    ttl = 300 if interval in ("15m", "1h") else 1800
+    await set_cached(db, cache_key, result, ttl_seconds=ttl)
+    return {"ticker": ticker, "volume_analysis": result, "cached": False}
 
 
 @router.get("/{ticker}/chart-patterns")
@@ -2294,6 +2455,46 @@ async def compute_dual_direction_buffer(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Dual Direction Buffer failed: {exc}")
+
+
+class DualBufferScreenIn(BaseModel):
+    ticker: str = Field(..., description="Reference asset ticker")
+    amount: float = Field(..., gt=0, description="Target investment amount in USD")
+    downside_buffer_pct: float = Field(..., ge=0, le=50)
+    upside_cap_pct: float = Field(..., ge=0, le=100)
+    entry_cost_mode: str = Field(default="non_negative", description="standard | self_financing | non_negative | cheapest")
+    risk_budget: float | None = Field(default=None, description="Max $ loss to size to (fixed-risk sizing)")
+    tenors: list[int] | None = Field(default=None, description="DTEs to scan (default 90/120/180/365)")
+
+
+@router.post("/{ticker}/strategies/dual-direction-buffer/screen")
+async def screen_dual_direction_buffer(
+    ticker: str,
+    body: DualBufferScreenIn,
+    user: User = Depends(get_current_user),
+):
+    """Scan several tenors for a ticker and return the single best no-cost dual buffer."""
+    from ..services.dual_direction_service import screen_dual_direction_buffers
+    active_ticker = body.ticker or ticker
+    if active_ticker.startswith("."):
+        active_ticker = "^" + active_ticker[1:]
+    try:
+        result = await screen_dual_direction_buffers(
+            ticker=active_ticker,
+            amount=body.amount,
+            downside_buffer_pct=body.downside_buffer_pct,
+            upside_cap_pct=body.upside_cap_pct,
+            entry_cost_mode=body.entry_cost_mode,
+            tenors=tuple(body.tenors) if body.tenors else (90, 120, 180, 365),
+            risk_budget=body.risk_budget,
+        )
+        if not result.get("success"):
+            raise HTTPException(400, result.get("error", "No usable buffer found"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Dual buffer screen failed: {exc}")
 
 # =========================================================================
 # Strategies — Concentration Management

@@ -81,57 +81,90 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 # ── 1. Algorithmic preferences — replaces constant form defaults ───────────
 
-def _optimize_floor(curve: dict, spot: float, puts: dict, budget_pct: float) -> Optional[dict]:
-    """Search the REAL put chain for the floor with the best protection per dollar.
+def _lognormal_grid(spot: float, iv: float, T: float, r: float = 0.045, n: int = 121):
+    """Fallback density when the SVI/RND fit is unavailable (thin chain)."""
+    if not spot or iv <= 0 or T <= 0:
+        return None, None
+    sd = iv * math.sqrt(T)
+    lo, hi = -3.2 * sd, 3.2 * sd
+    xs = np.linspace(lo, hi, n)
+    prices = spot * np.exp(xs)
+    mu = math.log(spot) + (r - 0.5 * iv * iv) * T
+    lp = np.log(prices)
+    pdf = np.exp(-0.5 * ((lp - mu) / sd) ** 2) / (prices * sd * math.sqrt(2 * math.pi))
+    w = 0.5 * (pdf[:-1] + pdf[1:]) * np.diff(prices)
+    tot = w.sum()
+    return (prices, w / tot) if tot > 0 else (None, None)
 
-    For every liquid put 2–35% OTM, integrate under the market's own density:
-      relief     — share of the naked CVaR95 tail the put removes
-      efficiency — $ of tail removed per $ of premium
-      breach     — P(S_T < K)
-    Objective = 0.6·relief + 0.4·efficiency (each normalised across candidates),
-    restricted to puts that fit the budget. If none fit, return the best one
-    and let the caller finance it.
+
+def _bs_put(spot: float, k: float, T: float, iv: float, r: float = 0.045) -> float:
+    if iv <= 0 or T <= 0:
+        return max(k - spot, 0.0)
+    sq = iv * math.sqrt(T)
+    d1 = (math.log(spot / k) + (r + 0.5 * iv * iv) * T) / sq
+    d2 = d1 - sq
+    nd = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+    return k * math.exp(-r * T) * nd(-d2) - spot * nd(-d1)
+
+
+def _optimize_floor(prices, w, spot: float, puts: Optional[dict],
+                    budget_pct: float, iv: float, T: float,
+                    max_breach: float = 25.0) -> Optional[dict]:
+    """Pick the floor that MAXIMISES net tail benefit = ΔCVaR95 − premium.
+
+    This is the actual cost-vs-protection trade-off, not a rule of thumb: for
+    every candidate strike we integrate the hedged P&L under the density, take
+    the reduction in the 95% expected shortfall, and subtract what the put costs.
+    The winner is the strike where the last dollar of premium still buys more
+    than a dollar of tail relief. Budget caps the search; efficiency and breach
+    odds come along for reporting.
     """
-    prices, w = _grid_from_curve(curve or {}, spot)
-    if prices is None or not puts:
+    if prices is None:
         return None
     s_mid = 0.5 * (prices[:-1] + prices[1:])
-    naked = s_mid - spot                                   # per share
+    naked = s_mid - spot                                   # $ per share
     cvar_naked = _weighted_cvar(naked, w)
     if cvar_naked >= 0:
         return None
+
+    quoted = bool(puts)
+    if quoted:
+        universe = [(float(k), float(getattr(q, "mid", 0) or 0)) for k, q in puts.items()]
+    else:                                                  # no chain → model prices
+        universe = [(round(spot * (1 - x / 100), 2), _bs_put(spot, spot * (1 - x / 100), T, iv))
+                    for x in range(2, 36)]
+
     cands = []
-    for k, q in puts.items():
-        mid = float(getattr(q, "mid", 0) or 0)
-        k = float(k)
+    for k, mid in universe:
         otm = (1 - k / spot) * 100
         if mid <= 0 or otm < 2 or otm > 35:
             continue
         hedged = naked + np.maximum(k - s_mid, 0.0) - mid
-        red = _weighted_cvar(hedged, w) - cvar_naked
+        red = _weighted_cvar(hedged, w) - cvar_naked       # $ of tail removed / share
         if red <= 0:
             continue
         cands.append({
             "strike": k, "floor_pct": otm, "cost_pct": mid / spot * 100,
             "relief": red / abs(cvar_naked), "eff": red / mid,
+            "net_benefit_pct": (red - mid) / spot * 100,   # what you actually gain, net of premium
             "breach": float(np.sum(w[s_mid < k])) * 100,
         })
     if not cands:
         return None
-    fits = [c for c in cands if c["cost_pct"] <= budget_pct]
-    pool = fits or cands
-    # Most protection that still buys at a competitive rate: among strikes whose
-    # $-efficiency is within 70% of the best on the chain, take the one removing
-    # the most tail (ties → cheaper). This stops before premium turns wasteful
-    # (the near-ATM puts), without under-insuring with a lottery-ticket wing.
+
+    # A floor struck half the time isn't insurance — that's synthetically selling
+    # the stock, which is cheaper done by trimming the position. Keep the search
+    # in genuine-protection territory (relax only if nothing qualifies).
+    insur = [c for c in cands if c["breach"] <= max_breach] or \
+            [c for c in cands if c["breach"] <= max_breach * 1.6] or cands
+    fits = [c for c in insur if c["cost_pct"] <= budget_pct]
+    pool = fits or insur
+    best = max(pool, key=lambda c: c["net_benefit_pct"])
     emax = max(c["eff"] for c in pool) or 1
-    eligible = [c for c in pool if c["eff"] >= 0.70 * emax] or pool
-    for c in pool:
-        c["obj"] = c["relief"] - 1e-6 * c["cost_pct"] if c in eligible else -1.0
-    best = max(pool, key=lambda c: c["obj"])
     best["eff_vs_best"] = best["eff"] / emax
     best["fits_budget"] = bool(fits)
     best["n_scanned"] = len(cands)
+    best["basis"] = "chain" if quoted else "model"
     return best
 
 
@@ -173,8 +206,6 @@ def suggest_preferences(market: dict, spot: float, horizon_days: int,
     """
     rnd = (market or {}).get("rnd") or {}
     curve = rnd.get("curve")
-    if not curve:
-        return None
 
     score = float(market.get("score") or 50)
     verdict = market.get("verdict") or "Fair"
@@ -203,15 +234,41 @@ def suggest_preferences(market: dict, spot: float, horizon_days: int,
                + (f", widened for β {beta:.2f}" if beta and beta > 1.2 else "") + ".")
 
     # ---- Floor: optimise on the real chain, else regime rule ----
-    opt = _optimize_floor(curve, spot, puts or {}, budget_pct) if puts else None
+    # Density: the market's own RND when we have it, else a lognormal from ATM IV
+    # so a thin chain degrades to a model estimate instead of silent constants.
+    density_model = False
+    prices, wts = _grid_from_curve(curve or {}, spot)
+    if prices is not None:
+        # Sanity: the RND's own dispersion must agree with ATM vol. A sparse chain
+        # can produce a badly-fit SVI whose density implies a wildly different
+        # sigma — that silently corrupts every breach probability downstream.
+        m_mid = 0.5 * (prices[:-1] + prices[1:])
+        lr = np.log(m_mid / spot)
+        mean = float(np.sum(wts * lr))
+        sd_d = float(np.sqrt(max(np.sum(wts * (lr - mean) ** 2), 0.0)))
+        sd_ref = iv * math.sqrt(T)
+        if sd_ref > 0 and (sd_d < 0.70 * sd_ref or sd_d > 1.45 * sd_ref):
+            prices, wts = _lognormal_grid(spot, iv, T)
+            density_model = True
+            why.append(f"Density check: the fitted RND implied {sd_d * 100:.0f}% dispersion vs "
+                       f"{sd_ref * 100:.0f}% from ATM vol — too far apart to trust, so the floor "
+                       f"was optimised on a lognormal model instead.")
+    if prices is None:
+        prices, wts = _lognormal_grid(spot, iv, T)
+        density_model = True
+    opt = _optimize_floor(prices, wts, spot, puts, budget_pct, iv, T)
+    if opt and density_model:
+        opt["basis"] = "model"   # quoted puts, but probabilities came from the model
     upside_cap_pct = downside_cap_pct = 0
     if opt:
         floor_pct = int(round(_clamp(opt["floor_pct"], 2, 35)))
         target_breach = opt["breach"]
         why.append(f"Floor −{floor_pct}% (${opt['strike']:g} put) is the best of {opt['n_scanned']} "
                    f"strikes scanned: removes {opt['relief'] * 100:.0f}% of the tail at "
-                   f"{opt['eff']:.1f}× protection per $ ({opt.get('eff_vs_best', 1) * 100:.0f}% of the chain's best rate), costs {opt['cost_pct']:.2f}%, "
-                   f"{target_breach:.0f}% chance of being breached.")
+                   f"{opt['eff']:.1f}× protection per $, costs {opt['cost_pct']:.2f}% — the best net gain "
+                   f"(tail removed minus premium) of any strike, "
+                   f"{target_breach:.0f}% chance of being breached."
+                   + ("" if opt["basis"] == "chain" else " Estimated from ATM vol — no usable live chain."))
         shortfall = opt["cost_pct"] - budget_pct
         if shortfall > 0.05:
             fin = _financing_call(calls or {}, spot, shortfall, momentum)
@@ -222,7 +279,7 @@ def suggest_preferences(market: dict, spot: float, horizon_days: int,
                            f"that still covers it, so you give up as little upside as possible"
                            + (" (kept wide: the name is trending near its highs)." if momentum else "."))
             elif vol_of_vol and vol_of_vol <= 1.2 and (skew_pts or 0) > 2:
-                deep = _pct_at_cdf(curve, 0.03)
+                deep = _pct_at_cdf(curve, 0.03) if curve else None
                 downside_cap_pct = int(round(_clamp(-(deep or -35.0), floor_pct + 12.0, 55.0)))
                 why.append(f"No call covers the shortfall, so the desk sells the −{downside_cap_pct}% "
                            f"put wing (3% breach odds) to subsidise the floor.")
@@ -238,7 +295,7 @@ def suggest_preferences(market: dict, spot: float, horizon_days: int,
             target_breach, regime = 13.0, "mixed pricing"
         else:
             target_breach, regime = 9.0, "protection is rich"
-        floor_move = _pct_at_cdf(curve, target_breach / 100)
+        floor_move = _pct_at_cdf(curve, target_breach / 100) if curve else None
         floor_pct = int(round(_clamp(-(floor_move or -10.0), 2.0, 35.0)))
         why.append(f"Floor −{floor_pct}% sits at a {target_breach:.0f}% market-implied breach "
                    f"probability — {regime} ({verdict.lower()}). (No live chain: regime rule used.)")
@@ -256,6 +313,8 @@ def suggest_preferences(market: dict, spot: float, horizon_days: int,
         "regime": verdict,
         "needs_financing": bool(upside_cap_pct or downside_cap_pct),
         "optimized": bool(opt),
+        "basis": (opt or {}).get("basis", "regime"),
+        "net_benefit_pct": round(float((opt or {}).get("net_benefit_pct", 0)), 3),
         "horizon_days": int(horizon_days),
         "why": why,
     }

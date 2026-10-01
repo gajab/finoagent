@@ -58,6 +58,58 @@ function ScoreChip({ score, grade, dim }: { score?: number | null; grade?: strin
   );
 }
 
+// Trade status: Open (amber "Expiring" ≤2 DTE) · Expired · ITM/OTM · Closed.
+function StatusBadge({ it }: { it: PaperTradeListItem }) {
+  if (it.status === 'expired') {
+    const itm = it.expiry_outcome === 'itm';
+    return (
+      <span className={`badge badge-xs badge-outline gap-1 ${itm ? 'badge-error' : 'badge-success'}`}
+        title={it.close_note || undefined}>
+        Expired · {itm ? 'ITM' : 'OTM'}
+      </span>
+    );
+  }
+  if (it.status === 'closed') return <span className="badge badge-xs badge-ghost">Closed</span>;
+  const soon = it.dte != null && it.dte <= 2;
+  return <span className={`badge badge-xs badge-outline ${soon ? 'badge-warning' : 'badge-success'}`}>{soon ? 'Expiring' : 'Open'}</span>;
+}
+
+// Terminal settlement (expired): intrinsic value at the expiry close → realized P&L.
+function SettlementCard({ current, item }: { current: PaperTradeCurrent; item: PaperTradeListItem }) {
+  const itm = !!current.itm;
+  const realized = current.realized_pnl ?? current.pnl?.realized_pnl ?? item.close_pnl;
+  return (
+    <div className={`rounded-lg border p-3 space-y-2 ${itm ? 'border-error/25 bg-error/[0.04]' : 'border-success/25 bg-success/[0.04]'}`}>
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={`badge badge-sm ${itm ? 'badge-error' : 'badge-success'}`}>Expired · {itm ? 'ITM' : 'OTM'}</span>
+        <span className="text-[10px] uppercase tracking-wider text-base-content/40">settled to intrinsic at expiry</span>
+        <span className={`ml-auto text-sm font-bold ${pnlCls(realized)}`}>{signedMoney(realized)} <span className="text-[10px] text-base-content/40 font-normal">realized</span></span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+        <div><div className="text-base-content/40 text-[9px] uppercase tracking-wider">Close price</div><div className="font-mono">{current.close_price != null ? `$${current.close_price.toFixed(2)}` : '—'}</div></div>
+        <div><div className="text-base-content/40 text-[9px] uppercase tracking-wider">Premium collected</div><div className="font-mono">{fmtMoney(current.pnl?.cost_basis ?? item.cost_basis)}</div></div>
+        <div><div className="text-base-content/40 text-[9px] uppercase tracking-wider">Intrinsic owed</div><div className="font-mono">{current.settlement_cost != null ? fmtMoney(current.settlement_cost) : '—'}</div></div>
+        <div><div className="text-base-content/40 text-[9px] uppercase tracking-wider">Realized P&amp;L</div><div className={`font-mono font-semibold ${pnlCls(realized)}`}>{signedMoney(realized)}</div></div>
+      </div>
+      <p className="text-[10px] text-base-content/50 leading-snug">
+        {itm
+          ? 'Finished in-the-money: premium collected minus the option’s intrinsic value at the expiry close.'
+          : 'Finished out-of-the-money: the options expired worthless, so the full premium collected is the profit.'}
+      </p>
+      {current.legs_settlement && current.legs_settlement.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 pt-1">
+          {current.legs_settlement.map((l, i) => (
+            <span key={i} className={`inline-flex items-baseline gap-1 rounded border px-1.5 py-0.5 text-[10px] ${l.itm ? 'border-error/30 text-error/90' : 'border-white/[0.08] text-base-content/60'}`}>
+              <span className="font-mono">{l.action === 'SELL' ? '−' : '+'}{l.right}{l.strike}</span>
+              <span className="opacity-70">{l.itm ? `ITM ${l.intrinsic_per_share.toFixed(2)}` : 'OTM'}</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function PaperTraderPanel({ quoteSource = 'yfinance' }: { quoteSource?: string }) {
   const [filter, setFilter] = useState<'open' | 'closed' | 'all'>('open');
   const [items, setItems] = useState<PaperTradeListItem[]>([]);
@@ -207,11 +259,12 @@ export default function PaperTraderPanel({ quoteSource = 'yfinance' }: { quoteSo
               <tr className="text-[10px] uppercase tracking-wider text-base-content/40">
                 <th></th>
                 <th>Trade</th>
+                <th>Status</th>
                 <th>Placed</th>
                 <th className="text-right">DTE</th>
                 <th className="text-right">Cost basis</th>
                 <th className="text-right">Current</th>
-                <th className="text-right">Unrealized P&amp;L</th>
+                <th className="text-right" title="Unrealized while open; realized once closed/expired">P&amp;L</th>
                 <th className="text-center" title="Desk score when placed → now">Score · placed→now</th>
                 <th></th>
               </tr>
@@ -221,7 +274,8 @@ export default function PaperTraderPanel({ quoteSource = 'yfinance' }: { quoteSo
                 const open = expanded.has(it.id);
                 const detail = detailMap[it.id];
                 const cur = currentMap[it.id];
-                const pnl = it.status === 'closed' ? it.close_pnl : it.last_pnl;
+                const terminal = it.status !== 'open';
+                const pnl = terminal ? it.close_pnl : it.last_pnl;
                 return (
                   <React.Fragment key={it.id}>
                     <tr className="hover:bg-base-200/30 cursor-pointer" onClick={() => toggle(it.id)}>
@@ -229,8 +283,8 @@ export default function PaperTraderPanel({ quoteSource = 'yfinance' }: { quoteSo
                       <td>
                         <div className="font-semibold">{it.ticker}</div>
                         <div className="text-[10px] text-base-content/50">{it.label || it.structure}</div>
-                        {it.status === 'closed' && <span className="badge badge-ghost badge-xs mt-0.5 text-[9px]">closed</span>}
                       </td>
+                      <td><StatusBadge it={it} /></td>
                       <td className="whitespace-nowrap text-base-content/60">{fmtDate(it.created_at)}</td>
                       <td className="text-right font-mono">{it.dte ?? '—'}</td>
                       <td className="text-right font-mono" title="Net credit received at placement">{fmtMoney(it.cost_basis)}</td>
@@ -273,7 +327,7 @@ export default function PaperTraderPanel({ quoteSource = 'yfinance' }: { quoteSo
                     </tr>
                     {open && (
                       <tr className="bg-secondary/[0.04]">
-                        <td colSpan={9} className="!p-0">
+                        <td colSpan={10} className="!p-0">
                           <div className="m-2 rounded-lg border border-secondary/25 bg-base-100/40 p-3">
                             <ExpandedPaperTrade
                               item={it} detail={detail} current={cur}
@@ -304,7 +358,8 @@ function DeltaStrip({ item, current }: { item: PaperTradeListItem; current?: Pap
   const scoreFrom = item.placed_desk_score;
   const scoreTo = current?.desk_score ?? item.last_desk_score;
   const dScore = (scoreFrom != null && scoreTo != null) ? Math.round(scoreTo) - Math.round(scoreFrom) : null;
-  const pnl = item.status === 'closed' ? item.close_pnl : (p?.unrealized_pnl ?? item.last_pnl);
+  const terminal = item.status !== 'open';
+  const pnl = terminal ? item.close_pnl : (p?.unrealized_pnl ?? item.last_pnl);
   const pnlPct = p?.unrealized_pct;
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[11px] rounded-lg bg-base-200/30 px-3 py-2 mb-3">
@@ -322,7 +377,7 @@ function DeltaStrip({ item, current }: { item: PaperTradeListItem; current?: Pap
         <b className={`font-mono ${gradeCls(current?.algo_grade ?? item.last_algo_grade)}`}>{scoreTo != null ? Math.round(scoreTo) : '—'}</b>
         {dScore != null && dScore !== 0 && <span className={`ml-1 ${dScore >= 0 ? 'text-success' : 'text-error'}`}>({dScore >= 0 ? '+' : ''}{dScore})</span>}
       </span>
-      <span className={`font-semibold ${pnlCls(pnl)}`}>{item.status === 'closed' ? 'Realized' : 'Unrealized'} {signedMoney(pnl)}
+      <span className={`font-semibold ${pnlCls(pnl)}`}>{terminal ? 'Realized' : 'Unrealized'} {signedMoney(pnl)}
         {pnlPct != null && <span className="ml-1 opacity-80">({signedPct(pnlPct)})</span>}</span>
     </div>
   );
@@ -337,6 +392,7 @@ function ExpandedPaperTrade({ item, detail, current, detailLoading, refreshing, 
   onRefresh: () => void;
 }) {
   const placed = detail?.placed_snapshot;
+  const terminal = item.status !== 'open';
   // The exact legs of the trade, as placed (strike/type/action + entry bid/ask/mid/greeks).
   const legs = (detail?.legs && detail.legs.length ? detail.legs : placed?.legs) || [];
   return (
@@ -374,13 +430,21 @@ function ExpandedPaperTrade({ item, detail, current, detailLoading, refreshing, 
         {/* NOW — the same engine re-run on the exact legs (+ holder Management Analysis). */}
         <div>
           <div className="text-[10px] uppercase tracking-wider text-base-content/40 mb-1.5 flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5"><Cpu className="w-3 h-3" /> Now{current?.pnl?.dte_remaining != null ? ` · ${current.pnl.dte_remaining} DTE left` : ''}</span>
-            <button className="btn btn-ghost btn-xs gap-1 h-5 min-h-0 text-[10px]" onClick={onRefresh} disabled={refreshing}>
-              {refreshing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
-              {refreshing ? 'Repricing…' : 'Refresh'}
-            </button>
+            <span className="flex items-center gap-1.5"><Cpu className="w-3 h-3" />
+              {terminal
+                ? (item.status === 'expired' ? 'At expiry · settled' : 'Closed')
+                : `Now${current?.pnl?.dte_remaining != null ? ` · ${current.pnl.dte_remaining} DTE left` : ''}`}
+            </span>
+            {!terminal && (
+              <button className="btn btn-ghost btn-xs gap-1 h-5 min-h-0 text-[10px]" onClick={onRefresh} disabled={refreshing}>
+                {refreshing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                {refreshing ? 'Repricing…' : 'Refresh'}
+              </button>
+            )}
           </div>
-          {refreshing && !current ? (
+          {current?.settled ? (
+            <SettlementCard current={current} item={item} />
+          ) : refreshing && !current ? (
             <div className="flex items-center gap-2 text-xs text-base-content/50 py-3"><Loader2 className="w-4 h-4 animate-spin" /> Re-pricing the legs & recomputing the desk read…</div>
           ) : current && current.matched === false ? (
             <div className="text-[11px] text-base-content/50 flex items-start gap-1.5 py-2">

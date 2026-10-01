@@ -13,6 +13,7 @@ when the premium has decayed in your favour). Cost basis = the entry net credit 
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -25,14 +26,27 @@ logger = logging.getLogger(__name__)
 CONTRACT_MULTIPLIER = 100   # shares per option contract
 
 
-def dte_remaining(expiration: Optional[str]) -> Optional[int]:
-    """Calendar days from today to the expiration (min 1). None if unparseable."""
+def expiry_date(expiration: Optional[str]) -> Optional[dt.date]:
+    """Parse the trade's expiration (YYYY-MM-DD…) to a date. None if unparseable."""
     if not expiration:
         return None
     try:
-        return max(1, (dt.date.fromisoformat(str(expiration)[:10]) - dt.date.today()).days)
+        return dt.date.fromisoformat(str(expiration)[:10])
     except (ValueError, TypeError):
         return None
+
+
+def dte_remaining(expiration: Optional[str]) -> Optional[int]:
+    """Calendar days from today to the expiration (min 1). None if unparseable."""
+    e = expiry_date(expiration)
+    return None if e is None else max(1, (e - dt.date.today()).days)
+
+
+def is_expired(pt) -> bool:
+    """True once the expiration date is strictly in the past — so the expiry-date CLOSE is final
+    (settled), not an intraday print. On the expiry date itself the trade stays open (live MTM)."""
+    e = expiry_date(pt.expiration)
+    return e is not None and dt.date.today() > e
 
 
 def _per_share_credit(opp_or_row: dict) -> Optional[float]:
@@ -156,3 +170,128 @@ async def recompute(pt, user, db, quote_source: str = "yfinance") -> dict:
     await db.commit()
     await db.refresh(pt)
     return result
+
+
+# ── Expiry settlement ──────────────────────────────────────────────────────────
+# At expiry a short-premium income trade settles to INTRINSIC value: each short leg that
+# finished in-the-money is a cash liability (its intrinsic), each long leg in-the-money is a
+# cash asset. Realized P&L = entry credit − net intrinsic liability. If everything expired OTM
+# the intrinsic is 0 → the full premium collected is the profit. (User's rule, generalized to
+# spreads / condors so the short and long wings net correctly, capped by width.)
+
+def intrinsic_settlement(legs: list[dict], contracts: int, close_price: float) -> dict:
+    """PURE — the net intrinsic liability of the option structure at expiry, given the closing
+    stock price. `net_liability_per_share` > 0 means the structure finished against you (ITM);
+    `settlement_cost` is that liability in dollars (× 100 × contracts)."""
+    S = float(close_price)
+    mult = CONTRACT_MULTIPLIER * (contracts or 1)
+    net_liab_ps = 0.0   # per share: + = you owe (short ITM), − = you're owed (long ITM)
+    detail: list[dict] = []
+    for l in legs or []:
+        strike = l.get("strike")
+        typ = str(l.get("type", "")).upper()
+        act = str(l.get("action", "")).upper()
+        if strike is None or not (typ.startswith("C") or typ.startswith("P")):
+            continue   # skip non-option / stock legs — they don't expire to intrinsic
+        K = float(strike)
+        is_call = typ.startswith("C")
+        intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
+        is_short = "SELL" in act
+        net_liab_ps += intrinsic if is_short else -intrinsic
+        detail.append({
+            "strike": K, "right": "C" if is_call else "P",
+            "action": "SELL" if is_short else "BUY",
+            "intrinsic_per_share": round(intrinsic, 4),
+            "itm": intrinsic > 1e-9,
+        })
+    return {
+        "close_price": round(S, 4),
+        "net_liability_per_share": round(net_liab_ps, 4),
+        "settlement_cost": round(net_liab_ps * mult, 2),   # $ it costs to settle (≈ what you owe)
+        "itm": net_liab_ps > 1e-9,                          # structure finished against you
+        "legs": detail,
+    }
+
+
+async def _fetch_expiry_close(ticker: str, exp: dt.date) -> Optional[float]:
+    """The daily CLOSE on the expiration date (the settlement print). Falls back to the last close
+    on/just before expiry if the exact day is missing. Runs off-thread; None on any failure."""
+    def _fetch():
+        import yfinance as yf
+        start = (exp - dt.timedelta(days=6)).isoformat()
+        end = (exp + dt.timedelta(days=2)).isoformat()
+        h = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
+        if h is None or h.empty:
+            return None
+        h = h[[d <= exp for d in h.index.date]]   # up to and including expiry
+        if h.empty:
+            return None
+        return float(h["Close"].iloc[-1])
+    try:
+        return await asyncio.to_thread(_fetch)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("expiry close fetch failed for %s @ %s: %s", ticker, exp, exc)
+        return None
+
+
+async def settle_expiry(pt, db, close_memo: Optional[dict] = None, commit: bool = True) -> dict:
+    """Settle an EXPIRED paper trade to intrinsic value → status 'expired', realized P&L banked.
+    Fetches the expiry-date close (memoized per ticker+expiry across a batch). Raises if the close
+    can't be fetched (caller leaves the trade open to retry). Returns the settlement summary."""
+    exp = expiry_date(pt.expiration)
+    if exp is None:
+        raise RuntimeError(f"paper trade {pt.id} has no parseable expiration")
+    key = (pt.ticker, pt.expiration)
+    S: Optional[float]
+    if close_memo is not None and key in close_memo:
+        S = close_memo[key]
+    else:
+        S = await _fetch_expiry_close(pt.ticker, exp)
+        if close_memo is not None:
+            close_memo[key] = S
+    if S is None:
+        raise RuntimeError(f"no expiry close for {pt.ticker} on {pt.expiration}")
+
+    legs = json.loads(pt.legs) if pt.legs else []
+    st = intrinsic_settlement(legs, pt.contracts or 1, S)
+    entry_credit = pt.entry_credit or 0.0
+    realized = round(entry_credit - st["settlement_cost"], 2)
+    itm = st["itm"]
+    now = dt.datetime.now(dt.timezone.utc)
+
+    summary = {
+        "matched": False,          # no live desk score for an expired chain
+        "settled": True, "expired": True, "status": "expired",
+        "itm": itm, "close_price": st["close_price"],
+        "settlement_cost": st["settlement_cost"], "realized_pnl": realized,
+        "legs_settlement": st["legs"],
+        "pnl": {
+            "cost_basis": entry_credit, "current_value": st["settlement_cost"],
+            "unrealized_pnl": realized, "realized_pnl": realized,
+            "unrealized_pct": (round(realized / abs(entry_credit) * 100.0, 2) if entry_credit else None),
+            "current_spot": st["close_price"], "entry_spot": pt.entry_spot,
+            "spot_change_pct": (round((st["close_price"] - pt.entry_spot) / pt.entry_spot * 100.0, 2)
+                                if pt.entry_spot else None),
+            "dte_remaining": 0, "contracts": pt.contracts or 1,
+        },
+    }
+
+    pt.status = "expired"
+    pt.closed_at = now
+    pt.close_pnl = realized
+    pt.close_note = (
+        f"Expired {'in-the-money' if itm else 'out-of-the-money'} — settled at ${st['close_price']:.2f} close"
+        + (f"; intrinsic ${st['net_liability_per_share']:.2f}/sh → −${st['settlement_cost']:,.0f} vs "
+           f"${entry_credit:,.0f} credit" if itm else "; full premium kept")
+    )
+    pt.last_pnl = realized
+    pt.last_spot = st["close_price"]
+    pt.last_value_per_share = st["net_liability_per_share"]
+    pt.last_desk_score = None
+    pt.last_algo_grade = None
+    pt.last_eval = json.dumps(summary, default=str)
+    pt.last_eval_at = now
+    if commit:
+        await db.commit()
+        await db.refresh(pt)
+    return summary

@@ -18,7 +18,7 @@ import {
 import { Line, Bar } from 'react-chartjs-2';
 import { TechnicalData } from '../types';
 import { SmartMoneyChartOverlay } from './SmartMoneyChartOverlay';
-import { InstitutionalTA, MarketStateBanner } from './InstitutionalTA';
+import { InstitutionalTA } from './InstitutionalTA';
 import MicrostructurePanel from './MicrostructurePanel';
 import MarketStructurePanel from './MarketStructurePanel';
 import RegimePanel from './RegimePanel';
@@ -28,6 +28,8 @@ import TradeSetupCards from './TradeSetupCards';
 import ChartPatternsPanel from './ChartPatternsPanel';
 import { SectionIntro } from './taUi';
 import UnifiedTAWorkspace from './UnifiedTAWorkspace';
+import VolumePanel from './VolumePanel';
+import RegimeEdgePanel from './RegimeEdgePanel';
 import type { TradeSetupsData } from '../types';
 
 ChartJS.register(
@@ -612,12 +614,8 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
           </div>
         )}
 
-        {/* Market Regime Banner (Common) */}
-        {technical.institutional && (
-          <div className="mb-2">
-            <MarketStateBanner regime={technical.institutional.regime} />
-          </div>
-        )}
+        {/* Regime read lives in the Advanced tab (Regime method, with Hurst/ER) and the Setups hero —
+            removed here to avoid a third, duplicate regime banner. */}
 
         <div className="bg-base-300 rounded-xl mb-4 overflow-hidden shadow-xl border border-white/[0.05]">
           <div className="px-4 py-3 border-b border-white/[0.05] bg-gradient-to-r from-base-200/50 to-transparent flex flex-wrap justify-between items-center gap-4">
@@ -957,6 +955,8 @@ export const TechnicalAnalysis: React.FC<TechnicalAnalysisProps> = ({ technical:
               The institutional reads the setups are built from, on one candlestick chart. Switch the timeframe (15m · 1H · 1D · 1W), open a method, and toggle its levels onto the chart — or use a preset. Open a single method below for its full read.
             </SectionIntro>
             <UnifiedTAWorkspace ticker={ticker} spot={spot} confluenceZones={setups?.confluence_zones} />
+            <VolumePanel ticker={ticker} />
+            <RegimeEdgePanel ticker={ticker} />
             <details className="group rounded-xl border border-white/[0.05] bg-base-300/40">
               <summary className="cursor-pointer list-none px-4 py-2.5 flex items-center gap-2 text-sm font-semibold text-base-content/70 hover:text-base-content">
                 <ChevronRight className="w-4 h-4 shrink-0 transition-transform group-open:rotate-90" /> Study one method in depth

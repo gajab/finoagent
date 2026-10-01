@@ -28,6 +28,8 @@ Design notes
 from __future__ import annotations
 
 import math
+import re
+from datetime import date
 from typing import Optional
 
 import numpy as np
@@ -396,7 +398,8 @@ def _kelly_fraction(rets: np.ndarray, w: np.ndarray) -> Optional[float]:
 
 def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_loss,
                       max_profit, kelly, dte_days: int, sofr_pct: float = 5.0,
-                      income_mode: bool = False, buffer_mode: bool = False) -> dict:
+                      income_mode: bool = False, buffer_mode: bool = False,
+                      upside_cap_pct: Optional[float] = None) -> dict:
     """Deterministic entry recommendation from the whole payoff distribution.
 
     ``income_mode`` RE-ANCHORS the blend for premium-income selling — the goal there is a SAFE trade that
@@ -446,8 +449,14 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
         s_pop = clamp(((pop or 0) - 55.0) / (90.0 - 55.0)) if pop is not None else 0.5         # decent odds of a gain
         s_sortino = clamp((sortino or 0) / 1.5) if sortino is not None else 0.5
         s_tail = clamp(1.0 - tail_frac / 0.50)                                                 # PROTECTION is the point
-        s_carry = clamp(((exp_ret or 0)) / 8.0 + 0.5)                                          # participation vs 0, not cash
-        wts = {"edge": 0.20, "pop": 0.28, "sortino": 0.15, "tail": 0.27, "carry": 0.10}
+        # Participation: a dual-direction buffer must KEEP real upside. When the achieved
+        # upside cap is known, score participation off it (a good cap ≈ 12%+); a collapsed
+        # cap ⇒ it's no longer "dual direction" and this lens must tank. Fall back to E[ret].
+        if upside_cap_pct is not None:
+            s_carry = clamp(upside_cap_pct / 12.0)
+        else:
+            s_carry = clamp(((exp_ret or 0)) / 8.0 + 0.5)
+        wts = {"edge": 0.18, "pop": 0.25, "sortino": 0.13, "tail": 0.26, "carry": 0.18}
     else:
         s_edge = clamp(((omega or 0) - 0.8) / (2.0 - 0.8)) if omega is not None else 0.4
         s_pop = clamp(((pop or 0) - 50.0) / (90.0 - 50.0)) if pop is not None else 0.4
@@ -471,6 +480,8 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
         reasons.append(f"{label} {tail_frac*100:.0f}% of capital (expected shortfall, not deep tail)")
     if income_mode and prem_ann is not None:
         reasons.append(f"premium yield {prem_ann:.1f}%/yr vs {sofr_pct:.1f}% cash (the income alpha)")
+    elif buffer_mode and upside_cap_pct is not None:
+        reasons.append(f"upside participation to a {upside_cap_pct:.1f}% cap")
     elif buffer_mode and exp_ret is not None:
         reasons.append(f"expected participation {exp_ret:+.1f}% (protected — judged vs 0, not the cash hurdle)")
     elif exp_ret is not None:
@@ -478,13 +489,48 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
     if kelly is not None:
         reasons.append(f"Kelly {kelly*100:.0f}%")
 
+    # Hard gate: a "dual-direction buffer" whose upside cap has collapsed (<2%) is no
+    # longer dual-direction — never let it read ENTER no matter how strong the protection.
+    if buffer_mode and upside_cap_pct is not None and upside_cap_pct < 2.0:
+        score = min(score, 44)
+        reasons.append(f"upside cap collapsed to {upside_cap_pct:.1f}% — not a genuine dual-direction buffer")
+
     if score >= 66:
         verdict, tone = "ENTER", "good"
     elif score >= 45:
         verdict, tone = "CONSIDER", "warn"
     else:
         verdict, tone = "AVOID", "bad"
+
+    # Per-lens breakdown (label · sub-score · weight · weighted contribution · metric-carrying note) so the
+    # ENTRY base quality is as auditable as the management base — NOT a black box. The note leads with THIS
+    # trade's measured metric (the UI shows it inline); the generic meaning follows the em-dash (on hover).
+    # Σ(contribution) == score by construction, so the lenses reconcile to the base.
+    _carry_note = (f"premium yield {prem_ann:.1f}%/yr vs {sofr_pct:.1f}% cash — the income alpha over the cash hurdle"
+                   if (income_mode and prem_ann is not None)
+                   else f"expected participation {exp_ret:+.1f}% — protected return, judged vs 0 not the cash hurdle"
+                   if (buffer_mode and exp_ret is not None)
+                   else f"exp. return {exp_ret:+.1f}% vs {hurdle:.1f}% hurdle — carry over the risk-free rate"
+                   if exp_ret is not None else "premium yield vs the cash hurdle — the income alpha you harvest")
+    _lens_spec = [
+        ("Safety",   s_pop,     wts["pop"],
+         (f"PoP {pop:.0f}% — probability you keep the FULL premium (the short expires OTM)" if pop is not None
+          else "probability you keep the full premium — the short expires OTM")),
+        ("Income",   s_carry,   wts["carry"], _carry_note),
+        ("Edge",     s_edge,    wts["edge"],
+         (f"Omega {omega:.2f} — probability-weighted gains ÷ losses (≥1 = you keep more than you risk)" if omega is not None
+          else "Omega — probability-weighted gains vs losses (≥1 = edge)")),
+        ("Tail",     s_tail,    wts["tail"],
+         (f"CVaR95 {abs(tail_frac)*100:.0f}% of capital — the contained expected shortfall, not the deep worst case"
+          if (capital and cvar95 is not None) else "expected shortfall (CVaR) vs capital — how contained the left tail is")),
+        ("Risk-adj", s_sortino, wts["sortino"],
+         (f"Sortino {sortino:.2f} — reward per unit of downside deviation" if sortino is not None
+          else "Sortino — reward per unit of downside deviation")),
+    ]
+    lenses = [{"label": lbl, "score": round(s * 100), "weight": round(wt * 100),
+               "contribution": round(s * wt * 100, 1), "note": note} for lbl, s, wt, note in _lens_spec]
     return {"verdict": verdict, "tone": tone, "score": score, "reasons": reasons,
+            "lenses": lenses,
             "subscores": {"edge": round(s_edge*100), "pop": round(s_pop*100),
                           "sortino": round(s_sortino*100), "tail": round(s_tail*100),
                           "carry": round(s_carry*100)}}
@@ -807,6 +853,57 @@ _MGMT_FACTOR_POLICY: dict = {
 }
 
 
+def _mgmt_factor_data(label: str, adj: dict, cushion_pct: Optional[float],
+                      next_earnings: Optional[str] = None) -> str:
+    """A concise, trade-specific DATA value for a management factor row — the number the UI shows
+    BEFORE the em-dash (the holder help follows it, on hover). Pulls the RIGHT datum per factor from
+    the scan's own evidence (cushion %/σ, IV vs HV, bid/ask width, earnings date), so every row
+    carries a number rather than a generic sentence."""
+    detail = (adj.get("detail") or "").strip()
+    lead = detail.split(" — ")[0].split("; ")[0].strip() if detail else ""
+
+    if label == "Moneyness":
+        # % cushion from spot to the short strike (+ the σ multiple the scan already measured).
+        bits = []
+        if cushion_pct is not None:
+            bits.append(f"{cushion_pct:.1f}% cushion")
+        m = re.search(r"([\d.]+)\s*σ", detail)
+        if m:
+            bits.append(f"{m.group(1)}σ from spot")
+        if bits:
+            return " · ".join(bits)
+        return lead
+
+    if label == "VRP":
+        # implied-vs-realized — the whole point of "vol decay / premium".
+        m = re.search(r"IV/HV\s*([\d.]+)", detail)
+        if m:
+            return f"IV/HV {m.group(1)}× (implied vs realized)"
+        m = re.search(r"implied\s*(\d+)%\s*of\s*realized", detail)
+        if m:
+            return f"implied {m.group(1)}% of realized vol"
+        return lead
+
+    if label == "Earnings timing":
+        # the actual print date + how many days out — a binary event you hold through.
+        when = ""
+        if next_earnings:
+            try:
+                ed = date.fromisoformat(next_earnings)
+                days = (ed - date.today()).days
+                when = f"earnings {ed.strftime('%b %-d')}" + (f" · in {days}d" if days >= 0 else "")
+            except (ValueError, TypeError):
+                when = ""
+        if when:
+            return when
+        m = re.search(r"earnings in (\d+)d", detail)     # scan fallback ("earnings in 5d …")
+        if m:
+            return f"earnings in {m.group(1)}d"
+        return lead
+
+    return lead                      # Liquidity (spread %), Term structure (vp), Expectation, … lead with their own number
+
+
 def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct: Optional[float],
                           subscores: Optional[dict], grade_adjustments: Optional[list],
                           ta_factors: Optional[list], captured_pct: Optional[float],
@@ -816,7 +913,8 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
                           omega: Optional[float] = None, sortino: Optional[float] = None,
                           cvar95: Optional[float] = None, capital: Optional[float] = None,
                           net_gamma: Optional[float] = None, net_vega: Optional[float] = None,
-                          net_theta: Optional[float] = None) -> dict:
+                          net_theta: Optional[float] = None,
+                          next_earnings: Optional[str] = None) -> dict:
     """The DEEP management read for a trade you ALREADY hold — "given I'm in, is what's
     LEFT worth the risk?" Not enter-vs-skip; hold-vs-close (STRONG_HOLD / HOLD / CLOSE /
     STRONG_CLOSE).
@@ -866,16 +964,22 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
         pol = _MGMT_FACTOR_POLICY.get(label)
         if pol is None:
             continue
-        w, note = pol
+        w, help_note = pol
         pts = round(float(a.get("points", 0) or 0) * w)
         if pts == 0:
             continue
         if label == "VRP":
             disp = "Vol decay" if pts > 0 else "Vol premium"
-            note = ("cheap / falling implied vol — your shorts are decaying and cheap to buy back" if pts > 0
-                    else "rich implied still in your shorts — more premium to collect, but a vol spike would hurt")
+            help_note = ("your shorts are decaying and cheap to buy back" if pts > 0
+                         else "rich implied still in your shorts — more premium to collect, but a vol spike would hurt")
         else:
             disp = label   # Liquidity, Moneyness, Earnings timing, Expectation keep their own names
+        # The note is this trade's MEASURED value only (cushion %/σ, bid/ask width, IV vs HV, earnings
+        # date) — shown inline in front of the factor name. The generic "what this factor means" help is
+        # a static glossary on the frontend (the hover), NOT trade data. Fall back to the policy help
+        # only when the scan carries no number for this factor.
+        data = _mgmt_factor_data(label, a, cushion_pct, next_earnings)
+        note = data if data else help_note
         contribs.append({"label": disp, "pts": pts, "favorable": pts > 0, "note": note})
 
     # Dynamic greeks — the CONVEXITY the static score misses. Short gamma tightening into
@@ -953,7 +1057,7 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
 
 def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_profit,
                              avg_iv, dte_days, stock_shares=0.0, r=0.05, sofr_pct=5.0,
-                             realized_vol=None, strategy_type="") -> dict:
+                             realized_vol=None, strategy_type="", upside_cap_pct=None) -> dict:
     """Full desk read for a PROPOSED trade: Trader Greeks + PM ratios + position
     VaR/CVaR + the algorithmic Quant recommendation. `avg_iv` (implied) is decimal (0 = unknown).
 
@@ -1005,7 +1109,8 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
     _buffer = ("buffer" in _st or "dual_direction" in _st or "hedge" in _st)
     _income = ("income" in _st) or (not _st)   # blank = the income-desk default (back-compat)
     quant = algorithmic_quant(pm, tail_cvar, capital, max_loss, max_profit, kelly, dte_days, sofr_pct,
-                              income_mode=(_income and not _buffer), buffer_mode=_buffer)
+                              income_mode=(_income and not _buffer), buffer_mode=_buffer,
+                              upside_cap_pct=(upside_cap_pct if _buffer else None))
     vrp_ratio = (implied / realized) if (implied and realized) else None   # < 1 = negative VRP
     return {
         "trader": {**trader, "avg_iv_pct": round(avg_iv * 100, 1) if (avg_iv and avg_iv > 0) else None},

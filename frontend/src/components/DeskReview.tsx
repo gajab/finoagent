@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Gauge, Loader2, AlertTriangle, Cpu, Shield, Briefcase, ChevronDown, ChevronUp,
   Play, Terminal, Maximize2, X, MessageSquare, MessageCircle, Newspaper, Activity, LineChart, Layers, Zap, Sparkles, Check, Network, GitCompare,
@@ -85,23 +86,86 @@ function SubBar({ label, v, hint }: { label: string; v: number; hint?: string })
 
 // A SIGNED adjustment cell centred at zero: green extends right (+), red left (−). Bounded + valued
 // so magnitude and where each metric starts are both unambiguous.
-function AdjBar({ label, v }: { label: string; v: number }) {
-  const MAX = 12;                                   // largest single-factor magnitude
-  const mag = (Math.min(Math.abs(v), MAX) / MAX) * 50;
-  const pos = v >= 0;
+const fsgn = (n: number) => `${n > 0 ? '+' : ''}${n}`;
+
+/**
+ * HelpTip — a reliable hover tooltip that renders through a PORTAL to document.body, so it is never
+ * clipped by a truncating span or an `overflow-hidden` ancestor (the reason the native `title` and a
+ * plain CSS tooltip both failed here). The trigger shows a dotted-underline affordance; hovering it
+ * pops the help instantly, positioned in fixed coordinates next to the trigger and clamped on-screen.
+ */
+export function HelpTip({ tip, children, className = '' }: { tip?: string; children: React.ReactNode; className?: string }) {
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const show = (e: React.MouseEvent) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setPos({ x: r.left, y: r.bottom });
+  };
   return (
-    <div className={`flex-1 min-w-[82px] rounded-md border px-2 py-1.5 ${v === 0 ? 'border-white/[0.06] bg-base-200/30' : pos ? 'border-success/25 bg-success/[0.05]' : 'border-error/25 bg-error/[0.05]'}`}>
-      <div className="flex justify-between items-baseline mb-1.5">
-        <span className="text-[10px] text-base-content/55">{label}</span>
-        <span className={`text-[11px] font-mono font-semibold ${v > 0 ? 'text-success' : v < 0 ? 'text-error' : 'text-base-content/40'}`}>{v > 0 ? '+' : ''}{v}</span>
-      </div>
-      <div className="relative h-2 rounded-full bg-base-300/50 overflow-hidden">
-        <div className="absolute left-1/2 top-0 h-full w-px bg-base-content/35 z-10" />
-        {v !== 0 && (
-          <div className={`absolute top-0 h-full ${pos ? 'bg-success' : 'bg-error'}`}
-            style={pos ? { left: '50%', width: `${mag}%` } : { right: '50%', width: `${mag}%` }} />
-        )}
-      </div>
+    <>
+      <span onMouseEnter={show} onMouseLeave={() => setPos(null)}
+        className={`cursor-help underline decoration-dotted decoration-base-content/30 underline-offset-2 hover:decoration-base-content/70 hover:text-base-content ${className}`}>
+        {children}
+      </span>
+      {pos && tip && createPortal(
+        <div style={{ position: 'fixed', left: Math.max(8, Math.min(pos.x, window.innerWidth - 288)),
+                      top: Math.min(pos.y + 5, window.innerHeight - 96), zIndex: 9999, maxWidth: 280 }}
+          className="pointer-events-none rounded-lg bg-base-100 border border-white/15 shadow-2xl px-2.5 py-1.5 text-[11px] leading-snug text-base-content/90">
+          {tip}
+        </div>, document.body)}
+    </>
+  );
+}
+
+/**
+ * FACTOR_GLOSSARY — the GENERIC meaning of each factor (what it measures), shown on the name's hover.
+ * This is reference text, NOT this trade's numbers — the trade-specific value is shown inline instead.
+ * Keyed by the label as rendered (incl. the holder relabels Vol decay / Vol premium).
+ */
+const FACTOR_GLOSSARY: Record<string, string> = {
+  'Breach risk': 'Probability the underlying TOUCHES your short strike before expiry — the core assignment risk of a short-premium trade.',
+  'Moneyness': 'How far out-of-the-money your short strike sits, as a % of spot and in σ. More distance = more cushion = safer to hold.',
+  'Vol decay': 'Implied vs realized vol on your shorts. Cheap / falling implied means the options you are short decay in your favor and are cheap to buy back.',
+  'Vol premium': 'Implied vs realized vol on your shorts. Rich implied is premium still to collect — but a volatility spike would hurt a short.',
+  'VRP': 'Volatility risk premium — implied vs realized vol. Positive means you are paid to be short.',
+  'Skew / IV-edge': 'Whether strike skew prices your short/wing richly or cheaply relative to the rest of the curve.',
+  'Term structure': 'Contango (front cheaper than back → the short rolls DOWN the curve, favorable carry) vs backwardation (event-inverted, a caution).',
+  'Structure': 'Whether your short strike is DEFENDED — sitting behind a gamma / volume wall with a σ-sized buffer, not exposed in open air.',
+  'LVN slip': 'A low-volume node near price — a thin shelf where price can slip through quickly with little resistance.',
+  'Value area': 'Where your strike sits vs the volume Value Area (the price band the market has accepted). Outside = extended.',
+  'Gamma regime': 'Dealer gamma positioning: positive gamma pins / damps moves, negative gamma accelerates them (whippy tape).',
+  'Trend drift': 'The underlying’s trend velocity (EMA slope) vs your position — is drift pushing toward or away from your short?',
+  'Range fit': 'Whether the tape is ranging (good for selling premium) or trending (pressures a short).',
+  'Calm tape': 'How calm and orderly recent price action is — jumpy tape raises the odds of a breach.',
+  'Systemic beta': 'Your position’s sensitivity to the broad market (SPX) — the systemic risk you can’t diversify away.',
+  'Beta': 'Market (SPX) sensitivity of the position — how much it moves with the index.',
+  'Tail': 'Severity of the worst-case loss (the fat left tail), beyond the everyday move.',
+  'Undefined risk': 'A short with no protective wing on its risk side — the max loss is unbounded until you cap or close it.',
+  'Naked risk': 'An uncovered short: loss is unbounded on the risk side with no stock or wing behind it. Size small and defend a tested strike.',
+  'Earnings timing': 'An earnings print lands before expiry — a binary gap you now hold through; the fat premium is event compensation, not free decay.',
+  'Earnings gap': 'Size of the expected earnings move versus your strike distance.',
+  'Liquidity': 'Bid/ask width on your legs — the friction (cost) to ROLL or CLOSE if you have to act.',
+  'Defensibility': 'How cheaply and cleanly the position can be defended (rolled, spread or hedged) if it is tested.',
+  'Convexity (short Γ)': 'Short gamma near expiry: delta flips fast around your strike, so small moves swing P&L hard — the dynamic cost of holding a winner.',
+  'Expectation': 'The risk-neutral expected value of what’s LEFT in the trade — a losing expectation at high keep-prob is the remote tail, not the base case.',
+};
+
+/**
+ * FactorLine — the ONE factor row used everywhere Quant Analysis shows a factor breakdown
+ * (scan · Evaluate · My-Trades entry AND the holder Manage view). One row:
+ *   NAME (hover = the GENERIC glossary: what this factor measures) · this trade's DATA (full, inline) · POINTS
+ * The trade-specific detail is shown IN FRONT of the name; hover is help to understand the factor,
+ * never the trade's numbers. Replaces the old diverging green/red magnitude bars.
+ */
+export function FactorLine({ label, pts, note, badge }:
+  { label: string; pts: number; note?: string; badge?: React.ReactNode }) {
+  const data = (note || '').trim();                 // FULL trade-specific detail — shown inline
+  const gloss = FACTOR_GLOSSARY[label];             // GENERIC meaning — on hover only
+  const tip = gloss ? `${label} — ${gloss}` : label;
+  return (
+    <div className="flex items-baseline gap-2 text-[11px] leading-snug py-1 border-b border-white/[0.04] hover:bg-base-100/20 transition-colors">
+      <HelpTip tip={tip} className="w-32 shrink-0 truncate font-medium text-base-content/85">{label}</HelpTip>
+      <span className="flex-1 min-w-0 text-base-content/65">{data}{badge}</span>
+      <span className={`w-8 shrink-0 text-right font-mono font-semibold tabular-nums ${pts >= 0 ? 'text-success' : 'text-error'}`}>{fsgn(pts)}</span>
     </div>
   );
 }
@@ -130,18 +194,26 @@ export function QpBoundary({ qp }: { qp: NonNullable<DeskRankedTrade['qp']> }) {
           </span>
         )}
       </div>
-      <div className="relative h-11 rounded-lg bg-base-300/25 border border-white/[0.06] overflow-hidden">
-        {phys > 0 && <div className="absolute inset-y-0 bg-warning/[0.16] border-x-2 border-warning/50"
+      <div className="relative h-12 rounded-lg bg-base-300/30 border border-white/[0.07] overflow-hidden">
+        {/* scale gridlines — subtle reference ticks so the bands read against a scale, not a void */}
+        {[10, 20, 30, 40, 60, 70, 80, 90].map(x => (
+          <div key={x} className="absolute inset-y-0 w-px bg-white/[0.035]" style={{ left: `${x}%` }} />
+        ))}
+        {/* physical (realized) P zone — softer, layered gradient that fades toward the boundary edges */}
+        {phys > 0 && <div className="absolute inset-y-0 bg-gradient-to-r from-warning/25 via-warning/[0.07] to-warning/25 border-x border-warning/45"
           style={{ left: `${50 - half(phys)}%`, width: `${2 * half(phys)}%` }} title={`physical (realized) ±${phys}%`} />}
-        {imp > 0 && <div className="absolute inset-y-2 rounded bg-info/[0.28] border-x-2 border-info/60"
+        {/* implied (market) Q zone — brighter, inset, layered top-down gradient + soft glow */}
+        {imp > 0 && <div className="absolute inset-y-[7px] rounded bg-gradient-to-b from-info/40 to-info/15 border-x-2 border-info/70 shadow-[0_0_12px_-2px] shadow-info/50"
           style={{ left: `${50 - half(imp)}%`, width: `${2 * half(imp)}%` }} title={`implied (market) ±${imp}%`} />}
-        <div className="absolute inset-y-0 left-1/2 w-px bg-base-content/45" />
-        <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[8px] uppercase tracking-wide text-base-content/50 bg-base-100/70 px-1 rounded">spot</span>
+        {/* SPOT — a sharp, bright marker line (the focal reference) */}
+        <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-[1.5px] bg-base-content/75 shadow-[0_0_6px_rgba(255,255,255,0.35)]" />
+        <span className="absolute top-0.5 left-1/2 -translate-x-1/2 text-[8px] uppercase tracking-wide font-semibold text-base-content/75 bg-base-100/85 px-1 rounded">spot</span>
+        {/* short-strike marker — sharp triangle on a hairline, tinted by exposure */}
         {dist > 0 && (
           <div className="absolute inset-y-0 -translate-x-1/2 flex flex-col items-center justify-end pb-0.5"
             style={{ left: `${Math.max(2, Math.min(98, 50 - half(dist)))}%` }} title={`short strike ${dist}% from spot`}>
-            <div className={`w-px flex-1 ${exposed ? 'bg-error/50' : 'bg-success/50'}`}></div>
-            <span className={`text-[11px] leading-none ${exposed ? 'text-error' : 'text-success'}`}>▲</span>
+            <div className={`w-[1.5px] flex-1 ${exposed ? 'bg-error/70' : 'bg-success/70'}`}></div>
+            <span className={`text-[11px] leading-none drop-shadow ${exposed ? 'text-error' : 'text-success'}`}>▲</span>
           </div>
         )}
       </div>
@@ -169,6 +241,66 @@ function GroupFoot({ label, value, signed = false }: { label: string; value: num
   return <div className={`text-right text-[10px] font-semibold mt-1 ${col}`}>{label} <span className="font-bold">{disp}</span></div>;
 }
 const GROUP_LABEL = 'text-[9px] uppercase tracking-wider text-base-content/40 mb-1';
+
+type QuantLens = { label: string; score: number; note?: string; weight?: number; contribution?: number };
+
+/**
+ * LensLine — ONE base-quality lens row, shared by the entry grade (scan · Evaluate · My-Trades entry)
+ * and the holder Manage view, so base quality reads the same everywhere:
+ *   NAME (hover = what it measures) · this trade's METRIC (inline) · score bar · ×weight = contribution
+ * The note splits at the em-dash: the measured metric before it is shown; the generic meaning follows,
+ * on the name's tooltip. When weight/contribution are absent it falls back to just the 0-100 score.
+ */
+export function LensLine({ label, score, note, weight, contribution }: QuantLens) {
+  const s = Math.max(0, Math.min(100, Math.round(score)));
+  const bar = s >= 66 ? 'bg-success' : s >= 40 ? 'bg-warning' : 'bg-error';
+  const tone = s >= 66 ? 'text-success' : s >= 40 ? 'text-warning' : 'text-error';
+  const m = (note || '').match(/^(.*?)\s[—–]\s(.*)$/);
+  const detail = m ? m[1].trim() : (note || '');
+  const gloss = m ? m[2].trim() : '';
+  return (
+    <div className="flex items-baseline gap-2 text-[11px] py-1 border-b border-white/[0.04] last:border-0">
+      <HelpTip tip={gloss ? `${label} — ${gloss}` : label} className="w-28 shrink-0 truncate font-medium text-base-content/85">{label}</HelpTip>
+      <span className="flex-1 min-w-0 truncate text-base-content/60">{detail}</span>
+      <div className="w-12 h-1.5 rounded-full bg-base-100/60 overflow-hidden shrink-0 self-center" title={`score ${s}/100`}>
+        <div className={`h-full ${bar} rounded-full`} style={{ width: `${s}%` }} />
+      </div>
+      {weight != null && contribution != null
+        ? <span className="font-mono text-[10px] tabular-nums w-[4.5rem] text-right text-base-content/55">×{weight}% = <b className={tone}>{contribution}</b></span>
+        : <span className={`font-mono text-[10px] tabular-nums w-8 text-right ${tone}`}>{s}</span>}
+    </div>
+  );
+}
+
+/**
+ * BaseQualityPanel — the auditable base-quality block used by BOTH the entry grade and the Manage view,
+ * so "base quality" is never a bare number (a black box). Renders the lens rows + a toned total with a
+ * progress bar. `base` is the weighted-lens total; Σ(contribution) reconciles to it.
+ */
+export function BaseQualityPanel({ lenses, base, intro }: { lenses: QuantLens[]; base: number; intro?: string }) {
+  if (!lenses || lenses.length === 0) return null;
+  const b = Math.round(base);
+  const bt = b >= 60 ? 'text-success' : b >= 45 ? 'text-warning' : 'text-error';
+  const bb = b >= 60 ? 'bg-success' : b >= 45 ? 'bg-warning' : 'bg-error';
+  return (
+    <div className="rounded-lg border border-secondary/20 bg-base-200/50 p-2.5">
+      <div className="flex items-baseline gap-2">
+        <span className="text-[10px] uppercase tracking-wider font-semibold text-secondary/80">Base quality</span>
+        <span className="text-[9px] text-base-content/45 ml-auto">metric · score bar · ×weight = pts</span>
+      </div>
+      {intro && <p className="text-[9.5px] text-base-content/55 leading-snug mt-0.5 mb-2">{intro} <span className="text-base-content/45">Hover a lens name for what it measures.</span></p>}
+      <div className={intro ? '' : 'mt-1'}>{lenses.map((l, i) => <LensLine key={i} {...l} />)}</div>
+      <div className="flex items-center gap-2 mt-2 pt-2 border-t border-white/[0.1]">
+        <span className="text-[10px] font-semibold text-base-content/75">Σ weighted lenses</span>
+        <div className="flex-1" />
+        <div className="w-24 h-1.5 rounded-full bg-base-100/60 overflow-hidden self-center shrink-0">
+          <div className={`h-full ${bb} rounded-full`} style={{ width: `${Math.max(0, Math.min(100, b))}%` }} />
+        </div>
+        <span className={`text-lg font-black tabular-nums leading-none ${bt}`}>{b}<span className="text-[10px] text-base-content/45 font-normal">/100 base</span></span>
+      </div>
+    </div>
+  );
+}
 
 // The QUANT ANALYSIS section on its own — base quality + option-math factor
 // adjustments + TA factors + the Q-vs-P boundary → desk score. Exported so the
@@ -291,41 +423,42 @@ type FactorItem = { label: string; points: number; detail?: string; baseline_poi
 // One DIMENSION group of factors — the bars for that dimension + each bar's inline evidence. Replaces the
 // old option-math / TA split so every contribution to one risk dimension (Loss probability, Vol edge, …)
 // reads together, whether it came from the option math or the technical read.
+/**
+ * DimensionHeader — one dimension's label + its ROLL-UP net, shown as the group headline. The net is
+ * the SUM of the group's factors, so it is the most prominent number in the group (a bold, tinted chip),
+ * never smaller than its own constituents. Shared by the entry FactorGroup and the Manage view.
+ */
+export function DimensionHeader({ dim, net, badge }: { dim: string; net: number; badge?: React.ReactNode }) {
+  const tone = net > 0 ? 'bg-success/15 text-success' : net < 0 ? 'bg-error/15 text-error' : 'bg-base-100/60 text-base-content/60';
+  return (
+    <div className="flex items-center gap-2 mb-1.5">
+      <span className="text-[10px] uppercase tracking-wider font-semibold text-base-content/60 shrink-0">{dim}</span>
+      {badge}
+      <div className="flex-1 h-px bg-white/[0.06]" />
+      <span className={`shrink-0 font-mono text-[13px] font-bold tabular-nums leading-none px-1.5 py-1 rounded ${tone}`}>{net > 0 ? '+' : ''}{net}</span>
+    </div>
+  );
+}
+
 function FactorGroup({ dim, factors }: { dim: string; factors: FactorItem[] }) {
   if (!factors.length) return null;
   const net = Math.round(factors.reduce((s, a) => s + a.points, 0) * 10) / 10;
-  const withDetail = factors.filter(a => a.detail);
   return (
-    <div className="mb-2">
-      <div className={GROUP_LABEL}>{dim}
-        {factors.some(a => a.earnings_impacted) && (
-          <span className="ml-2 badge badge-xs badge-warning badge-outline align-middle normal-case">earnings-aware</span>
-        )}
-        <span className={`ml-auto font-mono text-[10px] ${net > 0 ? 'text-success/80' : net < 0 ? 'text-error/80' : 'text-base-content/40'}`}>
-          {net > 0 ? '+' : ''}{net}
-        </span>
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {factors.map(a => <AdjBar key={a.label} label={a.label} v={a.points} />)}
-      </div>
-      {withDetail.length > 0 && (
-        <ul className="mt-1.5 space-y-1 border-t border-white/[0.06] pt-1.5">
-          {withDetail.map((a, i) => (
-            <li key={i} className="flex gap-2 text-[11px] leading-snug">
-              <span className={`font-mono font-semibold shrink-0 tabular-nums ${a.points >= 0 ? 'text-success' : 'text-error'}`}>{a.points > 0 ? '+' : ''}{a.points}</span>
-              <span className="text-base-content/65">
-                <b className="text-base-content/85">{a.label}</b>
-                {a.earnings_impacted && a.baseline_points != null && (
-                  <span className="ml-1 inline-flex items-baseline gap-1 rounded bg-warning/15 border border-warning/30 px-1 text-[9px] text-warning/90 align-middle whitespace-nowrap">
-                    earnings: <span className="line-through opacity-60">{a.baseline_points > 0 ? '+' : ''}{a.baseline_points}</span>→<b>{a.points > 0 ? '+' : ''}{a.points}</b>
-                  </span>
-                )}
-                {' · '}{a.detail}
+    <div className="mb-2.5">
+      <DimensionHeader dim={dim} net={net}
+        badge={factors.some(a => a.earnings_impacted)
+          ? <span className="badge badge-xs badge-warning badge-outline normal-case shrink-0">earnings-aware</span>
+          : undefined} />
+      <div>
+        {factors.map((a, i) => (
+          <FactorLine key={i} label={a.label} pts={a.points} note={a.detail}
+            badge={a.earnings_impacted && a.baseline_points != null ? (
+              <span className="ml-1.5 inline-flex items-baseline gap-1 rounded bg-warning/15 border border-warning/30 px-1 text-[9px] text-warning/90 align-middle whitespace-nowrap">
+                earn <span className="line-through opacity-60">{a.baseline_points > 0 ? '+' : ''}{a.baseline_points}</span>→<b>{a.points > 0 ? '+' : ''}{a.points}</b>
               </span>
-            </li>
-          ))}
-        </ul>
-      )}
+            ) : undefined} />
+        ))}
+      </div>
     </div>
   );
 }
@@ -430,8 +563,15 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
         );
       })()}
 
-      {/* 1) Base quality — bars, then the base score at the end */}
-      {sub && (
+      {/* 1) Base quality — the SAME auditable lens panel the Manage view uses (metric · score bar ·
+             ×weight = pts), so base quality reads identically on every surface and is never a black box.
+             Falls back to the legacy sub-bars only for older payloads without per-lens data. */}
+      {q?.lenses?.length ? (
+        <div className="mb-2.5">
+          <BaseQualityPanel lenses={q.lenses} base={base}
+            intro="Five quant lenses rate the payoff distribution 0–100; weighted together they set the base the factors below adjust." />
+        </div>
+      ) : sub ? (
         <div className="mb-2.5">
           <div className={GROUP_LABEL}>Base quality — payoff distribution</div>
           <div className="flex flex-wrap gap-2">
@@ -443,7 +583,7 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
           </div>
           <GroupFoot label="Base quality" value={base} />
         </div>
-      )}
+      ) : null}
 
       {/* 2) Factors grouped by DIMENSION — option-math + TA unified. Each factor is tagged with its risk
              dimension on the backend (_FACTOR_TAXONOMY), so all evidence for one dimension (Loss probability,
