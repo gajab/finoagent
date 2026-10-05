@@ -5,7 +5,7 @@ import {
   LineChart, TrendingUp, ShieldCheck, Loader2, Code2, Eye, FlaskConical, Clock, LogIn,
   CheckCircle2, AlertCircle, XCircle, Award, Rocket, Activity, Timer, History, ChevronsUpDown,
 } from 'lucide-react';
-import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg, QullamaggieData, ConnorsData, ConnorsBacktest } from '../types';
+import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg, QullamaggieData, ConnorsData, ConnorsBacktest, MomentumData } from '../types';
 
 // Push an option structure's legs into the Income-Desk → Evaluate tab (sessionStorage handoff).
 function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: string, navigate: (to: string) => void) {
@@ -20,7 +20,7 @@ function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: strin
 import { DirectionBadge, ConfidencePill, InfoTip } from './taUi';
 import IndicatorAIConsole from './IndicatorAIConsole';
 import PayoffDiagram from './PayoffDiagram';
-import { analyzeTa, verifySetup, trackTrade, fetchDayTradeSetups, fetchQullamaggieSetups, fetchConnorsSetups } from '../api';
+import { analyzeTa, verifySetup, trackTrade, fetchDayTradeSetups, fetchQullamaggieSetups, fetchConnorsSetups, fetchMomentumSetups } from '../api';
 
 const money = (n?: number | null) => (n == null ? '—' : `$${n.toFixed(2)}`);
 const pctFrom = (n?: number | null) => (n == null ? '—' : `${n > 0 ? '+' : ''}${n}%`);
@@ -555,6 +555,27 @@ function connorsPanel(d: ConnorsData): PanelData {
 ;
 }
 
+function momentumPanel(d: MomentumData): PanelData {
+  const q = d.qualification, m = d.metrics;
+  const tone = q.grade === 'A' ? 'good' : q.grade === 'B' ? 'info' : q.grade === 'C' ? 'warn' : 'neutral';
+  const gc = m.golden_cross?.above;
+  return {
+    Icon: TrendingUp, title: 'Momentum Swing', badge: `Grade ${q.grade}`, tone, score: q.score,
+    subBadge: q.is_candidate ? (q.entry_mode ? `${q.entry_mode} ready` : 'Candidate') : (q.gates?.uptrend ? 'No trigger' : 'Not a candidate'),
+    subBadgeGood: q.is_candidate, summary: q.summary,
+    stats: [
+      { label: 'from 52w-high', value: `${m.pct_from_52w_high ?? '—'}%` },
+      { label: 'RS vs SPY·1m', value: m.rs?.available ? `${m.rs.slope_1m ?? '—'}%${m.rs.new_high ? ' ·HI' : ''}` : 'n/a' },
+      { label: 'RSI', value: `${m.rsi ?? '—'}` },
+      { label: 'squeeze', value: m.bb_squeeze ? `yes·${m.bb_width_pctile}pct` : 'no' },
+      { label: 'golden×', value: gc ? 'yes' : 'no' },
+      { label: 'regime', value: m.regime?.label ?? '—' },
+    ],
+    checks: q.checks, execution: null, backtest: null,
+    footer: "Momentum Swing fuses the whole stack behind two HARD GATES — a Stage-2 uptrend (price>50-SMA>200-SMA, 200 rising) AND leadership (prior move / near 52w-high / outperforming SPY) — then scores 8 weighted pillars: trend & MA structure (golden cross, EMA stacks, Hurst), relative strength, volatility compression (Bollinger squeeze · ATR contraction · VCP base), MACD/RSI/ROC (RSI is continuation-aware), volume dry-up→expansion, demand/supply + POC/LVN + bull/bear FVG + BSL/SSL liquidity, regime (+ backtested regime-edge) and dealer gamma/walls. Entry auto-detects breakout / pullback / episodic pivot; stops & targets snap to real structure. Setups appear below when a trigger is live.",
+  };
+}
+
 type StyleKey = 'swing' | 'position' | 'day';
 const STYLE_TABS: { k: StyleKey; label: string; hint: string }[] = [
   { k: 'swing', label: 'Swing', hint: 'days–weeks' },
@@ -565,6 +586,7 @@ const STYLE_TABS: { k: StyleKey; label: string; hint: string }[] = [
 // named technical strategies live in the dropdown (extensible — add more here)
 interface NamedStrategy { key: string; label: string; hint: string; fetch: (t: string) => Promise<any>; toPanel: (d: any) => PanelData }
 const NAMED_STRATEGIES: NamedStrategy[] = [
+  { key: 'momentum', label: 'Momentum Swing', hint: 'multi-factor confluence', fetch: (t) => fetchMomentumSetups(t).then(r => r.momentum_setup), toPanel: momentumPanel },
   { key: 'qullamaggie', label: 'Qullamäggie', hint: 'momentum breakout', fetch: (t) => fetchQullamaggieSetups(t).then(r => r.qullamaggie_setup), toPanel: qmPanel },
   { key: 'connors_rsi2', label: 'Connors RSI-2', hint: 'mean reversion', fetch: (t) => fetchConnorsSetups(t).then(r => r.connors_setup), toPanel: connorsPanel },
 ];

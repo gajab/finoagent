@@ -26,6 +26,7 @@ from datetime import date, timedelta
 
 from . import bond_math as bm
 from . import bond_market_service as mkt
+from . import bond_income_service as inc
 from . import bond_portfolio_service as ps
 
 SPACING_MONTHS = {"annual": 12, "semiannual": 6, "quarterly": 3, "monthly": 1}
@@ -725,7 +726,7 @@ def fund_sale_profile(row: dict, profile: dict) -> dict:
     return {
         "id": row.get("id"), "label": row.get("label"), "ticker": row.get("ticker"), "account_type": acct,
         "value": mv, "yield": y, "cash_yield": cash, "accrual": y - cash,
-        "accumulates": fund.get("payout") == "accumulates",
+        "accumulates": fund.get("payout") == "accumulates", "non_usd": bool(fund.get("non_usd")),
         "duration": dur if dur is not None else 5.0,         # 0 is real (box / T-bill / floating-rate funds)
         "duration_estimated": dur is None or fund.get("duration_confidence") in (None, "low", "unverified"),
         "duration_source": fund.get("duration_source"),
@@ -1086,11 +1087,22 @@ def simulate_goal_funding(years: list[int], today: date, bond_inflow: dict[int, 
 
 
 async def plan_goals(holdings: list[dict], profile: dict, *, after_tax: bool = True, use_funds: bool = True,
-                     reinvest: bool = True, withdrawal_mode: str | None = None) -> dict:
+                     reinvest: bool = True, withdrawal_mode: str | None = None, light: bool = False,
+                     rate_shift: float = 0.0, ingredients: bool = False, fx_drift: float = 0.0) -> dict:
     """Goals vs cash, year by year. Individual bonds pay what they pay; bond ETFs/mutual funds pay
     distributions and (``use_funds``) are sold down in gap years; surplus years (``reinvest``) buy Treasuries
     maturing in later gap years; retirement-account withdrawals follow the 59½ rule (``withdrawal_mode``:
-    "age" with the profile's birth year, "before", or "after")."""
+    "age" with the profile's birth year, "before", or "after").
+
+    Scenario hooks (stress tests): the inflation path comes from ``profile`` (so pass a modified one), and
+    ``rate_shift`` moves interest rates with it — cash and future reinvestments earn that much more/less, and
+    open-ended funds take the price hit (−duration × shift) today and then yield the shift more. Bonds held
+    to maturity are untouched: that is exactly what "locking in" a rate means. ``fx_drift`` is how much faster
+    (or slower) the dollar loses value than expected: non-dollar bond funds gain that much a year in dollars
+    (purchasing-power parity) and don't feel US rate moves. ``light`` skips the
+    lever-comparison and claiming-age extras (for running many scenarios). ``ingredients`` returns the
+    plan's inputs (needs, income, each holding's after-tax cash by year, fund profiles, rates) instead of
+    solving — the whole-book rebalancer optimizes over exactly these."""
     today = mkt.us_today()
     goals = (profile or {}).get("goals") or []
     settings = (profile or {}).get("settings") or {}
@@ -1126,24 +1138,35 @@ async def plan_goals(holdings: list[dict], profile: dict, *, after_tax: bool = T
     open_ids = {r["id"] for r in open_funds}
     book_value = sum(r.get("market_value") or 0.0 for r in rows_h if r["status"] == "held" and not r.get("matured"))
     ordinary_in = lambda yr: sched.at(yr).fed + sched.at(yr).state   # noqa: E731 — lower once retired
-    r_bill = bm.interp(npts, 1.0) or 0.03
+    r_bill = max(0.0, (bm.interp(npts, 1.0) or 0.03) + rate_shift)
     bond_inflow: dict[int, float] = {}
     bond_tax: dict[int, float] = {}
     bond_early: dict[int, float] = {}
     held_back = {"traditional": 0.0, "roth": 0.0}      # retirement cash kept in the account until 59½ ("age")
-    for e in sorted(cash.get("events", []), key=lambda e: e["date"]):
-        if e["holding_id"] in open_ids:
-            continue
+    by_h: dict[int, dict[int, float]] = {}             # each holding's after-tax cash by year (same amounts)
+    held_h: dict[int, dict[str, float]] = {}
+    prov: dict[int, float] = {}                         # portfolio income that counts toward Social Security's
+    for e in sorted(cash.get("events", []), key=lambda e: e["date"]):      # "provisional income" test
         acct = (by_id.get(e["holding_id"], {}).get("account_type") or "taxable").lower()
         y = int(e["date"][:4])
+        if acct not in SHELTERED and e["type"] in ("coupon", "distribution"):
+            prov[y] = prov.get(y, 0.0) + e["amount"]                # taxable AND tax-exempt interest both count
+        if e["holding_id"] in open_ids:
+            continue
         if lock_early and _is_retirement(acct) and _is_early(y, early_until) and e["type"] != "tax":
-            # stays inside the IRA/Roth (pre-tax), earning ~T-bill rates until the penalty-free year
-            grow = (1 + r_bill) ** max(0.0, early_until + 1 - y - 0.5)
+            # stays inside the IRA/Roth (pre-tax) until the penalty-free year — rolled into a Treasury maturing then
+            # (what you'd actually do when a bond matures in an account you can't tap yet), not left in T-bills
+            wait = max(0.0, early_until + 1 - y - 0.5)
+            grow = (1 + max(0.0, (bm.interp(npts, max(0.25, wait)) or r_bill) + rate_shift)) ** wait
             held_back["traditional" if acct in TRADITIONAL else "roth"] += e["amount"] * grow
+            hb = held_h.setdefault(e["holding_id"], {"traditional": 0.0, "roth": 0.0})
+            hb["traditional" if acct in TRADITIONAL else "roth"] += e["amount"] * grow
             continue
         early = after_tax and _is_early(y, early_until)
         ordinary = ordinary_in(y)
         extra = 0.0
+        if acct in TRADITIONAL and e["type"] != "tax":
+            prov[y] = prov.get(y, 0.0) + e["amount"]                # IRA/401k cash spent = a taxable withdrawal
         if not after_tax:
             amt = e["amount"]
         elif acct in TRADITIONAL:
@@ -1161,6 +1184,8 @@ async def plan_goals(holdings: list[dict], profile: dict, *, after_tax: bool = T
         else:
             amt = e["after_tax"]
         bond_inflow[y] = bond_inflow.get(y, 0.0) + amt
+        hy = by_h.setdefault(e["holding_id"], {})
+        hy[y] = hy.get(y, 0.0) + amt
         bond_tax[y] = bond_tax.get(y, 0.0) + (e["amount"] - amt)       # interest/gain/phantom tax, IRA income tax, penalties
         if extra:
             bond_early[y] = bond_early.get(y, 0.0) + extra
@@ -1169,67 +1194,157 @@ async def plan_goals(holdings: list[dict], profile: dict, *, after_tax: bool = T
     if lock_early and (held_back["traditional"] or held_back["roth"]) and released_year <= years[-1]:
         released = held_back["traditional"] * ((1 - ordinary_in(released_year)) if after_tax else 1.0) + held_back["roth"]
         bond_inflow[released_year] = bond_inflow.get(released_year, 0.0) + released
+        prov[released_year] = prov.get(released_year, 0.0) + held_back["traditional"]
+        for hid, hb in held_h.items():
+            hy = by_h.setdefault(hid, {})
+            hy[released_year] = hy.get(released_year, 0.0) + hb["traditional"] * ((1 - ordinary_in(released_year)) if after_tax else 1.0) + hb["roth"]
         if after_tax:
             bond_tax[released_year] = bond_tax.get(released_year, 0.0) + held_back["traditional"] * ordinary_in(released_year)
     needs = _goal_needs(goals, infl, today, today.year + n_years)
     need = {y: sum(x["nominal"] for x in v) for y, v in needs.items()}
+    # Social Security (you + spouse) and other income: net of tax, added to each year's cash
+    def income_for(claim_age: float | None = None) -> dict:
+        return inc.household_income(settings, years, today, infl, tax_at=sched.at, after_tax=after_tax,
+                                    other_taxable_income=prov, filing_status=(profile or {}).get("filing_status"),
+                                    claim_age_override=claim_age)
+
+    def cash_with(income_: dict) -> dict[int, float]:
+        return {y: bond_inflow.get(y, 0.0) + income_["net"].get(y, 0.0) for y in set(bond_inflow) | set(income_["net"])}
+
+    income = income_for()
+    cash_in = cash_with(income)
+
     funds = [fund_sale_profile(r, profile) for r in open_funds]
+    if rate_shift:
+        for f in funds:
+            # a rate move reprices a fund today (−duration × shift) and it then earns the shift more; TIPS funds
+            # follow REAL rates, which the inflation scenarios leave unchanged → no price hit, payouts follow CPI
+            text = f"{f.get('label') or ''} {f.get('ticker') or ''}".lower()
+            hit = 1.0 if ("tips" in text or "inflation" in text or f.get("non_usd")) else max(0.5, 1 - f["duration"] * rate_shift)
+            if f.get("non_usd"):
+                continue                                  # foreign rates, not US ones — handled by fx_drift below
+            f["value"] *= hit
+            if f.get("cost_ratio") is not None:
+                f["cost_ratio"] /= hit
+            f["yield"] = max(0.0, f["yield"] + rate_shift)
+            if f["accumulates"]:
+                f["accrual"] = f["yield"]
+            else:
+                f["cash_yield"] = max(0.0, f["cash_yield"] + rate_shift)
+    if fx_drift:
+        for f in funds:
+            if f.get("non_usd"):                          # a weaker dollar lifts their dollar value year after year
+                f["yield"] = max(-0.5, f["yield"] + fx_drift)
+                f["accrual"] = f["yield"] - f["cash_yield"]
     tax_t = (rates.fed + rates.niit) if after_tax else 0.0          # Treasuries: federal only (state-exempt)
     r_carry = r_bill * (1 - tax_t)
-    reinvest_rate = lambda tenor: (bm.interp(npts, float(tenor)) or r_bill) * (1 - tax_t)  # noqa: E731
+    reinvest_rate = lambda tenor: max(0.0, (bm.interp(npts, float(tenor)) or r_bill) + rate_shift) * (1 - tax_t)  # noqa: E731
     plan_end = years[-1]
     common = dict(after_tax=after_tax, carry_rate=r_carry, plan_end=plan_end, early_until=early_until,
                   lock_early=lock_early)
+    if ingredients:
+        return {"today": today, "years": years, "need": need, "needs": needs, "income_net": income["net"],
+                "inflow_by_holding": by_h, "bond_inflow": bond_inflow, "funds": funds, "r_carry": r_carry, "r_bill": r_bill,
+                "early_until": early_until, "lock_early": lock_early, "released_year": released_year,
+                "after_tax": after_tax, "plan_end": plan_end, "rows": rows_h, "open_ids": open_ids, "sched": sched,
+                "infl": infl, "npts": npts, "mi": mi, "mode": mode, "tax_t": tax_t}
 
-    base = simulate_goal_funding(years, today, bond_inflow, need, funds, use_funds=False, **common)
-    gap_years = {r["year"] for r in base["rows"] if r["shortfall"] > 0.5}
-    # surplus is invested in Treasuries maturing in EVERY later year that will spend it — a ladder instead of
-    # rolling T-bills — not only in years that are short without it (those are usually paid by the same cash)
-    need_years = {y for y in years[1:] if need.get(y, 0.0) > 0.5}
+    def levers(inflow: dict[int, float]):
+        """The plan's levers for one stream of outside cash (bonds + Social Security + other income):
+        returns (baseline simulation, run(sales_on, reinvest_on))."""
+        base = simulate_goal_funding(years, today, inflow, need, funds, use_funds=False, **common)
+        gap_years = {r["year"] for r in base["rows"] if r["shortfall"] > 0.5}
+        # surplus is invested in Treasuries maturing in EVERY later year that will spend it — a ladder instead of
+        # rolling T-bills — not only in years that are short without it (those are usually paid by the same cash)
+        need_years = {y for y in years[1:] if need.get(y, 0.0) > 0.5}
 
-    cache: dict[tuple[bool, bool], tuple[dict, bool]] = {}
+        cache: dict[tuple[bool, bool], tuple[dict, bool]] = {}
 
-    def run(sales_on: bool, reinv_on: bool) -> tuple[dict, bool]:
-        """Simulate with the chosen levers. Fund sales (gap years only) and surplus reinvestment (into gap
-        years, never out of a year that sells funds) are optimized TOGETHER, so a Treasury arriving in a gap
-        year takes the place of fund sales there — the plan never double-funds a year or sells-and-buys.
-        Returns (simulation, optimizer_used); cached per lever combination."""
-        key = (sales_on and bool(funds), reinv_on and bool(need_years))
-        if key == (False, False):
-            return base, False
-        if key in cache:
+        def run(sales_on: bool, reinv_on: bool) -> tuple[dict, bool]:
+            """Simulate with the chosen levers. Fund sales (gap years only) and surplus reinvestment (into gap
+            years, never out of a year that sells funds) are optimized TOGETHER, so a Treasury arriving in a gap
+            year takes the place of fund sales there — the plan never double-funds a year or sells-and-buys.
+            Returns (simulation, optimizer_used); cached per lever combination."""
+            key = (sales_on and bool(funds), reinv_on and bool(need_years))
+            if key == (False, False):
+                return base, False
+            if key in cache:
+                return cache[key]
+            r_kw = dict(reinvest_rate=reinvest_rate, reinvest_targets=need_years) if key[1] else {}
+            if not key[0]:
+                pa = solve_cash_plan(years, today, inflow, need, funds, after_tax=after_tax, carry_rate=r_carry,
+                                     plan_end=plan_end, sale_years=set(), early_until=early_until,
+                                     lock_early=lock_early, **r_kw)
+                sim = simulate_goal_funding(years, today, inflow, need, funds, use_funds=False,
+                                            reinvest_plan=(pa or {}).get("reinvest", {}), reinvest_rate=reinvest_rate, **common)
+                cache[key] = (sim, pa is not None)
+                return cache[key]
+            used, sim = False, None
+            allowed = set(gap_years)
+            for _ in range(6):
+                pb = solve_cash_plan(years, today, inflow, need, funds, after_tax=after_tax, carry_rate=r_carry,
+                                     plan_end=plan_end, sale_years=allowed, early_until=early_until,
+                                     reinvest_sources_exclude=allowed, lock_early=lock_early, **r_kw)
+                used = used or pb is not None
+                sim = simulate_goal_funding(years, today, inflow, need, funds, use_funds=True,
+                                            plan=(pb or {}).get("sales"), reinvest_plan=(pb or {}).get("reinvest", {}),
+                                            reinvest_rate=reinvest_rate, **common)
+                new_gaps = {s_["year"] for s_ in sim["schedule"]} - allowed
+                if not new_gaps or pb is None:
+                    break
+                allowed |= new_gaps
+            cache[key] = (sim, used)
             return cache[key]
-        r_kw = dict(reinvest_rate=reinvest_rate, reinvest_targets=need_years) if key[1] else {}
-        if not key[0]:
-            pa = solve_cash_plan(years, today, bond_inflow, need, funds, after_tax=after_tax, carry_rate=r_carry,
-                                 plan_end=plan_end, sale_years=set(), early_until=early_until,
-                                 lock_early=lock_early, **r_kw)
-            sim = simulate_goal_funding(years, today, bond_inflow, need, funds, use_funds=False,
-                                        reinvest_plan=(pa or {}).get("reinvest", {}), reinvest_rate=reinvest_rate, **common)
-            cache[key] = (sim, pa is not None)
-            return cache[key]
-        used, sim = False, None
-        allowed = set(gap_years)
-        for _ in range(6):
-            pb = solve_cash_plan(years, today, bond_inflow, need, funds, after_tax=after_tax, carry_rate=r_carry,
-                                 plan_end=plan_end, sale_years=allowed, early_until=early_until,
-                                 reinvest_sources_exclude=allowed, lock_early=lock_early, **r_kw)
-            used = used or pb is not None
-            sim = simulate_goal_funding(years, today, bond_inflow, need, funds, use_funds=True,
-                                        plan=(pb or {}).get("sales"), reinvest_plan=(pb or {}).get("reinvest", {}),
-                                        reinvest_rate=reinvest_rate, **common)
-            new_gaps = {s_["year"] for s_ in sim["schedule"]} - allowed
-            if not new_gaps or pb is None:
-                break
-            allowed |= new_gaps
-        cache[key] = (sim, used)
-        return cache[key]
+        return base, run
 
+    base, run = levers(cash_in)
     chosen, used_opt = run(use_funds, reinvest)
-    funds_before, _ = run(False, reinvest)
-    funds_after, _ = run(True, reinvest) if funds else (funds_before, False)
-    reinv_before, _ = run(use_funds, False)
-    reinv_after, _ = run(use_funds, True)
+    # The IRA/401(k) fund withdrawals and realized gains the plan itself chooses are income too, so they count in
+    # Social Security's provisional-income test. That changes the benefit tax, which changes the plan — iterate
+    # to a fixed point (the sales stop moving), always from the portfolio's own income + the CURRENT plan's sales.
+    if after_tax and income["people"] and income["ss_taxable_override"] is None and funds and use_funds:
+        prov_base = dict(prov)
+        fund_by_id = {f["id"]: f for f in funds}
+
+        def plan_income(sim: dict) -> dict[int, float]:
+            add: dict[int, float] = {}
+            for s_ in sim["schedule"]:
+                f = fund_by_id.get(s_["holding_id"])
+                if not f:
+                    continue
+                if f["account_type"] in TRADITIONAL:
+                    v = s_["gross"]
+                elif f["account_type"] not in SHELTERED:
+                    cg = _tx(f, s_["year"]).get("cg") or 0.0
+                    v = max(0.0, (s_["tax"] - s_.get("early_penalty", 0.0)) / cg) if cg > 0 else 0.0
+                else:
+                    v = 0.0
+                add[s_["year"]] = add.get(s_["year"], 0.0) + v
+            return add
+
+        seen = plan_income(chosen)
+        for _ in range(5):
+            prov.clear()
+            prov.update({y: prov_base.get(y, 0.0) + seen.get(y, 0.0) for y in set(prov_base) | set(seen)})
+            income = income_for()
+            cash_in = cash_with(income)
+            base, run = levers(cash_in)
+            chosen, used_opt = run(use_funds, reinvest)
+            nxt = plan_income(chosen)
+            moved = max((abs(nxt.get(y, 0.0) - seen.get(y, 0.0)) for y in set(nxt) | set(seen)), default=0.0)
+            seen = nxt
+            if moved < 250.0:
+                break
+    for y, t in income["tax"].items():
+        if t:
+            bond_tax[y] = bond_tax.get(y, 0.0) + t
+    if light:
+        funds_before = funds_after = reinv_before = reinv_after = chosen
+    else:
+        funds_before, _ = run(False, reinvest)
+        funds_after, _ = run(True, reinvest) if funds else (funds_before, False)
+        reinv_before, _ = run(use_funds, False)
+        reinv_after, _ = run(use_funds, True)
 
     def _disc(y: int) -> float:
         t = _years_to(today, y)
@@ -1288,7 +1403,59 @@ async def plan_goals(holdings: list[dict], profile: dict, *, after_tax: bool = T
     for r in chosen["rows"]:
         r = {**r, "goals": [x["goal"] for x in needs.get(r["year"], [])], "early_withdrawal": _is_early(r["year"], early_until)}
         r["early_cost"] = round(r["early_cost"] + bond_early.get(r["year"], 0.0), 2)
+        items_y = needs.get(r["year"], [])
+        r["real_share"] = round(sum(x["nominal"] for x in items_y if x["real"]) / r["need"], 4) if r["need"] else 0.0
+        # split the outside cash into bonds vs Social Security / other income (both already net of tax)
+        other = income["net"].get(r["year"], 0.0)
+        r["other_income"] = round(other, 2)
+        r["ss_income"] = round(income["ss"].get(r["year"], 0.0), 2)
+        r["bond_inflow"] = round(r["bond_inflow"] - other, 2)
         rows.append(r)
+
+    # Social Security: what claiming earlier / later would do to THIS plan (everything else unchanged)
+    claim_cmp = []
+    me = income["people"].get("you")
+    if me and me["pia_monthly"] > 0 and goals and not light:
+        for age in sorted({62.0, round(me["fra_age"], 2), 70.0, me["claim_age"]}):
+            is_chosen = abs(age - me["claim_age"]) < 1e-6
+            if is_chosen:
+                inc_a, sim_a = income, chosen
+            else:
+                inc_a = income_for(age)
+                sim_a = levers(cash_with(inc_a))[1](use_funds, reinvest)[0]
+            ma, pa = metrics(sim_a), inc_a["people"]["you"]
+            claim_cmp.append({
+                "claim_age": age, "chosen": is_chosen, "start_year": pa["start_year"], "monthly_today": pa["own_monthly"],
+                "pct_of_fra": pa["pct_of_fra"],
+                "household_lifetime_today_dollars": round(sum(x["lifetime_today_dollars"] for x in inc_a["people"].values()), 2),
+                "funded_ratio_pct": ma["funded_ratio_pct"], "shortfall_total": ma["shortfall_total"],
+                "shortfall_years": len(ma["shortfall_years"]),
+                "first_shortfall": ma["shortfall_years"][0] if ma["shortfall_years"] else None})
+    inc_rows = [r for r in income["by_year"] if r["gross"] > 0]
+    ss_until = min((x["through_year"] for x in income["people"].values()), default=None)
+    horizon_short = bool(claim_cmp) and ss_until is not None and last_goal < ss_until - 1
+    income_summary = {
+        "configured": income["configured"], "people": income["people"], "sources": income["sources"],
+        "filing": income["filing"], "ss_taxable_override": income["ss_taxable_override"], "state_taxed": income["state_taxed"],
+        "by_year": inc_rows,
+        "total_gross": round(sum(r["gross"] for r in inc_rows), 2), "total_tax": round(sum(r["tax"] for r in inc_rows), 2),
+        "total_net": round(sum(r["net"] for r in inc_rows), 2),
+        "pv_net": round(sum(r["net"] * _disc(r["year"]) for r in inc_rows), 2),
+        "claim_comparison": claim_cmp, "comparison_horizon_short": horizon_short,
+        "goals_end_year": last_goal, "benefits_through_year": ss_until,
+        "notes": ([
+            *([f"Your goals stop in {last_goal} but Social Security runs to {ss_until}: the funded ratio only sees the years with "
+               "goals, which flatters claiming early. Extend your income goal to your plan-through age to compare claiming ages fairly."]
+              if horizon_short else []),
+            "Social Security is entered in today's dollars (as on your SSA statement) and rises with your inflation path (COLA).",
+            ("Federal tax on benefits follows the IRS provisional-income test using this plan's interest, IRA/401(k) withdrawals "
+             "and other income" + (" — joint thresholds." if income["filing"] == "joint" else " — single thresholds.")
+             if income["ss_taxable_override"] is None else
+             f"You set {income['ss_taxable_override']:.0f}% of benefits as federally taxable.")
+            + ("" if income["state_taxed"] else " No state tax on benefits (true in most states, incl. CA)."),
+            "Not modelled: the earnings test if you work while claiming before full retirement age, WEP/GPO, the family maximum.",
+        ] if income["people"] else []),
+    }
 
     # fund drawdown summary (holding the reinvestment choice fixed)
     draw = funds_after
@@ -1338,6 +1505,7 @@ async def plan_goals(holdings: list[dict], profile: dict, *, after_tax: bool = T
         "as_of": today.isoformat(), **ps.inflation_fields(infl, infl_src),
         "after_tax": after_tax, "use_funds": use_funds, "reinvest_surplus": reinvest, "years": rows, **m,
         "book_value": round(book_value, 2),
+        "income": income_summary,
         "funds": fund_summary if funds else None,
         "reinvest": reinvest_summary,
         "retired_tax": ps.tax_schedule_fields(sched),
@@ -1348,6 +1516,8 @@ async def plan_goals(holdings: list[dict], profile: dict, *, after_tax: bool = T
                        "early_years": [r["year"] for r in rows if r["early_withdrawal"]]},
         "notes": ["Individual bonds and defined-maturity ETFs pay their coupons and principal on schedule"
                   + (" (after tax)." if after_tax else " (pre-tax)."),
+                  *(["Social Security and your other income arrive every year" + (" (after tax)" if after_tax else "")
+                     + " and are spent first; the bonds and funds cover what's left."] if income["configured"] else []),
                   "Open-ended bond funds never mature: they pay distributions on what you still hold (price assumed flat) and"
                   + (" are sold down only when a year falls short — cheapest fund first (rate risk + tax + sheltered growth given up)."
                      if use_funds else " are NOT sold in this view."),

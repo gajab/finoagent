@@ -439,6 +439,37 @@ export interface QullamaggieData {
 }
 export interface QullamaggieResponse { ticker: string; qullamaggie_setup: QullamaggieData; cached?: boolean }
 
+// Momentum Swing — multi-factor confluence named strategy (own lazy endpoint)
+export interface MomentumCheck { key: string; label: string; status: 'pass' | 'warn' | 'fail' | string; value: string; ideal: string; detail: string }
+export interface MomentumQualification {
+  is_candidate: boolean; grade: 'A' | 'B' | 'C' | '—' | string; score: number;
+  checks: MomentumCheck[]; summary: string; passes: number;
+  entry_mode: string | null; gates: { uptrend: boolean; leadership: boolean };
+}
+export interface MomentumData {
+  price: number | null; as_of: string; atr: number | null; adr_pct: number | null;
+  qualification: MomentumQualification;
+  pillars: Record<string, { points: number; max: number }>;
+  moving_averages: { ema10: number | null; ema20: number | null; ema50: number | null; sma50: number | null; sma150: number | null; sma200: number | null };
+  metrics: {
+    rsi: number | null; macd_hist: number | null; adr_pct: number | null;
+    bb_squeeze: boolean; bb_width_pctile: number | null; atr_contracting: boolean;
+    hurst: number | null; efficiency_ratio: number | null;
+    golden_cross: { dir: string | null; bars_since: number | null; above: boolean };
+    rs: { slope_1m: number | null; slope_3m: number | null; new_high: boolean | null; available: boolean };
+    moves: { move_1m: number | null; move_3m: number | null; move_6m: number | null; thrust_from_low_pct: number | null; best_pct: number | null };
+    pct_from_52w_high: number | null; high_52w: number | null; low_52w: number | null;
+    base: QullamaggieBase | null;
+    volume: { dry_up: boolean; expansion: boolean; dryup_ratio: number | null; today_ratio: number | null; obv_rising: boolean | null; distribution_climax: boolean };
+    regime: { regime: string; label: string; playbook?: string | null };
+    regime_edge?: { verdict?: string; summary?: string; regime?: string } | null;
+    dealer?: { above_flip: boolean | null; gamma_flip: number | null; net_gex_label: string; call_wall: number | null; put_wall: number | null; expected_move: number | null } | null;
+  };
+  setups: TradeSetup[];
+  meta?: { has_intraday?: boolean; deep?: boolean; note?: string };
+}
+export interface MomentumResponse { ticker: string; momentum_setup: MomentumData; cached?: boolean }
+
 // Larry Connors' 2-Period RSI mean-reversion — a named strategy (own lazy endpoint)
 export interface ConnorsCheck { key: string; label: string; status: 'pass' | 'warn' | 'fail' | string; value: string; ideal: string; detail: string }
 export interface ConnorsSignal { state: string; tone: 'buy' | 'short' | 'watch' | 'flat' | string; armed: boolean; score: number; checks: ConnorsCheck[]; summary: string }
@@ -4744,7 +4775,7 @@ export interface BondRow {
            avg_maturity: number | null; category: string | null; family: string | null; credit_mix: Record<string, number>;
            tax_class: string; est_ytm_pct?: number | null; est_basis?: string | null; user_yield_pct?: number | null;
            payout?: BondFundPayout; payout_source?: string; cash_yield_pct?: number | null; accrual_pct?: number | null;
-           duration_confidence?: string | null };
+           duration_confidence?: string | null; cash_like?: boolean };
   krd?: Record<string, number>;
   warnings: string[];
 }
@@ -4864,6 +4895,7 @@ export interface BondPortfolio {
   tax: { years: BondTaxYear[]; rates: Record<string, number>; retired_rates?: BondRetiredTax | null; notes: string[] };
   recommendations: BondRecommendation[];
   profile: BondProfile;
+  curve?: { nominal: [number, number][] };
 }
 
 export interface BondCurvePoint { tenor: number; yield_pct: number }
@@ -5129,6 +5161,7 @@ export interface BondPlan {
   withdrawal: BondPlanWithdrawal;
   years: { year: number; need: number; inflow: number; covered: number; shortfall: number; surplus_carried: number; goals: string[];
            bond_inflow?: number; fund_distributions?: number; fund_sales?: number; reinvest_in?: number; reinvest_out?: number;
+           other_income?: number; ss_income?: number;
            early_cost?: number; early_withdrawal?: boolean }[];
   funded_ratio_pct: number | null;
   pv_needs: number;
@@ -5137,6 +5170,7 @@ export interface BondPlan {
   taxes_total?: number;
   taxes_pv?: number;
   book_value?: number;
+  income?: BondPlanIncome;
   shortfall_years: number[];
   notes: string[];
 }
@@ -5173,4 +5207,147 @@ export interface BondPreview {
 export interface BondFilters {
   kinds: string[];          // BondKind values; empty = all
   accountTypes: string[];   // taxable / ira / roth / 401k …; empty = all
+}
+
+// ---- Bond Desk: what to buy next (balanced-book purchase planner) ----
+export type BondBuyPreset = 'safety' | 'balanced' | 'income';
+export interface BondBuyParams {
+  amount: number; account_type: string; preset: BondBuyPreset;
+  target_duration?: number | null; duration_tolerance?: number | null; min_credit?: 'govt' | 'AA' | 'A' | 'BBB' | null;
+  tips_min_pct?: number | null; corp_max_pct?: number | null; bbb_max_pct?: number | null; max_line_pct?: number | null;
+  max_years?: number | null; kinds?: string[] | null;
+}
+export interface BondBuyMetrics {
+  market_value: number; duration: number; dv01: number; rate_shock_1pct: number; total_yield_pct: number | null;
+  after_tax_yield_pct: number | null; after_tax_income: number; tax_drag: number; tips_pct: number; corporate_pct: number;
+  below_a_pct: number; government_pct: number; muni_pct: number;
+}
+export interface BondBuyLine {
+  kind: BondKind; label: string; rating: string | null; tenor: number; tenor_label: string; amount: number; share_pct: number;
+  pre_tax_pct: number; real_yield_pct: number | null; after_tax_pct: number; tey_pct: number | null; tax_rate_pct: number | null;
+  duration: number; dv01: number; annual_after_tax: number; basis: string; tags: string[]; why: string; look_for: string;
+  security: { cusip: string; type: string; coupon_pct: number; maturity: string; price: number; yield_pct: number | null; real: boolean; index_ratio?: number | null } | null;
+}
+export interface BondBuyPlan {
+  params: Required<Pick<BondBuyParams, 'amount' | 'account_type' | 'preset'>> & {
+    target_duration: number; target_duration_source: string; duration_tolerance: number; min_credit: string; tips_min_pct: number;
+    corp_max_pct: number; bbb_max_pct: number; max_line_pct: number; max_years: number; kinds: string[];
+  };
+  before: BondBuyMetrics; after: BondBuyMetrics; book_duration: number; as_of: string;
+  lines: BondBuyLine[]; amount?: number; candidates_considered?: number;
+  allocation?: { before: { key: string; value: number }[]; after: { key: string; value: number }[] };
+  krd?: { tenor: number; before: number; after: number }[];
+  resilience?: { before: BondResilience };
+  notes: string[];
+}
+
+// ---- Bond Desk: income beyond the bond book (Social Security + other sources) ----
+export interface BondSSPerson {
+  birth_year?: number | null; birth_month?: number | null; claim_age?: number | null; monthly_benefit?: number | null;
+  basis?: 'fra' | 'claim'; through_age?: number | null;
+}
+export interface BondSocialSecurity { you?: BondSSPerson | null; spouse?: BondSSPerson | null; taxable_pct?: number | null; state_taxed?: boolean }
+export interface BondIncomeSource { name: string; amount: number | null; start_year: number | null; end_year?: number | null; cola: boolean; taxable_pct: number | null }
+export interface BondPlanIncomePerson {
+  birth_year: number; fra_age: number; fra_label: string; claim_age: number; start: string; start_year: number; pia_monthly: number;
+  pct_of_fra: number; own_monthly: number; spousal_monthly: number; spousal_start: string | null; monthly_at_claim: number;
+  through_age: number; through_year: number; lifetime_today_dollars: number;
+}
+export interface BondClaimOption {
+  claim_age: number; chosen: boolean; start_year: number; monthly_today: number; pct_of_fra: number; household_lifetime_today_dollars: number;
+  funded_ratio_pct: number | null; shortfall_total: number; shortfall_years: number; first_shortfall: number | null;
+}
+export interface BondPlanIncome {
+  configured: boolean; people: { you?: BondPlanIncomePerson; spouse?: BondPlanIncomePerson };
+  sources: { name: string; amount: number; start_year: number; end_year: number; cola: boolean; taxable_pct: number; total: number }[];
+  filing: 'single' | 'joint'; ss_taxable_override: number | null; state_taxed: boolean;
+  by_year: { year: number; social_security: number; ss_you: number; ss_spouse: number; other: number; gross: number; tax: number; net: number; ss_taxable_pct: number | null }[];
+  total_gross: number; total_tax: number; total_net: number; pv_net: number; claim_comparison: BondClaimOption[]; notes: string[];
+  comparison_horizon_short?: boolean; goals_end_year?: number; benefits_through_year?: number | null;
+}
+
+// ---- Bond Desk: fund the plan's gaps + inflation / debasement stress test ----
+export type BondGapScenarioKey = 'low' | 'base' | 'high' | 'debase';
+export interface BondGapParams {
+  budget?: number | null; account_type?: string; min_credit?: 'govt' | 'AA' | 'A' | 'BBB';
+  low_inflation?: number; high_inflation?: number; debase_inflation?: number;
+  after_tax?: boolean; use_funds?: boolean; reinvest?: boolean; withdrawal_mode?: BondWithdrawalMode | null;
+}
+export interface BondGapOutcome {
+  funded_ratio_pct: number | null; shortfall_years: number; first_shortfall: number | null; last_shortfall: number | null;
+  unfunded_today_dollars: number; unfunded_nominal: number; tips_to_close: number;
+}
+export interface BondGapLine {
+  year: number; leg: 'tips' | 'nominal'; kind: BondKind; label: string; rating: string | null; amount: number; face: number;
+  pre_tax_pct: number | null; real_yield_pct: number | null; after_tax_pct: number | null; spendable: number;
+  security: { cusip: string; coupon_pct: number; maturity: string; price: number; yield_pct: number | null; real: boolean; type: string; index_ratio?: number } | null;
+  etf: string | null; why: string; basis: string; alternatives: { label: string; after_tax_pct: number | null }[];
+}
+export interface BondResilience {
+  market_value: number; inflation_linked_pct: number; non_usd_pct: number; floating_or_short_pct: number; funds_pct: number;
+  largest_position: { name: string; pct: number }; largest_corporate_issuer: { name: string; pct: number } | null;
+  segments: { key: string; pct: number; value: number }[]; flags: string[];
+}
+export interface BondGapStrategy {
+  key: 'nominal' | 'blend' | 'tips'; label: string; blurb: string; cost: number; tips_cost: number; lines: BondGapLine[];
+  outcomes: Record<BondGapScenarioKey, BondGapOutcome>; worst_unfunded_today_dollars: number;
+  years: { year: number; need: number; shortfall_before: number; shortfall_after: number; covered: number }[];
+  fund_sales: { year: number; ticker: string | null; label: string; account_type: string; gross: number; net: number; tax: number; reason: string }[];
+}
+export interface BondGapPlan {
+  as_of: string; account_type: string; min_credit: string; budget: number | null; inflation_pct: number; inflation_long_pct?: number;
+  inflation_source?: string; has_goals: boolean; retired_tax?: BondRetiredTax | null;
+  scenarios: { key: BondGapScenarioKey; label: string; short: number; long: number; rate_shift: number; story: string }[];
+  current: { outcomes: Record<BondGapScenarioKey, BondGapOutcome>; cost_to_fund: { total: number } };
+  gaps: { year: number; shortfall: number; need: number; real_share: number }[];
+  strategies: BondGapStrategy[]; recommended: BondGapStrategy['key'] | null; why?: string[]; real_share_pct?: number;
+  breakeven_pct?: number | null;
+  placement?: { year: number; note: string; rows: { account: string; label: string;
+    nominal: { label: string; spendable_per_dollar: number; after_tax_pct: number | null } | null;
+    tips: { spendable_per_dollar: number; after_tax_pct: number | null } | null }[] };
+  resilience: { before: BondResilience; after?: BondResilience };
+  notes: string[];
+}
+
+// ---- Bond Desk: balance the whole book (keep / sell / swap within each account, + new money) ----
+export interface BondRebalanceParams {
+  new_money?: number; new_money_account?: string; max_turnover_pct?: number; robustness?: 'expected' | 'both' | 'high' | 'all';
+  min_credit?: 'govt' | 'AA' | 'A' | 'BBB'; keep_ids?: number[]; tips_max_pct?: number; type_max_pct?: number; intl_pct?: number;
+  bond_turnover_pct?: number;
+}
+export interface BondRebalanceSell {
+  holding_id: number; label: string; kind: BondKind; ticker: string | null; cusip: string | null; account_type: string;
+  fraction_pct: number; amount: number; proceeds: number; gain: number; tax_now: number; trading_cost: number;
+  total_yield_pct: number | null; after_tax_yield_pct: number | null; duration: number | null; maturity: string | null;
+  is_fund: boolean; reason?: string;
+}
+export interface BondRebalanceBuy extends Omit<BondGapLine, 'why' | 'basis' | 'alternatives' | 'leg'> {
+  account_type: string; years: number[]; leg: 'tips' | 'nominal' | 'intl'; ticker?: string; what?: string; non_usd?: boolean;
+}
+export interface BondFundAlternative {
+  holding_id: number; label: string; ticker: string | null; account_type: string; value: number; yield_pct: number | null;
+  alt_label: string | null; alt_years: number; alt_yield_pct: number | null; gap_pct: number | null; duration: number | null;
+  expense_ratio_pct: number | null; sold_pct: number; kept: boolean; basis: string;
+}
+export interface BondRebalance {
+  verdict: 'rebalance' | 'hold' | 'no_goals' | 'unavailable'; as_of: string; robustness: 'expected' | 'both' | 'high' | 'all';
+  new_money: number; new_money_account: string; max_turnover_pct: number; min_credit: string; book_value: number; has_goals: boolean;
+  inflation_source?: string; worlds_optimized: string[];
+  scenarios: BondGapPlan['scenarios'];
+  sells: BondRebalanceSell[]; buys: BondRebalanceBuy[]; cash_left?: { account_type: string; amount: number }[]; why: string[];
+  totals?: { sold: number; bought: number; turnover_pct: number; tax_now: number; trading_cost: number; positions_sold: number; lines_bought: number };
+  by_account?: { account_type: string; value: number; sold: number; bought: number; new_money: number }[];
+  outcomes?: { before: Record<BondGapScenarioKey, BondGapOutcome>; after: Record<BondGapScenarioKey, BondGapOutcome> };
+  book?: { before: Record<string, number | null>; after: Record<string, number | null> };
+  end_wealth?: { before: number; after: number };
+  resilience?: { before: BondResilience; after: BondResilience };
+  considered?: { holdings: number; kept_out: number; candidates: number };
+  keep_ids?: number[]; kept?: { holding_id: number; label: string }[];
+  fund_alternatives?: BondFundAlternative[];
+  roll_at_maturity?: { holding_id: number; label: string; account_type: string; maturity: string | null; value: number }[];
+  roll_until?: number | null;
+  allocation?: { before: BondAllocSlice[]; after: BondAllocSlice[] };
+  limits?: { tips_max_pct: number; type_max_pct: number; intl_pct: number; bond_turnover_pct: number; intl_target: number;
+             intl_funds: { ticker: string; name: string; what: string; share: number; yield_pct: number; duration: number | null; expense_ratio_pct: number | null }[] };
+  notes: string[];
 }

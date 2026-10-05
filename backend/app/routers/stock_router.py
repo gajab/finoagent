@@ -705,6 +705,44 @@ async def get_connors_rsi_setup(
     return {"ticker": ticker, "connors_setup": result, "cached": False}
 
 
+@router.get("/{ticker}/momentum-setup")
+async def get_momentum_setup(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """World-class momentum-swing confluence: 8 weighted pillars behind 2 hard gates (Stage-2 uptrend +
+    leadership), fusing trend/MA structure (golden cross, EMA stacks), relative strength vs SPY,
+    volatility compression (Bollinger squeeze, ATR contraction, VCP base), MACD/RSI/ROC, volume dry-up→
+    expansion, demand/supply + POC/LVN + bull/bear FVG + BSL/SSL liquidity, regime (Hurst/ER + backtested
+    regime-edge) and dealer gamma/walls — then the live entry (breakout / pullback / episodic pivot) with
+    stops & targets snapped to real structure. Deterministic; lazy endpoint (own ~2y daily + SPY + best-
+    effort options/regime-edge, off the main Setups load)."""
+    import asyncio
+    import yfinance as yf
+    from ..services.momentum_service import compute_momentum_setup
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"momentum-setup:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "momentum_setup": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_momentum_setup(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Momentum analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="No daily history available for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=1800)   # fuses many engines; cache longer
+    return {"ticker": ticker, "momentum_setup": result, "cached": False}
+
+
 @router.get("/{ticker}/regime-edge")
 async def get_regime_edge(
     ticker: str,
@@ -1112,7 +1150,25 @@ the real risk control is small size + the 200-SMA filter. Do NOT criticise the a
 - A stretched VIX (a fear spike well above its 10-day average) marks the HIGHEST-probability long windows. Caveat \
 honestly: in a true regime-change crash, mean-reversion can keep failing."""
 
-_STRATEGY_PRIMERS = {"qullamaggie": _QM_PRIMER, "connors_rsi2": _CONNORS_PRIMER}
+# Prepended when the trade is a Momentum Swing (style="momentum") multi-factor confluence trade.
+_MOMENTUM_PRIMER = """IMPORTANT — this is a MOMENTUM SWING trade from a multi-factor CONFLUENCE engine. Judge it by \
+momentum-leadership rules, not generic value/mean-reversion logic:
+- The thesis is CONTINUATION of an established trend in a LEADER. The setup only exists because the name passed two \
+HARD GATES — a Stage-2 uptrend (price > 50-SMA > 200-SMA, 200 rising) AND leadership (real prior move / near 52-week \
+highs / outperforming SPY) — and then scored across 8 weighted pillars (trend & MA structure incl. golden cross, \
+relative strength, volatility compression/Bollinger squeeze/VCP, MACD-RSI-ROC, volume dry-up→expansion, demand-supply \
+& POC/LVN/FVG/liquidity, regime + backtested regime-edge, dealer gamma/walls). The pillar scores & checklist are in the JSON.
+- RSI is CONTINUATION-AWARE: in a confirmed uptrend RSI > 70 is strength, NOT a sell signal. Only a bearish RSI \
+DIVERGENCE (price higher high, RSI lower high) counts against it. Do NOT reject the trade for a 'high' RSI.
+- A TIGHT structure stop (under the base low / rising 10-20 EMA / a demand order-block or bull FVG / swing-low SSL) is \
+a FEATURE that allows size for small risk — do not call it 'too tight'. Targets are an ATR THRUST plus any real supply \
+above; the real exit is scale-out into strength then TRAIL the 10/20-day EMA (exit on a daily close below it).
+- It is a SHARES trade (leverage = size on the tight stop); do NOT demand an options structure.
+- Entry mode is auto-detected: BREAKOUT of a coil (refined by the opening-range high), PULLBACK into a rising MA / \
+demand zone in an intact uptrend, or an EPISODIC PIVOT catalyst gap. The single biggest reason to 'pass' is a failed \
+gate, a chop/mean-reverting regime (the regime-edge verdict), heavy overhead supply, or the name already extended."""
+
+_STRATEGY_PRIMERS = {"qullamaggie": _QM_PRIMER, "connors_rsi2": _CONNORS_PRIMER, "momentum": _MOMENTUM_PRIMER}
 
 
 def _strategy_primer(setup: dict, dossier: dict) -> str:

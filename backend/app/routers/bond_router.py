@@ -15,6 +15,7 @@ only on explicit request with the user's own key and is grounded on the computed
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import logging
 
@@ -26,6 +27,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..auth import get_current_user, get_user_api_key
 from ..database import get_db
 from ..models import BondHolding, BondLadder, BondProfile, User
+from ..services import bond_buy_service as buy_svc
+from ..services import bond_gap_service as gap_svc
+from ..services import bond_rebalance_service as rebal_svc
 from ..services import bond_ladder_service as ladders
 from ..services import bond_market_service as mkt
 from ..services import bond_portfolio_service as ps
@@ -283,6 +287,131 @@ class YieldMenuIn(BaseModel):
     account_type: str = "taxable"
 
 
+class BuyPlanIn(BaseModel):
+    amount: float = 50000.0
+    account_type: str = "taxable"
+    preset: str = "balanced"                  # safety | balanced | income
+    target_duration: float | None = None      # None = keep the book's current duration
+    duration_tolerance: float | None = None
+    min_credit: str | None = None             # govt | AA | A | BBB
+    tips_min_pct: float | None = None
+    corp_max_pct: float | None = None
+    bbb_max_pct: float | None = None
+    max_line_pct: float | None = None
+    max_years: float | None = None
+    kinds: list[str] | None = None
+
+
+@router.post("/buy-plan")
+async def buy_plan(body: BuyPlanIn, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """What to buy next: allocate new money across Treasuries/TIPS/CDs/agencies/munis/corporates so the WHOLE book
+    hits your duration, credit, inflation and tax targets at the best after-tax yield (one LP)."""
+    if body.amount < 0 or body.amount > 1e9:
+        raise HTTPException(400, "Amount must be between 0 and 1,000,000,000.")
+    if body.account_type.lower() not in ACCOUNTS:
+        raise HTTPException(400, f"account_type must be one of {sorted(ACCOUNTS)}")
+    holdings = await _load_holdings(db, user.id)
+    profile = await _load_profile(db, user.id)
+    try:
+        return await buy_svc.buy_plan(holdings, profile, body.model_dump())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("bond buy plan failed")
+        raise HTTPException(502, f"Could not build a buy plan: {exc}")
+
+
+class GapPlanIn(BaseModel):
+    budget: float | None = None               # None = whatever it takes to close every gap
+    account_type: str = "taxable"
+    min_credit: str = "AA"                    # govt | AA | A | BBB
+    low_inflation: float = -1.0               # % a year in the low world (negative = deflation)
+    high_inflation: float = 5.0
+    debase_inflation: float = 6.0
+    after_tax: bool = True
+    use_funds: bool = True
+    reinvest: bool = True
+    withdrawal_mode: str | None = None
+
+
+@router.post("/gap-plan")
+async def gap_plan(body: GapPlanIn, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Purchases sized to the plan's shortfall years (TIPS vs nominal, best after-tax instrument per year), each
+    strategy re-run through the planner under low / expected / high inflation and dollar debasement."""
+    if body.account_type.lower() not in ACCOUNTS:
+        raise HTTPException(400, f"account_type must be one of {sorted(ACCOUNTS)}")
+    for v in (body.low_inflation, body.high_inflation, body.debase_inflation):
+        if not (-2.0 <= v <= 25.0):
+            raise HTTPException(400, "Scenario inflation must be between -2% and 25%.")
+    if body.withdrawal_mode not in (None, "age", "before", "after"):
+        raise HTTPException(400, "withdrawal_mode must be age, before or after.")
+    holdings = await _load_holdings(db, user.id)
+    profile = await _load_profile(db, user.id)
+    # ~20 full plan runs → cache per (book, profile, inputs, day): any edit to a holding, goal or setting misses
+    sig = hashlib.md5(json.dumps([holdings, profile, body.model_dump(), mkt.us_today().isoformat()],
+                                 sort_keys=True, default=str).encode()).hexdigest()
+    key = f"bonds:gap:v2:{user.id}:{sig}"
+    hit = await get_cached(db, key)
+    if hit is not None:
+        return hit
+    try:
+        out = await gap_svc.gap_plan(holdings, profile, body.model_dump())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("bond gap plan failed")
+        raise HTTPException(502, f"Could not build the gap plan: {exc}")
+    await set_cached(db, key, out, ttl_seconds=1800)
+    return out
+
+
+class RebalanceIn(BaseModel):
+    new_money: float = 0.0
+    new_money_account: str = "taxable"
+    max_turnover_pct: float = 25.0            # at most this share of the book may be sold
+    robustness: str = "both"                  # expected | both (deflation + high) | high | all — worlds it must hold up in
+    tips_max_pct: float = 50.0                # at most this share of what's BOUGHT is inflation-linked
+    type_max_pct: float = 35.0                # … and this share in any one of CDs / agencies / munis / corporates
+    intl_pct: float = 0.0                     # optional non-dollar sleeve, share of the book
+    bond_turnover_pct: float = 25.0           # funds first: individual bonds may use this share of the change limit
+    min_credit: str = "AA"
+    corp_max_pct: float = 25.0
+    stickiness_pct: float = 0.5               # "leave it alone" charge on everything sold
+    keep_ids: list[int] = Field(default_factory=list)   # holdings you won't sell
+    low_inflation: float = -1.0
+    high_inflation: float = 5.0
+    debase_inflation: float = 6.0
+    after_tax: bool = True
+    withdrawal_mode: str | None = None
+
+
+@router.post("/rebalance")
+async def rebalance(body: RebalanceIn, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Balance the whole book: keep / sell / swap every holding within its account (+ new money) so the plan is
+    funded at the best after-tax outcome with limited turnover — one LP, then verified by the planner."""
+    if body.new_money < 0 or body.new_money > 1e9:
+        raise HTTPException(400, "New money must be between 0 and 1,000,000,000.")
+    if body.new_money_account.lower() not in ACCOUNTS:
+        raise HTTPException(400, f"new_money_account must be one of {sorted(ACCOUNTS)}")
+    if body.robustness not in ("expected", "both", "high", "all"):
+        raise HTTPException(400, "robustness must be expected, both, high or all.")
+    if not (0 <= body.tips_max_pct <= 100 and 0 <= body.type_max_pct <= 100 and 0 <= body.intl_pct <= 30):
+        raise HTTPException(400, "tips_max_pct / type_max_pct must be 0–100 and intl_pct 0–30.")
+    if not (0 <= body.max_turnover_pct <= 100):
+        raise HTTPException(400, "max_turnover_pct must be between 0 and 100.")
+    holdings = await _load_holdings(db, user.id)
+    profile = await _load_profile(db, user.id)
+    sig = hashlib.md5(json.dumps([holdings, profile, body.model_dump(), mkt.us_today().isoformat()],
+                                 sort_keys=True, default=str).encode()).hexdigest()
+    key = f"bonds:rebal:v2:{user.id}:{sig}"
+    hit = await get_cached(db, key)
+    if hit is not None:
+        return hit
+    try:
+        out = await rebal_svc.rebalance(holdings, profile, body.model_dump())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("bond rebalance failed")
+        raise HTTPException(502, f"Could not rebalance the book: {exc}")
+    await set_cached(db, key, out, ttl_seconds=1800)
+    return out
+
+
 @router.post("/yield-menu")
 async def yield_menu(body: YieldMenuIn, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Per tenor, every instrument's pre-tax / after-tax / TEY for THIS user's tax profile."""
@@ -327,7 +456,11 @@ async def put_profile(body: ProfileIn, user: User = Depends(get_current_user), d
         setattr(p, k, d[k])
     p.state = (d["state"] or "").upper()[:2] or None
     p.goals = json.dumps(d["goals"][:50])
-    p.settings = json.dumps(d["settings"])
+    # Settings are MERGED key by key (null clears a key): several screens each own a few keys (planner: birth year,
+    # withdrawal mode, Social Security, income sources; tax profile: inflation, retirement rates) and may hold a
+    # stale copy of the rest — a save from one must never wipe what another saved.
+    merged = {**_loads(p.settings, {}), **(d["settings"] or {})}
+    p.settings = json.dumps({k: v for k, v in merged.items() if v is not None})
     await db.commit()
     return _profile_dict(p)
 

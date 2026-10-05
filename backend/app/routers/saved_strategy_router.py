@@ -2369,6 +2369,45 @@ async def update_purpose(
     return _to_out(strategy)
 
 
+class CoveredUpdateIn(BaseModel):
+    covered: bool = Field(...)
+
+
+@router.patch("/{strategy_id}/covered", response_model=SavedStrategyOut)
+async def update_covered(
+    strategy_id: int,
+    body: CoveredUpdateIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark a short-call trade COVERED without adding a stock leg — the user holds the shares ELSEWHERE.
+    Manage Book / book-risk math then treats the short call as covered (excluded from the naked-assignment
+    obligation and the per-scenario buy-to-cover cost). Stored on parameters.covered (no migration)."""
+    result = await db.execute(
+        select(SavedStrategy).where(
+            SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id,
+        )
+    )
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Position not found")
+    params = json.loads(strategy.parameters or "{}")
+    if body.covered:
+        params["covered"] = True
+    else:
+        params.pop("covered", None)
+    strategy.parameters = json.dumps(params)
+    await db.commit()
+    await db.refresh(strategy)
+    # The book-risk read changes → drop the cached Manage-Book snapshot so it recomputes on next load.
+    try:
+        from ..services.cache_service import invalidate
+        await invalidate(db, _book_tr_key(user.id))
+    except Exception:  # noqa: BLE001 — cache invalidation is best-effort
+        pass
+    return _to_out(strategy)
+
+
 def _leg_right(type_str: str) -> str:
     """Normalize an option type to 'C' or 'P'."""
     t = str(type_str or "").upper()
@@ -3893,6 +3932,13 @@ async def get_live_pnl(
 
         # Process option legs if any
         opt_legs = [l for l in legs if l.get("type") and str(l.get("type", "")).upper() in ("CALL", "PUT")]
+        # ORIGINAL legs_data index of each option leg. The frontend matches quotes/greeks/advice to a leg
+        # by its FULL legs_data index (a covered call's stock leg is index 0, the short call index 1), so we
+        # must emit THAT, not the options-only enumerate index — otherwise a combo's option quotes never
+        # match and the leg shows a stale entry price. `i` stays the options-only index for the entry-price /
+        # net-debit bookkeeping that is positional over the option legs.
+        _opt_orig_idx = [oi for oi, l in enumerate(legs)
+                         if l.get("type") and str(l.get("type", "")).upper() in ("CALL", "PUT")]
         opt_entry_cost = float(params.get("options_net_debit") or 0)
         opt_current_net = 0.0
         opt_quotes = []
@@ -3912,7 +3958,8 @@ async def get_live_pnl(
                 qty = leg.get("qty", 1)
                 action = leg.get("action", "").upper()
                 combo_leg_meta.append({
-                    "i": i, "strike": strike, "type": opt_type, "expiration": expiration,
+                    "i": i, "leg_idx": _opt_orig_idx[i] if i < len(_opt_orig_idx) else i,
+                    "strike": strike, "type": opt_type, "expiration": expiration,
                     "right": right, "qty": qty, "action": action, "_leg": leg,
                 })
 
@@ -3926,11 +3973,11 @@ async def get_live_pnl(
 
             def _record_combo_quote(lm: dict, q: object) -> None:
                 opt_quotes.append({
-                    "leg": lm["i"], "strike": lm["strike"], "type": lm["type"],
+                    "leg": lm["leg_idx"], "strike": lm["strike"], "type": lm["type"],
                     "bid": q.bid, "ask": q.ask, "mid": q.mid, "oi": q.oi, "volume": q.volume,
                 })
                 opt_greeks.append({
-                    "leg": lm["i"], "strike": lm["strike"], "type": lm["type"],
+                    "leg": lm["leg_idx"], "strike": lm["strike"], "type": lm["type"],
                     "iv": round(q.iv * 100, 2) if q.iv else None,
                     "delta": round(q.delta, 4) if q.delta else None,
                     "gamma": round(q.gamma, 4) if q.gamma else None,
@@ -4027,8 +4074,9 @@ async def get_live_pnl(
         combo_net_gamma = 0.0
         combo_net_vega  = 0.0
         for gd in opt_greeks:
-            lm_action = next((l.get("action", "").upper() for j, l in enumerate(opt_legs) if j == gd["leg"]), "BUY")
-            lm_qty = next((l.get("qty", 1) for j, l in enumerate(opt_legs) if j == gd["leg"]), 1)
+            _glm = next((m for m in combo_leg_meta if m["leg_idx"] == gd["leg"]), None)
+            lm_action = _glm["action"] if _glm else "BUY"
+            lm_qty = _glm["qty"] if _glm else 1
             sign = 1 if "BUY" in lm_action else -1
             mult = sign * lm_qty * 100
             if gd.get("delta") is not None:
@@ -4062,8 +4110,8 @@ async def get_live_pnl(
         combo_opt_legs = []
         combo_min_dte = 0
         for lm in combo_leg_meta:
-            gd = next((g for g in opt_greeks if g["leg"] == lm["i"]), None)
-            cq = next((v for v in opt_quotes if v["leg"] == lm["i"]), None)
+            gd = next((g for g in opt_greeks if g["leg"] == lm["leg_idx"]), None)
+            cq = next((v for v in opt_quotes if v["leg"] == lm["leg_idx"]), None)
             strike = float(lm["strike"]) if lm["strike"] else 0.0
             leg_dte = dte_from_expiry(lm["expiration"]) if lm["expiration"] else 0
             combo_min_dte = max(combo_min_dte, leg_dte)
@@ -4077,7 +4125,7 @@ async def get_live_pnl(
                 current_mid=cq["mid"] if cq else None, dte=leg_dte,
             )
             combo_leg_advice.append({
-                "leg": lm["i"], "strike": strike, "type": lm["type"], "right": lm["right"],
+                "leg": lm["leg_idx"], "strike": strike, "type": lm["type"], "right": lm["right"],
                 "action": advice["action"], "reason": advice["reason"],
                 "p_itm_pct": advice["p_itm_pct"], "captured_pct": advice["captured_pct"],
                 "prob_source": ("lognormal" if (gd and gd.get("iv") and strike > 0) else "delta"),
@@ -5924,13 +5972,95 @@ async def compute_lifecycle_desk_score(
     # Delegate the fresh-chain re-score + management overlay to the shared helper so a PLACED
     # trade here and a PAPER trade refresh compute identically (one engine, one code path).
     _legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    _covered = bool(json.loads(strategy.parameters or "{}").get("covered"))   # marked covered → not naked
     try:
         return await compute_placed_desk_score(
             ticker=strategy.ticker, structure=body.structure, expiration=body.expiration,
             short_strike=body.short_strike, legs=_legs, pnl_snapshot=body.pnl_snapshot or {},
-            user=user, db=db, quote_source=body.quote_source,
+            user=user, db=db, quote_source=body.quote_source, covered=_covered,
         )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Desk scan failed: {exc}")
+
+
+# ── Trade Manager — hold / exit desk (quant + technical + fundamental + events) ───────────────
+
+class TradeManagerRequest(BaseModel):
+    pnl_snapshot: dict = Field(...)             # the live-pnl response the card already holds
+    desk: Optional[dict] = None                 # the FULL desk-score result, if the user ran Quant Analysis
+
+
+async def _trade_manager_inputs(strategy_id: int, user: User, db: AsyncSession) -> dict:
+    """The saved trade as the Trade Manager needs it. The Trade Manager manages a position you are ALREADY IN — a saved
+    strategy you haven't entered (trade_status None) or a trade you've closed has nothing to hold or exit, so both are refused."""
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    if strategy.trade_status != "active":
+        state = {"closed": "already closed", None: "not entered yet (it is a saved strategy, not a trade)"}.get(strategy.trade_status, f"in status '{strategy.trade_status}'")
+        raise HTTPException(status_code=409, detail=f"The Trade Manager manages OPEN trades — this one is {state}.")
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+    banked = round(sum(float(l.get("realized") or 0) for l in (params.get("closed_legs") or []) if not l.get("roll")), 2)
+    return {
+        "id": strategy.id, "ticker": strategy.ticker, "name": strategy.name, "strategy_type": strategy.strategy_type,
+        "legs_data": json.loads(strategy.legs_data) if strategy.legs_data else [],
+        "parameters": params, "notes": strategy.notes, "trade_status": strategy.trade_status,
+        "entry_date": strategy.entry_date.isoformat() if strategy.entry_date else None,
+        "entry_prices": json.loads(strategy.entry_prices) if strategy.entry_prices else None,
+        "entry_net_debit": strategy.entry_net_debit,
+        "roll": _roll_summary(strategy), "realized_banked": banked,
+    }
+
+
+@router.post("/{strategy_id}/trade-manager")
+async def run_trade_manager_endpoint(
+    strategy_id: int,
+    body: TradeManagerRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The Trade Manager read for a PLACED trade: STRONG HOLD · HOLD · EXIT · STRONG EXIT with the exit
+    plan (levels + why), what to monitor, the famous-trader rule checks, fundamentals/events, and the
+    facts-only evidence JSON. Fully deterministic (no LLM); heavy, so on-demand only. Ticker-level
+    evidence is cached 10 min, the position-level read is recomputed every call."""
+    from ..services.trade_manager_service import run_trade_manager, NoMarketData
+    strategy = await _trade_manager_inputs(strategy_id, user, db)
+    try:
+        return await run_trade_manager(db, strategy, body.pnl_snapshot or {}, body.desk)
+    except HTTPException:
+        raise
+    except NoMarketData as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logging.getLogger(__name__).exception("trade-manager failed")
+        raise HTTPException(status_code=502, detail=f"Trade manager failed: {exc}")
+
+
+@router.post("/{strategy_id}/trade-manager/ai")
+async def run_trade_manager_ai_endpoint(
+    strategy_id: int,
+    body: TradeManagerRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """LLM assist on explicit user action: the model gets the collected evidence ONLY (every algorithm
+    decision — verdict, lens scores, trader stances, pillar scores — is stripped) and returns its own
+    verdict, exit plan, what-to-watch, per-trader views and fundamental/news/macro read."""
+    from ..services.trade_manager_service import run_trade_manager_ai, NoMarketData
+    api_key = await get_user_api_key(db, user.id, "openai_api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key not configured. Please add it in Settings.")
+    strategy = await _trade_manager_inputs(strategy_id, user, db)
+    try:
+        return await run_trade_manager_ai(db, strategy, body.pnl_snapshot or {}, api_key)
+    except HTTPException:
+        raise
+    except NoMarketData as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logging.getLogger(__name__).exception("trade-manager AI failed")
+        raise HTTPException(status_code=502, detail=f"Trade manager AI failed: {exc}")

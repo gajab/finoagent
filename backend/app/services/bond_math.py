@@ -29,6 +29,7 @@ from __future__ import annotations
 import calendar
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from datetime import date, timedelta
 
 DAY_COUNTS = ("30/360", "ACT/ACT", "ACT/360", "ACT/365")
@@ -103,11 +104,13 @@ def default_day_count(kind: str) -> str:
 # ---------------------------------------------------------------------------
 # Schedule
 # ---------------------------------------------------------------------------
-def _schedule_to(settle: date, end: date, freq: int) -> tuple[date, date, list[date]]:
+@lru_cache(maxsize=8192)
+def _schedule_to(settle: date, end: date, freq: int) -> tuple[date, date, tuple[date, ...]]:
     """Quasi-coupon schedule ending at ``end`` (a maturity or workout date).
 
     Returns ``(prev, next, future)`` where ``prev <= settle < next`` and ``future`` is
-    every schedule date after ``settle`` up to and including ``end``.
+    every schedule date after ``settle`` up to and including ``end``. Cached: a yield solve calls this
+    once per iteration with the same arguments (it was ~90% of the time to analyze a book).
     """
     step = 12 // freq
     eom = is_eom(end)
@@ -123,10 +126,10 @@ def _schedule_to(settle: date, end: date, freq: int) -> tuple[date, date, list[d
         if k > 2400:  # 200y of monthly periods — defensive
             raise ValueError("schedule overflow")
     future.reverse()
-    return prev, future[0], future
+    return prev, future[0], tuple(future)
 
 
-def coupon_schedule(spec: BondSpec, settle: date) -> tuple[date, date, list[date]]:
+def coupon_schedule(spec: BondSpec, settle: date) -> tuple[date, date, tuple[date, ...]]:
     return _schedule_to(settle, spec.maturity, spec.period_freq)
 
 

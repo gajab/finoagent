@@ -42,6 +42,7 @@ import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
 import InstitutionalDesk from './InstitutionalDesk';
 import DefendPanel from './DefendPanel';
+import TradeManagerPanel from './TradeManagerPanel';
 import { QuantAnalysisLoader } from './QuantExitCard';
 import CloseTradeModal from './CloseTradeModal';
 import BookTailRisk from './BookTailRisk';
@@ -52,7 +53,7 @@ import { TickerChrome } from '../DerivativeIncome';
 import { TraderGrid, PmGrid, RiskGrid } from './DeskMetrics';
 import { fetchUnderlyingDesk } from '../../api';
 import type { DeskFocusTrade, UnderlyingDeskResult } from '../../api';
-import { updateTradeTransaction, deleteTradeTransaction, updateTradePurpose } from '../../api';
+import { updateTradeTransaction, deleteTradeTransaction, updateTradePurpose, setTradeCovered } from '../../api';
 
 // ── Leg-action visuals (deterministic quant advisor) ─────────────────────────
 
@@ -198,8 +199,11 @@ function classifyTrade(trade: SavedStrategyItem): TradeGroup {
   const hasOptionLegs = legs.some(l => ['call', 'put'].includes((l.type || '').toLowerCase()));
   const hasStock = !!(trade.parameters?.shares && parseFloat(trade.parameters.shares) > 0);
   const allShortCalls = hasOptionLegs && legs.every(l => l.action === 'sell' && l.type?.toLowerCase() === 'call');
+  const coveredMark = !!trade.parameters?.covered;   // marked covered (shares held elsewhere, no stock leg)
 
   if (t === 'box_spread') return 'income_options';
+  // Explicitly marked covered + only short calls → a covered call, even with no stock leg here.
+  if (coveredMark && allShortCalls) return 'covered_calls';
 
   // Stock-based types — re-evaluate if option legs exist (handles evolution)
   if (t === 'stock_long' || t === 'stock_short') {
@@ -288,6 +292,7 @@ function tradeStructure(trade: SavedStrategyItem): { key: string; label: string 
   const legs = (trade.legs_data || []) as any[];
   const opts = legs.filter(l => /call|put/i.test(l.type || ''));
   const hasStock = (Number(trade.parameters?.shares) || 0) > 0;
+  const covered = !!trade.parameters?.covered;   // marked covered (shares held elsewhere, no stock leg)
   if (opts.length === 0) return hasStock ? { key: 'stock', label: 'Stock' } : { key: 'other', label: 'Other' };
   const short = (l: any) => /sell|short/i.test(l.action || '');
   const call = (l: any) => /call/i.test(l.type || '');
@@ -297,10 +302,11 @@ function tradeStructure(trade: SavedStrategyItem): { key: string; label: string 
   const lc = opts.filter(l => !short(l) && call(l)).length;
   const lp = opts.filter(l => !short(l) && put(l)).length;
   const one = opts.length === 1;
-  if (hasStock && sc === 1 && lp === 0) return { key: 'covered_call', label: 'Covered Call' };
+  // A single short call MARKED covered reads as a Covered Call (header + filter), even with no stock leg.
+  if ((hasStock && sc === 1 && lp === 0) || (covered && sc === 1 && one)) return { key: 'covered_call', label: 'Covered Call' };
   if (hasStock && sc === 1 && lp === 1) return { key: 'collar', label: 'Collar' };
   if (!hasStock && sp === 1 && one) return { key: 'cash_secured_put', label: 'Cash-Secured Put' };
-  if (!hasStock && sc === 1 && one) return { key: 'naked_call', label: 'Naked Call' };
+  if (!hasStock && !covered && sc === 1 && one) return { key: 'naked_call', label: 'Naked Call' };
   if (!hasStock && lp === 1 && one) return { key: 'long_put', label: 'Long Put' };
   if (!hasStock && lc === 1 && one) return { key: 'long_call', label: 'Long Call' };
   if (sp === 1 && lp === 1 && sc === 0 && lc === 0) return { key: 'put_credit_spread', label: 'Put Credit Spread' };
@@ -845,6 +851,20 @@ function TradeCard({
   // Show stock+options breakdown when position has both components
   const hasStockLeg = !!(trade.parameters?.shares && parseFloat(trade.parameters.shares) > 0);
   const hasOptionLegsNow = !!(trade.legs_data && trade.legs_data.length > 0);
+  // Covered-call MARK (shares held elsewhere, not added here) — lets a bare short call be treated as
+  // covered by Manage-Book risk math without an actual stock leg.
+  const hasShortCall = (trade.legs_data || []).some((l: any) =>
+    String(l.type || '').toUpperCase().includes('CALL') && String(l.action || '').toUpperCase().startsWith('S'));
+  const isMarkedCovered = !!trade.parameters?.covered;
+  const [coveredSaving, setCoveredSaving] = useState(false);
+  const toggleCovered = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setCoveredSaving(true);
+    try {
+      await setTradeCovered(trade.id, !isMarkedCovered);
+      onPositionChanged(trade.id);
+    } catch { /* noop */ } finally { setCoveredSaving(false); }
+  };
 
   const startRoll = (legIdx: number) => {
     const leg = trade.legs_data?.[legIdx];
@@ -1382,6 +1402,23 @@ function TradeCard({
                 onClick={e => { e.stopPropagation(); setAddingStock(v => !v); setAddingLeg(false); }}
               >
                 <TrendingUp className="w-3 h-3" /> Add Stock
+              </button>
+            )}
+
+            {/* Mark COVERED — a short call whose shares you hold ELSEWHERE (no stock leg added here). Manage
+                Book then treats it as covered (excluded from naked-assignment & buy-to-cover cost). Stays
+                visible once marked (group flips to covered_calls) so it can be toggled off. */}
+            {!hasStockLeg && hasShortCall && (group === 'multi_leg' || group === 'income_options' || isMarkedCovered) && (
+              <button
+                disabled={coveredSaving}
+                title={isMarkedCovered
+                  ? 'Marked covered — Manage Book treats the short call as covered (shares held elsewhere). Click to unmark.'
+                  : 'Mark as a covered call without adding stock — you hold the shares elsewhere. Manage Book will exclude it from naked-assignment risk.'}
+                className={`btn btn-ghost btn-xs gap-1 text-[10px] border ${isMarkedCovered ? 'border-success/40 text-success bg-success/10' : 'border-white/[0.06] hover:border-success/20 hover:text-success'}`}
+                onClick={toggleCovered}
+              >
+                {isMarkedCovered ? <Check className="w-3 h-3" /> : <Shield className="w-3 h-3" />}
+                {isMarkedCovered ? 'Covered' : 'Mark Covered'}
               </button>
             )}
 
@@ -2383,6 +2420,18 @@ function TradeCard({
               </div>
             );
           })()}
+
+          {/* Trade Manager — the hold / exit desk: STRONG HOLD · HOLD · EXIT · STRONG EXIT from the Quant +
+              Technical + Fundamental + Event lenses aligned to THIS position, the exit plan (levels + why),
+              what to watch next, 15 famous-trader rule checks, and the facts-only evidence JSON for the LLM.
+              Collapsed by default — opening it runs the (heavy) evidence build once, on demand. */}
+          {pnl && (
+            <CollapsibleSection title="Trade Manager" accent="secondary"
+              icon={<Target className="w-3 h-3" />}
+              subtitle="hold / exit verdict · exit levels & why · what to watch · trader rules · fundamentals · AI assist">
+              <TradeManagerPanel trade={trade} pnl={pnl} />
+            </CollapsibleSection>
+          )}
 
           {/* Defend — the trouble-trade desk: recoverability (+ TA outlook) · assignment · synthetic
               reframe · priced repair/adjust menu (rolled in) · cost-of-waiting · context · war-room.

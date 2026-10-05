@@ -436,6 +436,16 @@ def fund_user_yield(h: dict) -> float | None:
     return _num(h.get("coupon_rate")) if _fund_setting(h) is not None else None
 
 
+_NON_USD_HINTS = ("local currency", "lcl ccy", "local ccy", "international", "intl", "world", "foreign", "ex-us", "ex us", "global ex")
+
+
+def is_non_usd_fund(text: str) -> bool:
+    """A bond fund paid in OTHER currencies (unhedged international / local-currency EM) — its dollar value moves
+    with the dollar. USD-denominated EM debt and currency-hedged funds stay dollar assets."""
+    t = text.lower()
+    return any(k in t for k in _NON_USD_HINTS) and not any(k in t for k in ("hedged", "usd", "dollar"))
+
+
 def fund_payout(h: dict, fp: dict | None) -> tuple[str, str]:
     """("distributes" | "accumulates", where that came from). Box-spread ETFs (BOXX…) never distribute —
     the return builds up in the share price and is a capital gain when you sell."""
@@ -604,6 +614,8 @@ def analyze_holding(h: dict, profile: dict, rates: bm.TaxRates, ctx: Ctx) -> tup
             "fund": {"distribution_yield_pct": _pct(dist) if dist else None, "expense_ratio_pct": (fp or {}).get("expense_ratio_pct"),
                      "est_ytm_pct": _pct(est["yield"]) if est else None, "est_basis": est["basis"] if est else None,
                      "user_yield_pct": user_y, "payout": payout, "payout_source": payout_src,
+                     "cash_like": _is_box(_fund_text(h, fp)) or any(k in _fund_text(h, fp) for k in _BILL_HINTS),
+                     "non_usd": is_non_usd_fund(_fund_text(h, fp)),
                      "cash_yield_pct": _pct(cash_y), "accrual_pct": _pct(accrual),
                      "duration_source": (fp or {}).get("duration_source"), "avg_maturity": (fp or {}).get("avg_maturity"),
                      "duration_confidence": (fp or {}).get("duration_confidence"), "duration_r2": (fp or {}).get("duration_r2"),
@@ -872,7 +884,9 @@ def aggregate(rows: list[dict], internals: dict) -> dict:
     for r in live:
         v = r.get("market_value") or 0.0
         mix = (r.get("fund") or {}).get("credit_mix") or {}
-        if r["kind"] in FUNDS and mix:
+        if r["kind"] in FUNDS and (r.get("fund") or {}).get("cash_like"):
+            credit["GOVT"] += v                    # box-spread / T-bill funds: cash-like, no corporate credit
+        elif r["kind"] in FUNDS and mix:
             gov = min(mix.get("us_government") or 0.0, 1.0)
             rest = {k: x for k, x in mix.items() if k != "us_government" and x}
             tot_rest = sum(rest.values())
@@ -1565,6 +1579,7 @@ def _analyze_sync(holdings: list[dict], profile: dict, ctx: Ctx, cash_years: int
         "watchlist": [r for r in rows if r["status"] == "watch"],
         "cash_flow": {k: v for k, v in cash.items() if k != "events"}, "tax": tax, "recommendations": recs,
         "profile": {**default_profile(), **(profile or {})},
+        "curve": {"nominal": [[t, round(y * 100, 3)] for t, y in (ctx.mi.get("nominal") or {}).get("points") or []]},
     }
 
 

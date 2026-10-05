@@ -1058,3 +1058,421 @@ def test_plan_taxes_reconcile_and_shortfall_is_priced_after_tax(fake_market):
     zero = {**prof, "federal_rate": 0, "state_rate": 0, "niit": False}
     z = asyncio.run(L.plan_goals(book, zero, after_tax=True, use_funds=False, reinvest=False))["cost_to_fund_shortfalls"]
     assert z["total"] == pytest.approx(z["pre_tax_total"], rel=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# What to buy next (balanced-book purchase planner)
+# ---------------------------------------------------------------------------
+from app.services import bond_buy_service as BUY  # noqa: E402
+
+
+@pytest.mark.parametrize("preset", ["safety", "balanced", "income"])
+def test_buy_plan_respects_every_limit_and_reconciles(fake_market, preset):
+    out = asyncio.run(BUY.buy_plan(BOOK, PROFILE, {"amount": 100000, "preset": preset}))
+    p, b, a, lines = out["params"], out["before"], out["after"], out["lines"]
+    assert lines and sum(l["amount"] for l in lines) == pytest.approx(100000, abs=1)
+    assert all(l["amount"] >= 1000 for l in lines)                                      # no crumbs
+    assert all(BUY._CREDIT_LEVEL[(l["kind"], l["rating"])] <= BUY.MIN_CREDIT[p["min_credit"]] for l in lines)
+    assert all(l["kind"] != "tips" or l["tenor"] >= BUY.TIPS_MIN_TENOR for l in lines)
+    # the book after buying: duration inside the band, the after-tax income adds up line by line
+    assert p["target_duration"] - p["duration_tolerance"] - 0.01 <= a["duration"] <= p["target_duration"] + p["duration_tolerance"] + 0.01
+    assert a["after_tax_income"] == pytest.approx(b["after_tax_income"] + sum(l["annual_after_tax"] for l in lines), abs=1)
+    assert a["dv01"] == pytest.approx(b["dv01"] + sum(l["dv01"] for l in lines), abs=0.05)
+    assert sum(k["after"] - k["before"] for k in out["krd"]) == pytest.approx(sum(l["dv01"] for l in lines), abs=0.05)
+    assert a["corporate_pct"] <= max(p["corp_max_pct"], b["corporate_pct"]) + 0.1
+    if b["tips_pct"] < p["tips_min_pct"]:
+        assert a["tips_pct"] >= p["tips_min_pct"] - 0.1 or any("TIPS reach" in n for n in out["notes"])
+
+
+def test_buy_plan_safety_is_government_only_and_ira_skips_munis(fake_market):
+    safe = asyncio.run(BUY.buy_plan(BOOK, PROFILE, {"amount": 50000, "preset": "safety"}))
+    assert {l["kind"] for l in safe["lines"]} <= {"treasury", "tips", "cd"}
+    ira = asyncio.run(BUY.buy_plan(BOOK, PROFILE, {"amount": 50000, "preset": "income", "account_type": "ira"}))
+    assert all(l["kind"] != "muni" for l in ira["lines"])
+    assert all(l["after_tax_pct"] == pytest.approx(l["pre_tax_pct"]) for l in ira["lines"])   # no tax inside an IRA
+
+
+def test_buy_plan_explains_a_duration_target_it_cannot_reach(fake_market):
+    out = asyncio.run(BUY.buy_plan(BOOK, PROFILE, {"amount": 5000, "preset": "balanced", "target_duration": 12.0,
+                                                   "duration_tolerance": 0.25}))
+    assert out["after"]["duration"] < 11.75 and any("can only reach" in n for n in out["notes"])
+    assert max(l["tenor"] for l in out["lines"]) >= 20                       # goes as long as allowed to get closest
+
+
+# ---------------------------------------------------------------------------
+# Social Security + other income in the planner
+# ---------------------------------------------------------------------------
+from app.services import bond_income_service as INC  # noqa: E402
+
+
+def test_social_security_claiming_factors_follow_ssa_rules():
+    assert INC.fra_months(1954) == 66 * 12 and INC.fra_months(1957) == 66 * 12 + 6 and INC.fra_months(1960) == 67 * 12
+    fra = INC.fra_months(1970)
+    assert INC.retirement_factor(fra, 62 * 12) == pytest.approx(0.70)          # 36×5/9% + 24×5/12% = 30% cut
+    assert INC.retirement_factor(fra, 67 * 12) == pytest.approx(1.0)
+    assert INC.retirement_factor(fra, 70 * 12) == pytest.approx(1.24)          # 36 × 2/3% delayed credits
+    assert INC.retirement_factor(fra, 72 * 12) == pytest.approx(1.24)          # no credits past 70
+    assert INC.retirement_factor(66 * 12, 62 * 12) == pytest.approx(0.75)      # FRA 66 → 25% cut at 62
+    assert INC.spousal_factor(fra, 62 * 12) == pytest.approx(0.65) and INC.spousal_factor(fra, 69 * 12) == 1.0
+    assert INC.survivor_factor(fra, 60 * 12) == pytest.approx(0.715) and INC.survivor_factor(fra, 59 * 12) == 0.0
+
+
+def test_taxable_social_security_matches_the_irs_worksheet():
+    assert INC.taxable_social_security(12000, 10000, "single") == 0                                # under $25k
+    assert INC.taxable_social_security(12000, 20000, "single") == pytest.approx(500)               # 50% tier
+    assert INC.taxable_social_security(30000, 50000, "joint") == pytest.approx(0.85 * 21000 + 6000)   # 85% tier
+    assert INC.taxable_social_security(30000, 500000, "joint") == pytest.approx(0.85 * 30000)      # capped at 85%
+    assert INC.taxable_social_security(30000, 50000, "single") > INC.taxable_social_security(30000, 50000, "joint")
+
+
+def test_social_security_streams_start_grow_and_step_up_for_the_survivor():
+    yrs = list(range(2026, 2062))
+    you = INC.parse_person({"birth_year": 1960, "birth_month": 6, "claim_age": 67, "monthly_benefit": 3000, "through_age": 85})
+    sp = INC.parse_person({"birth_year": 1962, "birth_month": 6, "claim_age": 67, "monthly_benefit": 800, "through_age": 95})
+    out = INC.social_security_streams(you, sp, yrs, TODAY, bm.InflationPath(0.025, 0.025))
+    y, s, info = out["by_person"]["you"], out["by_person"]["spouse"], out["people"]
+    assert info["you"]["start"] == "2027-06" and y[2026] == 0
+    assert y[2027] == pytest.approx(7 * 3000 * 1.025) and y[2028] == pytest.approx(12 * 3000 * 1.025 ** 2)   # Jun–Dec, then COLA
+    # spouse: own 800 + spousal top-up (50% × 3000 − 800 = 700) from their FRA → 1,500 a month in today's dollars
+    assert info["spouse"]["spousal_monthly"] == pytest.approx(700) and info["spouse"]["start"] == "2029-06"
+    assert s[2030] == pytest.approx(12 * 1500 * 1.025 ** 4)
+    # you die after age 85 (May 2046): the survivor steps up to your 3,000
+    assert y[2047] == 0 and s[2047] == pytest.approx(12 * 3000 * 1.025 ** 21)
+    # claiming at 62 pays 70% sooner; an amount given "at my claiming age" is converted back to the FRA benefit
+    early = INC.parse_person({"birth_year": 1970, "claim_age": 62, "monthly_benefit": 2100, "basis": "claim"})
+    assert early["pia"] == pytest.approx(3000) and early["factor"] == pytest.approx(0.70)
+
+
+def test_planner_counts_social_security_and_other_income(fake_market):
+    goals = [{"name": "Retirement", "year": 2030, "end_year": 2040, "amount": 60000, "inflation_adjusted": False}]
+    book = [{"id": 1, "kind": "treasury", "face_value": 200000, "coupon_rate": 4.0, "coupon_freq": 2,
+             "maturity_date": "2031-06-30", "current_price": 99.5}]
+    plain = asyncio.run(L.plan_goals(book, {**PROFILE, "goals": goals}))
+    ss = {"you": {"birth_year": 1965, "birth_month": 1, "claim_age": 67, "monthly_benefit": 2500}, "taxable_pct": 85}
+    prof = {**PROFILE, "goals": goals, "settings": {"social_security": ss, "income_sources": [
+        {"name": "Pension", "amount": 12000, "start_year": 2031, "end_year": 2035, "cola": False, "taxable_pct": 100}]}}
+    out = asyncio.run(L.plan_goals(book, prof))
+    inc_ = out["income"]
+    assert inc_["configured"] and inc_["people"]["you"]["start"] == "2032-01" and plain["income"]["configured"] is False
+    assert out["funded_ratio_pct"] > plain["funded_ratio_pct"]
+    rates = ps.tax_rates(PROFILE)
+    by = {r["year"]: r for r in inc_["by_year"]}
+    assert by[2031]["other"] == pytest.approx(12000) and by[2031]["tax"] == pytest.approx(12000 * (rates.fed + rates.state))
+    g33 = 12 * 2500 * bm.InflationPath(0.023, 0.023).factor(7)                 # fake market: 2.3% breakeven
+    assert by[2033]["social_security"] == pytest.approx(g33, rel=1e-6)
+    assert by[2033]["tax"] == pytest.approx(0.85 * g33 * rates.fed + 12000 * (rates.fed + rates.state), rel=1e-6)   # no state tax on SS
+    for r, p0 in zip(out["years"], plain["years"]):
+        assert r["bond_inflow"] == pytest.approx(p0["bond_inflow"], abs=0.02)   # bonds unchanged; income is separate
+        assert r["other_income"] == pytest.approx(by.get(r["year"], {"net": 0})["net"], abs=0.02)
+    assert out["taxes_total"] == pytest.approx(plain["taxes_total"] + inc_["total_tax"], abs=1.0)
+    # claiming-age comparison: 62 / 67 / 70, one marked as chosen, benefit scales 70% / 100% / 124%
+    cmp_ = {c["claim_age"]: c for c in inc_["claim_comparison"]}
+    assert set(cmp_) == {62.0, 67.0, 70.0} and cmp_[67.0]["chosen"] and cmp_[67.0]["funded_ratio_pct"] == out["funded_ratio_pct"]
+    assert cmp_[62.0]["monthly_today"] == pytest.approx(1750) and cmp_[70.0]["monthly_today"] == pytest.approx(3100)
+    assert cmp_[62.0]["start_year"] == 2027 and cmp_[70.0]["start_year"] == 2035
+    pre = asyncio.run(L.plan_goals(book, prof, after_tax=False))
+    assert pre["income"]["total_tax"] == 0 and pre["income"]["total_net"] == pytest.approx(pre["income"]["total_gross"])
+
+
+def test_lifetime_benefits_run_to_the_plan_through_age_not_the_last_goal_year():
+    you = INC.parse_person({"birth_year": 1960, "birth_month": 1, "claim_age": 67, "monthly_benefit": 1000, "through_age": 90})
+    out = INC.social_security_streams(you, None, list(range(2026, 2031)), TODAY, 0.0)
+    # Jan 2027 → Dec 2050 (through the year he is 90) = 24 years × 12 × $1,000, though the plan ends in 2030
+    assert out["people"]["you"]["lifetime_today_dollars"] == pytest.approx(24 * 12 * 1000)
+    assert sum(out["by_person"]["you"].values()) == pytest.approx(4 * 12 * 1000) and max(out["by_person"]["you"]) == 2030
+
+
+def test_ira_fund_withdrawals_chosen_by_the_plan_make_social_security_taxable(fake_market):
+    """The plan sells an IRA bond fund to fund the goal: those withdrawals are income, so the benefit that
+    would be tax-free on its own becomes (up to 85%) taxable — found by the second pass."""
+    prof = {**PROFILE, "goals": [{"name": "Retirement", "year": 2030, "end_year": 2036, "amount": 90000, "inflation_adjusted": False}],
+            "settings": {"social_security": {"you": {"birth_year": 1962, "birth_month": 1, "claim_age": 67, "monthly_benefit": 2000}}}}
+    ira = [{"id": 1, "kind": "etf", "ticker": "BND", "quantity": 12000, "purchase_price": 70.0, "account_type": "ira"}]
+    out = asyncio.run(L.plan_goals(ira, prof))
+    held = asyncio.run(L.plan_goals(ira, prof, use_funds=False))          # no sales → only the fund's distributions are spent
+    y = 2032
+    sold = sum(s["gross"] for s in out["funds"]["schedule"] if s["year"] == y)
+    row = next(r for r in out["income"]["by_year"] if r["year"] == y)
+    row_held = next(r for r in held["income"]["by_year"] if r["year"] == y)
+    assert sold > 20000 and row["ss_taxable_pct"] > row_held["ss_taxable_pct"]
+    assert row["ss_taxable_pct"] == pytest.approx(100 * INC.taxable_social_security(row["social_security"], sold, "single") / row["social_security"], abs=0.2)
+    # goals end in 2036 but benefits run to 2057 → the comparison is flagged as short-horizon
+    assert out["income"]["comparison_horizon_short"] and out["income"]["benefits_through_year"] == 2057
+
+
+def test_profile_settings_are_merged_so_one_screen_never_wipes_anothers(monkeypatch):
+    from app.routers import bond_router as br
+
+    class FakeDB:
+        def __init__(self): self.row = None
+        async def execute(self, *_a, **_k): return SimpleNamespace(scalar_one_or_none=lambda: self.row)
+        def add(self, obj): self.row = obj
+        async def commit(self): pass
+
+    db, user = FakeDB(), SimpleNamespace(id=1)
+    ss = {"you": {"claim_age": 67, "monthly_benefit": 3200}}
+    asyncio.run(br.put_profile(br.ProfileIn(settings={"birth_year": 1977, "social_security": ss}), user, db))
+    # the tax-profile editor saves only its own keys (a stale copy without Social Security)
+    out = asyncio.run(br.put_profile(br.ProfileIn(settings={"retired_federal_rate": 12, "inflation_long": None}), user, db))
+    assert out["settings"] == {"birth_year": 1977, "social_security": ss, "retired_federal_rate": 12}
+    out = asyncio.run(br.put_profile(br.ProfileIn(settings={"social_security": None}), user, db))     # null clears a key
+    assert "social_security" not in out["settings"] and out["settings"]["birth_year"] == 1977
+
+
+# ---------------------------------------------------------------------------
+# Gap plan: purchases sized to the plan's shortfall years + inflation / debasement stress test
+# ---------------------------------------------------------------------------
+from app.services import bond_gap_service as GAP  # noqa: E402
+
+GAP_BOOK = [{"id": 1, "kind": "treasury", "face_value": 200000, "coupon_rate": 4.0, "coupon_freq": 2,
+             "maturity_date": "2031-06-30", "current_price": 99.5},
+            {"id": 2, "kind": "etf", "ticker": "BND", "quantity": 2000, "purchase_price": 72.0, "account_type": "taxable"}]
+
+
+def _gap(real: bool, **params):
+    prof = {**PROFILE, "goals": [{"name": "Retirement", "year": 2030, "end_year": 2040, "amount": 60000, "inflation_adjusted": real}]}
+    return asyncio.run(GAP.gap_plan(GAP_BOOK, prof, params))
+
+
+def test_gap_plan_fills_every_shortfall_year_and_tips_win_the_inflation_stress(fake_market):
+    out = _gap(True)
+    assert out["gaps"] and out["current"]["outcomes"]["base"]["unfunded_today_dollars"] > 100000
+    by = {s["key"]: s for s in out["strategies"]}
+    assert set(by) == {"nominal", "blend", "tips"}
+    gap_total = sum(g["shortfall"] for g in out["gaps"])
+    for s in by.values():                       # sized by the planner itself → the gap years are covered as expected
+        assert s["outcomes"]["base"]["unfunded_nominal"] < 0.01 * gap_total, s["key"]
+        assert {l["year"] for l in s["lines"]} <= {g["year"] for g in out["gaps"]}
+        assert s["cost"] == pytest.approx(sum(l["amount"] for l in s["lines"]), abs=0.05)
+        assert all(l["amount"] >= 1000 for l in s["lines"])
+    assert all(l["kind"] == "tips" for l in by["tips"]["lines"]) and all(l["kind"] != "tips" for l in by["nominal"]["lines"])
+    # inflation-adjusted goals: fixed dollars fall short when prices run, CPI-linked ones keep up
+    for sc in ("high", "debase"):
+        u = {k: by[k]["outcomes"][sc]["unfunded_today_dollars"] for k in by}
+        assert u["tips"] < u["blend"] < u["nominal"], (sc, u)
+    assert out["recommended"] == "tips" and out["real_share_pct"] == 100.0
+    assert by["tips"]["worst_unfunded_today_dollars"] == pytest.approx(max(o["unfunded_today_dollars"] for o in by["tips"]["outcomes"].values()))
+    # buying TIPS raises the book's inflation-linked share; the stress table of the untouched plan is worst in debasement
+    assert out["resilience"]["after"]["inflation_linked_pct"] > out["resilience"]["before"]["inflation_linked_pct"]
+    cur = out["current"]["outcomes"]
+    assert cur["debase"]["unfunded_today_dollars"] > cur["high"]["unfunded_today_dollars"] > cur["base"]["unfunded_today_dollars"] > cur["low"]["unfunded_today_dollars"]
+
+
+def test_gap_plan_fixed_dollar_goals_are_matched_by_nominal_bonds(fake_market):
+    out = _gap(False)
+    by = {s["key"]: s for s in out["strategies"]}
+    assert out["real_share_pct"] == 0.0 and out["recommended"] == "nominal"
+    # a fixed-dollar need is met by fixed-dollar bonds in every world; TIPS pay fewer dollars when inflation is low
+    # (in the deflation world rates collapse, so the EXISTING fund and carried cash earn less — that gap isn't the new bonds')
+    gap_total = sum(g["shortfall"] for g in out["gaps"])
+    assert max(by["nominal"]["outcomes"][k]["unfunded_nominal"] for k in ("base", "high", "debase")) < 0.02 * gap_total
+    assert by["tips"]["outcomes"]["low"]["unfunded_nominal"] > by["nominal"]["outcomes"]["low"]["unfunded_nominal"] + 1000
+    # the nominal pick is the best AFTER-TAX instrument within the credit limit, and it says what it beat
+    line = by["nominal"]["lines"][-1]
+    assert line["alternatives"] and all(line["after_tax_pct"] >= a["after_tax_pct"] for a in line["alternatives"])
+    safe = {s["key"]: s for s in _gap(False, min_credit="govt")["strategies"]}
+    assert {l["kind"] for l in safe["nominal"]["lines"]} <= {"treasury", "cd"}
+
+
+def test_gap_plan_budget_funds_the_nearest_years_first(fake_market):
+    full = {s["key"]: s for s in _gap(True)["strategies"]}["tips"]
+    capped = {s["key"]: s for s in _gap(True, budget=100000)["strategies"]}["tips"]
+    assert capped["cost"] <= 100000 + 1000 < full["cost"]
+    years = sorted({l["year"] for l in capped["lines"]})
+    assert years == sorted({l["year"] for l in full["lines"]})[:len(years)]            # earliest gap years, in order
+    after = {y["year"]: y["shortfall_after"] for y in capped["years"]}
+    assert after[years[0]] < 1500 and after[2040] > 20000                              # near year closed, far year still open
+
+
+def test_gap_plan_scenarios_and_rate_shift_mechanics(fake_market):
+    scs = {s["key"]: s for s in GAP.scenario_defs(bm.InflationPath(0.025, 0.02), 1.0, 5.0, 6.0)}
+    assert scs["low"]["rate_shift"] == pytest.approx(-0.01) and scs["high"]["rate_shift"] == pytest.approx(0.03)
+    assert scs["debase"]["rate_shift"] == pytest.approx(0.02)                  # rates lag: half of the 4-point rise
+    prof = {**PROFILE, "goals": [{"name": "G", "year": 2030, "end_year": 2032, "amount": 20000, "inflation_adjusted": False}]}
+    base = asyncio.run(L.plan_goals(GAP_BOOK, prof, light=True))
+    up = asyncio.run(L.plan_goals(GAP_BOOK, prof, light=True, rate_shift=0.02))
+    f0, f1 = base["funds"]["available"][0], up["funds"]["available"][0]
+    assert f1["value"] == pytest.approx(f0["value"] * (1 - f0["duration"] * 0.02), rel=1e-9)   # price hit today…
+    assert f1["yield_pct"] == pytest.approx(f0["yield_pct"] + 2.0, abs=1e-6)                   # …then it earns more
+    assert up["years"][3]["bond_inflow"] == pytest.approx(base["years"][3]["bond_inflow"], abs=0.01)   # the held Treasury is untouched
+    none = asyncio.run(GAP.gap_plan(GAP_BOOK, {**PROFILE, "goals": [{"name": "Small", "year": 2031, "amount": 1000, "inflation_adjusted": False}]}, {}))
+    assert none["strategies"] == [] and none["gaps"] == [] and set(none["current"]["outcomes"]) == {"low", "base", "high", "debase"}
+
+
+def test_resilience_flags_concentration_and_missing_inflation_protection():
+    rows, _ = ps.analyze_rows(BOOK + [{"id": 50, "kind": "etf", "ticker": "BOXX", "quantity": 20000, "account_type": "taxable"}],
+                              PROFILE, _ctx(funds=FUNDS_X, cpi={(2026, 6): 334.0, (2026, 7): 334.5}))
+    r = GAP.resilience(rows)
+    assert r["largest_position"]["name"] == "BOXX" and r["largest_position"]["pct"] > 20
+    assert r["non_usd_pct"] == 0 and r["inflation_linked_pct"] < 15 and sum(s["pct"] for s in r["segments"]) == pytest.approx(100, abs=0.5)
+    assert any("BOXX alone" in f for f in r["flags"]) and any("inflation-linked" in f for f in r["flags"]) and any("US dollars" in f for f in r["flags"])
+
+
+# ---------------------------------------------------------------------------
+# Balance the whole book: keep / sell / swap within each account (+ new money), judged by the planner
+# ---------------------------------------------------------------------------
+from app.services import bond_rebalance_service as REB  # noqa: E402
+
+REB_BOOK = [
+    {"id": 1, "kind": "treasury", "label": "UST 2031", "face_value": 150000, "coupon_rate": 4.0, "coupon_freq": 2,
+     "maturity_date": "2031-06-30", "current_price": 99.5, "purchase_price": 99.0, "purchase_date": "2024-01-10"},
+    {"id": 2, "kind": "etf", "ticker": "BOXX", "label": "BOXX", "quantity": 1500, "purchase_price": 108.0, "account_type": "taxable"},
+    {"id": 3, "kind": "etf", "ticker": "BND", "label": "BND", "quantity": 1500, "purchase_price": 72.0, "account_type": "ira"},
+    {"id": 4, "kind": "corporate", "label": "JPM 2034", "face_value": 40000, "coupon_rate": 5.0, "coupon_freq": 2,
+     "maturity_date": "2034-06-30", "current_price": 100.0, "rating": "A", "account_type": "ira"},
+]
+REB_PROF = {**PROFILE, "goals": [{"name": "Retirement", "year": 2030, "end_year": 2040, "amount": 40000, "inflation_adjusted": True}]}
+
+
+@pytest.fixture
+def reb_market(fake_market, monkeypatch):
+    intl = {"IGOV": {"ticker": "IGOV", "name": "iShares International Treasury Bond ETF", "quote_type": "ETF", "price": 40.0,
+                     "distribution_yield_pct": 3.0, "duration": 7.0, "expense_ratio_pct": 0.35, "credit_mix": {}},
+            "EMLC": {"ticker": "EMLC", "name": "VanEck J.P. Morgan EM Local Currency Bond ETF", "quote_type": "ETF", "price": 25.0,
+                     "distribution_yield_pct": 6.0, "duration": 5.0, "expense_ratio_pct": 0.30, "credit_mix": {}}}
+
+    async def fp(t):
+        return FUNDS_X.get(t.upper()) or intl.get(t.upper())
+    monkeypatch.setattr(mkt, "fund_profile", fp)
+    monkeypatch.setattr(mkt, "fund_profile_full", fp)
+
+
+def _reb(**params):
+    return asyncio.run(REB.rebalance(REB_BOOK, REB_PROF, params))
+
+
+@pytest.mark.parametrize("params", [{}, {"robustness": "expected"}, {"robustness": "all", "max_turnover_pct": 60}, {"new_money": 100000}])
+def test_rebalance_keeps_money_in_its_account_within_turnover_and_the_planner_agrees(reb_market, params):
+    out = _reb(**params)
+    assert out["verdict"] == "rebalance" and out["buys"]
+    cap = params.get("max_turnover_pct", 25.0)
+    assert out["totals"]["turnover_pct"] <= cap + 0.6                              # (lot rounding)
+    for acct in {x["account_type"] for x in out["sells"] + out["buys"]}:
+        proceeds = sum(s["proceeds"] for s in out["sells"] if s["account_type"] == acct)
+        proceeds += params.get("new_money", 0.0) if acct == "taxable" else 0.0
+        bought = sum(l["amount"] for l in out["buys"] if l["account_type"] == acct)
+        left = sum(c["amount"] for c in out["cash_left"] if c["account_type"] == acct)
+        assert bought <= proceeds + 1000, acct                                     # nothing crosses accounts
+        assert bought + left == pytest.approx(proceeds, abs=1200), acct
+    assert all(l["kind"] != "muni" for l in out["buys"] if l["account_type"] != "taxable")
+    assert all(l["after_tax_pct"] == l["pre_tax_pct"] for l in out["buys"] if l["account_type"] == "ira")   # untaxed inside
+    # the planner (not the optimizer) reports before/after — and in the worlds optimized for it's no worse
+    worlds = REB.ROBUST[out["robustness"]]
+    b, a = out["outcomes"]["before"], out["outcomes"]["after"]
+    assert sum(a[k]["unfunded_today_dollars"] for k in worlds) <= sum(b[k]["unfunded_today_dollars"] for k in worlds) + 500
+    assert all(s["reason"] for s in out["sells"]) and out["why"]
+
+
+def test_rebalance_robust_to_inflation_buys_tips_and_improves_the_stress_worlds(reb_market):
+    exp, rob = _reb(robustness="expected"), _reb(robustness="all", max_turnover_pct=60)
+    tips = lambda o: sum(l["amount"] for l in o["buys"] if l["kind"] == "tips")       # noqa: E731
+    assert tips(rob) > tips(exp)
+    for k in ("high", "debase"):
+        assert rob["outcomes"]["after"][k]["unfunded_today_dollars"] < rob["outcomes"]["before"][k]["unfunded_today_dollars"] - 5000
+        assert rob["outcomes"]["after"][k]["unfunded_today_dollars"] < exp["outcomes"]["after"][k]["unfunded_today_dollars"]
+    assert rob["resilience"]["after"]["inflation_linked_pct"] > rob["resilience"]["before"]["inflation_linked_pct"]
+
+
+def test_rebalance_respects_keep_locks_and_a_zero_turnover_means_hold(reb_market):
+    base = _reb()
+    sold = {s["holding_id"] for s in base["sells"]}
+    assert sold
+    locked = _reb(keep_ids=sorted(sold))
+    assert not ({s["holding_id"] for s in locked["sells"]} & sold) and locked["keep_ids"] == sorted(sold)
+    hold = _reb(max_turnover_pct=0)
+    assert hold["verdict"] == "hold" and hold["sells"] == [] and hold["buys"] == []
+    assert hold["outcomes"]["after"] == hold["outcomes"]["before"] and hold["book"]["after"] == hold["book"]["before"]
+    only_new = asyncio.run(REB.rebalance(REB_BOOK, REB_PROF, {"new_money": 50000, "max_turnover_pct": 0, "new_money_account": "roth"}))
+    assert only_new["sells"] == [] and {l["account_type"] for l in only_new["buys"]} == {"roth"}
+    assert sum(l["amount"] for l in only_new["buys"]) + sum(c["amount"] for c in only_new["cash_left"]) == pytest.approx(50000, abs=1200)
+
+
+def test_rebalance_sale_tax_and_no_goals(reb_market):
+    rates = ps.tax_rates(PROFILE)
+    lt = {"account_type": "taxable", "market_value": 110.0, "unrealized_pnl": 10.0, "purchase_date": "2024-01-10"}
+    st = {**lt, "purchase_date": "2026-06-01"}
+    assert REB._sale_tax_rate(lt, rates, TODAY) == pytest.approx(10 / 110 * (rates.ltcg + rates.niit + rates.state))
+    assert REB._sale_tax_rate(st, rates, TODAY) == pytest.approx(10 / 110 * (rates.fed + rates.niit + rates.state))   # held < 1 year
+    assert REB._sale_tax_rate({**lt, "unrealized_pnl": -10.0}, rates, TODAY) < 0                    # a loss saves tax
+    assert REB._sale_tax_rate({**lt, "account_type": "ira"}, rates, TODAY) == 0                     # stays inside the IRA
+    none = asyncio.run(REB.rebalance(REB_BOOK, PROFILE, {}))
+    assert none["verdict"] == "no_goals" and none["sells"] == []
+
+
+def test_rebalance_is_balanced_between_inflation_linked_and_fixed_dollar_bonds(reb_market):
+    bonds = lambda o: [l for l in o["buys"] if l["leg"] != "intl"]                    # noqa: E731
+    share = lambda o, pred: sum(l["amount"] for l in bonds(o) if pred(l)) / sum(l["amount"] for l in bonds(o))   # noqa: E731
+    base = _reb()                                                                    # default: optimized BOTH ways
+    assert base["robustness"] == "both" and "Deflation" in base["worlds_optimized"][0]
+    assert 0 < share(base, lambda l: l["kind"] == "tips") <= 0.5 + 0.03              # ≤ half inflation-linked (lot rounding)
+    for kind in REB.TYPE_KEYS:                                                        # no single credit type dominates
+        assert share(base, lambda l, k=kind: l["kind"] == k) <= 0.35 + 0.03, kind
+    assert all(l["kind"] != "tips" for l in _reb(tips_max_pct=0)["buys"])
+    full = _reb(tips_max_pct=100, robustness="all", max_turnover_pct=60)
+    assert share(full, lambda l: l["kind"] == "tips") > 0.6                          # only if you ask for it
+    # the deflation world is in the stress table, and buying doesn't make it worse
+    assert base["scenarios"][0]["key"] == "low" and base["scenarios"][0]["short"] == -1.0
+    assert base["outcomes"]["after"]["low"]["unfunded_today_dollars"] <= base["outcomes"]["before"]["low"]["unfunded_today_dollars"] + 500
+
+
+def test_deflation_tips_floor_and_social_security_never_cut():
+    sched = ps.TaxSchedule(ps.tax_rates(PROFILE))
+    args = ("tips", None, 10.0, 2036, "roth", PROFILE, sched, MI)
+    d_def = GAP.delivered_per_dollar(*args, bm.InflationPath(-0.02, -0.02), TODAY, True)
+    d_zero = GAP.delivered_per_dollar(*args, bm.InflationPath(0.0, 0.0), TODAY, True)
+    d_up = GAP.delivered_per_dollar(*args, bm.InflationPath(0.03, 0.03), TODAY, True)
+    assert d_def["growth"] == pytest.approx(d_zero["growth"]) and d_up["growth"] > d_zero["growth"]     # par floor at maturity
+    you = INC.parse_person({"birth_year": 1960, "birth_month": 1, "claim_age": 67, "monthly_benefit": 1000})
+    ss = INC.social_security_streams(you, None, list(range(2026, 2036)), TODAY, bm.InflationPath(-0.02, -0.02))["by_person"]["you"]
+    assert ss[2028] == pytest.approx(12000) and ss[2035] == pytest.approx(12000)                         # no negative COLA
+    sc = GAP.scenario_defs(bm.InflationPath(0.025, 0.02), -1.0, 5.0, 6.0)[0]
+    assert sc["label"].startswith("Deflation") and sc["rate_shift"] == pytest.approx(-0.03) and sc["fx_drift"] == pytest.approx(-0.03)
+
+
+def test_rebalance_sells_funds_first_and_rolls_locked_retirement_bonds(reb_market):
+    """Born 1975 → retirement accounts open in 2035. The IRA corporate maturing 2034 is rolled at maturity, not sold;
+    the IRA fund is what gets swapped. Every fund is compared with the best alternative in its own account."""
+    prof = {**REB_PROF, "settings": {"birth_year": 1975}}
+    out = asyncio.run(REB.rebalance(REB_BOOK, prof, {}))
+    assert [r["holding_id"] for r in out["roll_at_maturity"]] == [4] and out["roll_until"] == 2035
+    assert 4 not in {s["holding_id"] for s in out["sells"]}
+    assert all(s["is_fund"] for s in out["sells"] if s["account_type"] == "ira")       # only the fund may go from the IRA
+    alts = {a["ticker"]: a for a in out["fund_alternatives"]}
+    assert set(alts) == {"BOXX", "BND"}
+    for a in alts.values():                                                            # gap = alternative − the fund's own yield
+        assert a["gap_pct"] == pytest.approx(a["alt_yield_pct"] - a["yield_pct"], abs=1e-3) and a["alt_label"]
+    assert alts["BND"]["basis"] == "inside the account" and alts["BOXX"]["basis"] == "after tax"
+    gaps = [a["gap_pct"] for a in out["fund_alternatives"]]
+    assert gaps == sorted(gaps, reverse=True)
+    assert REB.FUND_STICKY < 1 < REB.BOND_STICKY                                       # funds are cheaper to give up
+
+
+def test_rebalance_international_sleeve_adds_non_dollar_bonds(reb_market):
+    none = _reb()
+    assert all(l["leg"] != "intl" for l in none["buys"]) and none["resilience"]["after"]["non_usd_pct"] == 0
+    out = _reb(intl_pct=10, new_money=50000)
+    intl = [l for l in out["buys"] if l["leg"] == "intl"]
+    total = sum(l["amount"] for l in intl)
+    assert {l["ticker"] for l in intl} == {"IGOV", "EMLC"} and all(l["non_usd"] for l in intl)
+    target = 0.10 * (out["book_value"] + 50000)
+    assert out["limits"]["intl_target"] == pytest.approx(target, rel=1e-6) and total == pytest.approx(target, rel=0.03)
+    assert sum(l["amount"] for l in intl if l["ticker"] == "IGOV") / total == pytest.approx(0.7, abs=0.02)   # 70 / 30 split
+    assert out["resilience"]["after"]["non_usd_pct"] == pytest.approx(10.0, abs=0.6)
+    # a sleeve that can't fit inside the change limit is dropped, and the output says so
+    tight = _reb(intl_pct=10, max_turnover_pct=2)
+    assert all(l["leg"] != "intl" for l in tight["buys"]) and any("doesn't fit" in n for n in tight["notes"])
+    # a weaker dollar helps them, a stronger one hurts — and US rate moves don't reprice them
+    hold = [{"id": 1, "kind": "etf", "ticker": "IGOV", "quantity": 1000, "purchase_price": 40.0, "account_type": "roth"}]
+    goal = {**PROFILE, "goals": [{"name": "G", "year": 2040, "amount": 10000, "inflation_adjusted": False}]}
+    up = asyncio.run(L.plan_goals(hold, goal, ingredients=True, fx_drift=0.03))["funds"][0]
+    flat = asyncio.run(L.plan_goals(hold, goal, ingredients=True))["funds"][0]
+    shock = asyncio.run(L.plan_goals(hold, goal, ingredients=True, rate_shift=0.03))["funds"][0]
+    assert flat["non_usd"] and up["yield"] == pytest.approx(flat["yield"] + 0.03) and shock["value"] == pytest.approx(flat["value"])
+
+
+def test_rebalance_individual_bonds_get_only_a_share_of_the_change_limit(reb_market):
+    bond_sold = lambda o: sum(s["amount"] for s in o["sells"] if not s["is_fund"])     # noqa: E731
+    few = _reb()                                                                       # default: bonds ≤ 25% of the 25% limit
+    assert bond_sold(few) <= 0.25 * 0.25 * few["book_value"] + 1000
+    assert all(s["is_fund"] for s in _reb(bond_turnover_pct=0)["sells"])               # funds only
+    assert bond_sold(_reb(bond_turnover_pct=100)) > bond_sold(few)

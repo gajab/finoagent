@@ -3622,7 +3622,8 @@ async def reprice_desk_focus(
     return ranked[idx], desk
 
 
-def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structure: str) -> dict:
+def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structure: str,
+                          covered: bool = False) -> dict:
     """PURE assembly (no I/O): given a repriced focus ``row`` + the ``desk`` payload + a live
     ``pnl_snapshot`` (dte_remaining / captured_pct / unrealized_pnl / max_profit / max_loss),
     build the full desk-score result the UI renders — base quality + option-math + TA + Q-vs-P,
@@ -3651,6 +3652,7 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
         net_gamma=_trader.get("net_gamma"), net_vega=_trader.get("net_vega"),
         net_theta=_trader.get("net_theta"),
         next_earnings=(desk.get("context") or {}).get("next_earnings"),
+        covered=covered,
     )
     mgmt = management_desk_score(grade_adjustments=row.get("grade_adjustments"),
                                 ta_factors=row.get("ta_factors"), **_mgmt_kw)
@@ -3728,6 +3730,7 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
 async def compute_placed_desk_score(
     *, ticker: str, structure: str, expiration: Optional[str], short_strike: Optional[float],
     legs: list[dict], pnl_snapshot: dict, user, db, quote_source: str = "yfinance",
+    covered: bool = False,
 ) -> dict:
     """The FULL institutional desk score for an ALREADY-PLACED income trade — reprice the exact
     legs (``reprice_desk_focus``) then score the holder overlay (``score_desk_management``).
@@ -3741,7 +3744,7 @@ async def compute_placed_desk_score(
     )
     if row is None:
         return desk  # error dict
-    return score_desk_management(row, desk, pnl_snapshot=pnl_snapshot, structure=structure)
+    return score_desk_management(row, desk, pnl_snapshot=pnl_snapshot, structure=structure, covered=covered)
 
 
 async def _run_agent(role: str, persona: dict, context: str, api_key: str, model: str) -> dict:

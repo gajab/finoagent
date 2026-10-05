@@ -5,6 +5,7 @@ import type { BondPortfolio, BondProfile, BondYieldMenu } from '../../types';
 import { Card, ErrorBox, Field, KindBadge, Loading, Note, Seg, US_STATES, inputCls, pct, selectCls, tenorLabel, usd } from './bondUi';
 
 const BRACKETS = [10, 12, 22, 24, 32, 35, 37];
+const OWN_SETTINGS = ['inflation_long', 'retire_year', 'retired_federal_rate', 'retired_state_rate', 'retired_ltcg_rate'];
 
 export function ProfileEditor({ profile, onSaved, compact = false }: { profile: BondProfile; onSaved: () => void; compact?: boolean }) {
   const [p, setP] = useState<BondProfile>(profile);
@@ -20,7 +21,10 @@ export function ProfileEditor({ profile, onSaved, compact = false }: { profile: 
   const retiredSet = ['retired_federal_rate', 'retired_state_rate', 'retired_ltcg_rate'].some(k => st[k] != null && st[k] !== '');
   const save = async () => {
     setSaving(true); setErr(null);
-    try { await saveBondProfile(p); setOk(true); onSaved(); } catch (e) { setErr(e instanceof Error ? e.message : 'Save failed'); } finally { setSaving(false); }
+    // send only the settings this editor owns — the server merges, so the planner's keys (Social Security,
+    // income sources, birth year…) are never overwritten by this page's possibly stale copy
+    const own = Object.fromEntries(OWN_SETTINGS.map(k => [k, (p.settings ?? {})[k] ?? null]));
+    try { await saveBondProfile({ ...p, settings: own }); setOk(true); onSaved(); } catch (e) { setErr(e instanceof Error ? e.message : 'Save failed'); } finally { setSaving(false); }
   };
   return (
     <div>

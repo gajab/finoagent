@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
-  Activity, BarChart3, Calculator, Flag, Layers, LayoutGrid, Lightbulb, Plus, Receipt, RefreshCw, ScrollText, ShieldCheck, Table2, Waves,
+  Activity, BarChart3, Calculator, Flag, Layers, LayoutGrid, Lightbulb, Plus, Receipt, RefreshCw, ScrollText, ShieldCheck, ShoppingCart, Table2, Waves,
 } from 'lucide-react';
 import ErrorBoundary from '../components/ErrorBoundary';
 import { fetchBondHoldings, fetchBondLadders, fetchBondPortfolio } from '../api';
@@ -15,6 +15,7 @@ import TipsCenter from '../components/bonds/TipsCenter';
 import BondRisk from '../components/bonds/BondRisk';
 import BondTax, { ProfileEditor } from '../components/bonds/BondTax';
 import BondPlanner from '../components/bonds/BondPlanner';
+import BondBuyPlanner from '../components/bonds/BondBuyPlanner';
 import BondMarket from '../components/bonds/BondMarket';
 import BondInsights from '../components/bonds/BondInsights';
 import { Card, ErrorBox, Loading, fmtDate } from '../components/bonds/bondUi';
@@ -30,6 +31,7 @@ const TABS = [
   { id: 'risk', label: 'Risk', icon: Activity },
   { id: 'tax', label: 'Tax & Profile', icon: Receipt },
   { id: 'planner', label: 'Planner', icon: Flag },
+  { id: 'buy', label: 'What to buy', icon: ShoppingCart },
   { id: 'market', label: 'Market', icon: BarChart3 },
   { id: 'insights', label: 'Insights', icon: Lightbulb },
 ] as const;
@@ -126,12 +128,13 @@ export default function BondsPage() {
     switch (tab) {
       case 'overview': return <BondOverview data={data} onGoto={t => goto(t as TabId)} />;
       case 'holdings': return <BondHoldings data={data} filters={filters} onAdd={openAdd} onEdit={openEdit} onChanged={refresh} />;
+      case 'buy': return <BondBuyPlanner data={data} onChanged={refresh} onGotoPlanner={() => goto('planner')} />;
       case 'cashflow': return <BondCashFlow key={data.as_of + (s?.market_value ?? 0)} initial={data.cash_flow} filters={filters} />;
       case 'ladders': return <BondLadders onChanged={refresh} prefill={ladderPrefill} />;
       case 'tips': return <TipsCenter onChanged={refresh} />;
       case 'risk': return <BondRisk data={data} />;
       case 'tax': return <BondTax data={data} onChanged={refresh} />;
-      case 'planner': return <BondPlanner profile={data.profile} filters={filters} onChanged={refresh}
+      case 'planner': return <BondPlanner profile={data.profile} filters={filters} onChanged={refresh} onFundGaps={() => goto('buy')}
         onBuildLadder={(pf, tips) => { if (tips) goto('tips'); else { setLadderPrefill(pf); goto('ladders'); } }} />;
       case 'market': return <BondMarket />;
       case 'insights': return <BondInsights data={data} onGotoHolding={() => goto('holdings')} />;

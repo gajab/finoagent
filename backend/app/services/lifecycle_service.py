@@ -914,7 +914,8 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
                           cvar95: Optional[float] = None, capital: Optional[float] = None,
                           net_gamma: Optional[float] = None, net_vega: Optional[float] = None,
                           net_theta: Optional[float] = None,
-                          next_earnings: Optional[str] = None) -> dict:
+                          next_earnings: Optional[str] = None,
+                          covered: bool = False) -> dict:
     """The DEEP management read for a trade you ALREADY hold — "given I'm in, is what's
     LEFT worth the risk?" Not enter-vs-skip; hold-vs-close (STRONG_HOLD / HOLD / CLOSE /
     STRONG_CLOSE).
@@ -990,19 +991,22 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
                          "note": f"short gamma with {dte_days} DTE — delta flips fast near your strike; the "
                                  "dynamic risk of holding a winner into the gamma zone"})
 
-    # Covered vs naked short call — capital is already committed, so the ADVICE differs.
+    # Covered vs naked short call — capital is already committed, so the ADVICE differs. `covered` = the
+    # user holds the shares (a covered_call structure, OR a short call explicitly MARKED covered with the
+    # shares held elsewhere) → NO unbounded-upside / naked penalty; the risk is being called away, not a
+    # cash loss.
     advisories: list[str] = []
-    if structure == "naked_call":
+    if structure == "naked_call" and not covered:
         contribs.append({"label": "Naked risk", "pts": -6, "favorable": False,
                          "note": "unbounded upside — no stock cap; size small and defend a tested strike"})
         advisories.append(
             "Naked call — upside risk is UNBOUNDED. A sharp rally loses far more than the credit; keep it small "
             "and defend (roll up · add a long-call wing · close) if the strike is threatened.")
-    elif structure == "covered_call":
+    elif structure == "covered_call" or covered:
         advisories.append(
-            "Covered call — you hold the stock, so the risk is being CALLED AWAY above the strike (opportunity "
-            "cost), not a cash loss. To keep the shares, roll the call up/out when it's threatened; otherwise let "
-            "it decay for the income.")
+            "Covered call — you hold the stock (held elsewhere if you marked it covered), so the risk is being "
+            "CALLED AWAY above the strike (opportunity cost), not a cash loss. To keep the shares, roll the call "
+            "up/out when it's threatened; otherwise let it decay for the income.")
 
     factors_net = sum(c["pts"] for c in contribs)
 

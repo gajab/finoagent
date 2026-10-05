@@ -1,5 +1,5 @@
 import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, DeskReviewResult, DeskAgentsResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight } from './types';
-import type { BondMarket, BondCatalogue, BondLookup, BondProfile, BondHoldingInput, BondPortfolio, BondCashFlow, BondLadderParams, BondLadderResult, TipsLadderResult, BondSimulation, BondLadderSaved, BondPlan, BondCalcResult, BondYieldMenu, BondStatus, BondPreview, BondFilters, BondWithdrawalMode } from './types';
+import type { BondMarket, BondCatalogue, BondLookup, BondProfile, BondHoldingInput, BondPortfolio, BondCashFlow, BondLadderParams, BondLadderResult, TipsLadderResult, BondSimulation, BondLadderSaved, BondPlan, BondCalcResult, BondYieldMenu, BondStatus, BondPreview, BondFilters, BondWithdrawalMode, BondBuyParams, BondBuyPlan, BondGapParams, BondGapPlan, BondRebalanceParams, BondRebalance } from './types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -137,6 +137,15 @@ export async function fetchConnorsSetups(
 ): Promise<import('./types').ConnorsResponse> {
   return apiFetch<import('./types').ConnorsResponse>(
     `/api/stock/${encodeURIComponent(ticker)}/connors-rsi-setup`,
+  );
+}
+
+// Momentum Swing multi-factor confluence setups — lazy (fetched when the Momentum strategy is opened).
+export async function fetchMomentumSetups(
+  ticker: string,
+): Promise<import('./types').MomentumResponse> {
+  return apiFetch<import('./types').MomentumResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/momentum-setup`,
   );
 }
 
@@ -1503,6 +1512,15 @@ export async function deleteSavedStrategy(id: number): Promise<void> {
   await apiFetch<void>(`/api/saved-strategies/${id}`, { method: 'DELETE' });
 }
 
+// Mark a short-call trade as a COVERED call WITHOUT adding a stock leg (shares held elsewhere).
+// Manage Book / book-risk math then treats the short call as covered. Persists on parameters.covered.
+export async function setTradeCovered(id: number, covered: boolean): Promise<SavedStrategyItem> {
+  return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${id}/covered`, {
+    method: 'PATCH',
+    body: JSON.stringify({ covered }),
+  });
+}
+
 // ===== Trade Tracking =====
 
 export async function deleteTrade(strategyId: number): Promise<void> {
@@ -2253,6 +2271,87 @@ export async function runLifecycleManager(id: number, pnlSnapshot: LivePnlRespon
   });
 }
 
+// ── Trade Manager: hold / exit desk (quant + technical + fundamental + events) ────────────────
+export type ManagerSignal = 'STRONG_HOLD' | 'HOLD' | 'EXIT' | 'STRONG_EXIT';
+export interface ManagerLens { score: number; weight: number; vol?: any; detail?: any; label?: string; adjustment?: number; clear?: boolean; pts?: number; scope?: string; notes?: string[]; signal?: string | null; source?: string; overrides?: string[]; dir?: number; available?: boolean; items?: any[]; signals?: { family: string; name: string; d: number; w: number; note: string }[]; factors?: any[] }
+export interface ManagerExitItem {
+  kind: 'stop' | 'trail' | 'target' | 'guard' | 'strike' | 'pnl' | 'time' | 'event' | 'breakeven' | 'level' | 'note';
+  level: number | null; basis: string; action: string; why: string; sources: string[];
+  distance_pct?: number | null; distance_atr?: number | null; hard_stop?: number | null; hard_stop_why?: string;
+  tier?: string; r_multiple?: number | null; pnl_level?: number; in_days?: number;
+  status?: 'hit' | 'near' | 'far'; fraction?: string; evidence?: string; p_touch?: number | null; z_sigma?: number | null;
+  title?: string; group?: 'against' | 'for' | 'rules' | 'levels'; detail?: string | null;
+  status_text?: string; status_tone?: 'good' | 'bad' | 'warn'; distance_usd?: number | null; source_levels?: { label: string; price: number }[];
+}
+export interface ManagerBacktest {
+  universe: string; exit_takeaway: string; vol_ratio: string;
+  direction: { finding: string; so: string };
+  tail_state: Record<string, any>;
+  exit_rules: Record<string, { label: string; mean: number; win: number; p5: number; worst: number; hold: number }>;
+  short_put?: any;
+  hold_state?: any;
+}
+export interface ManagerWatchLevel { level: number; what: string; distance_atr?: number; distance_usd?: number; distance_pct?: number | null; noise?: boolean; source_levels?: { label: string; price: number }[]; if_break: string; if_reject?: string; if_hold?: string; effect_if_break: 'good' | 'bad' | 'mixed'; effect_note?: string }
+export interface ManagerRule { id: string; rule: string; value: any; met: boolean | null }
+export interface ManagerTraderLens {
+  key: string; trader: string; philosophy: string; rules: ManagerRule[]; met: number; total: number;
+  exit_level: number | null; exit_rule: string; stance: 'bullish' | 'bearish' | 'neutral'; d: number; note?: string;
+}
+export interface ManagerSinceEntry {
+  entry_date?: string | null; days_held?: number | null; underlying_entry?: number; underlying_entry_source?: string; underlying_now?: number;
+  move_pct?: number; vs_you?: 'with you' | 'against you' | 'flat'; high_since_pct?: number; low_since_pct?: number; bars_since_entry?: number;
+  rolls?: number; roll_realized_pnl?: number | null; realized_banked?: number; effective_breakevens?: number[] | null;
+}
+export interface TradeManagerResult {
+  ticker: string; as_of: string | null; cached_evidence: boolean; headline: string; since_entry?: ManagerSinceEntry;
+  profile: any;
+  decision: {
+    signal: ManagerSignal; score: number; raw_score: number; blend: number; event_adj: number; confidence: 'high' | 'medium' | 'low'; conviction: number;
+    weights: Record<string, number>; overrides: string[]; conflicts: string[]; coverage: number;
+    lenses: { quant: ManagerLens; technical: ManagerLens; fundamental: ManagerLens; event: ManagerLens };
+  };
+  exit_plan: {
+    recommendation: { when: string; level: number | null; text: string; steps?: { tag: string; text: string }[] }; items: ManagerExitItem[]; atr: number | null; atr_pct?: number | null;
+    risk_reward?: { risk: number; reward: number; ratio: number; note: string } | null;
+    hold_odds?: { rows: { state: string; n: number; mean_delta: number; p_close_better: number; worst5: number; p_finish_lt_neg2: number }[];
+      baseline: { n: number; mean_delta: number; p_close_better: number; worst5: number; p_finish_lt_neg2: number }; takeaway: string } | null;
+    vol?: { sigma_ann_pct?: number | null; iv_pct?: number | null; rv_blend_pct?: number | null; ratio_21_63?: number | null; regime?: string | null;
+      sigma_dte_pct?: number; dte: number; horizon?: string; horizon_short?: string; strikes: { side: string; strike: number; z_sigma: number | null; p_touch: number | null; breached: boolean }[] };
+  };
+  backtest?: ManagerBacktest;
+  monitor: {
+    up: ManagerWatchLevel[]; down: ManagerWatchLevel[];
+    indicators: { metric: string; now: any; watch: string[] }[];
+    fundamental_events: { item: string; when: string; watch: string; url?: string }[];
+  };
+  trader_lenses: ManagerTraderLens[];
+  technical: any; fundamental: any; pillars: Record<string, { score: number | null; data: any }>;
+  events: any; market: any; sources_ok: Record<string, boolean>;
+  evidence_json: any;
+}
+export interface TradeManagerAI {
+  verdict: ManagerSignal | null; conviction?: number; one_line?: string; why?: string[];
+  exit_plan?: { primary_exit?: { level: number | null; basis?: string; why?: string }; stop?: { level: number | null; why?: string };
+    profit_targets?: { level: number; why: string }[]; time_or_event_exit?: string | null };
+  hold_case?: string; exit_case?: string;
+  watch?: { upside?: { trigger: string; means: string }[]; downside?: { trigger: string; means: string }[];
+    indicators?: { metric: string; trigger: string; means: string }[]; fundamental_events?: { item: string; why: string }[] };
+  trader_views?: { trader: string; would: string; because: string; their_exit?: string }[];
+  fundamental_read?: { recent_changes?: string; competitor_industry?: string; macro_geopolitical?: string; analyst_street?: string; what_could_change_direction?: string[] };
+  risks_to_this_call?: string[]; data_gaps?: string[]; parse_error?: boolean; raw?: string;
+  _meta?: { model: string; packet_chars: number; as_of: string | null };
+}
+export async function fetchTradeManager(id: number, pnlSnapshot: LivePnlResponse, desk?: any): Promise<TradeManagerResult> {
+  return apiFetch<TradeManagerResult>(`/api/saved-strategies/${id}/trade-manager`, {
+    method: 'POST', body: JSON.stringify({ pnl_snapshot: pnlSnapshot, desk: desk ?? null }),
+  });
+}
+export async function runTradeManagerAI(id: number, pnlSnapshot: LivePnlResponse): Promise<TradeManagerAI> {
+  return apiFetch<TradeManagerAI>(`/api/saved-strategies/${id}/trade-manager/ai`, {
+    method: 'POST', body: JSON.stringify({ pnl_snapshot: pnlSnapshot }),
+  });
+}
+
 export interface RiskTradeSummary {
   ticker: string; name: string; unrealized_pnl: number; net_delta: number; net_vega: number;
 }
@@ -2988,6 +3087,18 @@ export async function fetchBondPlan(opts: { afterTax?: boolean; useFunds?: boole
 
 export async function calcBond(terms: Record<string, unknown>): Promise<BondCalcResult> {
   return apiFetch<BondCalcResult>('/api/bonds/calc', { method: 'POST', body: JSON.stringify(terms) });
+}
+
+export async function fetchBondBuyPlan(params: BondBuyParams): Promise<BondBuyPlan> {
+  return apiFetch<BondBuyPlan>('/api/bonds/buy-plan', { method: 'POST', body: JSON.stringify(params) });
+}
+
+export async function fetchBondGapPlan(params: BondGapParams): Promise<BondGapPlan> {
+  return apiFetch<BondGapPlan>('/api/bonds/gap-plan', { method: 'POST', body: JSON.stringify(params) });
+}
+
+export async function fetchBondRebalance(params: BondRebalanceParams): Promise<BondRebalance> {
+  return apiFetch<BondRebalance>('/api/bonds/rebalance', { method: 'POST', body: JSON.stringify(params) });
 }
 
 export async function fetchYieldMenu(accountType = 'taxable', tenors?: number[]): Promise<BondYieldMenu> {

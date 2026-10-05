@@ -5,6 +5,7 @@ import type { BondFilters, BondGoal, BondLadderParams, BondPlan, BondProfile, Bo
 import { AXIS, Card, Chart, Empty, ErrorBox, LEGEND, Loading, Note, Seg, Stat, TOOLTIP, inputCls, pct, usd } from './bondUi';
 import BondFundDrawdown from './BondFundDrawdown';
 import BondReinvestPlan, { REINVEST_COLOR } from './BondReinvestPlan';
+import BondIncomeSources, { INCOME_COLOR } from './BondIncomeSources';
 
 const TEMPLATES: { label: string; goal: BondGoal }[] = [
   { label: 'Retirement income floor', goal: { name: 'Retirement income', year: new Date().getFullYear() + 5, end_year: new Date().getFullYear() + 25, amount: 40000, inflation_adjusted: true } },
@@ -12,10 +13,11 @@ const TEMPLATES: { label: string; goal: BondGoal }[] = [
   { label: 'Home down payment', goal: { name: 'Home down payment', year: new Date().getFullYear() + 3, amount: 100000, inflation_adjusted: false } },
 ];
 
-export default function BondPlanner({ profile, filters, onChanged, onBuildLadder }: {
+export default function BondPlanner({ profile, filters, onChanged, onBuildLadder, onFundGaps }: {
   profile: BondProfile;
   filters?: BondFilters;
   onChanged: () => void;
+  onFundGaps?: () => void;
   onBuildLadder: (prefill: Partial<BondLadderParams>, tips: boolean) => void;
 }) {
   const [goals, setGoals] = useState<BondGoal[]>(profile.goals ?? []);
@@ -28,6 +30,7 @@ export default function BondPlanner({ profile, filters, onChanged, onBuildLadder
   const [settings, setSettings] = useState<Record<string, unknown>>(profile.settings ?? {});
   const savedBirth = settings.birth_year ? String(settings.birth_year) : '';
   const [birthYear, setBirthYear] = useState(savedBirth);
+  useEffect(() => { setBirthYear(savedBirth); }, [savedBirth]);     // e.g. changed from the Income sources card
   const [mode, setMode] = useState<BondWithdrawalMode>(
     (settings.withdrawal_mode as BondWithdrawalMode) || (settings.birth_year ? 'age' : 'after'));
   const [loading, setLoading] = useState(false);
@@ -47,13 +50,13 @@ export default function BondPlanner({ profile, filters, onChanged, onBuildLadder
   const persistSettings = async (patch: Record<string, unknown>) => {
     const next = { ...settings, ...patch };
     try { await saveBondProfile({ ...profile, goals: profile.goals, settings: next }); setSettings(next); }
-    catch (e) { setErr(e instanceof Error ? e.message : 'Save failed'); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Save failed'); throw e; }
   };
-  const chooseMode = (m: BondWithdrawalMode) => { setMode(m); persistSettings({ withdrawal_mode: m }); };
+  const chooseMode = (m: BondWithdrawalMode) => { setMode(m); persistSettings({ withdrawal_mode: m }).catch(() => {}); };
   const commitBirthYear = () => {
     const y = Number(birthYear);
     if (birthYear === savedBirth || (birthYear && (!Number.isInteger(y) || y < 1920 || y > now))) return;
-    persistSettings({ birth_year: birthYear ? y : null, withdrawal_mode: birthYear ? 'age' : mode });
+    persistSettings({ birth_year: birthYear ? y : null, withdrawal_mode: birthYear ? 'age' : mode }).catch(() => {});
     if (birthYear) setMode('age');
   };
 
@@ -66,10 +69,12 @@ export default function BondPlanner({ profile, filters, onChanged, onBuildLadder
   const chart = useMemo(() => {
     if (!plan) return null;
     const ys = plan.years.filter(y => y.need > 0 || y.inflow > 0 || (y.reinvest_out ?? 0) > 0);
-    // attribute each year's covered amount: the Treasury set aside for THIS year first, then fund sales (the plan
-    // sizes them to what's still missing — together they never exceed the need), then bonds & cash
-    const reinvPart = (y: typeof ys[number]) => Math.min(y.reinvest_in ?? 0, y.covered);
-    const fundPart = (y: typeof ys[number]) => Math.min(y.fund_sales ?? 0, Math.max(0, y.covered - reinvPart(y)));
+    // attribute each year's covered amount: Social Security & other income first (it arrives regardless), then the
+    // Treasury set aside for THIS year, then fund sales (the plan sizes them to what's still missing), then bonds & cash
+    const hasIncome = !!plan.income?.configured;
+    const incomePart = (y: typeof ys[number]) => Math.min(Math.max(0, y.other_income ?? 0), y.covered);
+    const reinvPart = (y: typeof ys[number]) => Math.min(y.reinvest_in ?? 0, Math.max(0, y.covered - incomePart(y)));
+    const fundPart = (y: typeof ys[number]) => Math.min(y.fund_sales ?? 0, Math.max(0, y.covered - incomePart(y) - reinvPart(y)));
     const early = plan.withdrawal?.early_until != null && plan.withdrawal.applies
       ? ys.filter(y => y.early_withdrawal).map(y => String(y.year)) : [];
     return {
@@ -78,7 +83,8 @@ export default function BondPlanner({ profile, filters, onChanged, onBuildLadder
       xAxis: { type: 'category', data: ys.map(y => String(y.year)), ...AXIS },
       yAxis: { type: 'value', ...AXIS, axisLabel: { ...AXIS.axisLabel, formatter: (v: number) => usd(v, { compact: true }) } },
       series: [
-        { name: 'Covered by bonds & cash', type: 'bar', stack: 'n', data: ys.map(y => Math.max(0, y.covered - fundPart(y) - reinvPart(y))), itemStyle: { color: '#34d399' },
+        ...(hasIncome ? [{ name: 'Covered by Social Security & income', type: 'bar', stack: 'n', data: ys.map(incomePart), itemStyle: { color: INCOME_COLOR } }] : []),
+        { name: 'Covered by bonds & cash', type: 'bar', stack: 'n', data: ys.map(y => Math.max(0, y.covered - incomePart(y) - fundPart(y) - reinvPart(y))), itemStyle: { color: '#34d399' },
           markArea: early.length ? { silent: true, itemStyle: { color: 'rgba(251,191,36,0.07)' },
             label: { show: true, position: 'insideTop', color: '#fbbf24', fontSize: 9, formatter: 'before 59½' },
             data: [[{ xAxis: early[0] }, { xAxis: early[early.length - 1] }]] } : undefined },
@@ -86,7 +92,7 @@ export default function BondPlanner({ profile, filters, onChanged, onBuildLadder
         { name: 'Covered by selling funds', type: 'bar', stack: 'n', data: ys.map(fundPart), itemStyle: { color: '#a78bfa' } },
         { name: 'Shortfall', type: 'bar', stack: 'n', data: ys.map(y => y.shortfall), itemStyle: { color: '#f87171' } },
         { name: 'Set aside for a later year', type: 'bar', stack: 'aside', data: ys.map(y => y.reinvest_out ?? 0), itemStyle: { color: REINVEST_COLOR, opacity: 0.35, borderColor: REINVEST_COLOR, borderType: 'dashed', borderWidth: 1 } },
-        { name: `Bond & fund income${afterTax ? ' (after tax)' : ''}`, type: 'line', data: ys.map(y => y.inflow), itemStyle: { color: '#60a5fa' }, symbol: 'circle', symbolSize: 4 },
+        { name: `${hasIncome ? 'All income: bonds, funds, Social Security' : 'Bond & fund income'}${afterTax ? ' (after tax)' : ''}`, type: 'line', data: ys.map(y => y.inflow), itemStyle: { color: '#60a5fa' }, symbol: 'circle', symbolSize: 4 },
         { name: 'Surplus carried (T-bills)', type: 'line', data: ys.map(y => y.surplus_carried), itemStyle: { color: '#94a3b8' }, symbol: 'none', lineStyle: { type: 'dashed' } },
       ],
     };
@@ -134,6 +140,8 @@ export default function BondPlanner({ profile, filters, onChanged, onBuildLadder
       </Card>
 
       {err && <ErrorBox message={err} onRetry={load} />}
+      <BondIncomeSources settings={settings} plan={dirty ? null : plan} onSave={persistSettings} />
+
       {loading && !plan ? <Loading label="Matching cash flows to goals…" /> : plan && goals.length > 0 && !dirty && (
         <>
           <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-2xl border border-white/[0.06] bg-base-100/60 px-4 py-2.5 text-[11px] text-base-content/70">
@@ -200,12 +208,19 @@ export default function BondPlanner({ profile, filters, onChanged, onBuildLadder
             )}
             {gapYears.length > 0 && (
               <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-rose-500/20 bg-rose-500/5 p-3">
-                <span className="text-xs text-rose-200">Close the gap: a ladder maturing {gapYears[0]}–{gapYears[gapYears.length - 1]} costs about {usd(plan.cost_to_fund_shortfalls.total)} today.</span>
-                <button className="btn btn-xs btn-primary" onClick={() => onBuildLadder({
+                <span className="text-xs text-rose-200">Close the gap: bonds maturing {gapYears[0]}–{gapYears[gapYears.length - 1]} cost about {usd(plan.cost_to_fund_shortfalls.total)} today.</span>
+                {onFundGaps && (
+                  <button className="btn btn-xs btn-primary" onClick={onFundGaps}
+                    title="Sized to each shortfall year, aware of what you hold, taxed at your pre-/post-retirement rates, and stress-tested for low and high inflation and dollar debasement">
+                    What to buy to close it — and how it holds up if inflation surprises →
+                  </button>
+                )}
+                <span className="text-[10.5px] text-base-content/40">or a plain ladder:</span>
+                <button className="btn btn-xs btn-ghost" onClick={() => onBuildLadder({
                   amount: Math.ceil(plan.cost_to_fund_shortfalls.total / 1000) * 1000,
                   start_years: Math.max(0.5, gapYears[0] - now), end_years: Math.max(1, gapYears[gapYears.length - 1] - now), instrument: 'treasury', weighting: 'level_income',
-                }, false)}>Build Treasury ladder</button>
-                {realGoals && <button className="btn btn-xs btn-success btn-outline" onClick={() => onBuildLadder({ start_years: gapYears[0] - now, end_years: gapYears[gapYears.length - 1] - now }, true)}>Build TIPS ladder</button>}
+                }, false)}>Treasury</button>
+                {realGoals && <button className="btn btn-xs btn-ghost" onClick={() => onBuildLadder({ start_years: gapYears[0] - now, end_years: gapYears[gapYears.length - 1] - now }, true)}>TIPS</button>}
               </div>
             )}
             <div className="mt-2 space-y-0.5">{plan.notes.map((n, i) => <Note key={i}>{n}</Note>)}</div>

@@ -214,9 +214,16 @@ def _qualify(m: dict) -> dict:
     else:
         st, pts, val = "fail", 0, "not stacked"
     score += pts
+    e20_up, s50_up = bool(m["ema20_rising"]), bool(m["sma50_rising"])
+    rise_txt = (f"Rising test (needs BOTH): 20-EMA sloping up over ~2 weeks = {'yes' if e20_up else 'no'}; "
+                f"50-SMA sloping up over ~3 weeks (or turning up over ~2) = {'yes' if s50_up else 'no'}.")
+    if stacked and not trend_rising:
+        lag = "the 50-SMA" if (e20_up and not s50_up) else "the 20-EMA" if (s50_up and not e20_up) else "both MAs"
+        rise_txt += (f" {lag} isn't rising yet — commonly a slow MA still catching up after a recent pullback "
+                     "(the dip just rolled into its window) even as price makes new highs.")
     checks.append(_check("ma_stack", "Stacked rising MAs", st, val,
-                         "price > 10EMA > 20EMA > 50SMA, rising",
-                         f"10EMA ${_r(e10)} · 20EMA ${_r(e20)} · 50SMA ${_r(s50)}. Trend must be up and orderly on the daily."))
+                         "price > 10EMA > 20EMA > 50SMA, all sloping up",
+                         f"10EMA ${_r(e10)} · 20EMA ${_r(e20)} · 50SMA ${_r(s50)}. {rise_txt} Trend must be up and orderly on the daily."))
 
     # 4) near the 52-week high (leadership)
     d = m["pct_from_52w_high"]
@@ -528,7 +535,15 @@ def _build_metrics(daily, sess_low, next_earnings, ep) -> dict:
         # "rising" = the TREND context (20-EMA over ~2 weeks, 50-SMA over ~3 weeks) — not the
         # noisy 10-EMA, which routinely flattens inside a tight base without breaking the uptrend.
         "ema20_rising": bool(len(ema20) > 11 and ema20[-1] > ema20[-11]),
-        "sma50_rising": bool(len(c) >= 65 and float(np.mean(c[-50:])) > float(np.mean(c[-65:-15]))),
+        # 50-SMA "rising" = up over ~3 weeks (steady trend) OR turned up over the last ~2 weeks. The
+        # short-window OR catches a V-RECOVERY: a sharp dip that has just rolled INTO the trailing
+        # 50-day window drags the 50-SMA below where it sat 15 bars ago even as price makes new highs
+        # (e.g. ALAB after a ~17% shakeout — −1.7% over 15 bars but +2% over 10). Without it the whole
+        # stack mislabels a ripping 10/20-EMA uptrend as "trend flat". Strictly additive (only the
+        # genuinely-still-falling 50-SMA stays "not rising").
+        "sma50_rising": bool(len(c) >= 65 and (
+            float(np.mean(c[-50:])) > float(np.mean(c[-65:-15]))        # steady ~3-week rise
+            or float(np.mean(c[-50:])) > float(np.mean(c[-60:-10])))),  # recent ~2-week turn-up
         "high_52w": high_52w, "low_52w": low_52w,
         "pct_from_52w_high": (close / high_52w - 1.0) * 100.0 if high_52w > 0 else None,
         "moves": _pct_move(c, l), "base": base, "volume": volume,

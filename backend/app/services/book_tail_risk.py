@@ -317,10 +317,16 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
     # the economic leg the crash / CVaR / ladder must revalue. Prefer parameters.shares (how the
     # combo P&L path stores it); fall back to a stock/share leg in legs_data. long>0, short<0.
     shares = 0.0
+    _sparams: dict = {}
     try:
-        shares = float(json.loads(strategy.parameters or "{}").get("shares") or 0)
+        _sparams = json.loads(strategy.parameters or "{}")
+        shares = float(_sparams.get("shares") or 0)
     except (ValueError, TypeError):
         shares = 0.0
+    # Explicit "covered" mark — the user holds the shares ELSEWHERE (not added to the income book), so a
+    # short call is covered for risk/assignment even with no stock leg here. Respected like a covered_call
+    # structure / a real stock leg (see _is_covered).
+    covered_flag = bool(_sparams.get("covered"))
     if not shares:
         for l in legs:
             if "stock" in str(l.get("type", "")).lower() or "share" in str(l.get("type", "")).lower():
@@ -334,7 +340,8 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
     return {"ticker": ticker, "name": strategy.name, "trade_id": getattr(strategy, "id", None),
             "spot": spot, "iv": avg_iv,
             "n_short": n_short, "capital": round(capital, 0), "legs": life_legs, "shares": round(shares, 2),
-            "strikes_by_exp": strikes_by_exp, "structure": structure, "has_stock": bool(has_stock), **g}
+            "strikes_by_exp": strikes_by_exp, "structure": structure,
+            "has_stock": bool(has_stock), "covered": covered_flag, **g}
 
 
 async def _index_puts(provider, dte_days: int, today: date):
@@ -681,6 +688,13 @@ def _vol_shock_for(mv: float) -> float:
     return -_SKEW_K * 100.0 * mv if mv < 0 else -0.30 * 100.0 * mv
 
 
+def _is_covered(p: dict) -> bool:
+    """A short CALL is COVERED when the shares sit behind it — a covered_call structure, a real long-share
+    leg (has_stock), or the user's explicit 'covered' mark (shares held ELSEWHERE, not in the income book).
+    A covered call delivers held shares on assignment, so it carries no naked-assignment / buy-to-cover cost."""
+    return bool(p.get("structure") == "covered_call" or p.get("has_stock") or p.get("covered"))
+
+
 def _assignment_ladder(positions: list[dict], r: float, moves=None) -> list[dict]:
     """What-if ASSIGNMENT / capital lab — 'what happens in various market scenarios'.
 
@@ -701,6 +715,7 @@ def _assignment_ladder(positions: list[dict], r: float, moves=None) -> list[dict
         puts_itm = calls_itm = 0
         for p in positions:
             s = p["spot"] * (1 + mv * p.get("beta", 1.0))     # β-adjusted per name
+            p_covered = _is_covered(p)                         # covered call → shares delivered, no cover cost
             for lg in p["legs"]:
                 if lg["sign"] >= 0:                            # only SHORT legs get assigned
                     continue
@@ -708,8 +723,8 @@ def _assignment_ladder(positions: list[dict], r: float, moves=None) -> list[dict
                 if lg["right"] == "P" and s < K:
                     put_cap += K * _MULT * qty                 # cash to buy the assigned shares
                     puts_itm += 1
-                elif lg["right"] == "C" and s > K:
-                    call_cost += (s - K) * _MULT * qty         # intrinsic to deliver / cover
+                elif lg["right"] == "C" and s > K and not p_covered:
+                    call_cost += (s - K) * _MULT * qty         # intrinsic to deliver / cover (naked only)
                     calls_itm += 1
         pnl = reprice_scenario(positions, mv, _vol_shock_for(mv), r)
         out.append({
@@ -735,7 +750,7 @@ def _naked_assignment(positions: list[dict]) -> dict:
     n_puts = n_calls = 0
     for p in positions:
         legs = p.get("legs", [])
-        covered = (p.get("structure") == "covered_call") or p.get("has_stock")
+        covered = _is_covered(p)
         has_long_put = any(lg["right"] == "P" and lg["sign"] > 0 for lg in legs)
         has_long_call = any(lg["right"] == "C" and lg["sign"] > 0 for lg in legs)
         for lg in legs:

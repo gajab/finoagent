@@ -3,6 +3,7 @@ import { AlertTriangle, ChevronDown, ChevronRight, Eye, Pencil, Plus, Trash2, Ch
 import { deleteBondHolding, setBondHoldingStatus } from '../../api';
 import type { BondFilters, BondPortfolio, BondRow } from '../../types';
 import { filtersActive, matchesFilters } from './bondFilters';
+import BondHoldingsVisuals from './BondHoldingsVisuals';
 import { Card, Empty, KindBadge, Seg, YieldBreakdown, bp, fmtDate, num, pct, pnlClass, tenorLabel, usd } from './bondUi';
 
 type SortKey = 'maturity' | 'market_value' | 'ytw_pct' | 'eff_duration' | 'after_tax' | 'label';
@@ -133,6 +134,10 @@ export default function BondHoldings({ data, filters, onAdd, onEdit, onChanged }
   onChanged: () => void;
 }) {
   const [view, setView] = useState<'held' | 'watch' | 'closed'>('held');
+  const [layout, setLayout] = useState<'table' | 'charts'>(() => {
+    try { return localStorage.getItem('bonds.holdings.layout') === 'charts' ? 'charts' : 'table'; } catch { return 'table'; }
+  });
+  const pickLayout = (l: 'table' | 'charts') => { setLayout(l); try { localStorage.setItem('bonds.holdings.layout', l); } catch { /* private mode */ } };
   const [sort, setSort] = useState<{ k: SortKey; dir: 1 | -1 }>({ k: 'maturity', dir: 1 });
   const [open, setOpen] = useState<number | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
@@ -172,6 +177,7 @@ export default function BondHoldings({ data, filters, onAdd, onEdit, onChanged }
   return (
     <Card title="Holdings" subtitle="Every bond, CD and bond fund — marked to market, with yield, duration and after-tax view"
       right={<>
+        {view === 'held' && <Seg value={layout} onChange={v => pickLayout(v as typeof layout)} options={[{ value: 'table', label: 'Table' }, { value: 'charts', label: 'Charts' }]} />}
         <Seg value={view} onChange={v => setView(v as typeof view)} options={[
           { value: 'held', label: `Held (${data.holdings.filter(r => r.status === 'held').length})` },
           { value: 'watch', label: `Watchlist (${data.watchlist.length})` },
@@ -187,6 +193,8 @@ export default function BondHoldings({ data, filters, onAdd, onEdit, onChanged }
           body={view === 'watch' ? 'Add bonds you are considering with status "Watchlist" — or adopt a ladder plan as a watchlist.'
             : 'Add Treasuries, TIPS, munis, corporates, CDs or bond funds. Paste a CUSIP and we fill in the terms.'}
           action={<button className="btn btn-primary btn-sm" onClick={onAdd}><Plus className="h-3.5 w-3.5" /> Add a bond</button>} />
+      ) : view === 'held' && layout === 'charts' ? (
+        <BondHoldingsVisuals rows={rows} curve={data.curve?.nominal} />
       ) : (
         <div className="overflow-x-auto">
           {sub && (
