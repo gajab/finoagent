@@ -335,14 +335,14 @@ class TestAssignmentLadder:
     def test_put_assignment_capital_on_the_downside(self):
         rows = _assignment_ladder(self._pos(), 0.045, moves=[-0.20])
         r = rows[0]
-        assert r["puts_itm"] == 1 and r["calls_itm"] == 0
+        assert r["puts_itm"] == 10 and r["calls_itm"] == 0       # CONTRACTS in the money (same unit as the capital)
         assert r["put_assignment_capital"] == 88 * 100 * 10     # strike × 100 × qty, cash to buy
         assert r["call_cover_cost"] == 0
 
     def test_call_cover_cost_on_the_upside(self):
         rows = _assignment_ladder(self._pos(), 0.045, moves=[0.20])
         r = rows[0]
-        assert r["calls_itm"] == 1 and r["puts_itm"] == 0
+        assert r["calls_itm"] == 14 and r["puts_itm"] == 0
         # (spot·1.20 − 106) × 100 × 14 intrinsic
         assert r["call_cover_cost"] == round((120.0 - 106.0) * 100 * 14, 0)
         assert r["put_assignment_capital"] == 0
@@ -351,6 +351,41 @@ class TestAssignmentLadder:
         # the strangle never demands BOTH put-assignment and call-cover at the same spot
         for r in _assignment_ladder(self._pos(), 0.045):
             assert not (r["puts_itm"] and r["calls_itm"])
+
+
+class TestLadderMatchesTheNakedTotal:
+    """The ladder and the 'if every naked short is assigned' total must agree on WHICH legs count — a spread's
+    protected short once inflated the ladder past the all-naked total (6 puts / $155k vs 4 naked puts / $130k)."""
+    def _L(self, K, rt, sg, q):
+        return {"strike": K, "right": rt, "sign": sg, "qty": q, "iv": 0.3, "dte_years": 30 / 365}
+
+    def _book(self):
+        return [
+            {"spot": 100.0, "beta": 1.0, "structure": "cash_secured_put", "has_stock": False, "legs": [self._L(90, "P", -1, 2)]},
+            {"spot": 100.0, "beta": 1.0, "structure": "put_credit_spread", "has_stock": False,
+             "legs": [self._L(95, "P", -1, 3), self._L(85, "P", 1, 3)]},
+            {"spot": 100.0, "beta": 1.0, "structure": "naked_call", "has_stock": False, "legs": [self._L(110, "C", -1, 2)]},
+            {"spot": 100.0, "beta": 1.0, "structure": "call_credit_spread", "has_stock": False,
+             "legs": [self._L(105, "C", -1, 3), self._L(115, "C", 1, 3)]},
+            {"spot": 100.0, "beta": 1.0, "structure": "covered_call", "has_stock": True, "legs": [self._L(104, "C", -1, 5)]},
+        ]
+
+    def test_the_ladder_never_demands_more_than_every_naked_short_assigned(self):
+        book, na = self._book(), None
+        na = _naked_assignment(book)
+        for r in _assignment_ladder(book, 0.045):
+            assert r["put_assignment_capital"] <= na["put_capital"] + 1e-6
+            assert r["puts_itm"] <= 2                              # only the 2 naked put CONTRACTS, never the spread's 3
+            assert r["calls_itm"] <= 2                             # only the 2 naked call contracts
+
+    def test_the_deepest_selloff_hits_exactly_the_naked_put_total(self):
+        book = self._book()
+        deepest = _assignment_ladder(book, 0.045, moves=[-0.35])[0]
+        assert deepest["put_assignment_capital"] == _naked_assignment(book)["put_capital"] == 90 * 100 * 2
+
+    def test_a_protected_call_leg_costs_nothing_in_the_ladder(self):
+        r = _assignment_ladder(self._book(), 0.045, moves=[0.20])[0]
+        assert r["call_cover_cost"] == round((120.0 - 110.0) * 100 * 2, 0)       # the naked 110C only
 
 
 class TestNakedAssignment:

@@ -16,6 +16,7 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (!url.includes('/api/')) return real(input, init);
   await new Promise(r => setTimeout(r, 250 + Math.random() * 400));
   if (fail && url.includes(fail)) return json({ detail: 'mock failure' }, 500);
+  if (url.includes('/trader-strategies')) return json(F.traderStrategies);
   if (url.includes('/candles')) return json(F.candles(new URL(url, location.origin).searchParams.get('interval') || '1d'));
   if (url.includes('/trade-setups')) {
     if (params.has('slow')) await new Promise(r => setTimeout(r, 6000));
@@ -37,7 +38,7 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 function App() {
   return (
     <div className="container-app py-5">
-      <div className="mb-3 rounded-lg border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs text-warning">Preview with MOCK data — layout and behaviour check only. Query flags: <code>?slow</code> <code>?noiv</code> <code>?mixed</code> <code>?fail=trade-setups</code></div>
+      <div className="mb-3 rounded-lg border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs text-warning">Preview with MOCK data — layout and behaviour check only. Query flags: <code>?slow</code> <code>?noiv</code> <code>?mixed</code> <code>?fail=trade-setups</code> <code>?fail=trader-strategies</code></div>
       <BetaTechnical ticker="NVDA" technical={F.technical as never} onLeave={() => alert('Back to classic')} />
     </div>
   );

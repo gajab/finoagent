@@ -315,7 +315,14 @@ export function tradeStructure(trade: SavedStrategyItem): { key: string; label: 
   if (sc === 1 && lc === 1 && sp === 0 && lp === 0) return { key: 'call_credit_spread', label: 'Call Credit Spread' };
   if (sp === 1 && lp === 1 && sc === 1 && lc === 1) return { key: 'iron_condor', label: 'Iron Condor' };
   if (sp === 1 && sc === 1 && lc === 1 && lp === 0) return { key: 'jade_lizard', label: 'Jade Lizard' };
-  if (sp === 1 && sc === 1 && lc === 0 && lp === 0) return { key: 'short_strangle', label: 'Short Strangle' };
+  if (sp === 1 && sc === 1 && lc === 0 && lp === 0) {
+    const kp = Number(opts.find(l => short(l) && put(l))?.strike), kc = Number(opts.find(l => short(l) && call(l))?.strike);
+    return kp === kc ? { key: 'short_straddle', label: 'Short Straddle' } : { key: 'short_strangle', label: 'Short Strangle' };   // same strike = straddle
+  }
+  if (lp === 1 && lc === 1 && sp === 0 && sc === 0 && !hasStock) {
+    const kp = Number(opts.find(l => !short(l) && put(l))?.strike), kc = Number(opts.find(l => !short(l) && call(l))?.strike);
+    return kp === kc ? { key: 'long_straddle', label: 'Long Straddle' } : { key: 'long_strangle', label: 'Long Strangle' };
+  }
   return { key: 'custom', label: 'Custom' };
 }
 
@@ -402,42 +409,34 @@ export function tradeHasStock(t: SavedStrategyItem): boolean {
   return (Number(t.parameters?.shares) || 0) > 0;
 }
 
-// P&L to show: total by default, or DERIVATIVE-ONLY (strip the stock leg's P&L) when the user
-// unchecks "include stock". A stock-less income trade's unrealized_pnl is already options-only.
-// Prefer the backend's options_pnl; else derive it as total − stock_pnl (both persisted in the
-// snapshot). If NEITHER split field is present (a pre-feature cached snapshot) we can't strip —
-// a refresh repopulates them.
-export function effectivePnl(p: LivePnlResponse | null | undefined, excludeStock: boolean): number | null {
-  if (!p) return null;
-  const total = p.unrealized_pnl ?? null;
-  if (!excludeStock) return total;
-  const op = (p as any).options_pnl;
-  if (op != null) return Number(op);
-  const sp = (p as any).stock_pnl;
-  if (sp != null && total != null) return total - Number(sp);
-  return total;
-}
-
 // Does the snapshot carry the stock/option P&L split needed for the "derivatives only" toggle?
 function hasPnlSplit(p: LivePnlResponse | null | undefined): boolean {
   return !!p && ((p as any).options_pnl != null || (p as any).stock_pnl != null);
 }
 
-export function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): number {
+export type DeployedBasis = 'margin' | 'stock' | 'futures' | 'max_loss' | 'collateral' | 'debit';
+
+/** Deployed capital AND which rule produced it — so a row can say "Reg-T margin" vs "stock held" vs "debit paid".
+ *  `deployedCapital()` is exactly `.value` of this (one chain, never two). */
+export function deployedCapitalWithBasis(t: SavedStrategyItem, p?: LivePnlResponse | null): { value: number; basis: DeployedBasis } {
   const shares = Number(t.parameters?.shares) || 0;
   const avgCost = Number(t.parameters?.avg_cost ?? t.entry_prices?.[0]?.price) || 0;
   if (t.strategy_type === 'futures') {
     const margin = t.parameters?.margin_req ? parseFloat(t.parameters.margin_req) : 0;
-    return margin || Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));
+    return { value: margin || Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0)), basis: 'futures' };
   }
-  if (shares > 0 && avgCost > 0) return shares * avgCost;                 // stock / covered call — stock is the collateral
+  if (shares > 0 && avgCost > 0) return { value: shares * avgCost, basis: 'stock' };      // stock / covered call — stock is the collateral
   const margin = Number((p as any)?.margin_required) || 0;
-  if (margin > 0) return margin;                                         // Reg-T / portfolio margin on hold
+  if (margin > 0) return { value: margin, basis: 'margin' };                              // Reg-T / portfolio margin on hold
   const ml = (p as any)?.max_loss;
-  if (ml != null && ml < 0) return Math.abs(ml);                          // fallback: defined-risk collateral (width)
+  if (ml != null && ml < 0) return { value: Math.abs(ml), basis: 'max_loss' };            // fallback: defined-risk collateral (width)
   const coll = Number(t.parameters?.collateral) || 0;
-  if (coll > 0) return coll;
-  return Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0));     // last resort (understates naked shorts)
+  if (coll > 0) return { value: coll, basis: 'collateral' };
+  return { value: Math.abs(p?.entry_cost ?? Math.abs(t.entry_net_debit ?? 0)), basis: 'debit' };   // last resort (understates naked shorts)
+}
+
+export function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): number {
+  return deployedCapitalWithBasis(t, p).value;
 }
 
 // ── Closed-trade ledger (simple realized-P&L accounting — no live metrics) ─────

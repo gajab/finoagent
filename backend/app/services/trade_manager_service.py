@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 SEV = {"STRONG_HOLD": 0, "HOLD": 1, "EXIT": 2, "STRONG_EXIT": 3}
 _BY_SEV = {v: k for k, v in SEV.items()}
+ALIGN_K = 1.15                                             # technical alignment → points gain (see _technical_score)
 CUT_STRONG_HOLD, CUT_HOLD, CUT_EXIT = 68, 45, 28          # = the quant desk's management cut-points
 INVAL_MIN_ATR = 2.0                                        # min distance of the structural invalidation (see _levels)
 STOCK_STOP_PCT = 10.0                                      # discipline stop for share positions (see decide())
@@ -922,14 +923,19 @@ def _technical_score(profile: dict, ev: dict, sig: list[dict]) -> dict:
     upside = bool(profile["short_call_strike"]) or (profile["kind"] == "stock" and ps < 0) or ps < 0
 
     # 1) structure alignment — CONTEXT only
+    build = None
     if profile["kind"] == "stock" or ps != 0:
         s = ps * tech_dir
         gain = 22.0
         if s < 0 and ((ps > 0 and oversold) or (ps < 0 and overbought)):
             gain *= 0.5
             notes.append(f"RSI {rsi:.0f} — adverse structure discounted: oversold/overbought names mean-revert within a month more often than they continue")
-        score = 50 + gain * _clamp(1.15 * s, -1, 1)
+        pts = gain * _clamp(ALIGN_K * s, -1, 1)
+        score = 50 + pts
         notes.append(f"{'bullish' if ps > 0 else 'bearish'} position vs technical consensus {tech_dir:+.2f} → alignment {s:+.2f} (context: ≈0 backtested directional edge, so low gain)")
+        # The arithmetic, exposed so the UI can show it instead of a bare number: score = 50 + gain × clamp(k × alignment, −1, 1).
+        build = {"kind": "alignment", "dir": round(tech_dir, 3), "aligned": round(s, 3), "k": ALIGN_K, "gain": gain, "base": 50.0,
+                 "points": round(pts, 1), "lo": 50.0 - gain, "hi": 50.0 + gain, "weight_total": round(sum(x["w"] for x in sig), 2)}
     elif profile["range_play"]:
         trend_strength = _clamp(0.55 * abs(tech_dir) + 0.45 * adx_s, 0, 1)
         score = 64 - 14 * trend_strength
@@ -948,6 +954,7 @@ def _technical_score(profile: dict, ev: dict, sig: list[dict]) -> dict:
     else:
         score = 50.0
 
+    core_score = score
     # 2) vol regime — validated (for shares this lives in the Position-risk lens instead)
     ratio = _num(vc.get("ratio_21_63"))
     if ratio is not None and profile["kind"] != "stock":
@@ -974,7 +981,9 @@ def _technical_score(profile: dict, ev: dict, sig: list[dict]) -> dict:
         if pen:
             score -= pen
             notes.append(f"short {worst['side']} ${worst['strike']:g} is {worst['z_sigma']}σ away ({vc['sigma_dte_pct']}% 1σ to expiry) → P(touch) ≈ {pt * 100:.0f}% (−{pen})")
-    return {"score": round(_clamp(score), 1), "dir": round(tech_dir, 3), "notes": notes, "signals": sig, "vol": vc, "scope": _lens_scope(profile)["technical"]}
+    if build is not None:
+        build["adjust"] = round(_clamp(score) - core_score, 1)           # vol-regime / drawdown / strike-distance terms (each is in `notes`)
+    return {"score": round(_clamp(score), 1), "dir": round(tech_dir, 3), "notes": notes, "signals": sig, "vol": vc, "build": build, "scope": _lens_scope(profile)["technical"]}
 
 
 def _fundamental_score(profile: dict, ev: dict) -> dict:
@@ -1104,8 +1113,8 @@ def _lens_scope(profile: dict) -> dict:
     if profile.get("kind") == "stock":
         return {
             "quant": "For shares there is no option payoff to price (no odds-of-profit, theta or greeks), so Quant is a POSITION-RISK read in volatility terms: "
-                     "how big a normal move is, how far you are from the −10% discipline stop, drawdown from the high, beta. It carries a small weight; "
-                     "the verdict leans on the Technical, Fundamental and Event lenses.",
+                     "how big a normal move is, how far you are from the −10% discipline stop, drawdown from the high, beta. It is scored alongside Technical "
+                     "and Fundamental (each lens shows its weight); event risk is then added or subtracted as visible points.",
             "technical": "For shares the chart is the main timing evidence — trend, support/resistance, the 50/150/200d ladder, momentum. Backtests found ~0 "
                          "directional edge in these signals, so Technical supplies LEVELS and risk state (volatility regime, drawdown) rather than a forecast.",
         }
@@ -1260,48 +1269,71 @@ def _quant_detail(profile: dict, ev: dict) -> dict:
 
 def _position_risk(profile: dict, ev: dict) -> dict:
     """Shares have no option payoff, so the 'quant' lens is POSITION RISK in volatility terms (all validated states):
-    how likely the −10% discipline stop is to be touched in a month, volatility regime, drawdown depth, beta."""
+    how likely the −10% discipline stop is to be touched in a month, volatility regime, drawdown depth, beta.
+
+    `build` is the same arithmetic as structured data — base 62 plus each term's points — so the UI can show the sum instead of
+    parsing the notes; `stop` carries the distance facts (cost, stop level, σ-distance, touch odds) the UI draws."""
     spot = profile["spot"] or ev.get("spot") or 0.0
     suite = (ev.get("technical") or {}).get("suite") or {}
     vc = _vol_context(profile, ev)
     ps = profile["pos_sign"] or 1
-    score, notes = 62.0, []
+    base = 62.0
+    score, notes = base, []
+    terms: list[dict] = []
+
+    def term(label: str, pts: float, note: str):
+        nonlocal score
+        score += pts
+        terms.append({"label": label, "pts": pts, "note": note})
+
     sig = _num(vc.get("sigma_ann_pct"))
     pct = (profile["pnl"] or {}).get("pct")
     cost = profile.get("avg_cost") or (spot / (1 + pct / 100.0) if (pct is not None and (1 + pct / 100.0)) else None)
+    stop = None
     if sig and spot and cost:
         s21 = sig / 100.0 * math.sqrt(21 / 252.0)
         lvl = cost * (1 - STOCK_STOP_PCT / 100.0) if ps > 0 else cost * (1 + STOCK_STOP_PCT / 100.0)
         crossed = (spot <= lvl) if ps > 0 else (spot >= lvl)
         if crossed:
-            score -= 30; notes.append(f"price is already through the {STOCK_STOP_PCT:.0f}% discipline stop ({lvl:,.2f}) (−30)")
+            note = f"price is already through the {STOCK_STOP_PCT:.0f}% discipline stop ({lvl:,.2f})"
+            term("Discipline stop", -30.0, note); notes.append(f"{note} (−30)")
+            stop = {"cost": round(cost, 2), "level": round(lvl, 2), "pct": STOCK_STOP_PCT, "crossed": True, "z": None, "p_touch": 1.0, "sigma21_pct": round(s21 * 100, 2)}
         else:
             z = abs(math.log(spot / lvl)) / s21
             pt = min(1.0, 2.0 * (1.0 - _norm_cdf(z)))
             pen = 18 if pt >= 0.35 else 9 if pt >= 0.2 else 0
             bonus = 4 if pt <= 0.08 else 0
-            score += bonus - pen
-            notes.append(f"{pt * 100:.0f}% chance of touching the {STOCK_STOP_PCT:.0f}% stop ({lvl:,.2f}) within a month — it is {z:.1f}σ away" + (f" (−{pen})" if pen else f" (+{bonus})" if bonus else ""))
+            note = f"{pt * 100:.0f}% chance of touching the {STOCK_STOP_PCT:.0f}% stop ({lvl:,.2f}) within a month — it is {z:.1f}σ away"
+            term("Stop distance", float(bonus - pen), note)
+            notes.append(note + (f" (−{pen})" if pen else f" (+{bonus})" if bonus else ""))
+            stop = {"cost": round(cost, 2), "level": round(lvl, 2), "pct": STOCK_STOP_PCT, "crossed": False, "z": round(z, 2), "p_touch": round(pt, 3), "sigma21_pct": round(s21 * 100, 2)}
     ratio = _num(vc.get("ratio_21_63"))
     if ratio is not None:
         if ratio >= 1.4:
-            score -= 8; notes.append(f"volatility EXPANDING (21d is {ratio:.2f}× the 63d) — bigger swings ahead (−8)")
+            note = f"volatility EXPANDING (21d is {ratio:.2f}× the 63d) — bigger swings ahead"
+            term("Volatility regime", -8.0, note); notes.append(f"{note} (−8)")
         elif ratio <= 0.75:
-            score += 2; notes.append(f"volatility compressing ({ratio:.2f}×) (+2)")
+            note = f"volatility compressing ({ratio:.2f}×)"
+            term("Volatility regime", 2.0, note); notes.append(f"{note} (+2)")
     fh = _num((suite.get("range") or {}).get("pct_from_52w_high"))
     if fh is not None:
         if ps > 0 and fh <= -20:
-            score -= 8; notes.append(f"{abs(fh):.0f}% below the 52-wk high — left-tail state (P(≤−8% in a month) ≈ 17% vs ~8%) (−8)")
+            note = f"{abs(fh):.0f}% below the 52-wk high — left-tail state (P(≤−8% in a month) ≈ 17% vs ~8%)"
+            term("Drawdown", -8.0, note); notes.append(f"{note} (−8)")
         elif ps > 0 and fh <= -10:
-            score -= 4; notes.append(f"{abs(fh):.0f}% below the 52-wk high — fatter left tail (−4)")
+            note = f"{abs(fh):.0f}% below the 52-wk high — fatter left tail"
+            term("Drawdown", -4.0, note); notes.append(f"{note} (−4)")
         elif ps < 0 and fh >= -3:
-            score -= 4; notes.append("short at the 52-wk high — squeeze risk (−4)")
+            note = "short at the 52-wk high — squeeze risk"
+            term("Drawdown", -4.0, note); notes.append(f"{note} (−4)")
     beta = _num(((ev.get("fundamental") or {}).get("shares") or {}).get("beta"))
     if beta is not None and beta >= 1.6:
-        score -= 3; notes.append(f"beta {beta:.1f} — amplifies market drops (−3)")
+        note = f"beta {beta:.1f} — amplifies market drops"
+        term("Beta", -3.0, note); notes.append(f"{note} (−3)")
     if not notes:
         notes.append("no elevated position-risk signal — volatility, drawdown and stop distance are all normal")
-    return {"score": round(_clamp(score), 1), "notes": notes}
+    return {"score": round(_clamp(score), 1), "notes": notes,
+            "build": {"kind": "position_risk", "base": base, "terms": terms, "stop": stop, "clamped": round(_clamp(score), 1) != round(score, 1)}}
 
 
 def _quant_score(profile: dict, ev: Optional[dict] = None) -> dict:
@@ -1310,7 +1342,7 @@ def _quant_score(profile: dict, ev: Optional[dict] = None) -> dict:
     detail = _quant_detail(profile, ev)
     if profile.get("kind") == "stock":
         pr = _position_risk(profile, ev)
-        return {"score": pr["score"], "signal": None, "source": "position_risk", "overrides": [], "notes": pr["notes"], "detail": detail, "label": "Position risk"}
+        return {"score": pr["score"], "signal": None, "source": "position_risk", "overrides": [], "notes": pr["notes"], "detail": detail, "label": "Position risk", "build": pr["build"]}
     sc = q.get("score")
     if sc is None:
         # no quant-desk read yet → NOT scored: it drops out of the blend rather than contributing a made-up 50

@@ -25,7 +25,7 @@ const STATE: Record<LensState, { word: string; tone: Tone; dot: string }> = {
   neutral: { word: 'neutral', tone: 'neutral', dot: 'bg-base-content/40' },
   not_scored: { word: 'not scored', tone: 'neutral', dot: 'border border-base-content/40 bg-transparent' },
 };
-const LAYER_NAME: Record<LayerKey, string> = { plan: 'plan', levels: 'key levels', structure: 'structure', blocks: 'order blocks', liquidity: 'liquidity', dealer: 'dealer gamma', value: 'value & volume' };
+const LAYER_NAME: Record<LayerKey, string> = { plan: 'plan', levels: 'key levels', structure: 'structure', blocks: 'order blocks', liquidity: 'liquidity', dealer: 'dealer gamma', value: 'value & volume', strategy: 'strategy levels' };
 const NEEDS_CTX = new Set(['trend', 'dealer', 'regime']);
 
 export function LensRail({ lenses, pending, active, onToggle }: {

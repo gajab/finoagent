@@ -10,13 +10,12 @@
  * odds (firstPassage.ts), which is validated against independent numerical solutions.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, RefreshCw, Layers, CandlestickChart, ListChecks, Table2, FileSearch, AlertTriangle } from 'lucide-react';
+import { Loader2, RefreshCw, Layers, CandlestickChart, ListChecks, Table2, FileSearch, AlertTriangle, ListTree, X } from 'lucide-react';
 import { fetchTradeSetups, fetchDayTradeSetups, fetchMarketStructure, fetchMicrostructure, fetchRegime, fetchDealerPositioning } from '../../api';
 import type { CandleInterval, TechnicalData, TradeSetup, TradeSetupsData } from '../../types';
 import { structureLayers, liquidityLayers, vpLayers, regimeLayers, gammaLayers, type TALayer } from '../../components/taLayers';
 import { useLocalState } from '../../components/taShared';
 import ErrorBoundary from '../../components/ErrorBoundary';
-import TradeSetupCards from '../../components/TradeSetupCards';
 import ChartPatternsPanel from '../../components/ChartPatternsPanel';
 import VolumePanel from '../../components/VolumePanel';
 import RegimeEdgePanel from '../../components/RegimeEdgePanel';
@@ -28,6 +27,7 @@ import { PricePrediction } from '../../components/PricePrediction';
 import { BetaBadge, BackToClassicButton } from '../BetaChrome';
 import { Chip, Accordion, SubHead, type Tone } from '../BetaKit';
 import BetaTaChart from './BetaTaChart';
+import BetaStrategies, { type StrategyDraw } from './BetaStrategies';
 import { LensRail, Disagree, PlanCard, NoPlan, LevelsTable, IndicatorGrid } from './BetaTaPanels';
 import {
   deriveVerdict, deriveLenses, disagreements, setupsForStyle, planLevels, planOdds, levelRows, settleLevels, windowLabel, money,
@@ -131,6 +131,9 @@ export default function BetaTechnical({ ticker, technical, onLeave }: Props) {
   const ctx = setups?.context ?? null;
   const [chartSpot, setChartSpot] = useState<number | null>(null);
   useEffect(() => { setChartSpot(null); }, [ticker]);
+  // a strategy's levels drawn on the chart from the Strategies board (one at a time); cleared when the ticker changes
+  const [strategyDraw, setStrategyDraw] = useState<StrategyDraw | null>(null);
+  useEffect(() => { setStrategyDraw(null); }, [ticker]);
   const techSpot = technical?.prices?.length ? technical.prices[technical.prices.length - 1] : null;
   const spot = setups?.price ?? chartSpot ?? techSpot ?? null;
 
@@ -159,8 +162,9 @@ export default function BetaTechnical({ ticker, technical, onLeave }: Props) {
       const src = SOURCE_OF[k]!;
       out.push(...levelsFromLayers(store[src], k, tier));
     }
+    if (strategyDraw) out.push(...strategyDraw.levels);
     return dedupeLevels(out);
-  }, [layers, lv, setups, spot, technical, store, tier]);
+  }, [layers, lv, setups, spot, technical, store, tier, strategyDraw]);
 
   const extraRows = useMemo(() => {
     const ex: { id: string; price: number; label: string; kind: string }[] = [];
@@ -227,7 +231,7 @@ export default function BetaTechnical({ ticker, technical, onLeave }: Props) {
           {!pending && <Disagree items={notes} />}
         </div>
 
-        <div className="order-1 xl:order-2 min-w-0 rounded-xl border border-white/[0.08] bg-base-200/25 p-2">
+        <div id="beta-ta-chart" className="order-1 xl:order-2 min-w-0 rounded-xl border border-white/[0.08] bg-base-200/25 p-2">
           <div className="flex items-center gap-1.5 flex-wrap px-1 pb-2">
             <span className="text-[11px] text-base-content/45 mr-1">Layers</span>
             {CHIPS.map(c => {
@@ -241,6 +245,12 @@ export default function BetaTechnical({ ticker, technical, onLeave }: Props) {
                 </button>
               );
             })}
+            {strategyDraw && (
+              <button type="button" onClick={() => setStrategyDraw(null)} title="Remove this strategy's levels from the chart" data-testid="strategy-chip"
+                className="inline-flex items-center gap-1 rounded-full border border-secondary/40 bg-secondary/10 px-2.5 py-0.5 text-xs text-secondary hover:bg-secondary/20">
+                {strategyDraw.label} <X className="w-3 h-3" aria-label="remove" />
+              </button>
+            )}
             <div className="ml-auto inline-flex rounded-lg border border-white/10 p-0.5 bg-base-200/40" role="tablist" aria-label="Chart timeframe">
               {INTERVALS.map(i => (
                 <button key={i.k} role="tab" aria-selected={interval === i.k} onClick={() => setIntervalState(i.k)}
@@ -269,6 +279,11 @@ export default function BetaTechnical({ ticker, technical, onLeave }: Props) {
         <LevelsTable rows={rows} spot={spot} />
       </Accordion>
 
+      <Accordion title="Strategies" icon={<ListTree className="w-4 h-4" />}
+        summary="engine setups · Momentum Swing, Qullamäggie, Connors · 13 famous-trader rule-sets — rules, exits and levels you can draw on the chart">
+        {evidenceBody(<BetaStrategies ticker={ticker} setups={setups} spot={spot} drawnKey={strategyDraw?.key ?? null} onDraw={setStrategyDraw} />)}
+      </Accordion>
+
       <SubHead hint="loaded only when you open one">Evidence</SubHead>
       <div className="space-y-2">
         <Accordion title="Indicators" icon={<ListChecks className="w-4 h-4" />}
@@ -295,9 +310,6 @@ export default function BetaTechnical({ ticker, technical, onLeave }: Props) {
         </Accordion>
         <Accordion title="Dealer positioning" summary="net gamma, flip, walls and the expected-move cone">
           {evidenceBody(<DealerPositioningPanel ticker={ticker} price={spot ?? undefined} confluenceZones={setups?.confluence_zones} />)}
-        </Accordion>
-        <Accordion title="Every setup and named strategy" summary="all ranked setups, options versions, Momentum Swing, Qullamäggie, Connors RSI-2">
-          {setups ? evidenceBody(<TradeSetupCards data={setups} ticker={ticker} />) : <p className="text-xs text-base-content/50">Waiting for the setup read…</p>}
         </Accordion>
         <Accordion title="Statistical price model" summary="a separate forecast — not part of the call above">
           {evidenceBody(<PricePrediction ticker={ticker} />)}

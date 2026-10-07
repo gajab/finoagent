@@ -743,6 +743,42 @@ async def get_momentum_setup(
     return {"ticker": ticker, "momentum_setup": result, "cached": False}
 
 
+@router.get("/{ticker}/trader-strategies")
+async def get_trader_strategies(
+    ticker: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The 15 famous-trader rule-sets (Minervini, O'Neil, Weinstein, Turtles, Jones, Druckenmiller, Raschke, Connors,
+    Qullamaggie, Livermore, Carter, Ichimoku, Elder, Wyckoff/VSA, trend CTAs) run on THIS ticker's daily history — the same
+    rules the Trade Manager's "Famous-trader consensus" uses, here as per-ticker strategies: each checklist with measured
+    values, the trader's own exit level + its distance from price, drawable reference levels, and the backtested behaviour of
+    the matching exit. Deterministic, no LLM. Lazy endpoint (own 2y daily + SPY), off the main Setups load."""
+    import asyncio
+    import yfinance as yf
+    from ..services.trader_strategy_service import compute_trader_strategies
+
+    if ticker.startswith("."):
+        ticker = "^" + ticker[1:]
+    ticker = ticker.upper()
+
+    cache_key = f"trader-strategies:{ticker}:v1"
+    cached = await get_cached(db, cache_key)
+    if cached is not None:
+        return {"ticker": ticker, "trader_strategies": cached, "cached": True}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: compute_trader_strategies(yf.Ticker(ticker)))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Trader-strategy analysis failed: {exc}")
+    if not result:
+        raise HTTPException(status_code=404, detail="Not enough daily history for this ticker.")
+
+    await set_cached(db, cache_key, result, ttl_seconds=900)
+    return {"ticker": ticker, "trader_strategies": result, "cached": False}
+
+
 @router.get("/{ticker}/regime-edge")
 async def get_regime_edge(
     ticker: str,

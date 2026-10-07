@@ -13,7 +13,7 @@ import { tradeOdds, type OddsResult } from './firstPassage';
 export type Dir = 'long' | 'short' | 'neutral';
 export type LensKey = 'trend' | 'momentum' | 'dealer' | 'stretch' | 'volume' | 'regime';
 export type LensState = 'supports' | 'caution' | 'against' | 'neutral' | 'not_scored';
-export type LayerKey = 'plan' | 'levels' | 'structure' | 'blocks' | 'liquidity' | 'dealer' | 'value';
+export type LayerKey = 'plan' | 'levels' | 'structure' | 'blocks' | 'liquidity' | 'dealer' | 'value' | 'strategy';
 export type Style = 'day' | 'swing' | 'position';
 
 export interface Lens {

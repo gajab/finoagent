@@ -1,0 +1,1059 @@
+{
+ "price": 238.9,
+ "atr14": 4.73,
+ "bars": 500,
+ "families": {
+  "trend": "Trend following",
+  "leaders": "Leaders & momentum",
+  "timing": "Pullbacks & timing",
+  "volatility": "Volatility & volume"
+ },
+ "consensus": {
+  "d": 0.15,
+  "bull": 7,
+  "bear": 2,
+  "neutral": 6,
+  "n": 15
+ },
+ "strategies": [
+  {
+   "key": "minervini",
+   "trader": "Minervini",
+   "family": "leaders",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Mark Minervini",
+   "philosophy": "Trade only Stage-2 leaders; sell when the 50d fails or the run goes climactic.",
+   "rules": [
+    {
+     "id": "px_gt_150_200",
+     "rule": "Price > 150d & 200d SMA",
+     "value": "238.9 vs 198.6/190.78",
+     "met": true
+    },
+    {
+     "id": "150_gt_200",
+     "rule": "150d SMA > 200d SMA",
+     "value": "198.6 vs 190.78",
+     "met": true
+    },
+    {
+     "id": "200_rising",
+     "rule": "200d SMA rising \u2265 1 month",
+     "value": 4.14,
+     "met": true
+    },
+    {
+     "id": "50_gt_150_gt_200",
+     "rule": "50d > 150d > 200d",
+     "value": "238.35/198.6/190.78",
+     "met": true
+    },
+    {
+     "id": "px_gt_50",
+     "rule": "Price > 50d SMA",
+     "value": "238.9 vs 238.35",
+     "met": true
+    },
+    {
+     "id": "30pct_off_low",
+     "rule": "\u2265 30% above 52-wk low",
+     "value": 62.5,
+     "met": true
+    },
+    {
+     "id": "within_25_high",
+     "rule": "Within 25% of 52-wk high",
+     "value": -6.11,
+     "met": true
+    },
+    {
+     "id": "rs_leader",
+     "rule": "Outperforming the market over 6-12 months",
+     "value": 40.6,
+     "met": true
+    },
+    {
+     "id": "not_climactic",
+     "rule": "Not extended > 25% above the 50d (climax-run risk)",
+     "value": 0.23,
+     "met": true
+    }
+   ],
+   "met": 9,
+   "total": 9,
+   "grade": "all",
+   "stance": "bullish",
+   "d": 1.0,
+   "note": "",
+   "exit_rule": "Close below the 50d SMA on expanding volume (or a 7-8% stop from entry)",
+   "exit_is_level": true,
+   "stop": {
+    "level": 238.35,
+    "distance_pct": -0.23,
+    "atr_multiple": 0.12,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "50d avg",
+     "price": 238.35,
+     "role": "exit"
+    },
+    {
+     "label": "150d avg",
+     "price": 198.6,
+     "role": "reference"
+    },
+    {
+     "label": "200d avg",
+     "price": 190.78,
+     "role": "reference"
+    }
+   ],
+   "exit_backtest": {
+    "match": "exact",
+    "label": "Minervini \u2153 at 50d / \u2153 at 150d / \u2153 at 200d",
+    "mean": 3.7,
+    "win": 47,
+    "p5": -11.5,
+    "worst": -51.7,
+    "hold": 64,
+    "baseline": {
+     "label": "hold 126 days (no exit)",
+     "mean": 7.8,
+     "win": 65,
+     "p5": -20.3,
+     "worst": -74.2,
+     "hold": 124
+    },
+    "note": "Backtest of entering on bullish rule-set readings and leaving on this kind of exit (126-day max hold)."
+   }
+  },
+  {
+   "key": "oneil",
+   "trader": "O'Neil",
+   "family": "leaders",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "William O'Neil",
+   "philosophy": "Buy strength on volume; the market tells you \u2014 heavy distribution and a lost 50d are the exit.",
+   "rules": [
+    {
+     "id": "above_21ema",
+     "rule": "Holding the 21d EMA",
+     "value": -0.93,
+     "met": false
+    },
+    {
+     "id": "above_50",
+     "rule": "Holding the 50d SMA",
+     "value": "238.9 vs 238.35",
+     "met": true
+    },
+    {
+     "id": "dist_days",
+     "rule": "Distribution days (25 sessions) < 5",
+     "value": 3,
+     "met": true
+    },
+    {
+     "id": "accum_gt_dist",
+     "rule": "Accumulation days \u2265 distribution days",
+     "value": "5 vs 3",
+     "met": true
+    },
+    {
+     "id": "updown_vol",
+     "rule": "Up-volume \u2265 down-volume (20d)",
+     "value": 2.03,
+     "met": true
+    },
+    {
+     "id": "near_highs",
+     "rule": "Within 15% of the 52-wk high",
+     "value": -6.11,
+     "met": true
+    }
+   ],
+   "met": 5,
+   "total": 6,
+   "grade": "most",
+   "stance": "bullish",
+   "d": 0.667,
+   "note": "",
+   "exit_rule": "Heavy-volume close below the 50d, or \u2265 5 distribution days in 25 sessions",
+   "exit_is_level": true,
+   "stop": {
+    "level": 238.35,
+    "distance_pct": -0.23,
+    "atr_multiple": 0.12,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "21d EMA",
+     "price": 241.15,
+     "role": "reference"
+    },
+    {
+     "label": "50d avg",
+     "price": 238.35,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": {
+    "match": "exact",
+    "label": "exit on a close below the 50d SMA",
+    "mean": 1.8,
+    "win": 39,
+    "p5": -8.7,
+    "worst": -44.4,
+    "hold": 34,
+    "baseline": {
+     "label": "hold 126 days (no exit)",
+     "mean": 7.8,
+     "win": 65,
+     "p5": -20.3,
+     "worst": -74.2,
+     "hold": 124
+    },
+    "note": "Backtest of entering on bullish rule-set readings and leaving on this kind of exit (126-day max hold)."
+   }
+  },
+  {
+   "key": "weinstein",
+   "trader": "Weinstein",
+   "family": "trend",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Stan Weinstein",
+   "philosophy": "Only own Stage-2 advances; a break of the 30-wk MA into Stage 3/4 is a sell.",
+   "rules": [
+    {
+     "id": "stage",
+     "rule": "Stage (1 base \u00b7 2 advance \u00b7 3 top \u00b7 4 decline)",
+     "value": 2,
+     "met": true
+    },
+    {
+     "id": "above_30w",
+     "rule": "Price above rising 30-wk SMA",
+     "value": "slope 5.12%",
+     "met": true
+    },
+    {
+     "id": "weekly_macd",
+     "rule": "Weekly MACD histogram rising",
+     "value": -0.143,
+     "met": false
+    }
+   ],
+   "met": 2,
+   "total": 3,
+   "grade": "some",
+   "stance": "bullish",
+   "d": 0.8,
+   "note": "Stage 2",
+   "exit_rule": "Weekly close below the 30-week SMA",
+   "exit_is_level": true,
+   "stop": {
+    "level": 201.78,
+    "distance_pct": -15.54,
+    "atr_multiple": 7.85,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "30-wk avg",
+     "price": 201.78,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": {
+    "match": "closest",
+    "label": "exit on a close below the 150d SMA",
+    "mean": 4.4,
+    "win": 42,
+    "p5": -13.8,
+    "worst": -55.1,
+    "hold": 75,
+    "baseline": {
+     "label": "hold 126 days (no exit)",
+     "mean": 7.8,
+     "win": 65,
+     "p5": -20.3,
+     "worst": -74.2,
+     "hold": 124
+    },
+    "note": "Backtest of entering on bullish rule-set readings and leaving on this kind of exit (126-day max hold)."
+   }
+  },
+  {
+   "key": "turtles",
+   "trader": "Turtles",
+   "family": "trend",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Richard Dennis \u00b7 Turtles",
+   "philosophy": "Pure channel breakout; exit when price takes out the 10/20-day opposite extreme; risk = 2N (ATR).",
+   "rules": [
+    {
+     "id": "brk_20",
+     "rule": "At / above the 20-day high (System-1 entry zone)",
+     "value": "238.9 vs 250.84",
+     "met": false
+    },
+    {
+     "id": "above_10d_low",
+     "rule": "Above the 10-day low (System-1 exit channel)",
+     "value": "238.9 vs 232.47",
+     "met": true
+    },
+    {
+     "id": "above_20d_low",
+     "rule": "Above the 20-day low (System-2 exit channel)",
+     "value": "238.9 vs 232.47",
+     "met": true
+    },
+    {
+     "id": "above_55d_low",
+     "rule": "Above the 55-day low",
+     "value": "238.9 vs 217.32",
+     "met": true
+    }
+   ],
+   "met": 3,
+   "total": 4,
+   "grade": "most",
+   "stance": "bullish",
+   "d": 0.5,
+   "note": "",
+   "exit_rule": "Close below the 10-day low 232.47 (2N stop = 229.44)",
+   "exit_is_level": true,
+   "stop": {
+    "level": 232.47,
+    "distance_pct": -2.69,
+    "atr_multiple": 1.36,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "20d high",
+     "price": 250.84,
+     "role": "trigger"
+    },
+    {
+     "label": "10d low",
+     "price": 232.47,
+     "role": "exit"
+    },
+    {
+     "label": "20d low",
+     "price": 232.47,
+     "role": "reference"
+    },
+    {
+     "label": "55d low",
+     "price": 217.32,
+     "role": "reference"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "ptj",
+   "trader": "Paul Tudor Jones",
+   "family": "trend",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Paul Tudor Jones",
+   "philosophy": "Stay on the right side of the 200d; take only \u2265 5:1 reward/risk; never average a loser.",
+   "rules": [
+    {
+     "id": "above_200",
+     "rule": "Price above the 200d MA ('my metric for everything')",
+     "value": 25.23,
+     "met": true
+    },
+    {
+     "id": "200_slope",
+     "rule": "200d MA sloping up",
+     "value": 4.14,
+     "met": true
+    },
+    {
+     "id": "trend_follow_mom",
+     "rule": "63-day momentum positive",
+     "value": 20.0,
+     "met": true
+    }
+   ],
+   "met": 3,
+   "total": 3,
+   "grade": "all",
+   "stance": "bullish",
+   "d": 1.0,
+   "note": "",
+   "exit_rule": "Close below the 200d MA",
+   "exit_is_level": true,
+   "stop": {
+    "level": 190.78,
+    "distance_pct": -20.14,
+    "atr_multiple": 10.17,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "200d avg",
+     "price": 190.78,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": {
+    "match": "exact",
+    "label": "exit on a close below the 200d SMA",
+    "mean": 5.0,
+    "win": 46,
+    "p5": -15.4,
+    "worst": -56.3,
+    "hold": 84,
+    "baseline": {
+     "label": "hold 126 days (no exit)",
+     "mean": 7.8,
+     "win": 65,
+     "p5": -20.3,
+     "worst": -74.2,
+     "hold": 124
+    },
+    "note": "Backtest of entering on bullish rule-set readings and leaving on this kind of exit (126-day max hold)."
+   }
+  },
+  {
+   "key": "druckenmiller",
+   "trader": "Druckenmiller",
+   "family": "leaders",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Stan Druckenmiller",
+   "philosophy": "Concentrate where trend, liquidity and relative strength agree; cut fast when the tape or leadership turns.",
+   "rules": [
+    {
+     "id": "rs_3m",
+     "rule": "Beating the market over 3 months",
+     "value": 9.6,
+     "met": true
+    },
+    {
+     "id": "rs_line",
+     "rule": "RS line above its 50d",
+     "value": "above",
+     "met": true
+    },
+    {
+     "id": "mkt_trend",
+     "rule": "Market (benchmark) above its 200d",
+     "value": true,
+     "met": true
+    },
+    {
+     "id": "mom_21",
+     "rule": "21-day momentum positive",
+     "value": -4.6,
+     "met": false
+    }
+   ],
+   "met": 3,
+   "total": 4,
+   "grade": "most",
+   "stance": "bullish",
+   "d": 0.5,
+   "note": "",
+   "exit_rule": "Relative-strength line breaks below its 50d, or the benchmark loses its 200d",
+   "exit_is_level": false,
+   "stop": {
+    "level": 241.15,
+    "distance_pct": 0.94,
+    "atr_multiple": -0.48,
+    "breached": true
+   },
+   "levels": [
+    {
+     "label": "21d EMA",
+     "price": 241.15,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "raschke",
+   "trader": "Raschke",
+   "family": "timing",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Linda Raschke",
+   "philosophy": "Trade the pullback in a trending market; exit the moment the 3/10 momentum rolls over against you.",
+   "rules": [
+    {
+     "id": "adx30",
+     "rule": "ADX > 30 (a real trend)",
+     "value": 25.3,
+     "met": false
+    },
+    {
+     "id": "pullback_20",
+     "rule": "Price within \u00be ATR of the 20 EMA (the Holy-Grail pullback)",
+     "value": "238.9 vs 241.2",
+     "met": true
+    },
+    {
+     "id": "di_dir",
+     "rule": "+DI above \u2212DI",
+     "value": "23.0/20.3",
+     "met": true
+    },
+    {
+     "id": "osc_310",
+     "rule": "3/10 oscillator positive & rising",
+     "value": 1.338,
+     "met": false
+    }
+   ],
+   "met": 2,
+   "total": 4,
+   "grade": "some",
+   "stance": "bullish",
+   "d": 0.588,
+   "note": "",
+   "exit_rule": "Close through the 20 EMA against the trend, or the 3/10 oscillator crossing zero",
+   "exit_is_level": true,
+   "stop": {
+    "level": 241.2,
+    "distance_pct": 0.96,
+    "atr_multiple": -0.49,
+    "breached": true
+   },
+   "levels": [
+    {
+     "label": "20d EMA",
+     "price": 241.2,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": {
+    "match": "closest",
+    "label": "exit on a close below the 21 EMA",
+    "mean": 0.8,
+    "win": 38,
+    "p5": -6.0,
+    "worst": -30.1,
+    "hold": 16,
+    "baseline": {
+     "label": "hold 126 days (no exit)",
+     "mean": 7.8,
+     "win": 65,
+     "p5": -20.3,
+     "worst": -74.2,
+     "hold": 124
+    },
+    "note": "Backtest of entering on bullish rule-set readings and leaving on this kind of exit (126-day max hold)."
+   }
+  },
+  {
+   "key": "connors",
+   "trader": "Connors",
+   "family": "timing",
+   "named_elsewhere": "connors_rsi2",
+   "available": true,
+   "full_name": "Larry Connors",
+   "philosophy": "Short-term mean reversion: buy extreme weakness in an uptrend, sell the first strength (close > 5d MA / RSI2 > 70).",
+   "rules": [
+    {
+     "id": "above_200",
+     "rule": "Above the 200d (only buy dips in uptrends)",
+     "value": 25.23,
+     "met": true
+    },
+    {
+     "id": "rsi2_low",
+     "rule": "RSI(2) < 10 = oversold entry; > 70 = take-profit",
+     "value": 18.6,
+     "met": false
+    },
+    {
+     "id": "rsi2_hot",
+     "rule": "RSI(2) > 70 (short-term overbought \u2192 exit)",
+     "value": 18.6,
+     "met": false
+    }
+   ],
+   "met": 1,
+   "total": 3,
+   "grade": "few",
+   "stance": "neutral",
+   "d": 0.3,
+   "note": "RSI2 18.6",
+   "exit_rule": "Exit on a close above the 5-day MA or RSI(2) > 70 (it is a short-term trade)",
+   "exit_is_level": false,
+   "stop": {
+    "level": 239.91,
+    "distance_pct": 0.42,
+    "atr_multiple": -0.21,
+    "breached": true
+   },
+   "levels": [
+    {
+     "label": "10d avg",
+     "price": 239.91,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "qullamaggie",
+   "trader": "Qullam\u00e4gi",
+   "family": "leaders",
+   "named_elsewhere": "qullamaggie",
+   "available": true,
+   "full_name": "Kristjan Qullam\u00e4gi",
+   "philosophy": "Ride the 10/20 EMA surf; the trailing stop is the first daily close below the 10 (or 20) EMA.",
+   "rules": [
+    {
+     "id": "above_10_20",
+     "rule": "Close above the 10 & 20 EMA",
+     "value": "238.9 vs 241.06/241.2",
+     "met": false
+    },
+    {
+     "id": "ema10_gt_20",
+     "rule": "10 EMA above 20 EMA",
+     "value": "241.06 vs 241.2",
+     "met": false
+    },
+    {
+     "id": "adr",
+     "rule": "ADR(20) \u2265 4% (enough range to be worth trading)",
+     "value": 1.85,
+     "met": false
+    },
+    {
+     "id": "mom_63",
+     "rule": "Strong 3-month momentum (> 25%)",
+     "value": 20.0,
+     "met": false
+    }
+   ],
+   "met": 0,
+   "total": 4,
+   "grade": "few",
+   "stance": "bearish",
+   "d": -1.0,
+   "note": "",
+   "exit_rule": "First daily close below the 10 EMA (fast) / 20 EMA (slow)",
+   "exit_is_level": true,
+   "stop": {
+    "level": 241.06,
+    "distance_pct": 0.9,
+    "atr_multiple": -0.46,
+    "breached": true
+   },
+   "levels": [
+    {
+     "label": "10d EMA",
+     "price": 241.06,
+     "role": "exit"
+    },
+    {
+     "label": "20d EMA",
+     "price": 241.2,
+     "role": "reference"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "livermore",
+   "trader": "Livermore",
+   "family": "leaders",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Jesse Livermore",
+   "philosophy": "Add only at confirmed pivotal points; a break that fails back into the range is a signal to leave.",
+   "rules": [
+    {
+     "id": "pivot_break",
+     "rule": "Closing above the prior 20-day high (pivotal point)",
+     "value": "238.9 vs 250.84",
+     "met": false
+    },
+    {
+     "id": "vol_confirm",
+     "rule": "Volume expansion (RVOL \u2265 1.5) on the break",
+     "value": 1.07,
+     "met": false
+    },
+    {
+     "id": "least_resistance",
+     "rule": "50d SMA rising (line of least resistance is up)",
+     "value": 0.23,
+     "met": true
+    },
+    {
+     "id": "no_failure",
+     "rule": "No close back inside the prior range after a break",
+     "value": null,
+     "met": null
+    }
+   ],
+   "met": 1,
+   "total": 3,
+   "grade": "few",
+   "stance": "neutral",
+   "d": -0.333,
+   "note": "",
+   "exit_rule": "A close back below the breakout pivot (prior 20-day high)",
+   "exit_is_level": true,
+   "stop": {
+    "level": 250.84,
+    "distance_pct": 5.0,
+    "atr_multiple": -2.52,
+    "breached": true
+   },
+   "levels": [
+    {
+     "label": "20d pivot",
+     "price": 250.84,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "carter",
+   "trader": "Carter",
+   "family": "volatility",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "John Carter",
+   "philosophy": "Volatility compresses before it expands; trade the release in the momentum direction, exit when momentum fades.",
+   "rules": [
+    {
+     "id": "squeeze",
+     "rule": "Bollinger Bands inside Keltner Channels (energy coiling)",
+     "value": true,
+     "met": true
+    },
+    {
+     "id": "mom_sign",
+     "rule": "Squeeze momentum positive",
+     "value": -1.947,
+     "met": false
+    },
+    {
+     "id": "mom_rising",
+     "rule": "Squeeze momentum rising",
+     "value": false,
+     "met": false
+    }
+   ],
+   "met": 1,
+   "total": 3,
+   "grade": "few",
+   "stance": "neutral",
+   "d": -0.3,
+   "note": "squeeze ON",
+   "exit_rule": "Squeeze-momentum histogram turning against the position",
+   "exit_is_level": false,
+   "stop": {
+    "level": 235.15,
+    "distance_pct": -1.57,
+    "atr_multiple": 0.79,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "Lower band",
+     "price": 235.15,
+     "role": "exit"
+    },
+    {
+     "label": "Upper band",
+     "price": 247.46,
+     "role": "reference"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "ichimoku",
+   "trader": "Ichimoku",
+   "family": "trend",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Ichimoku (Hosoda)",
+   "philosophy": "Trend, momentum and support in one frame; price in/under the cloud is no-man's-land or a downtrend.",
+   "rules": [
+    {
+     "id": "cloud",
+     "rule": "Price above the cloud",
+     "value": "above",
+     "met": true
+    },
+    {
+     "id": "tk",
+     "rule": "Tenkan above Kijun",
+     "value": "239.66 vs 243.46",
+     "met": false
+    },
+    {
+     "id": "chikou",
+     "rule": "Chikou (lagging) span above price",
+     "value": false,
+     "met": false
+    }
+   ],
+   "met": 1,
+   "total": 3,
+   "grade": "few",
+   "stance": "neutral",
+   "d": -0.333,
+   "note": "",
+   "exit_rule": "Close below the Kijun-sen (or into the cloud)",
+   "exit_is_level": true,
+   "stop": {
+    "level": 243.46,
+    "distance_pct": 1.91,
+    "atr_multiple": -0.96,
+    "breached": true
+   },
+   "levels": [
+    {
+     "label": "Kijun",
+     "price": 243.46,
+     "role": "exit"
+    },
+    {
+     "label": "Tenkan",
+     "price": 239.66,
+     "role": "reference"
+    },
+    {
+     "label": "Cloud top",
+     "price": 238.72,
+     "role": "reference"
+    },
+    {
+     "label": "Cloud low",
+     "price": 221.95,
+     "role": "reference"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "elder",
+   "trader": "Elder",
+   "family": "timing",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Alexander Elder",
+   "philosophy": "Trade with the weekly tide, time the entry/exit with the daily wave; a red impulse bar vetoes new longs.",
+   "rules": [
+    {
+     "id": "tide",
+     "rule": "Weekly MACD histogram rising (the tide)",
+     "value": -0.143,
+     "met": false
+    },
+    {
+     "id": "wave",
+     "rule": "Daily Stochastic not overbought (< 80)",
+     "value": 61.0,
+     "met": true
+    },
+    {
+     "id": "impulse",
+     "rule": "Impulse system green (EMA13 & MACD-hist both rising)",
+     "value": "red",
+     "met": false
+    }
+   ],
+   "met": 1,
+   "total": 3,
+   "grade": "few",
+   "stance": "bearish",
+   "d": -0.8,
+   "note": "",
+   "exit_rule": "Impulse turns red / weekly tide turns down",
+   "exit_is_level": false,
+   "stop": {
+    "level": 241.18,
+    "distance_pct": 0.95,
+    "atr_multiple": -0.48,
+    "breached": true
+   },
+   "levels": [
+    {
+     "label": "13d EMA",
+     "price": 241.18,
+     "role": "exit"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "wyckoff",
+   "trader": "Wyckoff / VSA",
+   "family": "volatility",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Wyckoff / VSA",
+   "philosophy": "Read effort vs result: climactic volume without progress = the smart money is distributing (or absorbing).",
+   "rules": [
+    {
+     "id": "buy_climax",
+     "rule": "Buying climax (huge volume + wide spread + weak close at highs)",
+     "value": false,
+     "met": true
+    },
+    {
+     "id": "upthrust",
+     "rule": "No upthrust (break of highs that closes back inside)",
+     "value": false,
+     "met": true
+    },
+    {
+     "id": "no_demand",
+     "rule": "No 'no-demand' up-bars (low-volume rallies) in the last 5",
+     "value": 0,
+     "met": true
+    },
+    {
+     "id": "spring",
+     "rule": "Spring (undercut + reclaim) \u2014 bullish",
+     "value": false,
+     "met": false
+    },
+    {
+     "id": "sell_climax",
+     "rule": "Selling climax (capitulation at lows) \u2014 bullish",
+     "value": false,
+     "met": false
+    }
+   ],
+   "met": 3,
+   "total": 5,
+   "grade": "some",
+   "stance": "neutral",
+   "d": 0.0,
+   "note": "",
+   "exit_rule": "Upthrust / buying-climax at highs, or a break of the range low on volume",
+   "exit_is_level": true,
+   "stop": {
+    "level": 232.47,
+    "distance_pct": -2.69,
+    "atr_multiple": 1.36,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "Range low",
+     "price": 232.47,
+     "role": "exit"
+    },
+    {
+     "label": "Range high",
+     "price": 250.84,
+     "role": "reference"
+    }
+   ],
+   "exit_backtest": null
+  },
+  {
+   "key": "cta",
+   "trader": "Trend CTAs",
+   "family": "trend",
+   "named_elsewhere": null,
+   "available": true,
+   "full_name": "Trend-following CTAs (Seykota / Dunn)",
+   "philosophy": "Cut losses short, ride winners: a volatility-scaled trailing stop is the only exit.",
+   "rules": [
+    {
+     "id": "supertrend",
+     "rule": "Supertrend(10,3) direction up",
+     "value": "down",
+     "met": false
+    },
+    {
+     "id": "chandelier",
+     "rule": "Price above the Chandelier long-stop",
+     "value": "238.9 vs 237.15",
+     "met": true
+    },
+    {
+     "id": "ema_stack",
+     "rule": "EMA 10 > 20 > 50",
+     "value": "241.06/241.2/235.04",
+     "met": false
+    }
+   ],
+   "met": 1,
+   "total": 3,
+   "grade": "few",
+   "stance": "neutral",
+   "d": -0.333,
+   "note": "",
+   "exit_rule": "Close below the Chandelier stop 237.15 / supertrend flip",
+   "exit_is_level": true,
+   "stop": {
+    "level": 237.15,
+    "distance_pct": -0.73,
+    "atr_multiple": 0.37,
+    "breached": false
+   },
+   "levels": [
+    {
+     "label": "Chand 3\u00d7ATR",
+     "price": 237.15,
+     "role": "exit"
+    },
+    {
+     "label": "Chand 5\u00d7ATR",
+     "price": 227.63,
+     "role": "reference"
+    },
+    {
+     "label": "Supertrend",
+     "price": 247.98,
+     "role": "reference"
+    }
+   ],
+   "exit_backtest": {
+    "match": "exact",
+    "label": "Chandelier 3\u00d7ATR trail",
+    "mean": 1.2,
+    "win": 40,
+    "p5": -7.2,
+    "worst": -30.1,
+    "hold": 24,
+    "baseline": {
+     "label": "hold 126 days (no exit)",
+     "mean": 7.8,
+     "win": 65,
+     "p5": -20.3,
+     "worst": -74.2,
+     "hold": 124
+    },
+    "note": "Backtest of entering on bullish rule-set readings and leaving on this kind of exit (126-day max hold)."
+   }
+  }
+ ],
+ "edge_note": "Backtested on 99 liquid US stocks and ETFs, 2016-2026 (52.6k point-in-time samples): none of these 15 rule-sets, nor their consensus, predicts the next 21- or 63-day return (information coefficient \u22120.02 to +0.01, |t| < 1.2). Treat each one as a discipline and a structure read \u2014 what that trader would require and where they would get out \u2014 not as a forecast.",
+ "meta": {
+  "unavailable": [],
+  "benchmark": true
+ },
+ "as_of": "2026-10-05"
+}

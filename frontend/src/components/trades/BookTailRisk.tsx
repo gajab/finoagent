@@ -99,8 +99,8 @@ export default function BookTailRisk({ quoteSource, onManageTrade }: { quoteSour
             </div>
             <div className="text-[10px] text-base-content/40 truncate">
               {data?.computed_at
-                ? `Updated ${ago(data.computed_at)} · click to ${open ? 'collapse' : 'view'}`
-                : 'Institutional guardrails · two-sided stress · 1-mo CVaR · factor & correlation · cheapest fix per breach'}
+                ? `${data.scope ? `Income trades only (${data.scope.included}) · ` : ''}Updated ${ago(data.computed_at)} · click to ${open ? 'collapse' : 'view'}`
+                : 'Income trades · institutional guardrails · two-sided stress · 1-mo CVaR · factor & correlation · cheapest fix per breach'}
             </div>
           </div>
         </button>

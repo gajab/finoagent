@@ -1899,7 +1899,48 @@ _BOOK_TR_TTL = 90 * 86400   # persist the last "Manage Book" result ~90 days (un
 
 
 def _book_tr_key(user_id: int) -> str:
-    return f"book_tail_risk:v1:{user_id}"
+    # v4: scoped to trades EXPLICITLY tagged Income (v1 covered every active trade; v2 also counted untagged),
+    # covered shares netted in the scenarios (+ the optional downside variant), fixes priced from live quotes,
+    # and the concentration view.
+    return f"book_tail_risk:v4:{user_id}"
+
+
+def _book_purpose(s) -> str:
+    """The folder a trade was EXPLICITLY tagged with (parameters.purpose). A trade with no tag — or an
+    unrecognised one — is "untagged". Unlike the UI's tradePurpose() (which shows untagged trades under
+    Income), Manage Book does not guess: untagged is not Income."""
+    try:
+        params = json.loads(s.parameters or "{}")
+    except (TypeError, ValueError):
+        params = {}
+    p = str(params.get("purpose") or "").lower().strip() if isinstance(params, dict) else ""
+    return p if p in _VALID_PURPOSES else "untagged"
+
+
+def _income_book(strategies: list) -> tuple[list, dict]:
+    """Manage Book scope: ONLY trades explicitly tagged Income. Hedges, directional trades, managed
+    floors, 'other' and untagged trades are not part of the short-vol income book — folding them in
+    would muddy its CVaR / θ / hedge sizing. Returns (income trades, {other folder: count excluded})."""
+    income, excluded = [], {}
+    for s in strategies:
+        purpose = _book_purpose(s)
+        if purpose == "income":
+            income.append(s)
+        else:
+            excluded[purpose] = excluded.get(purpose, 0) + 1
+    return income, excluded
+
+
+def _book_scope(income: list, excluded: dict) -> dict:
+    return {"purpose": "income", "included": len(income), "excluded": excluded,
+            "excluded_total": sum(excluded.values())}
+
+
+def _no_income_msg(excluded: dict) -> str:
+    n = sum(excluded.values())
+    return ("No active trades tagged Income to analyze." if not n else
+            f"No active trades tagged Income to analyze — Manage Book only covers trades explicitly tagged "
+            f"Income ({n} active trade{'s' if n != 1 else ''} in other folders or untagged ignored).")
 
 
 @router.get("/book-tail-risk")
@@ -1910,7 +1951,7 @@ async def book_tail_risk(
     db: AsyncSession = Depends(get_db),
 ):
     """Book-level short-vol / tail-risk desk ("Manage Book"): aggregate the OPTION-LAYER
-    greeks of every open trade, flag laddered/concentrated shorts as one bet, replay crash
+    greeks of every open INCOME trade (purpose=income; other folders are excluded), flag laddered/concentrated shorts as one bet, replay crash
     scenarios on the aggregate, and size INDEX / VIX tail hedges with the Spitznagel
     cost-vs-drag test.
 
@@ -1931,11 +1972,12 @@ async def book_tail_risk(
 
     result = await db.execute(select(SavedStrategy).where(
         SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))
-    strategies = list(result.scalars().all())
+    strategies, excluded = _income_book(list(result.scalars().all()))
     if not strategies:
-        return {"positions": 0, "error": "No active trades to analyze.", "stored": False}
+        return {"positions": 0, "error": _no_income_msg(excluded), "stored": False}
     computed = await compute_book_tail_risk(strategies, quote_source, user, db)
     if not computed.get("error"):
+        computed["scope"] = _book_scope(strategies, excluded)
         computed["computed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         try:
             await set_cached(db, key, computed, ttl_seconds=_BOOK_TR_TTL)
@@ -1947,6 +1989,7 @@ async def book_tail_risk(
 @router.get("/book-hedge-advice")
 async def book_hedge_advice(
     quote_source: str = "yfinance",
+    include_stock_downside: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1966,18 +2009,25 @@ async def book_hedge_advice(
     if not d:
         result = await db.execute(select(SavedStrategy).where(
             SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))
-        strategies = list(result.scalars().all())
+        strategies, excluded = _income_book(list(result.scalars().all()))
         if not strategies:
-            return {"error": "No active trades to analyze."}
+            return {"error": _no_income_msg(excluded)}
         d = await compute_book_tail_risk(strategies, quote_source, user, db)
+        d["scope"] = _book_scope(strategies, excluded)
     if d.get("error"):
         return {"error": d["error"]}
+    # Advise on the same downside policy the user is looking at (the "include stock losses" checkbox).
+    stock_in = bool(include_stock_downside and d.get("with_stock_downside"))
+    if stock_in:
+        d = {**d, **d["with_stock_downside"]}
 
     def _pick(obj, keys):
         return {k: obj.get(k) for k in keys if obj.get(k) is not None}
 
     # DATA-ONLY payload — strip every opinion (verdict prose, assumptions text, hedge_note).
     book_data = {
+        "scope": "Income-tagged trades ONLY (hedges and directional trades held elsewhere are NOT in these numbers)",
+        "downside_includes_stock_losses_on_covered_calls": stock_in,
         "positions": d.get("positions"),
         "net_greeks": _pick(d, ("net_delta", "net_gamma", "net_vega", "net_theta")),
         "beta_weighted_delta_spy_shares": d.get("beta_delta_spy"),
@@ -2019,8 +2069,25 @@ async def book_hedge_advice(
         "hedge_menu": [
             _pick(h, ("label", "instrument", "kind", "long_strike", "short_strike", "contracts",
                       "annual_bleed", "offsets_pct", "cvar_reduction", "efficiency", "cagr_lift_pct",
-                      "cost_effective", "sleeve_capital", "dte_days"))
+                      "cost_effective", "sleeve_capital", "dte_days", "standby"))
             for h in (d.get("hedge_menu") or [])],
+        # ETF hedges built on the nearest ETFs to the book's names (measured ρ): a put on the ETF, optionally funded by a sold call / lower put.
+        "etf_hedges": (lambda eh: [{
+            "etf": c.get("etf"), "avg_rho_of_names_to_etf": c.get("avg_rho"), "tracking": c.get("strength"),
+            "group_loss_at_etf_minus15pct_usd": c.get("loss_ref"), "names": [m.get("ticker") for m in (c.get("members") or [])],
+            "variants": [_pick(v, ("label", "qty", "net_debit", "annual_cost", "cost_pct_income", "funded_pct", "offset_pct", "upside_given_up", "adds_upside_risk"))
+                         | {"put_strike": (v.get("put") or {}).get("strike"), "sold_leg": v.get("short")} for v in (c.get("variants") or [])],
+        } for c in ((eh or {}).get("candidates") or [])] if eh else None)(d.get("etf_hedges")),
+        # BUDGET-SIZED plan: which tail the CVaR lives in, and per hedge what each income budget buys and does to CVaR.
+        "hedge_plan": (lambda hp: {
+            "tail_attribution_worst_5pct_months": hp.get("tail"),
+            "cvar_now": hp.get("cvar_now"), "cvar_guardrail": hp.get("limit_warn"), "annual_option_income": hp.get("annual_income"),
+            "hedges": [{"label": c.get("label"), "instrument": c.get("instrument"), "kind": c.get("kind"), "standby": c.get("standby"),
+                        "cuts_cvar": c.get("helps"), "why_not": c.get("reason"),
+                        "at_budgets": [_pick(pl, ("budget_pct", "units", "annual_cost", "cvar_after", "cvar_reduction")) for pl in c.get("plans", []) if pl.get("units")]}
+                       for c in (hp.get("candidates") or [])],
+            "exposures": [_pick(x, ("label", "value", "shock", "worst", "worst_pct_capital")) for x in (hp.get("exposures") or [])],
+        } if hp else None)(d.get("hedge_plan")),
     }
 
     system = (
@@ -2037,6 +2104,15 @@ async def book_hedge_advice(
         "SPX put spread that fixes both extreme-tail AND CVaR; buying SPY that fixes both net-direction AND "
         "up/down symmetry), and note when de-risking a concentrated cluster is cheaper than a blanket hedge. "
         "Keep every fix's own numbers; do not invent new ones.\n\n"
+        "HEDGE_PLAN is the budget-sized view: it says whether the CVaR tail is made of RALLIES or SELLOFFS "
+        "(tail_attribution up_pct/down_pct) and, per hedge, whether it actually cuts CVaR (cuts_cvar) at each income "
+        "budget. Recommend ONLY hedges with cuts_cvar true, name the cheapest budget that reaches the guardrail, and "
+        "never recommend a put/VIX hedge against a rally-driven tail. A standby hedge (VIXY) is a rule that arms on "
+        "VIX backwardation — say so; it is not a trade to place today.\n\n"
+        "ETF_HEDGES are puts on the ETF nearest to the book's names (measured ρ), sized to a −15% ETF move and optionally funded "
+        "by a sold call or a lower put. Prefer a high-ρ ETF; call out basis risk when tracking is 'loose' or 'weak'; and warn that a "
+        "sold call is covered only if the client holds the ETF — otherwise it is a short call that adds upside risk, especially "
+        "when the book's tail is the upside.\n\n"
         "Then add the deeper read, NOT a restatement of the table. In order:\n"
         "1) Name the book's REAL concentration: the correlated_clusters and the top sectors — these are "
         "the names that move together, so a hit to one hits the whole cluster (cite the tickers + avg_rho).\n"

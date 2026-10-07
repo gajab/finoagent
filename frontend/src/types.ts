@@ -483,6 +483,28 @@ export interface MomentumData {
 }
 export interface MomentumResponse { ticker: string; momentum_setup: MomentumData; cached?: boolean }
 
+// Famous-trader rule-sets run on a ticker (Technical → strategies board); same rules as the Trade Manager's trader lenses
+export interface TraderRule { id: string; rule: string; value: unknown; met: boolean | null }
+export interface TraderStop { level: number; distance_pct: number; atr_multiple: number | null; breached: boolean }
+export interface TraderLevel { label: string; price: number; role: 'exit' | 'trigger' | 'reference' }
+export interface TraderExitRow { label: string; mean: number; win: number; p5: number; worst: number; hold: number }
+export interface TraderExitBacktest extends TraderExitRow { match: 'exact' | 'closest'; baseline: TraderExitRow; note: string }
+export type TraderFamily = 'trend' | 'leaders' | 'timing' | 'volatility';
+export interface TraderStrategy {
+  key: string; trader: string; full_name?: string; family: TraderFamily; named_elsewhere: string | null;
+  available: boolean; reason?: string; philosophy?: string;
+  rules: TraderRule[]; met: number; total: number; grade: 'all' | 'most' | 'some' | 'few' | 'no_data' | string;
+  stance: 'bullish' | 'neutral' | 'bearish' | string; d: number; note?: string;
+  exit_rule?: string; exit_is_level?: boolean; stop: TraderStop | null; levels: TraderLevel[]; exit_backtest: TraderExitBacktest | null;
+}
+export interface TraderStrategiesData {
+  price: number | null; atr14: number | null; bars: number | null; as_of?: string;
+  families: Record<string, string>;
+  consensus: { d: number; bull: number; bear: number; neutral: number; n: number };
+  strategies: TraderStrategy[]; edge_note: string; meta?: { unavailable: string[]; benchmark: boolean };
+}
+export interface TraderStrategiesResponse { ticker: string; trader_strategies: TraderStrategiesData; cached?: boolean }
+
 // Larry Connors' 2-Period RSI mean-reversion — a named strategy (own lazy endpoint)
 export interface ConnorsCheck { key: string; label: string; status: 'pass' | 'warn' | 'fail' | string; value: string; ideal: string; detail: string }
 export interface ConnorsSignal { state: string; tone: 'buy' | 'short' | 'watch' | 'flat' | string; armed: boolean; score: number; checks: ConnorsCheck[]; summary: string }

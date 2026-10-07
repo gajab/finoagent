@@ -1701,3 +1701,76 @@ def test_risk_reward_is_labelled_from_here_not_from_entry():
     ev = _ev("up"); p = TM.build_profile(_strategy(PCS), _pnl(ev["spot"]))
     rr = TM.build_exit_plan(p, ev, {"signal": "HOLD"})["risk_reward"]
     assert rr is None or "FROM HERE" in rr["note"]
+
+
+# ── the displayed arithmetic is the real arithmetic ────────────────────────────────────────────────────
+
+def test_technical_lens_build_reconciles_with_the_score_for_shares():
+    ev = _ev("up"); p = _shares(ev["spot"])
+    sig = TM._tech_signals(ev, ev["spot"])
+    t = TM._technical_score(p, ev, sig)
+    b = t["build"]
+    assert b["kind"] == "alignment" and b["base"] == 50.0 and b["gain"] == 22.0 and b["k"] == TM.ALIGN_K
+    # dir is the weight-averaged signal strength, and the points are exactly gain × clamp(k × aligned)
+    assert b["dir"] == pytest.approx(sum(s["d"] * s["w"] for s in sig) / sum(s["w"] for s in sig), abs=1e-3)
+    assert b["points"] == pytest.approx(b["gain"] * max(-1, min(1, b["k"] * b["aligned"])), abs=0.06)
+    assert b["lo"] == 28.0 and b["hi"] == 72.0 and b["weight_total"] == pytest.approx(sum(s["w"] for s in sig), abs=0.01)
+    assert t["score"] == pytest.approx(b["base"] + b["points"] + b["adjust"], abs=0.11)      # score = 50 + points + other adjustments
+    assert b["adjust"] == 0.0                                                                     # shares carry no vol/strike terms
+
+
+def test_technical_lens_build_halves_the_gain_when_an_adverse_chart_is_oversold():
+    ev = _ev("down"); ev["technical"]["suite"]["rsi14"] = 25
+    p = _shares(ev["spot"])
+    b = TM._technical_score(p, ev, TM._tech_signals(ev, ev["spot"]))["build"]
+    assert b["gain"] == 11.0 and b["lo"] == 39.0 and b["hi"] == 61.0
+
+
+def test_technical_lens_build_adjust_carries_the_option_terms():
+    ev = _ev("up"); p = TM.build_profile(_strategy(PCS), _quant_pnl(ev["spot"]))
+    t = TM._technical_score(p, ev, TM._tech_signals(ev, ev["spot"]))
+    if t["build"] is not None:                                   # a directional option structure: the later terms are the difference
+        assert t["score"] == pytest.approx(max(0.0, min(100.0, t["build"]["base"] + t["build"]["points"] + t["build"]["adjust"])), abs=0.11)
+
+
+def test_position_risk_build_is_base_plus_terms_and_matches_the_score():
+    ev = _ev("up"); p = _shares(ev["spot"], pnl_pct=-2.0)
+    q = TM._position_risk(p, ev)
+    b = q["build"]
+    assert b["kind"] == "position_risk" and b["base"] == 62.0
+    assert q["score"] == pytest.approx(max(0.0, min(100.0, b["base"] + sum(t["pts"] for t in b["terms"]))), abs=0.06)
+    assert all(set(t) == {"label", "pts", "note"} for t in b["terms"])
+    st = b["stop"]
+    assert st and st["pct"] == TM.STOCK_STOP_PCT and st["level"] == pytest.approx(st["cost"] * (1 - TM.STOCK_STOP_PCT / 100), abs=0.01)
+    assert 0 <= st["p_touch"] <= 1 and st["crossed"] is False and st["z"] > 0
+
+
+def test_position_risk_stop_touch_odds_agree_with_the_quant_detail_row():
+    """The Position-risk 'P(touch stop)' shown in the groups and the one in build.stop are the same number."""
+    ev = _ev("up"); p = _shares(ev["spot"], pnl_pct=1.0)
+    d = TM.decide(p, ev)["lenses"]["quant"]
+    row = next(m for g in d["detail"]["groups"].values() for m in g if m["key"] == "stop_touch")
+    assert row["value"] == round(d["build"]["stop"]["p_touch"] * 100)
+
+
+def test_position_risk_through_the_stop_is_flagged_crossed_and_scores_the_penalty():
+    ev = _ev("up"); p = _shares(ev["spot"], pnl_pct=-15.0)
+    q = TM._position_risk(p, ev)
+    assert q["build"]["stop"]["crossed"] is True and q["build"]["stop"]["p_touch"] == 1.0
+    assert any(t["label"] == "Discipline stop" and t["pts"] == -30.0 for t in q["build"]["terms"])
+
+
+def test_position_risk_terms_list_every_note_with_points():
+    """Every note that carries a (+n)/(−n) tag has a matching term, so the UI list and the prose can never disagree."""
+    ev = _ev("down"); ev["technical"]["suite"].setdefault("range", {})["pct_from_52w_high"] = -25
+    p = _shares(ev["spot"], pnl_pct=-3.0)
+    q = TM._position_risk(p, ev)
+    tagged = [n for n in q["notes"] if n.endswith(")") and ("(+" in n or "(−" in n)]
+    nonzero = [t for t in q["build"]["terms"] if t["pts"]]
+    assert len(tagged) == len(nonzero)
+    assert sum(t["pts"] for t in nonzero) == pytest.approx(q["score"] - q["build"]["base"], abs=0.06) or q["build"]["clamped"]
+
+
+def test_shares_quant_lens_text_no_longer_calls_position_risk_a_small_weight():
+    d = TM.decide(_shares(_ev("up")["spot"]), _ev("up"))["lenses"]["quant"]
+    assert "small weight" not in d["detail"]["how_it_counts"] and "scored alongside Technical" in d["detail"]["how_it_counts"]

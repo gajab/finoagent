@@ -448,7 +448,7 @@ const TONE_CLASS: Record<string, string> = {
 };
 
 interface PanelCheck { key: string; label: string; status: string; value: string; ideal: string; detail: string }
-interface PanelData {
+export interface PanelData {
   Icon: any;
   title: string;
   badge: string;          // "A" (grade) or "BUY ZONE" (signal state)
@@ -506,7 +506,7 @@ function Backtest({ bt }: { bt: ConnorsBacktest }) {
   );
 }
 
-function StrategyPanel({ p }: { p: PanelData }) {
+export function StrategyPanel({ p }: { p: PanelData }) {
   return (
     <div className="glass-card p-4 space-y-3">
       <div className="flex items-start gap-3 flex-wrap">
@@ -619,8 +619,8 @@ const STYLE_TABS: { k: StyleKey; label: string; hint: string }[] = [
 ];
 
 // named technical strategies live in the dropdown (extensible — add more here)
-interface NamedStrategy { key: string; label: string; hint: string; fetch: (t: string) => Promise<any>; toPanel: (d: any) => PanelData }
-const NAMED_STRATEGIES: NamedStrategy[] = [
+export interface NamedStrategy { key: string; label: string; hint: string; fetch: (t: string) => Promise<any>; toPanel: (d: any) => PanelData }
+export const NAMED_STRATEGIES: NamedStrategy[] = [
   { key: 'momentum', label: 'Momentum Swing', hint: 'multi-factor confluence', fetch: (t) => fetchMomentumSetups(t).then(r => r.momentum_setup), toPanel: momentumPanel },
   { key: 'qullamaggie', label: 'Qullamäggie', hint: 'momentum breakout', fetch: (t) => fetchQullamaggieSetups(t).then(r => r.qullamaggie_setup), toPanel: qmPanel },
   { key: 'connors_rsi2', label: 'Connors RSI-2', hint: 'mean reversion', fetch: (t) => fetchConnorsSetups(t).then(r => r.connors_setup), toPanel: connorsPanel },

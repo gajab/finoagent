@@ -5,7 +5,9 @@
  *   verdict → ONE state + one sentence (Act · Watch · Harvest · Hold · No quote), never six competing badges
  *   hero    → payoff + the handful of numbers that decide it
  *   tabs    → Overview (underlying · legs · numbers) · Risk · Quant · Manage · Journal. Manage has two Beta
- *             panels — Underlying Analysis (BetaUnderlyingAnalysis) and Defend & repair (BetaDefend). Heavy panels
+ *             panels — Underlying Analysis (BetaUnderlyingAnalysis) and Defend & repair (BetaDefend). The desk score
+ *             runs ONCE per position (betaDesk.ts): the Quant tab renders it and Underlying Analysis adopts the same
+ *             result, so the quant number is identical in both places. Heavy panels
  *             are mounted only when first opened, so nothing expensive runs on landing — the same on-demand
  *             behavior as classic, with one click instead of a long scroll.
  *
@@ -19,12 +21,13 @@ import { X, RefreshCw, Loader2, ExternalLink, Shield, LogOut, PlusCircle, AlertT
 import type { SavedStrategyItem, LivePnlResponse, UnderlyingDeskResult } from '../api';
 import { fetchUnderlyingDesk, fetchTradeTransactions, setTradeCovered } from '../api';
 import { fmtMoney, fmtPct, fmtDate, fmtDTE, fmtQty } from '../lib/tradeFormat';
+import { effectivePnl } from '../lib/tradePnl';
 import {
-  tradePurpose, PURPOSE_META, tradeStructure, expiryFrom, dteFrom, daysHeld, effectivePnl, deskFocusForTrade,
+  tradePurpose, PURPOSE_META, tradeStructure, expiryFrom, dteFrom, daysHeld, deskFocusForTrade,
   classifyTrade, tradeHasStock,
 } from '../components/trades/MyTradesV2';
 import PayoffChart from '../components/trades/PayoffChart';
-import { QuantAnalysisLoader } from '../components/trades/QuantExitCard';
+import ManagementAnalysis from '../components/trades/ManagementAnalysis';
 import TransactionHistoryPanel from '../components/trades/TransactionHistoryPanel';
 import { TraderGrid, PmGrid, RiskGrid } from '../components/trades/DeskMetrics';
 import { TickerChrome } from '../components/DerivativeIncome';
@@ -34,6 +37,7 @@ import BetaDefend from './BetaDefend';
 import { STATE_META, legHasMarket, type TradeState } from './betaState';
 import { RollForm, EditLegForm, AddLegForm } from './LegForms';
 import { canMarkCovered, hasShortCall } from './betaLegEdit';
+import { useDeskScore, type DeskState } from './betaDesk';
 
 type Tab = 'overview' | 'risk' | 'quant' | 'manage' | 'journal';
 const TABS: { id: Tab; label: string }[] = [
@@ -62,9 +66,7 @@ function Notice({ children, tone: t = 'neutral' }: { children: React.ReactNode; 
   );
 }
 
-export default function BetaTradeInspector({
-  trade, pnl, state, quoteSource, loading, onRefresh, onClose, onChanged, onCloseTrade, onUpdatePosition,
-}: {
+interface InspectorProps {
   trade: SavedStrategyItem;
   pnl: LivePnlResponse | undefined;
   state: TradeState;
@@ -75,7 +77,20 @@ export default function BetaTradeInspector({
   onChanged: () => void;
   onCloseTrade: () => void;
   onUpdatePosition: () => void;
-}) {
+}
+
+/**
+ * One inspector per position. Keyed by the trade so that picking another row starts from a clean slate: without the key,
+ * the first render for the NEW trade still carried the previous trade's "opened" tab flags and mounted its heavy panels
+ * (desk score, hold/exit read, defend menu) for a trade nobody had asked about, before the reset effect could run.
+ */
+export default function BetaTradeInspector(props: InspectorProps) {
+  return <TradeInspector key={props.trade.id} {...props} />;
+}
+
+function TradeInspector({
+  trade, pnl, state, quoteSource, loading, onRefresh, onClose, onChanged, onCloseTrade, onUpdatePosition,
+}: InspectorProps) {
   const [tab, setTab] = useState<Tab>('overview');
   const [seen, setSeen] = useState<Set<Tab>>(new Set(['overview']));
   // null = no explicit choice yet: follow the live state (Defend when the position needs defending, else the plan).
@@ -112,6 +127,8 @@ export default function BetaTradeInspector({
   const noQuote = state.state === 'noquote';
   const blocked = noQuote && !force;
   const deskFocus = useMemo(() => deskFocusForTrade(trade, pnl), [trade, pnl]);
+  // ONE desk-score run, started when either consumer is first opened: the Quant tab, or Manage ▸ Underlying Analysis.
+  const desk = useDeskScore(trade, pnl, deskFocus, !blocked && (seen.has('quant') || manageSeen.has('plan')));
   const a: any = (pnl as any)?.analysis || {};
   const unreal = effectivePnl(pnl, false);
   // "Mark covered": a short call whose shares are held ELSEWHERE (no stock leg here) — same rule as classic.
@@ -299,7 +316,7 @@ export default function BetaTradeInspector({
             {!deskFocus ? <Notice>The quant score is built for option-selling structures; this position has none.</Notice>
               : blocked ? <BlockedNotice onForce={() => setForce(true)} />
               : !pnl ? <Notice>Load live P&amp;L first.</Notice>
-              : <QuantAnalysisLoader trade={trade} pnl={pnl} deskFocus={deskFocus} />}
+              : <QuantPanel desk={desk} />}
           </div>
         )}
 
@@ -312,7 +329,7 @@ export default function BetaTradeInspector({
                   <span className="text-sm font-semibold">Underlying Analysis</span>
                   <span className="text-xs text-base-content/50">hold / exit plan for the shares · Defend &amp; repair is for option positions</span>
                 </div>
-                {pnl ? <BetaUnderlyingAnalysis trade={trade} pnl={pnl} /> : <Notice>Load live P&amp;L first — press Refresh.</Notice>}
+                {pnl ? <BetaUnderlyingAnalysis trade={trade} pnl={pnl} desk={desk} /> : <Notice>Load live P&amp;L first — press Refresh.</Notice>}
               </>
             ) : blocked ? <BlockedNotice onForce={() => setForce(true)} /> : (
               <>
@@ -322,7 +339,7 @@ export default function BetaTradeInspector({
                       className={`px-3 py-1 rounded-md transition-colors ${manageSub === k ? 'bg-primary/20 text-primary font-semibold' : 'text-base-content/60 hover:text-base-content'}`}>{lbl}</button>
                   ))}
                 </div>
-                {manageSeen.has('plan') && pnl && <div className={manageSub === 'plan' ? '' : 'hidden'}><BetaUnderlyingAnalysis trade={trade} pnl={pnl} /></div>}
+                {manageSeen.has('plan') && pnl && <div className={manageSub === 'plan' ? '' : 'hidden'}><BetaUnderlyingAnalysis trade={trade} pnl={pnl} desk={desk} onOpenQuant={() => go('quant')} /></div>}
                 {manageSeen.has('defend') && <div className={manageSub === 'defend' ? '' : 'hidden'}><BetaDefend tradeId={trade.id} quoteSource={quoteSource} ticker={trade.ticker} /></div>}
                 <div className="text-[11px] text-base-content/45">The LLM desk (Run Institutional Desk, Review hold or exit) is still in <Link className="link" to={`/my-trades?open=${trade.id}`}>the classic card</Link>.</div>
               </>
@@ -404,6 +421,31 @@ function LegsSection({ trade, pnl, cached, onChanged }: { trade: SavedStrategyIt
       {mode?.kind === 'edit' && <EditLegForm key={`edit-${trade.id}-${mode.idx}`} trade={trade} idx={mode.idx} onDone={done} onCancel={() => setMode(null)} />}
       {mode?.kind === 'add' && <AddLegForm key={`add-${trade.id}`} trade={trade} onDone={done} onCancel={() => setMode(null)} />}
       <div className="text-[11px] text-base-content/45">Add stock, change purpose, delete the trade or create an agent? Those are still in <Link className="link" to={`/my-trades?open=${trade.id}`}>the classic card</Link>.</div>
+    </div>
+  );
+}
+
+/** The Quant tab: the full desk score (the SAME deep read as the Income Desk scan, re-signed for a holder). */
+function QuantPanel({ desk }: { desk: DeskState }) {
+  if (desk.status === 'idle' || desk.status === 'loading') return (
+    <div className="flex items-center gap-2 text-xs text-base-content/50 py-3"><Loader2 className="w-4 h-4 animate-spin" /> Running the desk on this exact trade…</div>
+  );
+  if (desk.status === 'error' || !desk.desk) return (
+    <div className="text-xs text-base-content/55 flex items-start gap-1.5 py-1">
+      <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0 text-base-content/40" /><span>{desk.error || 'The desk score is not available for this trade.'}</span>
+      <button className="underline ml-1 hover:text-base-content" onClick={desk.run}>Retry</button>
+    </div>
+  );
+  const d = desk.desk;
+  return (
+    <div className="space-y-2">
+      {d.management_analysis
+        ? <ManagementAnalysis ma={d.management_analysis} qp={d.qp} perSide={d.opp?.per_side} />
+        : <Notice>The desk returned no management read for this structure.</Notice>}
+      <div className="text-[11px] text-base-content/40">
+        Computed with the prices at the moment you opened this tab. <button className="underline hover:text-base-content/70" onClick={desk.run}>Re-run with current prices</button>
+        {' '}— the Manage ▸ Underlying Analysis read then adopts the new number too.
+      </div>
     </div>
   );
 }

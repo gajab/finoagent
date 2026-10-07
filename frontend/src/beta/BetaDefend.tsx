@@ -6,16 +6,17 @@
  * recommendation is held back until it lands (so it never changes under you), and the LLM war room runs only on
  * an explicit click. What changes is the reading order and the look:
  *
- *   header        → where the trade stands: posture, spot, cushion, days left, mark if closed
+ *   header        → where the trade stands: posture, spot, cushion, days left, P(finish ITM), mark if closed
+ *                   (plus a warning when early assignment is likely)
  *   recommendation→ the ONE desk pick: score ring, why, runner-up, what to avoid
- *   next best moves → every priced option as a compact ranked row (tap for payoff, breakdown and rationale)
+ *   next best moves → every priced option as a ranked row WITH its payoff curve (tap for breakdown and rationale)
  *   risk read     → recoverability as tiles + the drivers that build it
- *   folded        → assignment · cost of waiting · what broke · synthetic reframe · war room
+ *   folded        → cost of waiting · what broke · synthetic reframe · war room
  */
 import React, { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  Loader2, AlertTriangle, ShieldAlert, Wrench, Activity, Clock, Users, ArrowUpRight, TrendingDown, TrendingUp, Layers, Check, X, Minus,
+  Loader2, AlertTriangle, Wrench, Activity, Clock, Users, ArrowUpRight, TrendingDown, TrendingUp, Layers, Check, X, Minus,
   Target, Star, ShieldCheck, Infinity as InfinityIcon, DollarSign, BarChart3, Thermometer, Ruler, Compass, CalendarDays,
 } from 'lucide-react';
 import { fetchDefendMenu, fetchDefendCommittee, fetchDefendRefine } from '../api';
@@ -56,6 +57,10 @@ function Header({ d }: { d: RepairMenuResult }) {
   const sev = SEV[r?.severity || 'fresh'] || SEV.fresh;
   const pb: { label: string; tone: Tone } = posture === 'marginal' ? { label: 'Marginal', tone: 'warn' } : posture === 'healthy' ? { label: 'Healthy', tone: 'good' } : sev;
   const t = TONE[pb.tone];
+  const a = d.assignment;
+  const pItm = a?.p_itm;
+  // How likely the short leg finishes in the money — the odds that assignment is a real outcome, not a tail.
+  const itmTone: Tone | undefined = pItm == null ? undefined : pItm >= 55 ? 'bad' : pItm >= 30 ? 'warn' : 'good';
   return (
     <div className={`rounded-2xl border p-4 ${t.border} ${t.soft}`}>
       <div className="flex flex-wrap items-center gap-2">
@@ -64,12 +69,17 @@ function Header({ d }: { d: RepairMenuResult }) {
         {d.covered && <Chip tone="info" title="Shares cover the short call — the risk is being called away (opportunity cost), not an unbounded loss">covered</Chip>}
         <span className="text-sm text-base-content/70 ml-1">{d.ticker} · {posture === 'healthy' || posture === 'marginal' ? 'short' : 'tested'} {d.short_right === 'P' ? 'put' : 'call'} ${num(d.short_strike, 0)}</span>
       </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
+      <div className={`grid grid-cols-2 gap-2 mt-3 ${a ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
         <Tile label="Spot" value={`$${num(d.spot, 2)}`} />
         <Tile label="Cushion" value={d.cushion_pct == null ? '—' : `${num(d.cushion_pct, 1)}%`} sub="to the short strike" />
         <Tile label="Days left" value={d.dte_days == null ? '—' : `${d.dte_days}d`} />
+        {a && <Tile label="P(finish ITM)" value={pct(pItm)} tone={itmTone} sub={a.extrinsic != null ? `$${num(a.extrinsic, 2)} time value left` : 'short leg in the money at expiry'}
+          title="Probability the short leg finishes in the money — i.e. that assignment is a real outcome. Time value left is what an early exercise would forfeit." />}
         <Tile label="Mark if closed" value={money(d.unrealized_pnl)} tone={(d.unrealized_pnl ?? 0) >= 0 ? 'good' : 'bad'} />
       </div>
+      {a?.early_assignment_risk && (
+        <Callout tone="bad" icon={<AlertTriangle className="w-3.5 h-3.5" />} className="mt-2">Early-assignment risk — {a.early_reason}</Callout>
+      )}
     </div>
   );
 }
@@ -102,6 +112,7 @@ function Recommendation({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a
           <div className="text-base font-semibold leading-snug mt-0.5">→ {rec.name}</div>
         </div>
       </div>
+      {winner && <PayoffBlock a={winner} spot={d.spot ?? 0} />}
       {b && (
         <div className="grid sm:grid-cols-2 gap-x-6 gap-y-1.5">
           <Bar label="Edge / $ risk" v={b.edge} /><Bar label="Risk shape" v={b.risk} /><Bar label="Recovery" v={b.recovery} /><Bar label="Market fit" v={b.market_fit} />
@@ -127,6 +138,19 @@ function Recommendation({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a
   );
 }
 
+/** An option's payoff curve across spot moves, with the move axis labelled. Renders nothing when there is no usable curve. */
+function PayoffBlock({ a, spot, className = '' }: { a: RepairAlternative; spot: number; className?: string }) {
+  const sc = a.scenarios || [];
+  const xs = sc.map(p => p.move_pct);
+  if (xs.length < 2 || !(Math.max(...xs) > Math.min(...xs)) || !sc.every(p => Number.isFinite(p.pnl))) return null;
+  return (
+    <div className={className} data-testid="move-payoff">
+      <div className="rounded-lg border border-white/[0.06] bg-base-100/30 p-2"><PayoffCurve alt={a} spot={spot} /></div>
+      <div className="flex justify-between text-[11px] text-base-content/40 mt-1"><span>{Math.min(...xs)}% move</span><span>now ${spot}</span><span>+{Math.max(...xs)}% move</span></div>
+    </div>
+  );
+}
+
 // ── ranked moves ─────────────────────────────────────────────────────────────
 function RollRead({ m }: { m: NonNullable<RepairAlternative['roll_meta']> }) {
   const cleared = Object.entries(m.structure || {}).filter(([k, v]) => k.startsWith('clears ') && v === true).map(([k]) => k.replace('clears ', ''));
@@ -144,10 +168,9 @@ function MoveRow({ a, no, best, spot, onEvaluate }: { a: RepairAlternative; no?:
   const [open, setOpen] = useState(false);
   const bench = a.category === 'exit' || a.category === 'hold';
   const canEval = a.category !== 'exit' && (a.legs || []).some(l => l.right === 'P' || l.right === 'C');
-  const xs = (a.scenarios || []).map(p => p.move_pct);
   return (
     <div className={`rounded-xl border ${best ? 'border-success/40 bg-success/[0.05]' : bench ? 'border-white/[0.08] border-dashed bg-base-100/10' : 'border-white/[0.08] bg-base-100/20'}`}>
-      <button type="button" aria-expanded={open} onClick={() => setOpen(o => !o)} className="w-full text-left p-3 hover:bg-white/[0.02] rounded-xl transition-colors">
+      <button type="button" aria-expanded={open} onClick={() => setOpen(o => !o)} className="w-full text-left p-3 hover:bg-white/[0.02] rounded-xl transition-colors" title="Tap for the score breakdown, break-evens and rationale">
         <div className="flex items-start gap-3">
           <div className="h-6 w-6 shrink-0 rounded-full bg-base-content/10 flex items-center justify-center text-xs font-semibold">{no ?? '·'}</div>
           <div className="min-w-0 flex-1">
@@ -172,12 +195,10 @@ function MoveRow({ a, no, best, spot, onEvaluate }: { a: RepairAlternative; no?:
           <Stat label="Δ recovery" value={a.d_pop != null && !bench ? `${a.d_pop >= 0 ? '+' : ''}${a.d_pop}%` : '—'} tone={a.d_pop != null && !bench ? (a.d_pop >= 0 ? 'text-success' : 'text-error') : undefined} />
         </div>
       </button>
+      {/* every option shows its payoff up front — the shape is what you are choosing between */}
+      <PayoffBlock a={a} spot={spot} className="px-3 pb-3" />
       {open && (
         <div className="px-3 pb-3 pt-3 space-y-3 border-t border-white/[0.06]">
-          <div>
-            <div className="rounded-lg border border-white/[0.06] bg-base-100/30 p-2"><PayoffCurve alt={a} spot={spot} /></div>
-            {xs.length > 0 && <div className="flex justify-between text-[11px] text-base-content/40 mt-1"><span>{Math.min(...xs)}% move</span><span>now ${spot}</span><span>+{Math.max(...xs)}% move</span></div>}
-          </div>
           <div className="flex flex-wrap items-center gap-2">
             {a.category !== 'exit' && (a.defined_risk
               ? <Chip tone="good"><ShieldCheck className="w-3 h-3" /> defined risk</Chip>
@@ -306,24 +327,6 @@ function RiskRead({ d }: { d: RepairMenuResult }) {
 }
 
 // ── folded sections ──────────────────────────────────────────────────────────
-function AssignmentBody({ d }: { d: RepairMenuResult }) {
-  const a = d.assignment; if (!a) return null;
-  const nakedCall = d.short_right === 'C' && !d.covered;
-  return (
-    <div className="space-y-3">
-      {a.early_assignment_risk && <Callout tone="bad" icon={<AlertTriangle className="w-3.5 h-3.5" />}>Early-assignment risk — {a.early_reason}</Callout>}
-      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-        <Tile label="P(finish ITM)" value={pct(a.p_itm)} tone={a.p_itm != null && a.p_itm >= 55 ? 'bad' : 'warn'} />
-        <Tile label="Time value left" value={`$${num(a.extrinsic, 2)}`} tone={a.extrinsic <= 0.15 ? 'bad' : undefined} />
-        <Tile label="Pin ratio" value={a.pin_ratio == null ? '—' : num(a.pin_ratio, 2)} />
-        <Tile label={nakedCall ? 'Effective sale price' : 'Effective basis'} value={`$${num(a.effective_basis, 2)}`} />
-        <Tile label="Capital at stake" value={`$${num(a.assignment_capital)}`} />
-      </div>
-      <p className="text-xs text-base-content/65 leading-relaxed">{a.consequence}</p>
-    </div>
-  );
-}
-
 function CostOfWaitingBody({ d }: { d: RepairMenuResult }) {
   const cw = d.cost_of_waiting || []; if (!cw.length) return null;
   const pts = [{ in_trading_days: 0, recovery_pop: d.recoverability?.recovery_score ?? null, expected_pnl: d.hold?.expected_pnl ?? null }, ...cw];
@@ -507,7 +510,6 @@ export default function BetaDefend({ tradeId, quoteSource, ticker }: { tradeId: 
 
   const holdBack = data.roll_search === 'pending' && !refineErr;
   const cw = data.cost_of_waiting || [];
-  const a = data.assignment;
   const ctx = data.context;
   return (
     <div className="space-y-3">
@@ -522,13 +524,6 @@ export default function BetaDefend({ tradeId, quoteSource, ticker }: { tradeId: 
       {!holdBack && (data.alternatives || []).length > 0 && <Moves d={data} onEvaluate={toEvaluate} />}
       <RiskRead d={data} />
 
-      {a && (
-        <Accordion title="Assignment risk" icon={<ShieldAlert className="w-4 h-4" />} defaultOpen={!!a.early_assignment_risk}
-          summary={`P(finish ITM) ${pct(a.p_itm)} · time value left $${num(a.extrinsic, 2)}`}
-          badge={a.early_assignment_risk ? <Chip tone="bad">early-assignment risk</Chip> : undefined}>
-          <AssignmentBody d={data} />
-        </Accordion>
-      )}
       {cw.length > 0 && (
         <Accordion title="Cost of waiting" icon={<Clock className="w-4 h-4" />}
           summary={`recovery odds ${data.recoverability?.recovery_score ?? '—'}% now → ${cw[cw.length - 1]?.recovery_pop ?? '—'}% in ${cw[cw.length - 1]?.in_trading_days}d`}>

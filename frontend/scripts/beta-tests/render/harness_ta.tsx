@@ -13,8 +13,11 @@ const g: any = globalThis;
 let passed = 0;
 const ok = (name: string) => { passed++; console.log('  ok -', name); };
 const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x));
+// the smallest payload the classic Momentum panel adapter can render (checks + metrics), with no live trade
+const MOMENTUM: any = { price: 238.9, as_of: 'x', setups: [], qualification: { is_candidate: false, grade: 'B', score: 61, passes: 4, summary: 'Stage-2 uptrend, no trigger yet.', gates: { uptrend: true }, checks: [{ key: 'trend', label: 'Stage-2 uptrend', status: 'pass', value: 'yes', ideal: 'yes', detail: 'price above a rising 200d' }] },
+  metrics: { pct_from_52w_high: -4.2, rs: { available: true, slope_1m: 3.1, new_high: false }, rsi: 66, bb_squeeze: false, bb_width_pctile: 40, golden_cross: { above: true }, regime: { label: 'trending' } } };
 
-interface Net { log: string[]; setups: (url: string) => any; gate: Record<string, Promise<void>>; delay?: (url: string, nth: number) => number; fail: Set<string>; posted: any[] }
+interface Net { log: string[]; setups: (url: string) => any; traders?: (url: string) => any; gate: Record<string, Promise<void>>; delay?: (url: string, nth: number) => number; fail: Set<string>; posted: any[] }
 function installFetch(net: Net) {
   g.fetch = async (url: string, opts: any) => {
     const method = opts?.method || 'GET';
@@ -28,6 +31,8 @@ function installFetch(net: Net) {
     if (url.includes('/api/tracked-trades') && method === 'POST') { net.posted.push(JSON.parse(opts.body)); return reply({ id: 1 }); }
     if (url.includes('/candles')) return reply(F.candles(new URL(url, 'http://x').searchParams.get('interval') || '1d'));
     if (url.includes('/trade-setups')) return reply(net.setups(url));
+    if (url.includes('/trader-strategies')) return reply(net.traders ? net.traders(url) : F.traderStrategies);
+    if (url.includes('/momentum-setup')) return reply({ ticker: 'NVDA', momentum_setup: MOMENTUM });
     if (url.includes('/day-trade-setups')) return reply(F.dayTradeSetups);
     if (url.includes('/dealer-positioning')) { const d: any = clone(F.dealer); if (url.includes('/AAA/')) d.dealer_positioning.gamma_levels.call_resistance.strike = 9999; return reply(d); }
     if (url.includes('/market-structure')) return reply(F.marketStructure);
@@ -228,6 +233,117 @@ async function main() {
     reset(); g.localStorage.setItem('beta:ta:layers', '{"oops":1}'); installFetch(newNet());
     const m = await mount(); await settle(300); has(m.text(), 'Lean long'); assert(pressed(m.container).includes('Plan'), 'falls back to the default layers');
     ok('a corrupted saved-layers value falls back to the defaults instead of crashing'); await m.unmount();
+  }
+
+  // ── strategies board ──
+  {
+    reset(); const net = newNet(); installFetch(net); const m = await mount(); await settle(400);
+    assert.equal(count(net.log, '/trader-strategies'), 0, 'the 15 rule-sets are not run until the board is opened');
+    await click(m.container, /^Strategies/); await settle(400);
+    assert.equal(count(net.log, '/trader-strategies'), 1);
+    const tile = (id: string) => m.container.querySelector(`[data-tile="${id}"]`) as HTMLElement;
+    const ids = [...m.container.querySelectorAll('[data-testid="beta-strategies"] [data-tile]')].map(e => e.getAttribute('data-tile'));
+    assert.equal(ids.length, 3 + 3 + 13, 'three engine styles, three named screens, thirteen traders'); assert(!ids.includes('qullamaggie') || ids.indexOf('qullamaggie') < 6 || false);
+    for (const k of ['swing', 'position', 'day', 'momentum', 'qullamaggie', 'connors_rsi2', 'minervini', 'oneil', 'weinstein', 'turtles', 'ptj', 'druckenmiller', 'raschke', 'livermore', 'carter', 'ichimoku', 'elder', 'wyckoff', 'cta']) assert(tile(k), `tile ${k}`);
+    assert(!tile('connors') , 'Connors is the named screen, not a second tile');
+    const D: any = F.traderStrategies.trader_strategies;
+    has(m.text(), `${D.consensus.bull} bullish`, `${D.consensus.neutral} neutral`, `${D.consensus.bear} bearish`, `of ${D.consensus.n}`, 'no edge predicting returns');
+    ok('opening the board runs the 15 rule-sets once and shows 3 engine styles, 3 named screens and the 13 other traders, with the consensus');
+
+    // a trader's detail: its rules with measured values, its exit, how that exit has behaved
+    await click(m.container, /./, '[data-tile="minervini"]'); await settle(60);
+    const det = m.container.querySelector('[data-testid="trader-detail"]')!.textContent || '';
+    const mv = D.strategies.find((s: any) => s.key === 'minervini');
+    has(det, 'Mark Minervini', mv.philosophy, `${mv.met} of ${mv.total} rules met`, 'Draw on the chart', 'Their rules');
+    for (const r of mv.rules) has(det, r.rule);
+    assert.equal(m.container.querySelectorAll('[data-testid="trader-detail"] [data-rule]').length, mv.rules.length);
+    has(det, 'How this kind of exit has behaved', 'Minervini ⅓ at 50d', 'hold 126 days');
+    ok('a trader tile opens its checklist with every rule, its philosophy, its exit and the backtested behaviour of that exit');
+
+    // a lost line: a price-line exit reads as a level to reclaim; a non-price exit's line is only a reference
+    const detailText = () => m.container.querySelector('[data-testid="trader-detail"]')!.textContent || '';
+    const lostLevel = D.strategies.find((s: any) => s.available && s.stop?.breached && s.exit_is_level && !s.named_elsewhere);
+    const lostRef = D.strategies.find((s: any) => s.available && s.stop?.breached && s.exit_is_level === false && !s.named_elsewhere);
+    const live = D.strategies.find((s: any) => s.available && s.stop && !s.stop.breached && s.exit_is_level && !s.named_elsewhere);
+    assert(lostLevel && lostRef && live, 'the fixture must contain a lost price-line exit, a lost reference line and a live exit');
+    await click(m.container, /./, `[data-tile="${lostLevel.key}"]`); await settle(60);
+    has(detailText(), `Price has closed below $${lostLevel.stop.level.toFixed(2)}`, 'level to reclaim, not a future exit');
+    await click(m.container, /./, `[data-tile="${lostRef.key}"]`); await settle(60);
+    has(detailText(), `Price is below $${lostRef.stop.level.toFixed(2)}, a reference line`, 'not a price line', 'has not triggered it'); lacks(detailText(), 'level to reclaim', 'trend condition has failed');
+    await click(m.container, /./, `[data-tile="${live.key}"]`); await settle(60);
+    has(detailText(), `Their exit sits at $${live.stop.level.toFixed(2)}`); lacks(detailText(), 'Price has closed below', 'reference line');
+    ok('a lost price-line exit is a level to reclaim; a lost reference line never claims their exit fired; a live exit is a future exit');
+
+    // draw on the chart: one strategy at a time, removable
+    const lines = () => Number(m.container.querySelector('[data-testid="echart"]')!.getAttribute('data-lines'));
+    const base = lines();
+    await click(m.container, /./, '[data-tile="turtles"]'); await settle(60);
+    await click(m.container, /Draw on the chart/); await settle(80);
+    assert(lines() > base, 'the strategy levels are on the chart'); has(m.text(), 'Turtles'); assert(m.container.querySelector('[data-testid="strategy-chip"]'));
+    assert(find(m.container, /Drawn on the chart — remove/), 'the button flips to remove');
+    await click(m.container, /./, '[data-tile="cta"]'); await settle(60); await click(m.container, /Draw on the chart/); await settle(80);
+    assert.equal(m.container.querySelectorAll('[data-testid="strategy-chip"]').length, 1); has(m.container.querySelector('[data-testid="strategy-chip"]')!.textContent || '', 'Trend CTAs');
+    await click(m.container, /./, '[data-testid="strategy-chip"]'); await settle(60);
+    assert.equal(lines(), base, 'removing from the chip clears the overlay'); assert(!m.container.querySelector('[data-testid="strategy-chip"]'));
+    ok('Draw on the chart adds that strategy\'s levels to the cockpit chart, one strategy at a time, removable from the chip');
+
+    // filters
+    await click(m.container, /^Trend following/); await settle(40);
+    const shown = () => [...m.container.querySelectorAll('[data-testid="beta-strategies"] [data-tile]')].map(e => e.getAttribute('data-tile')).filter(k => D.strategies.some((s: any) => s.key === k && !s.named_elsewhere));
+    const trend = D.strategies.filter((s: any) => s.family === 'trend' && !s.named_elsewhere).map((s: any) => s.key).sort();
+    assert.deepEqual(shown().sort(), trend);
+    await click(m.container, /^Bullish/); await settle(40);
+    assert.deepEqual(shown().sort(), D.strategies.filter((s: any) => s.family === 'trend' && !s.named_elsewhere && s.stance === 'bullish').map((s: any) => s.key).sort());
+    assert(tile('swing') && tile('momentum'), 'engine and named tiles are never hidden by a trader filter');
+    await click(m.container, /^All \d+$/); await settle(40);                       // family back to all; the stance filter (bullish) stays
+    assert.equal(shown().length, D.strategies.filter((s: any) => !s.named_elsewhere && s.stance === 'bullish').length);
+    ok('family and stance filters narrow only the trader tiles, and combine');
+    await click(m.container, /^Bullish/); await settle(40);
+
+    // engine setups
+    await click(m.container, /./, '[data-tile="swing"]'); await settle(60);
+    has(m.text(), 'Trend Pullback', '6.75R');
+    await click(m.container, /./, '[data-tile="position"]'); await settle(60); has(m.text(), 'Position Accumulate');
+    assert.equal(count(net.log, '/day-trade-setups'), 0);
+    await click(m.container, /./, '[data-tile="day"]'); await settle(250); has(m.text(), 'VWAP Pullback'); assert.equal(count(net.log, '/day-trade-setups'), 1);
+    await click(m.container, /./, '[data-tile="swing"]'); await click(m.container, /./, '[data-tile="day"]'); await settle(80);
+    assert.equal(count(net.log, '/day-trade-setups'), 1); ok('engine tiles list the same ranked setups; the day trade scan runs only once, when asked');
+
+    // named screens are lazy and show their state on the tile
+    assert.equal(count(net.log, '/momentum-setup'), 0);
+    await click(m.container, /./, '[data-tile="momentum"]'); await settle(250);
+    assert.equal(count(net.log, '/momentum-setup'), 1); has(m.text(), 'Momentum Swing', 'Stage-2 uptrend'); has(tile('momentum').textContent || '', 'Grade B');
+    await click(m.container, /./, '[data-tile="swing"]'); await click(m.container, /./, '[data-tile="momentum"]'); await settle(100);
+    assert.equal(count(net.log, '/momentum-setup'), 1); ok('a named screen runs when its tile is picked, once, and its grade shows on the tile afterwards');
+    await m.unmount();
+  }
+
+  // ── strategies board: failure, retry, unavailable traders, stale ticker ──
+  {
+    reset(); const net = newNet(); net.fail.add('/trader-strategies'); installFetch(net); const m = await mount(); await settle(300);
+    await click(m.container, /^Strategies/); await settle(300);
+    has(m.text(), "Couldn't run the trader rule-sets: mock failure", 'Retry');
+    assert(m.container.querySelector('[data-tile="swing"]') && m.container.querySelector('[data-tile="momentum"]'), 'engine and named tiles still work'); assert(!m.container.querySelector('[data-tile="minervini"]'));
+    await click(m.container, /Retry/, '[data-testid="beta-strategies"] button'); await settle(300);
+    assert(m.container.querySelector('[data-tile="minervini"]')); assert.equal(count(net.log, '/trader-strategies'), 2); ok('a failed rule-set run says so, leaves the other tiles usable, and Retry recovers'); await m.unmount();
+  }
+  {
+    reset(); const net = newNet({ traders: () => { const b: any = clone(F.traderStrategies); const w = b.trader_strategies.strategies.find((s: any) => s.key === 'weinstein');
+      Object.assign(w, { available: false, reason: 'Needs about 200 daily bars (a 30-week average and a weekly stage).', rules: [], met: 0, total: 0, grade: 'no_data', stance: 'neutral', stop: null, levels: [], exit_backtest: null }); delete w.philosophy; return b; } });
+    installFetch(net); const m = await mount(); await settle(300); await click(m.container, /^Strategies/); await settle(300);
+    has(m.container.querySelector('[data-tile="weinstein"]')!.textContent || '', 'Not scored'); lacks(m.container.querySelector('[data-tile="weinstein"]')!.textContent || '', 'rules met');
+    await click(m.container, /./, '[data-tile="weinstein"]'); await settle(60);
+    has(m.container.querySelector('[data-testid="trader-detail"]')!.textContent || '', 'Not scored', '200 daily bars'); assert(!find(m.container, /Draw on the chart/));
+    ok('a trader the backend could not score shows "Not scored" and why — no fake rules, nothing to draw'); await m.unmount();
+  }
+  {
+    reset(); const net = newNet({ delay: (url) => (url.includes('/trader-strategies') && url.includes('/AAA/') ? 350 : 0) });
+    net.traders = (url: string) => { const b: any = clone(F.traderStrategies); if (url.includes('/AAA/')) b.trader_strategies.consensus = { d: 1, bull: 15, bear: 0, neutral: 0, n: 15 }; return b; };
+    installFetch(net); const m = await mount('AAA'); await settle(40);
+    // the board mounts when opened, so open it for AAA, then move to BBB before AAA answers
+    await click(m.container, /^Strategies/); await m.rerender('BBB'); await settle(900);
+    const t = m.text(); lacks(t, '15 bullish'); has(t, `${(F.traderStrategies.trader_strategies as any).consensus.bull} bullish`);
+    ok('switching ticker while the rule-sets run never shows the previous ticker\'s consensus'); await m.unmount();
   }
 
   // ── leaving ──

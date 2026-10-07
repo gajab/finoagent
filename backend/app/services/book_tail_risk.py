@@ -86,12 +86,13 @@ def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r
     """Book P&L if the market instantly moves `move` (each name × its beta) and vol
     jumps `vol_shock_pts`, by fully repricing every OPTION leg with Black-Scholes.
 
-    OPTION-OVERLAY ONLY by default: this desk manages the option-income overlay, so a covered
-    call's / collar's long SHARES are a separate core holding and their mark-to-market is NOT
-    counted here — the stock is used only to mark a short call "covered" and to size assignment
-    capital. (Pass include_stock=True to also revalue the shares, e.g. for an economic-exposure
-    view.) Consequence: a covered-call book can PROFIT in a crash — the short calls decay to
-    zero (you keep the premium) — so its real risk is the melt-up, not the selloff."""
+    COVERED CALLS: the shares behind a short call (`cov_shares`, capped at the calls' size) are part
+    of the position. In a RALLY their gain offsets the short call — a covered call is never a cash
+    loss on the way up, it only forgoes upside — so that gain is ALWAYS counted. On the way DOWN their
+    loss is counted only when the position carries `down_stock` (the user's "include stock losses"
+    choice); otherwise the downside is the OPTION OVERLAY only, the shares being a separate core
+    holding. Naked / spread shorts have no `cov_shares` and are unaffected.
+    (include_stock=True revalues EVERY share both ways — an economic-exposure view.)"""
     total = 0.0
     for p in positions:
         s_crash = p["spot"] * (1 + move * p.get("beta", 1.0))
@@ -104,6 +105,10 @@ def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r
             total += lg["sign"] * lg["qty"] * _MULT * (v1 - v0)
         if include_stock and p.get("shares"):
             total += p["shares"] * (s_crash - p["spot"])   # signed: long>0 loses on the way down
+        elif p.get("cov_shares"):
+            d_stock = p["cov_shares"] * (s_crash - p["spot"])
+            if d_stock >= 0 or p.get("down_stock"):         # gains always; losses only when asked
+                total += d_stock
     return total
 
 
@@ -124,6 +129,9 @@ def book_mc(positions: list[dict], r: float, mkt_vol: float, idx_spot: float,
     t = rng.standard_t(_TDF, n_sims) * math.sqrt((_TDF - 2) / _TDF)
     mkt = t * mkt_vol * h
     pnl = np.zeros(n_sims)
+    # Taylor attribution of the SAME sims (delta / gamma / vega / theta; the rest is higher-order + expiry effects),
+    # so the tail can be read as "how much of the bad month is direction, convexity or vol".
+    c_delta, c_gamma, c_vega, c_theta = (np.zeros(n_sims) for _ in range(4))
     for p in positions:
         beta = p.get("beta", 1.0)
         tot_vol = max(p.get("iv") or 0.3, 0.05)
@@ -145,10 +153,45 @@ def book_mc(positions: list[dict], r: float, mkt_vol: float, idx_spot: float,
             else:
                 v1 = np.maximum(0.0, lg["strike"] - s_sim)
             pnl += lg["sign"] * lg["qty"] * _MULT * (v1 - v0)
-        # Option-overlay only — the long shares behind a covered call/collar are a separate core
-        # holding, not part of the income overlay's risk (see reprice_scenario).
+        # Shares behind a covered call: their GAIN always offsets the short call; their LOSS only when
+        # the position carries `down_stock` (see reprice_scenario).
+        d_stock = np.zeros(n_sims)
+        if p.get("cov_shares"):
+            d_stock = p["cov_shares"] * (s_sim - p["spot"])
+            d_stock = d_stock if p.get("down_stock") else np.maximum(d_stock, 0.0)
+            pnl += d_stock
+        ds = s_sim - p["spot"]
+        dvol_pts = -_SKEW_K * (s_sim / p["spot"] - 1.0) * 100.0          # the legs' vol rule, in vol points
+        c_delta += (p.get("net_delta") or 0.0) * ds + d_stock             # covered shares are delta too
+        c_gamma += 0.5 * (p.get("net_gamma") or 0.0) * ds * ds
+        c_vega += (p.get("net_vega") or 0.0) * dvol_pts
+        c_theta += (p.get("net_theta") or 0.0) * (dt * 365.0)
     idx_sim = idx_spot * np.exp(mkt)
-    return {"pnl": pnl, "idx_sim": idx_sim, "horizon_years": dt, **_tail_stats(pnl)}
+    return {"pnl": pnl, "idx_sim": idx_sim, "idx_spot": idx_spot, "horizon_years": dt,
+            "components": {"delta": c_delta, "gamma": c_gamma, "vega": c_vega, "theta": c_theta},
+            **_tail_stats(pnl)}
+
+
+def _tail_attribution(mc: dict) -> Optional[dict]:
+    """What the worst-5% months are MADE OF: the average P&L of those sims split into delta / gamma / vega /
+    theta (+ higher-order), and whether they are rallies or selloffs. Deterministic — the same sims as CVaR."""
+    pnl, comps = mc.get("pnl"), mc.get("components")
+    if pnl is None or not comps:
+        return None
+    losses = -pnl
+    tail = losses >= np.percentile(losses, 95)
+    if not tail.any():
+        return None
+    avg = lambda a: float(np.mean(a[tail]))
+    parts = {k: avg(v) for k, v in comps.items()}
+    total = avg(pnl)
+    other = total - sum(parts.values())
+    up_pct = float(np.mean(mc["idx_sim"][tail] > mc["idx_spot"])) * 100.0
+    return {"avg_tail_pnl": round(total, 0), "n_sims": int(tail.sum()),
+            "delta": round(parts["delta"], 0), "gamma": round(parts["gamma"], 0), "vega": round(parts["vega"], 0),
+            "theta": round(parts["theta"], 0), "other": round(other, 0),
+            "up_pct": round(up_pct, 0), "down_pct": round(100.0 - up_pct, 0),
+            "side": "up" if up_pct >= 50.0 else "down"}
 
 
 def _tail_stats(pnl: np.ndarray) -> dict:
@@ -247,6 +290,81 @@ def _compute_betas(tickers: list[str]) -> dict:
     return betas
 
 
+# ── Implied-vol sanity: a quote's IV must reprice to the quote's own price ─────────────────────────────
+_IV_MIN, _IV_MAX = 0.03, 5.0
+
+
+def _solve_iv(price: float, S: float, K: float, T: float, r: float, ot: str) -> Optional[float]:
+    """Implied vol that makes Black-Scholes equal `price` (bisection). None when the price is at/below the
+    no-vol floor (a deep-ITM option quoted at intrinsic carries no vol information) or above the cap."""
+    if not (price > 0 and S > 0 and K > 0 and T > 0):
+        return None
+    lo, hi = 0.01, _IV_MAX
+    if price <= bs_price(S, K, T, r, lo, ot) + 1e-6 or price >= bs_price(S, K, T, r, hi, ot):
+        return None
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if bs_price(S, K, T, r, mid, ot) < price:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _sane_iv(q: Optional[dict], S: float, K: float, T: float, r: float, right: str, fallback: float) -> tuple[float, str]:
+    """The IV to use for one leg, and where it came from.
+
+    yfinance's `impliedVolatility` is junk whenever the market is closed or a strike has no two-sided quote (values
+    like 1e-5) while the PRICE (last / mid) is fine — feeding that IV into the Greeks made θ, vega and the stress P&Ls
+    collapse to ~0. So the chain IV is trusted only if it is plausible AND reprices to the quote's own price; otherwise
+    the vol is re-solved from that price; only with no usable price at all do we fall back to the trade's own IV / 30%.
+        'chain'    — the quote's IV, cross-checked against its price (or plausible with no price to check)
+        'solved'   — re-derived from the live/last price because the quote's IV was missing or inconsistent
+        'fallback' — no usable price or IV: the trade's recorded IV (or 30%) — an approximation"""
+    ot = "call" if right == "C" else "put"
+    px = None
+    if q:
+        px = q.get("mid") if (q.get("mid") or 0) > 0 else (q.get("last") if (q.get("last") or 0) > 0 else None)
+    iv_q = (q or {}).get("iv")
+    plausible = iv_q is not None and _IV_MIN <= iv_q <= _IV_MAX
+    if plausible and px is None:
+        return float(iv_q), "chain"
+    if plausible and abs(bs_price(S, K, T, r, iv_q, ot) - px) <= max(0.15 * px, 0.05):
+        return float(iv_q), "chain"
+    if px is not None:
+        solved = _solve_iv(px, S, K, T, r, ot)
+        if solved is not None:
+            return solved, "solved"
+    return float(fallback), "fallback"
+
+
+def _quote_dict(q) -> Optional[dict]:
+    """A provider OptionQuote → the few live fields a fix needs (bid/ask/mid/iv), or None."""
+    if q is None:
+        return None
+    def _f(x):
+        try:
+            v = float(x)
+            return v if v == v else None   # NaN → None
+        except (TypeError, ValueError):
+            return None
+    return {"bid": _f(getattr(q, "bid", None)), "ask": _f(getattr(q, "ask", None)),
+            "mid": _f(getattr(q, "mid", None)), "last": _f(getattr(q, "last", None)), "iv": _f(getattr(q, "iv", None)),
+            "oi": _f(getattr(q, "oi", None)), "volume": _f(getattr(q, "volume", None))}
+
+
+def _pay_price(q: Optional[dict]) -> tuple[Optional[float], str]:
+    """What it costs to BUY one share-equivalent of a leg from its live quote: the ask; the mid if there is
+    no ask; (None, 'model') when the chain has no usable quote and the caller must fall back to a model price."""
+    if not q:
+        return None, "model"
+    if (q.get("ask") or 0) > 0:
+        return float(q["ask"]), "live ask"
+    if (q.get("mid") or 0) > 0:
+        return float(q["mid"]), "live mid"
+    return None, "model"
+
+
 async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache) -> Optional[dict]:
     from .hedging_service import _split_chain
     legs = json.loads(strategy.legs_data or "[]")
@@ -265,7 +383,10 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
         return None
 
     life_legs, n_short, short_strikes = [], 0, []
+    iv_audit = {"chain": 0, "solved": 0, "fallback": 0}      # where each leg's IV came from (surfaced as data quality)
+    indicative = False                                        # any chain filled from last prices (market closed)
     strikes_by_exp: dict[str, dict] = {}   # exp → {"C":[listed call strikes], "P":[...]} for real-leg remediation
+    quotes_by_exp: dict[str, dict] = {}    # exp → {"C": {strike: live quote}, "P": {...}} — what a fix will really PAY
     for l in opt:
         exp = str(l.get("expiration") or l.get("expiry") or "")[:10]
         if not exp:
@@ -275,41 +396,46 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
         strike = float(l.get("strike") or 0)
         if sign < 0:
             n_short += 1
-            short_strikes.append(strike)
+            short_strikes.append((strike, float(l.get("qty") or l.get("contracts") or 1)))   # (strike, contracts)
         key = (ticker, exp)
         if key not in chain_cache:
             try:
                 chain_cache[key] = await provider.get_option_chain(ticker, exp)
             except Exception:  # noqa: BLE001
                 chain_cache[key] = None
-        iv, chain = None, chain_cache[key]
+        chain, own_q = chain_cache[key], None
+        try:
+            dte = max(1, (date.fromisoformat(exp) - today).days)
+        except (ValueError, TypeError):
+            dte = 30
         if chain is not None:
             try:
                 calls, puts = _split_chain(chain)
                 side = calls if right == "C" else puts
                 q = next((qq for k, qq in side.items() if abs(float(k) - strike) < 0.01), None)
-                if q and getattr(q, "iv", None):
-                    iv = float(q.iv)
-                if exp not in strikes_by_exp:   # capture the LISTED strikes once (cheap — chain already fetched)
+                own_q = _quote_dict(q)
+                if exp not in strikes_by_exp:   # capture the LISTED strikes + their live quotes once (chain already fetched)
                     strikes_by_exp[exp] = {"C": sorted(float(k) for k in calls.keys()),
                                            "P": sorted(float(k) for k in puts.keys())}
+                    quotes_by_exp[exp] = {"C": {float(k): _quote_dict(v) for k, v in calls.items()},
+                                          "P": {float(k): _quote_dict(v) for k, v in puts.items()}}
+                indicative = indicative or ("indicative" in str(getattr(chain, "source", "") or ""))
             except Exception:  # noqa: BLE001
-                iv = None
-        if iv is None:
-            raw = l.get("iv")
-            iv = (float(raw) / 100.0 if raw and float(raw) > 3 else float(raw)) if raw else 0.30
-        try:
-            dte = max(1, (date.fromisoformat(exp) - today).days)
-        except (ValueError, TypeError):
-            dte = 30
+                own_q = None
+        raw = l.get("iv")
+        fb = (float(raw) / 100.0 if raw and float(raw) > 3 else float(raw)) if raw else 0.30   # the trade's own IV, else 30%
+        iv, iv_src = _sane_iv(own_q, spot, strike, dte / 365.0, r, right, fb)
+        iv_audit[iv_src] += 1
         life_legs.append({"strike": strike, "right": right, "sign": sign,
                           "qty": float(l.get("qty") or l.get("contracts") or 1),
-                          "iv": iv, "dte_years": dte / 365.0, "exp": exp, "dte_days": dte})
+                          "iv": iv, "iv_src": iv_src, "dte_years": dte / 365.0, "exp": exp, "dte_days": dte,
+                          # the leg's OWN live quote (None when the chain had none) — real cost to close, real extrinsic
+                          "bid": (own_q or {}).get("bid"), "ask": (own_q or {}).get("ask"), "mid": (own_q or {}).get("mid")})
     if not life_legs:
         return None
     g = higher_order_greeks(life_legs, spot, r=r, stock_shares=0.0)   # OPTION LAYER ONLY
     avg_iv = sum(x["iv"] for x in life_legs) / len(life_legs)
-    capital = sum(sk * _MULT for sk in short_strikes) or abs(g["net_delta"]) * spot
+    capital = sum(sk * _MULT * q for sk, q in short_strikes) or abs(g["net_delta"]) * spot
     # structure + stock presence → so a short CALL can be flagged COVERED (excluded from the
     # naked-assignment total) vs naked. Any non-option long-share leg also counts as cover.
     structure = getattr(strategy, "strategy_type", None) or getattr(strategy, "structure", None)
@@ -337,11 +463,14 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
                 if q:
                     shares += (-1 if any(k in str(l.get("action", "")).upper() for k in ("SELL", "SHORT")) else 1) * q
     has_stock = bool(shares)
-    return {"ticker": ticker, "name": strategy.name, "trade_id": getattr(strategy, "id", None),
-            "spot": spot, "iv": avg_iv,
-            "n_short": n_short, "capital": round(capital, 0), "legs": life_legs, "shares": round(shares, 2),
-            "strikes_by_exp": strikes_by_exp, "structure": structure,
-            "has_stock": bool(has_stock), "covered": covered_flag, **g}
+    pos = {"ticker": ticker, "name": strategy.name, "trade_id": getattr(strategy, "id", None),
+           "spot": spot, "iv": avg_iv,
+           "n_short": n_short, "capital": round(capital, 0), "legs": life_legs, "shares": round(shares, 2),
+           "strikes_by_exp": strikes_by_exp, "quotes_by_exp": quotes_by_exp, "structure": structure,
+           "has_stock": bool(has_stock), "covered": covered_flag, **g}
+    pos["cov_shares"] = _covered_shares(pos)    # shares behind the short calls — scenarios net their P&L
+    pos["iv_audit"], pos["indicative"] = iv_audit, indicative
+    return pos
 
 
 async def _index_puts(provider, dte_days: int, today: date):
@@ -439,16 +568,45 @@ def _hedge_candidates(idx, iv, T, r, puts, book_pnl, idx_sim, cvar0,
             "cvar_reduction": round(cvar_red, 0),
             "efficiency": round(cvar_red / annual_bleed, 2) if annual_bleed > 0 else None,   # $ CVaR cut per $/yr spent
             "cagr_lift_pct": spitz["cagr_lift_pct"], "cost_effective": spitz["cost_effective"],
+            # private: ONE contract's P&L over the MC sims + its annual cost — lets the plan re-size to a budget
+            "_unit_pnl": hedge_pnl, "_unit_bleed": cost_per * rolls, "_max_units": 200,
+            "_unit": "spread" if so else "put",
         })
+    return out
+
+
+def _hedge_call_candidates(idx, iv, T, r, book_pnl, idx_sim, rolls, horizon_years=0.0):
+    """SPX CALL SPREADS — the hedge for an UPSIDE-driven tail. A short-call / short-gamma book loses in a
+    melt-up; index puts and VIX calls do nothing there. Priced with Black-Scholes at the index vol (no listed
+    call chain is fetched, so this is a model price and is labelled as one); repriced on the SAME MC paths at
+    the SAME horizon, with vol crushing on the rally exactly as the book's own legs do."""
+    t_h = max(1e-4, T - horizon_years)
+    out = []
+    for label, lo, so in (("Call spread 3%/12%", 0.03, 0.12), ("Call spread 5%/15%", 0.05, 0.15),
+                          ("Call spread 10%/25%", 0.10, 0.25)):
+        lk, sk = round(idx * (1 + lo) / 5.0) * 5.0, round(idx * (1 + so) / 5.0) * 5.0
+        if sk <= lk:
+            continue
+        v0l, v0s = bs_price(idx, lk, T, r, iv, "call"), bs_price(idx, sk, T, r, iv, "call")
+        cost_per = max(0.0, v0l - v0s) * _MULT
+        if cost_per <= 0:
+            continue
+        iv_h = np.maximum(0.02, iv - _SKEW_K * (idx_sim / idx - 1.0))
+        vh = (_bs_vec(idx_sim, lk, t_h, r, iv_h, "C") - _bs_vec(idx_sim, sk, t_h, r, iv_h, "C"))
+        out.append({"label": label, "instrument": "SPX", "kind": "call spread", "long_strike": lk, "short_strike": sk,
+                    "cost_per_spread": round(cost_per, 0), "pricing": "model (BS · index vol)",
+                    "_unit_pnl": (vh - (v0l - v0s)) * _MULT, "_unit_bleed": cost_per * rolls, "_max_units": 200,
+                    "_unit": "spread"})
     return out
 
 
 def _rank_hedges(out: list[dict]) -> list[dict]:
     """Rank a MIXED hedge menu (SPX puts + VIX calls) together: cost-effective first, then
     most book-CVaR reduced per $/yr spent. Flags the single best as recommended."""
-    out.sort(key=lambda c: (c.get("cost_effective", False), c.get("efficiency") or -1), reverse=True)
-    for i, c in enumerate(out):
-        c["recommended"] = (i == 0)
+    out.sort(key=lambda c: (not c.get("standby", False), c.get("cost_effective", False), c.get("efficiency") or -1), reverse=True)
+    first = next((c for c in out if not c.get("standby")), None)     # the standby sleeve is never the pick: its
+    for c in out:                                                    # ~zero assumed cost would always rank it first
+        c["recommended"] = c is first
     return out
 
 
@@ -568,6 +726,7 @@ def _vix_hedge_candidates(vix_calls, fwd_vix, idx, idx_sim, book_pnl, cvar0, boo
             "efficiency": round(cvar_red / annual_bleed, 2) if annual_bleed > 0 else None,
             "cagr_lift_pct": spitz["cagr_lift_pct"], "cost_effective": spitz["cost_effective"],
             "vix_at_minus20": round(vix20, 1),
+            "_unit_pnl": v1 - cost_per, "_unit_bleed": cost_per * rolls, "_max_units": 500, "_unit": "spread",
         })
     return out
 
@@ -618,7 +777,139 @@ def _vixy_dynamic_candidate(spot_vix, fwd_vix, idx, idx_sim, book_pnl, cvar0, bo
         "efficiency": round(cvar_red / annual_bleed, 2) if annual_bleed > 0 else None,
         "cagr_lift_pct": spitz["cagr_lift_pct"], "cost_effective": spitz["cost_effective"],
         "signal": "deploy when spot VIX > VIX3M (backwardation)", "capture_pct": round(capture * 100),
+        "standby": True,        # a rule that arms on a signal — never "the trade to put on today"
+        # unit = a $1,000 slice of the sleeve (P&L and friction both scale linearly with it); cap at 20% of capital
+        "_unit_pnl": hedge_pnl / max(sleeve, 1.0) * 1000.0, "_unit_bleed": 1000.0 * whipsaw,
+        "_max_units": int(max(0.0, 0.20 * book_capital) // 1000), "_unit": "$1k sleeve",
     }]
+
+
+# ── Budget-driven hedge plan: size insurance to a share of the INCOME it must be paid out of ──────────
+_HEDGE_BUDGETS = (5, 10, 15, 25)     # % of annual option income the insurance may cost
+_DEFAULT_BUDGET = 10
+_PRIVATE = ("_unit_pnl", "_unit_bleed", "_max_units", "_unit")
+_TARGETS = {"put": ["Downside tail", "Net direction"], "put spread": ["Downside tail", "Net direction"],
+            "call spread": ["Upside tail (melt-up)"], "VIX": ["Vol spike", "Crash tail"], "VIXY": ["Vol spike", "Crash tail"]}
+
+
+def _strip_private(items: list[dict]) -> None:
+    for c in items:
+        for k in _PRIVATE:
+            c.pop(k, None)
+
+
+def _hedge_plan(items: list[dict], *, mc: dict, cvar0: float, annual_income: float, book_capital: float,
+                tail: Optional[dict]) -> dict:
+    """Re-size every candidate hedge to a BUDGET (a % of annual income) instead of to a loss target, and
+    measure what it does to the book's CVaR on the SAME MC sims. A hedge whose payoff is outside the book's
+    tail (a put against a rally-driven tail) shows a ~0 or negative CVaR change at every budget — it is
+    flagged `helps: false` with the reason, instead of being ranked as if it were insurance."""
+    pnl = mc["pnl"]
+    cap = max(float(book_capital or 0.0), 1.0)
+    income_ok = annual_income > 0
+    lim_warn, lim_breach = _GUARDRAILS["cvar"]["warn"] * cap, _GUARDRAILS["cvar"]["breach"] * cap
+    gap = max(0.0, cvar0 - lim_warn)
+    side, up_pct = (tail or {}).get("side"), (tail or {}).get("up_pct")
+    min_useful = max(100.0, 0.02 * cvar0)
+    cands = []
+    for item in items:
+        c = dict(item)
+        up, ub, mx, unit = (c.pop(k) for k in _PRIVATE)
+        kind = c.get("kind") or ""
+        key = "VIXY" if c.get("instrument") == "VIXY" else ("VIX" if c.get("instrument") == "VIX" else kind)
+        plans = []
+        for b in _HEDGE_BUDGETS:
+            n = int(min((annual_income * b / 100.0) // ub, mx)) if (income_ok and ub > 0) else 0
+            if n < 1:
+                plans.append({"budget_pct": b, "units": 0})
+                continue
+            after = _cvar95_of(pnl + n * up)
+            red = cvar0 - after
+            cost = n * ub
+            plans.append({"budget_pct": b, "units": n, "annual_cost": round(cost, 0),
+                          "cost_pct_income": round(cost / annual_income * 100, 1),
+                          "cvar_after": round(after, 0), "cvar_reduction": round(red, 0),
+                          "reduction_pct": round(red / cvar0 * 100, 1) if cvar0 > 0 else None,
+                          "closes_gap_pct": round(min(100.0, max(0.0, red / gap * 100)), 0) if gap > 0 else None,
+                          "per_dollar": round(red / cost, 2) if cost > 0 else None})
+        helps = any(pl["units"] >= 1 and pl["cvar_reduction"] >= min_useful for pl in plans)
+        reason = None
+        if not helps:
+            if not any(pl["units"] >= 1 for pl in plans):
+                reason = ("no income to fund insurance" if not income_ok
+                          else f"one {unit} costs more than {_HEDGE_BUDGETS[-1]}% of your annual income")
+            elif kind != "call spread" and side == "up" and (up_pct or 0) >= 60:
+                reason = f"pays when the market FALLS, but {up_pct:.0f}% of your worst months are rallies"
+            elif kind == "call spread" and side == "down" and (100 - (up_pct or 0)) >= 60:
+                reason = f"pays in a RALLY, but {100 - (up_pct or 0):.0f}% of your worst months are selloffs"
+            else:
+                reason = "barely moves CVaR at any budget — its payoff sits outside your tail"
+        cands.append({**c, "unit": unit, "unit_annual": round(ub, 0), "targets": _TARGETS.get(key, []),
+                      "plans": plans, "helps": helps, "reason": reason, "standby": key == "VIXY"})
+
+    def _score(c):   # CVaR cut at the default budget (else the largest budget it can afford)
+        pl = next((p for p in c["plans"] if p["budget_pct"] == _DEFAULT_BUDGET and p["units"] >= 1), None) \
+            or next((p for p in reversed(c["plans"]) if p["units"] >= 1), None)
+        return pl["cvar_reduction"] if pl else float("-inf")
+    cands.sort(key=lambda c: (c["helps"] and not c["standby"], c["helps"], _score(c)), reverse=True)
+    for i, c in enumerate(cands):
+        c["recommended"] = bool(i == 0 and c["helps"] and not c["standby"])
+    return {"budgets": list(_HEDGE_BUDGETS), "default_budget": _DEFAULT_BUDGET, "income_ok": income_ok,
+            "annual_income": round(annual_income, 0), "cvar_now": round(cvar0, 0),
+            "cvar_pct_capital": round(cvar0 / cap * 100, 1), "limit_warn": round(lim_warn, 0),
+            "limit_breach": round(lim_breach, 0), "gap": round(gap, 0), "tail": tail, "candidates": cands}
+
+
+def _exposure_map(positions: list[dict], r: float, *, bw_delta_notional: float, beta_delta_spy, spy_price,
+                  net_vega: float, book_capital: float, mkt_vol: float, hedge_dte_days: int) -> list[dict]:
+    """Each Greek exposure of the book → what it costs in a standard shock (full reprice) → the instrument that
+    neutralises it and the size. Options only (covered shares are a separate holding). Ties the hedge back to
+    the risk it is for: some exposures are simply too small to be worth insuring."""
+    cap = max(float(book_capital or 0.0), 1.0)
+    opt = [{**p, "cov_shares": 0.0, "down_stock": False} for p in positions]
+    pct = lambda v: round(v / cap * 100, 2)
+    rows = []
+
+    # 1) net direction (β-Δ) — linear in the move, so a delta hedge is exact
+    dn, up = bw_delta_notional * -0.10, bw_delta_notional * 0.10
+    n_spy = int(round(abs(beta_delta_spy))) if beta_delta_spy else 0
+    rows.append({"key": "delta", "label": "Net direction (β-Δ)",
+                 "value": (f"{beta_delta_spy:+,.0f} SPY-equiv shares" if beta_delta_spy is not None else "—"),
+                 "shock": "market ±10% (β-weighted)", "impact_down": round(dn, 0), "impact_up": round(up, 0),
+                 "worst": round(min(dn, up), 0), "worst_pct_capital": pct(min(dn, up)),
+                 "hedge": ({"instrument": "SPY shares", "action": f"{'BUY' if beta_delta_spy < 0 else 'SELL'} {n_spy:,} SPY",
+                            "units": n_spy, "notional": round(n_spy * spy_price, 0) if spy_price else None, "annual_cost": 0.0,
+                            "note": "flattens β-Δ exactly — no premium, but it ties up the notional and removes the delta income too"}
+                           if n_spy and spy_price else None)})
+
+    # 2) net vega — full reprice of a pure vol move
+    v_up = reprice_scenario(opt, 0.0, 10.0, r)
+    hedge = None
+    if net_vega < 0 and spy_price and mkt_vol > 0:
+        T = max(hedge_dte_days, 7) / 365.0
+        d1 = (r + 0.5 * mkt_vol ** 2) * T / (mkt_vol * math.sqrt(T))
+        vega_ct = spy_price * norm.pdf(d1) * math.sqrt(T) / 100.0 * _MULT          # $ per vol-pt per SPY ATM option
+        prem_ct = bs_price(spy_price, spy_price, T, r, mkt_vol, "call") * _MULT
+        need = abs(net_vega) / vega_ct if vega_ct > 0 else 0.0
+        hedge = {"instrument": f"SPY ~{max(hedge_dte_days, 7)}d ATM option", "units": round(need, 2),
+                 "action": (f"BUY {max(1, round(need))}× SPY ATM option" if need >= 0.5 else "below one SPY option"),
+                 "annual_cost": round(need * prem_ct * (365.0 / (T * 365.0)), 0), "vega_per_contract": round(vega_ct, 0),
+                 "note": "assumes your names' IV moves ~1:1 with index IV; a long option also adds gamma/downside cover"}
+    rows.append({"key": "vega", "label": "Net vega (short vol)", "value": f"{net_vega:,.0f} $/vol-pt",
+                 "shock": "vol +10 pts, spot unchanged", "impact_up": round(v_up, 0), "impact_down": None,
+                 "worst": round(min(v_up, 0.0), 0), "worst_pct_capital": pct(min(v_up, 0.0)), "hedge": hedge})
+
+    # 3) gamma / convexity — what a ±10% move costs BEYOND the delta line
+    g_dn = reprice_scenario(opt, -0.10, 0.0, r) - bw_delta_notional * -0.10
+    g_up = reprice_scenario(opt, 0.10, 0.0, r) - bw_delta_notional * 0.10
+    rows.append({"key": "gamma", "label": "Short gamma (convexity)", "value": "",
+                 "shock": "market ±10%, beyond the delta line", "impact_down": round(g_dn, 0), "impact_up": round(g_up, 0),
+                 "worst": round(min(g_dn, g_up), 0), "worst_pct_capital": pct(min(g_dn, g_up)),
+                 "hedge": {"instrument": "Cap the short strikes (Fixes tab)", "action": "buy a wing on the offending shorts",
+                           "units": None, "annual_cost": None,
+                           "note": "targeted gamma cover is cheaper and more exact than an index option"}})
+    return rows
+
 
 
 def _lvl(x: float) -> str:
@@ -670,11 +961,15 @@ def _verdict_and_actions(*, scenarios, short_vol, concentration, hedge_menu, cva
         actions.append(f"De-concentrate {names}: laddered short strikes on one name are ONE bet — a single gap hits them all.")
     if short_vol and worst >= 15:
         actions.append("Reduce size or convert the biggest naked shorts to defined-risk spreads to cap the tail (both sides).")
-    rec = next((c for c in hedge_menu if c.get("recommended")), None)
+    rec = next((c for c in hedge_menu if c.get("recommended")), None)     # always an ACTIONABLE hedge (never the standby sleeve)
     if rec and rec.get("cost_effective"):
-        actions.append(f"Add the recommended hedge ({rec['label']}, {rec['contracts']}×) — it lifts compound growth (+{rec['cagr_lift_pct']}% CAGR) while capping the crash.")
+        actions.append(f"Add the recommended hedge ({_hedge_trade_str(rec)}) — it lifts compound growth (+{rec['cagr_lift_pct']}% CAGR) while capping the crash.")
     elif rec:
-        actions.append(f"A tail hedge here is pure insurance (it lowers CAGR by {abs(rec['cagr_lift_pct'])}%/yr) — only add it if avoiding the drawdown matters more than yield.")
+        actions.append(f"A tail hedge here is pure insurance ({_hedge_trade_str(rec)} lowers CAGR by {abs(rec['cagr_lift_pct'])}%/yr) — only add it if avoiding the drawdown matters more than yield.")
+    standby = next((c for c in hedge_menu if c.get("standby")), None)
+    if standby:
+        actions.append(f"Standby, not a trade today: keep ~{_usd0(standby.get('sleeve_capital'))} in cash for the VIXY sleeve and buy VIXY ONLY when spot VIX closes above VIX3M "
+                       f"(backwardation). Until that signal fires there is nothing to buy — protect the book with the actionable hedge and the Fixes above.")
     if abs(beta_delta_spy or 0) > 0:
         actions.append(f"Net directional exposure ≈ {beta_delta_spy:+.0f} SPY-share-equivalents — neutralize with the index if you want it market-flat.")
     if not actions:
@@ -688,11 +983,43 @@ def _vol_shock_for(mv: float) -> float:
     return -_SKEW_K * 100.0 * mv if mv < 0 else -0.30 * 100.0 * mv
 
 
+def _covered_shares(p: dict) -> float:
+    """Shares economically behind the position's SHORT CALLS (0 when none are covered).
+
+    Real shares in the trade cover up to the calls' size (1 contract = 100 sh); the user's explicit
+    'covered' mark (shares held ELSEWHERE) or a covered_call structure with no recorded shares covers
+    every short call. Short stock is never cover."""
+    short_call_sh = sum(lg["qty"] * _MULT for lg in p.get("legs", []) if lg["right"] == "C" and lg["sign"] < 0)
+    if short_call_sh <= 0:
+        return 0.0
+    sh = float(p.get("shares") or 0)
+    if sh < 0:
+        return 0.0
+    if p.get("covered"):
+        return float(short_call_sh)
+    if sh > 0:
+        return float(min(sh, short_call_sh))
+    return float(short_call_sh) if p.get("structure") == "covered_call" else 0.0
+
+
 def _is_covered(p: dict) -> bool:
     """A short CALL is COVERED when the shares sit behind it — a covered_call structure, a real long-share
     leg (has_stock), or the user's explicit 'covered' mark (shares held ELSEWHERE, not in the income book).
     A covered call delivers held shares on assignment, so it carries no naked-assignment / buy-to-cover cost."""
     return bool(p.get("structure") == "covered_call" or p.get("has_stock") or p.get("covered"))
+
+
+def _is_naked_short(p: dict, lg: dict) -> bool:
+    """A short leg with nothing behind it. A short PUT is protected by a long put on the same position (a
+    spread — its loss is capped at the width, the long leg can be exercised); a short CALL by covering shares
+    or a long call (spread). Used by BOTH the all-naked-assigned total and the assignment ladder, so the two
+    can never disagree about which legs count."""
+    if lg["sign"] >= 0:
+        return False
+    legs = p.get("legs", [])
+    if lg["right"] == "P":
+        return not any(x["right"] == "P" and x["sign"] > 0 for x in legs)
+    return (not _is_covered(p)) and not any(x["right"] == "C" and x["sign"] > 0 for x in legs)
 
 
 def _assignment_ladder(positions: list[dict], r: float, moves=None) -> list[dict]:
@@ -712,27 +1039,26 @@ def _assignment_ladder(positions: list[dict], r: float, moves=None) -> list[dict
     out = []
     for mv in moves:
         put_cap = call_cost = 0.0
-        puts_itm = calls_itm = 0
+        puts_itm = calls_itm = 0.0                             # CONTRACTS in the money (same unit as the capital)
         for p in positions:
             s = p["spot"] * (1 + mv * p.get("beta", 1.0))     # β-adjusted per name
-            p_covered = _is_covered(p)                         # covered call → shares delivered, no cover cost
             for lg in p["legs"]:
-                if lg["sign"] >= 0:                            # only SHORT legs get assigned
+                if not _is_naked_short(p, lg):                 # only NAKED shorts demand assignment capital
                     continue
                 K, qty = lg["strike"], lg["qty"]
                 if lg["right"] == "P" and s < K:
                     put_cap += K * _MULT * qty                 # cash to buy the assigned shares
-                    puts_itm += 1
-                elif lg["right"] == "C" and s > K and not p_covered:
-                    call_cost += (s - K) * _MULT * qty         # intrinsic to deliver / cover (naked only)
-                    calls_itm += 1
+                    puts_itm += qty
+                elif lg["right"] == "C" and s > K:
+                    call_cost += (s - K) * _MULT * qty         # intrinsic to deliver / cover
+                    calls_itm += qty
         pnl = reprice_scenario(positions, mv, _vol_shock_for(mv), r)
         out.append({
             "move_pct": round(mv * 100, 0),
             "pnl": round(pnl, 0),
             "put_assignment_capital": round(put_cap, 0),
             "call_cover_cost": round(call_cost, 0),
-            "puts_itm": puts_itm, "calls_itm": calls_itm,
+            "puts_itm": int(round(puts_itm)), "calls_itm": int(round(calls_itm)),
         })
     return out
 
@@ -749,18 +1075,14 @@ def _naked_assignment(positions: list[dict]) -> dict:
     put_cap = call_cap = 0.0
     n_puts = n_calls = 0
     for p in positions:
-        legs = p.get("legs", [])
-        covered = _is_covered(p)
-        has_long_put = any(lg["right"] == "P" and lg["sign"] > 0 for lg in legs)
-        has_long_call = any(lg["right"] == "C" and lg["sign"] > 0 for lg in legs)
-        for lg in legs:
-            if lg["sign"] >= 0:
+        for lg in p.get("legs", []):
+            if not _is_naked_short(p, lg):
                 continue
             notional = lg["strike"] * _MULT * lg["qty"]
-            if lg["right"] == "P" and not has_long_put:        # naked/cash-secured short put
+            if lg["right"] == "P":                             # naked / cash-secured short put
                 put_cap += notional
                 n_puts += 1
-            elif lg["right"] == "C" and not covered and not has_long_call:   # naked short call
+            else:                                              # naked short call
                 call_cap += notional
                 n_calls += 1
     return {
@@ -781,6 +1103,126 @@ def _loss_by_name(positions: list[dict], r: float, move: float, vshock: float) -
         a["pnl"] += pnl
     rows = sorted(agg.values(), key=lambda x: x["pnl"])
     return [{**a, "pnl": round(a["pnl"], 0)} for a in rows]
+
+
+# ── Concentration: where the RISK is vs where the MONEY is, and what a correlated group does ──────────
+_GROUP_SHOCKS = (-0.30, -0.20, -0.10, 0.10, 0.20, 0.30)
+
+
+def _concentration_view(positions: list[dict], r: float, book_capital: float, factor_exposure: Optional[dict]) -> dict:
+    """Concentration that means something — every number is a full reprice or a plain share, nothing invented.
+
+      names   — per underlying: its share of CAPITAL, of the tail LOSS on the book's worse side, and of the
+                income (θ); plus the days of its own θ it takes to pay back that loss. A name whose tail share
+                dwarfs its capital/income share is where the book is mis-paid for its risk.
+      groups  — each measured-ρ cluster and sector: what the group does if IT gaps (every member moves X%
+                itself, the rest of the book flat; full BS reprice + the usual vol shock). A correlated
+                cluster is one bet, so this is the loss a single sector headline can cause.
+      effective_bets — 1 / Σ share² of the tail with correlated clusters merged: how many INDEPENDENT bets
+                the book really holds (a name count of 14 can be ~4)."""
+    names: dict[str, dict] = {}
+    for p in positions:
+        n = names.setdefault(p["ticker"], {"ticker": p["ticker"], "trades": 0, "capital": 0.0, "theta": 0.0,
+                                           "gamma": 0.0, "beta": p.get("beta", 1.0), "down": 0.0, "up": 0.0})
+        n["trades"] += 1
+        n["capital"] += p.get("capital") or 0.0
+        n["theta"] += p.get("net_theta") or 0.0
+        n["gamma"] += abs(p.get("net_gamma") or 0.0)
+        n["down"] += _position_side_metrics(p, "down", r)["tail"]
+        n["up"] += _position_side_metrics(p, "up", r)["tail"]
+    if not names:
+        return {"names": [], "groups": [], "side": None, "effective_bets": None, "effective_names": None,
+                "n_names": 0, "n_groups": 0, "shock_moves": [int(m * 100) for m in _GROUP_SHOCKS]}
+
+    loss = lambda x: max(0.0, -x)
+    tot_down = sum(loss(n["down"]) for n in names.values())
+    tot_up = sum(loss(n["up"]) for n in names.values())
+    side = "up" if tot_up > tot_down else "down"            # the tail that actually dominates this book
+    tot_loss = tot_up if side == "up" else tot_down
+    tot_cap = sum(n["capital"] for n in names.values()) or 0.0
+    tot_theta = sum(max(0.0, n["theta"]) for n in names.values())
+    tot_gamma = sum(n["gamma"] for n in names.values()) or 0.0
+
+    rows = []
+    for n in names.values():
+        lo = loss(n["up"] if side == "up" else n["down"])
+        tail_pct = lo / tot_loss * 100 if tot_loss > 0 else 0.0
+        cap_pct = n["capital"] / tot_cap * 100 if tot_cap > 0 else 0.0
+        rows.append({
+            "ticker": n["ticker"], "trades": n["trades"], "beta": round(n["beta"], 2),
+            "capital": round(n["capital"], 0), "capital_pct": round(cap_pct, 1),
+            "theta": round(n["theta"], 1), "theta_pct": round(max(0.0, n["theta"]) / tot_theta * 100, 1) if tot_theta > 0 else 0.0,
+            "down_pnl": round(n["down"], 0), "up_pnl": round(n["up"], 0),
+            "tail_loss": round(lo, 0), "tail_pct": round(tail_pct, 1),
+            "gamma_pct": round(n["gamma"] / tot_gamma * 100, 1) if tot_gamma > 0 else 0.0,
+            "risk_ratio": round(tail_pct / cap_pct, 2) if cap_pct > 0 else None,        # tail share ÷ capital share
+            "payback_days": round(lo / n["theta"], 0) if (n["theta"] > 0 and lo > 0) else None,   # days of own θ to repay the loss
+        })
+    rows.sort(key=lambda x: (-x["tail_pct"], -x["capital"]))
+
+    # measured-ρ clusters merged (union-find over overlapping ticker lists) → independent bets
+    present = set(names)
+    clusters = [[t for t in (c.get("tickers") or []) if t in present] for c in ((factor_exposure or {}).get("clusters") or [])]
+    clusters = [c for c in clusters if len(c) >= 2]
+    parent = {t: t for t in present}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for c in clusters:
+        for t in c[1:]:
+            parent[_find(t)] = _find(c[0])
+    share: dict[str, float] = {}
+    for rw in rows:
+        share[_find(rw["ticker"])] = share.get(_find(rw["ticker"]), 0.0) + rw["tail_pct"] / 100.0
+    hhi_g = sum(v * v for v in share.values())
+    hhi_n = sum((rw["tail_pct"] / 100.0) ** 2 for rw in rows)
+
+    # what each correlated group / sector does if IT gaps
+    def _group(kind: str, label: str, tickers: list[str]) -> Optional[dict]:
+        mem = [{**p, "beta": 1.0} for p in positions if p["ticker"] in tickers]
+        if not mem:
+            return None
+        shocks = {f"{round(mv * 100):+d}": round(reprice_scenario(mem, mv, _vol_shock_for(mv), r), 0) for mv in _GROUP_SHOCKS}
+        cap = sum(p.get("capital") or 0.0 for p in mem)
+        th = sum(p.get("net_theta") or 0.0 for p in mem)
+        wk, wv = min(shocks.items(), key=lambda kv: kv[1])
+        return {"kind": kind, "label": label, "tickers": sorted(set(tickers)), "capital": round(cap, 0),
+                "capital_pct": round(cap / tot_cap * 100, 1) if tot_cap > 0 else 0.0,
+                "theta": round(th, 1), "shocks": shocks, "worst_move": wk, "worst": wv,
+                "worst_pct_capital": round(wv / cap * 100, 1) if cap > 0 else None,
+                "carry_years": round(abs(wv) / (th * 365.0), 1) if (th > 0 and wv < 0) else None}
+
+    groups, seen = [], set()
+    book = _group("book", "Whole book moves together", sorted(present))
+    for c in clusters:
+        key = frozenset(c)
+        if key not in seen:
+            seen.add(key)
+            g = _group("cluster", " · ".join(sorted(c)), sorted(c))
+            if g:
+                g["avg_rho"] = next((x.get("avg_rho") for x in ((factor_exposure or {}).get("clusters") or [])
+                                     if set(x.get("tickers") or []) >= set(c)), None)
+                groups.append(g)
+    for sct in ((factor_exposure or {}).get("sectors") or []):
+        tk = [t for t in (sct.get("tickers") or []) if t in present]
+        key = frozenset(tk)
+        if len(tk) >= 2 and key not in seen:
+            seen.add(key)
+            g = _group("sector", str(sct.get("sector")), tk)
+            if g:
+                groups.append(g)
+    groups.sort(key=lambda g: g["worst"])
+    if book:
+        groups.insert(0, book)
+
+    return {"side": side, "side_label": ("+30% squeeze × β" if side == "up" else "−20% crash × β"),
+            "names": rows, "groups": groups,
+            "effective_bets": round(1.0 / hhi_g, 1) if hhi_g > 0 else None,
+            "effective_names": round(1.0 / hhi_n, 1) if hhi_n > 0 else None,
+            "n_names": len(rows), "n_groups": len(share), "shock_moves": [round(m * 100) for m in _GROUP_SHOCKS]}
 
 
 # Independent-axis risk array (SPAN/RiskMetrics style): spot shock × vol shock, full reprice.
@@ -929,7 +1371,8 @@ def _pick_wing(strikes: list[float], ref: float, direction: int,
 def _short_extrinsic(spot: float, lg: dict, r: float) -> float:
     """$ of extrinsic (time value) still to collect on one short leg — the 'reward remaining'."""
     right = "call" if lg["right"] == "C" else "put"
-    val = bs_price(spot, lg["strike"], lg["dte_years"], r, lg["iv"], right)
+    # the leg's live MID when the chain gave one (the market's own value), else the model price
+    val = lg["mid"] if (lg.get("mid") or 0) > 0 else bs_price(spot, lg["strike"], lg["dte_years"], r, lg["iv"], right)
     intrin = max(0.0, spot - lg["strike"]) if lg["right"] == "C" else max(0.0, lg["strike"] - spot)
     return max(0.0, val - intrin) * _MULT * lg["qty"]
 
@@ -957,18 +1400,29 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
     tgt = min(shorts, key=lambda lg: lg["strike"]) if side == "up" else max(shorts, key=lambda lg: lg["strike"])
     spot, K, qty, iv, dte = p["spot"], tgt["strike"], tgt["qty"], tgt["iv"], tgt["dte_years"]
     tail_before = reprice_scenario([p], move, vshock, r)
-    val_now = bs_price(spot, K, dte, r, iv, ot)
     prem_leg = _short_extrinsic(spot, tgt, r)
+    quotes = (p.get("quotes_by_exp") or {}).get(tgt.get("exp"), {}).get(right, {})
+    beta = p.get("beta", 1.0)
+    stress = {"market_move_pct": round(move * 100, 1), "beta": round(beta, 2),
+              "name_move_pct": round(move * beta * 100, 1), "vol_shock_pts": round(vshock, 1)}
 
     opts = []
     # CAP — buy a real wing beyond the short → defined-risk spread.
     wing = _pick_wing((p.get("strikes_by_exp") or {}).get(tgt.get("exp"), {}).get(right, []), K, +1 if side == "up" else -1)
     if wing:
-        wing_cost = bs_price(spot, wing, dte, r, iv, ot) * _MULT * qty
-        p_cap = {**p, "legs": p["legs"] + [{"strike": wing, "right": right, "sign": 1, "qty": qty, "iv": iv, "dte_years": dte}]}
+        # Cost = what the wing REALLY costs: its live ask captured when the book was refreshed (mid if no
+        # ask). Only if the chain had no quote for that strike do we fall back to a model price — and say so.
+        wq = quotes.get(float(wing))
+        px, how = _pay_price(wq)
+        wing_iv = _sane_iv(wq, spot, float(wing), dte, r, right, iv)[0]   # the wing's own IV (skew), sanity-checked
+        if px is None:
+            px = bs_price(spot, wing, dte, r, wing_iv, ot)
+        wing_cost = px * _MULT * qty
+        p_cap = {**p, "legs": p["legs"] + [{"strike": wing, "right": right, "sign": 1, "qty": qty, "iv": wing_iv, "dte_years": dte}]}
         tail_after = reprice_scenario([p_cap], move, vshock, r)
         opts.append({"action": "cap", "cost": round(wing_cost, 0), "tail_after": round(tail_after, 0),
                      "premium_kept": round(prem_leg - wing_cost, 0),
+                     "unit_price": round(px, 2), "pricing": how,
                      "legs": f"BUY {qty:g}× {tgt.get('exp','')} {wing:g}{right} (vs your short {K:g}{right})",
                      "detail": f"turns the naked {K:g}{right} into a {K:g}/{wing:g} spread",
                      # structured legs so the UI can hand the REPAIRED spread to Evaluate for exact pricing.
@@ -978,9 +1432,12 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
                      ]}})
     # CLOSE — buy the short back.
     p_close = {**p, "legs": [lg for lg in p["legs"] if lg is not tgt]}
-    opts.append({"action": "close", "cost": round(val_now * _MULT * qty, 0),
+    cpx, chow = _pay_price({"ask": tgt.get("ask"), "mid": tgt.get("mid")})     # buy-to-close at the live ask
+    if cpx is None:
+        cpx = bs_price(spot, K, dte, r, iv, ot)
+    opts.append({"action": "close", "cost": round(cpx * _MULT * qty, 0),
                  "tail_after": round(reprice_scenario([p_close], move, vshock, r), 0),
-                 "premium_kept": 0.0,
+                 "premium_kept": 0.0, "unit_price": round(cpx, 2), "pricing": chow,
                  "legs": f"BUY-to-close {qty:g}× {tgt.get('exp','')} {K:g}{right}",
                  "detail": "exit the leg entirely"})
     # rank by LOSS REDUCED per $ spent (tail_after is less negative than tail_before → improvement
@@ -990,7 +1447,7 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
         return (improvement / max(o["cost"], 1.0), o["premium_kept"])
     opts.sort(key=_eff, reverse=True)
     best = opts[0]
-    return {"tail_before": round(tail_before, 0), "recommended": best,
+    return {"tail_before": round(tail_before, 0), "stress": stress, "recommended": best,
             "alt": next((o for o in opts if o["action"] != best["action"]), None),
             # the targeted short leg — so the UI can ALWAYS render a "Close {K}{right}" action, even
             # when no cap wing is available (e.g. an already-defined-risk spread → close is the only fix).
@@ -1063,7 +1520,7 @@ def _hedge_trade_str(c: dict) -> str:
     if not c:
         return "—"
     if c.get("instrument") == "VIXY":
-        return f"VIXY dynamic sleeve ({_usd0(c.get('sleeve_capital'))} cash)"
+        return f"VIXY dynamic sleeve ({_usd0(c.get('sleeve_capital'))} cash, standby until VIX backwardation)"
     lo = c.get("long_strike") if c.get("long_strike") is not None else c.get("long_put")
     sh = c.get("short_strike") if c.get("short_strike") is not None else c.get("short_put")
     strikes = f"{lo:g}/{sh:g}" if (lo is not None and sh is not None) else (f"{lo:g}" if lo is not None else "")
@@ -1072,7 +1529,7 @@ def _hedge_trade_str(c: dict) -> str:
 
 def _risk_scorecard(*, positions, r, book_capital, annual_income, scenarios, cvar_95, var_95,
                     beta_delta_notional, beta_delta_spy, spy_price, concentration,
-                    factor_exposure, naked_assignment, hedge_menu) -> dict:
+                    factor_exposure, naked_assignment, hedge_menu, hedge_plan=None) -> dict:
     cap = max(float(book_capital or 0), 1.0)
     carry = float(annual_income or 0)
     positions = positions or []
@@ -1124,7 +1581,25 @@ def _risk_scorecard(*, positions, r, book_capital, annual_income, scenarios, cva
                  value_pct=round(cv * 100, 1), value_str=f"{_usd0(cvar_95)} · {cv*100:.1f}%",
                  limit_str="≤ 2–3% of capital",
                  note="Average loss in the worst 5% of months — the fund-mandate tail measure.")
-        if st != "pass" and hedge_menu:
+        if st != "pass" and hedge_plan:
+            # The CVaR fix must act on the side the tail is actually on — an index put cannot cut a rally-driven
+            # CVaR (it can even raise it) — and be priced against the income that pays for it.
+            tail_side = (hedge_plan.get("tail") or {}).get("side") or "down"
+            best = next((h for h in hedge_plan["candidates"] if h.get("recommended")), None)
+            plan = None
+            if best:
+                plan = next((pl for pl in best["plans"] if pl["budget_pct"] == hedge_plan["default_budget"] and pl["units"] >= 1), None) \
+                    or next((pl for pl in best["plans"] if pl["units"] >= 1), None)
+            if best and plan:
+                c["fix"] = {"headline": f"Add {plan['units']}× {best['label']}",
+                            "cost": f"{_usd0(plan['annual_cost'])}/yr ({plan['cost_pct_income']:.0f}% of income)",
+                            "effect": f"CVaR {_usd0(cvar_95)} → {_usd0(plan['cvar_after'])} ({plan['cvar_after']/cap*100:.1f}% of cap)",
+                            "targets": _offender_targets(positions, tail_side, r, top=2)}
+            else:
+                c["fix"] = {"headline": "No index hedge cuts this CVaR — it is single-name risk; cap the offending shorts",
+                            "effect": f"the worst months are {'rallies' if tail_side == 'up' else 'selloffs'} in a few names",
+                            "targets": _offender_targets(positions, tail_side, r, top=2)}
+        elif st != "pass" and hedge_menu:
             gap = float(cvar_95) - _GUARDRAILS["cvar"]["breach"] * cap
             h, full = _pick_hedge(hedge_menu, gap)
             if h:
@@ -1243,6 +1718,33 @@ def _risk_scorecard(*, positions, r, book_capital, annual_income, scenarios, cva
             "checks": sorted(checks, key=lambda c: {"breach": 0, "warn": 1, "pass": 2}[c["status"]])}
 
 
+# The result fields that depend on whether covered shares' downside losses are counted. The
+# `with_stock_downside` variant carries ONLY these; the UI overlays them on the default result.
+_DOWNSIDE_KEYS = ("crash_scenarios", "loss_by_name", "scenario_grid", "assignment_ladder",
+                  "var_95", "cvar_95", "var_99", "cvar_99", "cvar_capital_pct",
+                  "risk_scorecard", "hedge_menu", "hedge_note", "verdict", "concentration_view", "hedge_plan", "etf_hedges")
+
+
+async def _fetch_etf_static(positions: list[dict], provider, today: date):
+    """Network side of the ETF hedge view (name→ETF mapping + live ETF chains); a separate hook so tests never hit the net."""
+    from .etf_hedge_service import fetch_etf_static
+    return await fetch_etf_static(positions, provider, today)
+
+
+def _skip_reason(strategy, spot_cache: dict) -> str:
+    """Why a trade produced no position — so the UI can say what was left out instead of implying it was analysed."""
+    try:
+        legs = json.loads(getattr(strategy, "legs_data", None) or "[]")
+    except (ValueError, TypeError):
+        legs = []
+    opt = [l for l in legs if "call" in str(l.get("type", "")).lower() or "put" in str(l.get("type", "")).lower()]
+    if not opt:
+        return "no open option legs (stock / futures only, or the options are closed)"
+    if (spot_cache.get(getattr(strategy, "ticker", None)) or 0) <= 0:
+        return "no underlying price from the quote provider"
+    return "no usable option legs (missing expiration)"
+
+
 async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
                                  *, hedge_target_pct: float = 0.6, crash_prob_annual: float = 0.05,
                                  hedge_dte_days: int = 90) -> dict:
@@ -1255,17 +1757,27 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
         r = 0.045
     today = date.today()
 
-    spot_cache, chain_cache, positions = {}, {}, []
+    spot_cache, chain_cache, positions, skipped = {}, {}, [], []
     for s in strategies:
+        reason = None
         try:
             p = await _position_greeks(s, provider, r, today, spot_cache, chain_cache)
         except Exception as exc:  # noqa: BLE001
             logger.debug("book greeks failed for %s: %s", getattr(s, "id", "?"), exc)
-            p = None
+            p, reason = None, f"error: {str(exc)[:80]}"
         if p:
             positions.append(p)
+        else:
+            skipped.append({"trade_id": getattr(s, "id", None), "ticker": getattr(s, "ticker", None),
+                            "reason": reason or _skip_reason(s, spot_cache)})
     if not positions:
-        return {"positions": 0, "error": "No option positions with live quotes to aggregate."}
+        return {"positions": 0, "error": "No option positions with live quotes to aggregate.", "coverage": {"requested": len(strategies), "analysed": 0, "skipped": skipped}}
+    coverage = {"requested": len(strategies), "analysed": len(positions), "skipped": skipped}
+    quality = {"legs": sum(sum(p["iv_audit"].values()) for p in positions if p.get("iv_audit")),
+               "chain": sum(p["iv_audit"]["chain"] for p in positions if p.get("iv_audit")),
+               "solved": sum(p["iv_audit"]["solved"] for p in positions if p.get("iv_audit")),
+               "fallback": sum(p["iv_audit"]["fallback"] for p in positions if p.get("iv_audit")),
+               "indicative": any(p.get("indicative") for p in positions)}
 
     betas = await asyncio.to_thread(_compute_betas, [p["ticker"] for p in positions])
     for p in positions:
@@ -1295,158 +1807,210 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
     spy_price = idx / _SPY_DIV if idx > 0 else None
     beta_delta_spy = round(bw_delta_notional / spy_price, 0) if spy_price else None   # SPY-share equivalents
 
-    # #2 — FULL-REPRICE crash scenarios. OPTION-OVERLAY ONLY (long shares behind covered calls /
-    # collars are a separate core holding, not this income desk's P&L — see reprice_scenario).
-    scenarios = []
-    for label, move, vshock in _CRASH:
-        pnl = reprice_scenario(positions, move, vshock, r)
-        scenarios.append({"label": label, "move_pct": move, "pnl": round(pnl, 0),
-                          "pct_of_capital": round(pnl / book_capital * 100, 1) if book_capital else None})
-    book_stock_notional = sum(abs(p.get("shares") or 0) * p["spot"] for p in positions)
+    # The scenario / CVaR / hedge / scorecard block depends on ONE policy: whether the SHARES behind covered
+    # calls lose money on a down move (`down_stock`). Gains always offset the short call. We run the block
+    # for the default (overlay-only downside) and, when any covered shares exist, a second time with the
+    # shares' losses included — so the UI toggle is instant and needs no live-quote refresh. The market /
+    # index-chain / factor lookups are made once and shared.
+    io: dict = {}
 
-    # #2 — full-reval MC VaR/CVaR at a 1-month horizon (fat tails + skew).
-    mc = book_mc(positions, r, mkt_vol, idx or 1.0) if idx > 0 else {"pnl": None, "var_95": None, "cvar_95": None, "var_99": None, "cvar_99": None}
-    book_loss20 = -reprice_scenario(positions, _HEDGE_SCEN[0], _HEDGE_SCEN[1], r)
+    async def _once(key, make):
+        if key not in io:
+            io[key] = await make()
+        return io[key]
 
-    # Concentration (β-aware).
-    by_u: dict[str, dict] = {}
-    for p in positions:
-        b = by_u.setdefault(p["ticker"], {"ticker": p["ticker"], "trades": 0, "short_legs": 0,
-                                          "net_gamma": 0.0, "net_vega": 0.0, "net_delta": 0.0,
-                                          "spot": p["spot"], "beta": p["beta"]})
-        b["trades"] += 1
-        b["short_legs"] += p["n_short"]
-        for k in ("net_gamma", "net_vega", "net_delta"):
-            b[k] += p[k]
-    tot_g = sum(abs(b["net_gamma"]) for b in by_u.values()) or 1.0
-    concentration = []
-    for b in sorted(by_u.values(), key=lambda x: abs(x["net_gamma"]), reverse=True):
-        share = abs(b["net_gamma"]) / tot_g
-        flags = []
-        if b["short_legs"] > 1:
-            flags.append(f"{b['short_legs']} short legs on {b['ticker']} — one concentrated bet, not diversification")
-        if share >= 0.40 and len(by_u) > 1:
-            flags.append(f"{share*100:.0f}% of the book's gamma is in {b['ticker']}")
-        if b["beta"] >= 1.3:
-            flags.append(f"β {b['beta']} — moves ~{b['beta']}× the market, so it leads the book down in a crash")
-        concentration.append({**{k: round(v, 4) if isinstance(v, float) else v for k, v in b.items()},
-                              "gamma_share_pct": round(share * 100, 1), "laddered": b["short_legs"] > 1, "flags": flags})
+    async def _run(positions: list[dict]) -> dict:
+        # #2 — FULL-REPRICE crash scenarios. OPTION-OVERLAY ONLY (long shares behind covered calls /
+        # collars are a separate core holding, not this income desk's P&L — see reprice_scenario).
+        scenarios = []
+        for label, move, vshock in _CRASH:
+            pnl = reprice_scenario(positions, move, vshock, r)
+            scenarios.append({"label": label, "move_pct": move, "pnl": round(pnl, 0),
+                              "pct_of_capital": round(pnl / book_capital * 100, 1) if book_capital else None})
+        book_stock_notional = sum(abs(p.get("shares") or 0) * p["spot"] for p in positions)
 
-    # #4 — hedge MENU (ranked), repriced on the MC scenarios for true CVaR reduction. Two
-    # families ranked TOGETHER: SPX put spreads (linear crash protection) and VIX call
-    # spreads (convex black-swan protection — VIX explodes in a vol spike, cheap, pays
-    # nothing in an ordinary drawdown that diversification already handles).
-    hedge_menu, hedge_note = [], None
-    if idx > 0 and book_loss20 > 0 and mc.get("pnl") is not None:
-        target = hedge_target_pct * book_loss20
-        puts, meta = await _index_puts(provider, hedge_dte_days, today)
-        hdte = meta["dte"] if meta else hedge_dte_days
-        spx = _hedge_candidates(idx, mkt_vol, hdte / 365.0, r, puts, mc["pnl"], mc["idx_sim"],
-                                mc["cvar_95"] or 0.0, book_loss20, target,
-                                crash_prob_annual, book_capital, annual_income, 365.0 / max(hdte, 1),
-                                horizon_years=mc.get("horizon_years", 0.0))
-        for c in spx:
-            c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
-                "SPX (European)", ("live SPX chain" if puts else "model (BS + VIX)"), hdte, (meta or {}).get("exp")
+        # #2 — full-reval MC VaR/CVaR at a 1-month horizon (fat tails + skew).
+        mc = book_mc(positions, r, mkt_vol, idx or 1.0) if idx > 0 else {"pnl": None, "var_95": None, "cvar_95": None, "var_99": None, "cvar_99": None}
+        book_loss20 = -reprice_scenario(positions, _HEDGE_SCEN[0], _HEDGE_SCEN[1], r)
 
-        # VIX call-spread overlay — real ^VIX chain + a forward-vol base.
-        vcalls, vmeta = await _vix_calls(provider, hedge_dte_days, today)
-        spot_vix, fwd_vix = await asyncio.to_thread(_vix_levels)
-        spot_vix = spot_vix or (vix if vix > 5 else None)
-        fwd_vix = fwd_vix or spot_vix
-        vix_cands = []
-        if vcalls and fwd_vix:
-            vdte = vmeta["dte"] if vmeta else hedge_dte_days
-            vix_cands = _vix_hedge_candidates(vcalls, fwd_vix, idx, mc["idx_sim"], mc["pnl"],
-                                              mc["cvar_95"] or 0.0, book_loss20, target,
-                                              crash_prob_annual, book_capital, annual_income,
-                                              365.0 / max(vdte, 1))
-            for c in vix_cands:
+        # Concentration (β-aware).
+        by_u: dict[str, dict] = {}
+        for p in positions:
+            b = by_u.setdefault(p["ticker"], {"ticker": p["ticker"], "trades": 0, "short_legs": 0,
+                                              "net_gamma": 0.0, "net_vega": 0.0, "net_delta": 0.0,
+                                              "spot": p["spot"], "beta": p["beta"]})
+            b["trades"] += 1
+            b["short_legs"] += p["n_short"]
+            for k in ("net_gamma", "net_vega", "net_delta"):
+                b[k] += p[k]
+        tot_g = sum(abs(b["net_gamma"]) for b in by_u.values()) or 1.0
+        concentration = []
+        for b in sorted(by_u.values(), key=lambda x: abs(x["net_gamma"]), reverse=True):
+            share = abs(b["net_gamma"]) / tot_g
+            flags = []
+            if b["short_legs"] > 1:
+                flags.append(f"{b['short_legs']} short legs on {b['ticker']} — one concentrated bet, not diversification")
+            if share >= 0.40 and len(by_u) > 1:
+                flags.append(f"{share*100:.0f}% of the book's gamma is in {b['ticker']}")
+            if b["beta"] >= 1.3:
+                flags.append(f"β {b['beta']} — moves ~{b['beta']}× the market, so it leads the book down in a crash")
+            concentration.append({**{k: round(v, 4) if isinstance(v, float) else v for k, v in b.items()},
+                                  "gamma_share_pct": round(share * 100, 1), "laddered": b["short_legs"] > 1, "flags": flags})
+
+        # #4 — hedge MENU (ranked), repriced on the MC scenarios for true CVaR reduction. Two
+        # families ranked TOGETHER: SPX put spreads (linear crash protection) and VIX call
+        # spreads (convex black-swan protection — VIX explodes in a vol spike, cheap, pays
+        # nothing in an ordinary drawdown that diversification already handles).
+        hedge_menu, hedge_note, hedge_plan = [], None, None
+        tail_attr = _tail_attribution(mc) if mc.get("pnl") is not None else None
+        if idx > 0 and mc.get("pnl") is not None:
+            # Candidates are built whenever there is a tail to hedge (the downside menu is only SHOWN when the
+            # book is net short the −20% tail; the budget plan below also covers an UPSIDE-driven tail).
+            target = hedge_target_pct * max(book_loss20, 0.0)
+            puts, meta = await _once('puts', lambda: _index_puts(provider, hedge_dte_days, today))
+            hdte = meta["dte"] if meta else hedge_dte_days
+            spx = _hedge_candidates(idx, mkt_vol, hdte / 365.0, r, puts, mc["pnl"], mc["idx_sim"],
+                                    mc["cvar_95"] or 0.0, book_loss20, target,
+                                    crash_prob_annual, book_capital, annual_income, 365.0 / max(hdte, 1),
+                                    horizon_years=mc.get("horizon_years", 0.0))
+            for c in spx:
                 c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
-                    "VIX (European)", "live ^VIX chain", vdte, (vmeta or {}).get("exp")
+                    "SPX (European)", ("live SPX chain" if puts else "model (BS + VIX)"), hdte, (meta or {}).get("exp")
 
-        # Dynamic VIXY sleeve — the near-zero-COST, signal-based hedge (only deploys on
-        # term-structure inversion, so no permanent roll decay).
-        vixy_cands = _vixy_dynamic_candidate(spot_vix, fwd_vix, idx, mc["idx_sim"], mc["pnl"],
-                                             mc["cvar_95"] or 0.0, book_loss20, target,
-                                             crash_prob_annual, book_capital, annual_income)
-        for c in vixy_cands:
-            c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
-                "VIXY (ETF)", "signal-based · VIX term structure", None, None
+            # VIX call-spread overlay — real ^VIX chain + a forward-vol base.
+            vcalls, vmeta = await _once('vcalls', lambda: _vix_calls(provider, hedge_dte_days, today))
+            spot_vix, fwd_vix = await _once('vix_levels', lambda: asyncio.to_thread(_vix_levels))
+            spot_vix = spot_vix or (vix if vix > 5 else None)
+            fwd_vix = fwd_vix or spot_vix
+            vix_cands = []
+            if vcalls and fwd_vix:
+                vdte = vmeta["dte"] if vmeta else hedge_dte_days
+                vix_cands = _vix_hedge_candidates(vcalls, fwd_vix, idx, mc["idx_sim"], mc["pnl"],
+                                                  mc["cvar_95"] or 0.0, book_loss20, target,
+                                                  crash_prob_annual, book_capital, annual_income,
+                                                  365.0 / max(vdte, 1))
+                for c in vix_cands:
+                    c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
+                        "VIX (European)", "live ^VIX chain", vdte, (vmeta or {}).get("exp")
 
-        hedge_menu = _rank_hedges(spx + vix_cands + vixy_cands)
-        if not vix_cands:
-            hedge_note = "VIX black-swan overlay unavailable (no live ^VIX chain) — showing SPX put hedges only."
-    elif book_loss20 <= 0:
-        hedge_note = "The book isn't net short the tail at −20% — no index hedge needed."
+            # Dynamic VIXY sleeve — the near-zero-COST, signal-based hedge (only deploys on
+            # term-structure inversion, so no permanent roll decay).
+            vixy_cands = _vixy_dynamic_candidate(spot_vix, fwd_vix, idx, mc["idx_sim"], mc["pnl"],
+                                                 mc["cvar_95"] or 0.0, book_loss20, target,
+                                                 crash_prob_annual, book_capital, annual_income)
+            for c in vixy_cands:
+                c["index"], c["pricing"], c["dte_days"], c["expiry"] = \
+                    "VIXY (ETF)", "signal-based · VIX term structure", None, None
 
-    # DETERMINISTIC factor / correlation / macro decomposition (sequential DB — shared session).
-    try:
-        factor_exposure = await _book_factor_exposure(positions, db)
-    except Exception as exc:  # noqa: BLE001 — a factor-data miss must never fail the desk
-        logger.debug("factor exposure failed: %s", exc)
-        factor_exposure = None
+            # SPX call spreads (model-priced) — the only index hedge for an upside-driven tail.
+            call_cands = _hedge_call_candidates(idx, mkt_vol, hdte / 365.0, r, mc["pnl"], mc["idx_sim"],
+                                                365.0 / max(hdte, 1), horizon_years=mc.get("horizon_years", 0.0))
+            for c in call_cands:
+                c["index"], c["dte_days"], c["expiry"] = "SPX (European)", hdte, (meta or {}).get("exp")
 
-    verdict = _verdict_and_actions(scenarios=scenarios, short_vol=net_gamma < 0,
-                                   concentration=concentration, hedge_menu=hedge_menu,
-                                   cvar_pct=(mc.get("cvar_95") or 0) / book_capital * 100 if book_capital else None,
-                                   beta_delta_spy=beta_delta_spy)
+            if (mc.get("cvar_95") or 0) > 0:
+                hedge_plan = _hedge_plan(
+                    [dict(c) for c in spx + vix_cands + vixy_cands + call_cands],
+                    mc=mc, cvar0=float(mc["cvar_95"]), annual_income=annual_income, book_capital=book_capital, tail=tail_attr)
+                hedge_plan["exposures"] = _exposure_map(
+                    positions, r, bw_delta_notional=bw_delta_notional, beta_delta_spy=beta_delta_spy, spy_price=spy_price,
+                    net_vega=net_vega, book_capital=book_capital, mkt_vol=mkt_vol, hedge_dte_days=hdte)
+            _strip_private(spx + vix_cands + vixy_cands + call_cands)
 
-    # Institutional risk SCORECARD — standardized guardrails + the cheapest fix for each breach.
-    scorecard = _risk_scorecard(
-        positions=positions, r=r,
-        book_capital=book_capital, annual_income=annual_income, scenarios=scenarios,
-        cvar_95=mc.get("cvar_95"), var_95=mc.get("var_95"),
-        beta_delta_notional=bw_delta_notional, beta_delta_spy=beta_delta_spy, spy_price=spy_price,
-        concentration=concentration, factor_exposure=factor_exposure,
-        naked_assignment=_naked_assignment(positions), hedge_menu=hedge_menu)
+            if book_loss20 > 0:
+                hedge_menu = _rank_hedges(spx + vix_cands + vixy_cands)
+                if not vix_cands:
+                    hedge_note = "VIX black-swan overlay unavailable (no live ^VIX chain) — showing SPX put hedges only."
+        if book_loss20 <= 0:
+            hedge_note = "The book isn't net short the tail at −20% — no downside index hedge needed (see the budget plan for the upside)."
 
-    return _native({
-        "positions": len(positions),
-        "net_delta": round(net_delta, 1), "net_gamma": round(net_gamma, 4),
-        "net_vega": round(net_vega, 0), "net_theta": round(net_theta, 0),
-        "net_delta_notional": round(sum(p["net_delta"] * p["spot"] for p in positions), 0),
-        "beta_delta_notional": round(bw_delta_notional, 0), "beta_delta_spy": beta_delta_spy,
-        "book_capital": round(book_capital, 0), "annual_income": round(annual_income, 0),
-        # What the "% of capital" denominator IS — surfaced so the user can see it, not guess.
-        "capital_basis": ("Σ committed capital across positions = short-put strikes × 100 (the cash "
-                          "each CSP secures) + short-call/other strike notional. It is the capital PUT TO "
-                          "WORK, the % of cap denominator — NOT your whole account net-liq."),
-        # θ/Net-Liq — daily decay income as a % of capital at work (how hard the book earns);
-        # carry_yield = that annualized. tastytrade rule-of-thumb: ~0.1%/day (~25%/yr) is healthy.
-        "theta_net_liq_pct": round(net_theta / book_capital * 100, 3) if book_capital else None,
-        "carry_yield_pct": round(annual_income / book_capital * 100, 1) if book_capital else None,
-        "cvar_capital_pct": round((mc.get("cvar_95") or 0) / book_capital * 100, 1) if book_capital else None,
-        "short_vol": bool(net_gamma < 0),
-        "stock_notional": round(book_stock_notional, 0),   # $ of shares behind the overlay (covered/collar/holding)
-        # Who is actually hurting me — per-name P&L at a −20% month (whole position, shares split out).
-        "loss_by_name": _loss_by_name(positions, r, _HEDGE_SCEN[0], _HEDGE_SCEN[1]),
-        # DETERMINISTIC factor read: sector buckets, correlated clusters (measured ρ), macro loadings.
-        "factor_exposure": factor_exposure,
-        # Institutional risk scorecard: standardized guardrails, book value vs limit, cheapest fix per breach.
-        "risk_scorecard": scorecard,
-        # 2-D risk array: book P&L for spot × vol shocks (the short-gamma valley + short-vega gradient).
-        "scenario_grid": _scenario_grid(positions, r, book_capital),
-        "avg_beta": round(sum(abs(p["net_gamma"]) * p["beta"] for p in positions) / (sum(abs(p["net_gamma"]) for p in positions) or 1), 2),
-        "var_95": mc.get("var_95"), "cvar_95": mc.get("cvar_95"),
-        "var_99": mc.get("var_99"), "cvar_99": mc.get("cvar_99"),
-        "horizon": "1 month (21 trading days)",
-        "concentration": concentration,
-        "crash_scenarios": scenarios,
-        # Assignment / scenario lab — capital demanded and P&L across a two-sided move ladder,
-        # plus the worst-case if EVERY naked short is assigned (covered calls excluded).
-        "assignment_ladder": _assignment_ladder(positions, r),
-        "naked_assignment": _naked_assignment(positions),
-        "hedge_menu": hedge_menu, "hedge_note": hedge_note,
-        "verdict": verdict,
-        "assumptions": {"beta": "per-name β vs S&P 500" if beta_weighted else "β≈1 (beta data unavailable)",
-                        "mkt_vol_pct": round(mkt_vol * 100, 1), "tail": f"Student-t (df={_TDF}) market factor + skew",
-                        "crash_prob_annual_pct": round(crash_prob_annual * 100, 1),
-                        "hedge_rolls_per_year": round(365 / hedge_dte_days, 1),
-                        "vix": ("VIX call spreads priced off the live ^VIX chain; payoff valued at intrinsic on a "
-                                "VIX FUTURE (not spot VIX) mapped from each MC path's SPX move, dampened for mean "
-                                "reversion — conservative, so the black-swan hedge is never overstated."),
-                        "vixy": ("Dynamic VIXY sleeve is near-zero COST (cash until the VIX term structure inverts) "
-                                 "but its payoff is haircut ~35% for signal/gap lag and it ties up the sleeve in cash — "
-                                 "shown as 'capital', not premium.")},
-    })
+        # ETF hedges around the book's own themes (nearest ETF by measured ρ; live ETF chains fetched once, shared by both passes).
+        etf_hedges = None
+        try:
+            from .etf_hedge_service import build_etf_hedges
+            etf_static = await _once('etf', lambda: _fetch_etf_static(positions, provider, today))
+            etf_hedges = build_etf_hedges(positions, etf_static, r, annual_income, (tail_attr or {}).get("side"))
+        except Exception as exc:  # noqa: BLE001 — the ETF view must never fail the desk
+            logger.debug("etf hedges failed: %s", exc)
+
+        # DETERMINISTIC factor / correlation / macro decomposition (sequential DB — shared session).
+        try:
+            factor_exposure = await _once('factor', lambda: _book_factor_exposure(positions, db))
+        except Exception as exc:  # noqa: BLE001 — a factor-data miss must never fail the desk
+            logger.debug("factor exposure failed: %s", exc)
+            factor_exposure = None
+
+        verdict = _verdict_and_actions(scenarios=scenarios, short_vol=net_gamma < 0,
+                                       concentration=concentration, hedge_menu=hedge_menu,
+                                       cvar_pct=(mc.get("cvar_95") or 0) / book_capital * 100 if book_capital else None,
+                                       beta_delta_spy=beta_delta_spy)
+
+        # Institutional risk SCORECARD — standardized guardrails + the cheapest fix for each breach.
+        scorecard = _risk_scorecard(
+            positions=positions, r=r,
+            book_capital=book_capital, annual_income=annual_income, scenarios=scenarios,
+            cvar_95=mc.get("cvar_95"), var_95=mc.get("var_95"),
+            beta_delta_notional=bw_delta_notional, beta_delta_spy=beta_delta_spy, spy_price=spy_price,
+            concentration=concentration, factor_exposure=factor_exposure,
+            naked_assignment=_naked_assignment(positions), hedge_menu=hedge_menu, hedge_plan=hedge_plan)
+
+        return _native({
+            "positions": len(positions),
+            "net_delta": round(net_delta, 1), "net_gamma": round(net_gamma, 4),
+            "net_vega": round(net_vega, 0), "net_theta": round(net_theta, 0),
+            "net_delta_notional": round(sum(p["net_delta"] * p["spot"] for p in positions), 0),
+            "beta_delta_notional": round(bw_delta_notional, 0), "beta_delta_spy": beta_delta_spy,
+            "book_capital": round(book_capital, 0), "annual_income": round(annual_income, 0),
+            # What the "% of capital" denominator IS — surfaced so the user can see it, not guess.
+            "capital_basis": ("Σ committed capital across positions = short-put strikes × 100 (the cash "
+                              "each CSP secures) + short-call/other strike notional. It is the capital PUT TO "
+                              "WORK, the % of cap denominator — NOT your whole account net-liq."),
+            # θ/Net-Liq — daily decay income as a % of capital at work (how hard the book earns);
+            # carry_yield = that annualized. tastytrade rule-of-thumb: ~0.1%/day (~25%/yr) is healthy.
+            "theta_net_liq_pct": round(net_theta / book_capital * 100, 3) if book_capital else None,
+            "carry_yield_pct": round(annual_income / book_capital * 100, 1) if book_capital else None,
+            "cvar_capital_pct": round((mc.get("cvar_95") or 0) / book_capital * 100, 1) if book_capital else None,
+            "short_vol": bool(net_gamma < 0),
+            "stock_notional": round(book_stock_notional, 0),   # $ of shares behind the overlay (covered/collar/holding)
+            # Who is actually hurting me — per-name P&L at a −20% month (whole position, shares split out).
+            "loss_by_name": _loss_by_name(positions, r, _HEDGE_SCEN[0], _HEDGE_SCEN[1]),
+            # DETERMINISTIC factor read: sector buckets, correlated clusters (measured ρ), macro loadings.
+            "factor_exposure": factor_exposure,
+            # Concentration that means something: tail share vs capital share vs income, per-group shocks.
+            "concentration_view": _concentration_view(positions, r, book_capital, factor_exposure),
+            # Institutional risk scorecard: standardized guardrails, book value vs limit, cheapest fix per breach.
+            "risk_scorecard": scorecard,
+            # 2-D risk array: book P&L for spot × vol shocks (the short-gamma valley + short-vega gradient).
+            "scenario_grid": _scenario_grid(positions, r, book_capital),
+            "avg_beta": round(sum(abs(p["net_gamma"]) * p["beta"] for p in positions) / (sum(abs(p["net_gamma"]) for p in positions) or 1), 2),
+            "var_95": mc.get("var_95"), "cvar_95": mc.get("cvar_95"),
+            "var_99": mc.get("var_99"), "cvar_99": mc.get("cvar_99"),
+            "horizon": "1 month (21 trading days)",
+            "concentration": concentration,
+            "crash_scenarios": scenarios,
+            # Assignment / scenario lab — capital demanded and P&L across a two-sided move ladder,
+            # plus the worst-case if EVERY naked short is assigned (covered calls excluded).
+            "assignment_ladder": _assignment_ladder(positions, r),
+            "naked_assignment": _naked_assignment(positions),
+            "hedge_menu": hedge_menu, "hedge_note": hedge_note, "hedge_plan": hedge_plan, "etf_hedges": etf_hedges,
+            "verdict": verdict,
+            "assumptions": {"beta": "per-name β vs S&P 500" if beta_weighted else "β≈1 (beta data unavailable)",
+                            "mkt_vol_pct": round(mkt_vol * 100, 1), "tail": f"Student-t (df={_TDF}) market factor + skew",
+                            "crash_prob_annual_pct": round(crash_prob_annual * 100, 1),
+                            "hedge_rolls_per_year": round(365 / hedge_dte_days, 1),
+                            "vix": ("VIX call spreads priced off the live ^VIX chain; payoff valued at intrinsic on a "
+                                    "VIX FUTURE (not spot VIX) mapped from each MC path's SPX move, dampened for mean "
+                                    "reversion — conservative, so the black-swan hedge is never overstated."),
+                            "vixy": ("Dynamic VIXY sleeve is near-zero COST (cash until the VIX term structure inverts) "
+                                     "but its payoff is haircut ~35% for signal/gap lag and it ties up the sleeve in cash — "
+                                     "shown as 'capital', not premium.")},
+        })
+
+    result = await _run(positions)
+    result["coverage"], result["data_quality"] = coverage, quality
+    has_cov = any(p.get("cov_shares") for p in positions)
+    result["has_covered_stock"] = has_cov
+    if has_cov:
+        alt = await _run([{**p, "down_stock": True} for p in positions])
+        result["with_stock_downside"] = {k: alt[k] for k in _DOWNSIDE_KEYS if k in alt}
+    return result

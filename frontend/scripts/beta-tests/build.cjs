@@ -9,7 +9,7 @@ const extractHelpers = {
   setup(b) {
     b.onLoad({ filter: /components\/trades\/MyTradesV2\.tsx$/ }, (args) => {
       const src = fs.readFileSync(args.path, 'utf8');
-      const want = (process.env.HELPERS || 'effectivePnl,expiryFrom,dteFrom').split(',');
+      const want = (process.env.HELPERS || 'expiryFrom,dteFrom').split(',');
       let out = '';
       for (const name of want) {
         const re = new RegExp('export function ' + name + '\\([\\s\\S]*?\\n}\\n', 'm');

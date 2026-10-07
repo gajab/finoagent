@@ -4,23 +4,26 @@
  * Same data and endpoints as the classic TradeManagerPanel (POST /trade-manager, /trade-manager/ai); a different
  * reading order and look:
  *
- *   Technical Analysis  → the underlying's chart read, collapsed, on top
  *   Decision hero       → score ring · signal · confidence · what you've done since entry
  *   What to do          → the steps, in words
  *   How the score is built → a zone scale (strong exit … strong hold) + the four lenses, tap one to open its evidence
  *   Exit plan           → a PRICE LADDER (stops below spot, targets above) instead of four text groups
  *   Watch next          → levels above / below with what a close through each means
- *   Evidence · AI assist→ the classic evidence views and the explicit-click LLM, behind accordions
+ *   Evidence · AI assist→ Technical · Fundamental · News & events (BetaEvidence) and the explicit-click LLM, behind accordions
  *
- * Nothing the classic panel shows is dropped — it is re-ordered, enlarged to a readable size, and folded.
+ * The Quant lens is NOT re-explained here: for an option position it is the Quant tab's own desk score (the inspector runs
+ * the desk once and hands the same result to this read), and its tile jumps to that tab. For shares there is no desk score,
+ * so the "Position risk" evidence stays in this panel.
  */
 import React, { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Loader2, AlertTriangle, RefreshCw, Target, Eye, Layers, Sparkles, FileJson, Copy, ShieldAlert, Flag } from 'lucide-react';
 import { fetchTradeManager, runTradeManagerAI } from '../api';
 import type { LivePnlResponse, SavedStrategyItem, TradeManagerResult, TradeManagerAI, ManagerExitItem, ManagerSignal, ManagerWatchLevel, ManagerSinceEntry } from '../api';
-import { QuantView, TechnicalView, FundamentalView, EventView, AIResult, gloss, type LensKey } from '../components/trades/TradeManagerPanel';
-import { LazyTechnicals } from '../components/DerivativeIncome';
+import { AIResult, gloss, type LensKey } from '../components/trades/TradeManagerPanel';
 import { Accordion, Callout, Chip, Meter, ScoreRing, SubHead, Tile, TONE, type Tone } from './BetaKit';
+import { TechnicalEvidence, FundamentalEvidence, EventsEvidence, PositionRiskEvidence, SourceChips } from './BetaEvidence';
+import { scoreRead } from './betaEvidenceModel';
+import { deskForManager, deskSettled, type DeskState } from './betaDesk';
 
 // ── formatting ───────────────────────────────────────────────────────────────
 const n = (v: any, d = 2) => (v == null || Number.isNaN(Number(v)) ? '–' : Number(v).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }));
@@ -51,22 +54,7 @@ const STEP: Record<string, { label: string; tone: Tone }> = {
 const LEFT_BORDER: Record<Tone, string> = {
   good: 'border-l-success/60', warn: 'border-l-warning/60', bad: 'border-l-error/60', info: 'border-l-info/60', accent: 'border-l-secondary/60', neutral: 'border-l-base-content/20',
 };
-const wordOf = (v: number): { w: string; tone: Tone } => (v >= 65 ? { w: 'Supportive', tone: 'good' } : v >= 45 ? { w: 'Neutral', tone: 'neutral' } : v >= 30 ? { w: 'Caution', tone: 'warn' } : { w: 'Against', tone: 'bad' });
-
-/** "Dealer put support 1,045 · Gamma flip 1,025" — the reads that agree at a level, each with a plain-English tooltip. */
-function SourceChips({ src, labels }: { src?: { label: string; price: number }[]; labels?: string[] }) {
-  const rows = src && src.length ? src : (labels || []).map(l => ({ label: l, price: NaN }));
-  if (!rows.length) return null;
-  return (
-    <div className="flex flex-wrap gap-1 mt-1.5">
-      {rows.map((r, i) => (
-        <span key={i} title={gloss(r.label) || r.label} className="inline-flex items-baseline gap-1 rounded-md bg-base-300/30 px-1.5 py-0.5 text-[11px] text-base-content/65 whitespace-nowrap cursor-help">
-          {r.label}{Number.isFinite(r.price) && <b className="font-mono text-base-content/85">{n(r.price)}</b>}
-        </span>
-      ))}
-    </div>
-  );
-}
+const wordOf = (v: number): { w: string; tone: Tone } => { const r = scoreRead(v); return { w: r.word, tone: r.tone }; };      // one vocabulary with the evidence views
 
 // ── hero ─────────────────────────────────────────────────────────────────────
 function SinceEntry({ se, p }: { se?: ManagerSinceEntry; p: any }) {
@@ -156,25 +144,25 @@ function ScoreScale({ score }: { score: number }) {
   );
 }
 
-function ScoreBuild({ res, onLens }: { res: TradeManagerResult; onLens: (k: LensKey) => void }) {
+function ScoreBuild({ res, onLens, quantNote }: { res: TradeManagerResult; onLens: (k: LensKey) => void; quantNote?: string }) {
   const d = res.decision; const L = d.lenses; const isStock = res.profile?.kind === 'stock';
   const quantLabel = L.quant.label || (isStock ? 'Position risk' : 'Quant');
   const first = (x?: string[]) => (x && x[0]) || '';
   const pct = (w: number) => `${Math.round(w * 100)}%`;
   const evAdj = d.event_adj;
-  const tiles: { k: LensKey; label: string; word: { w: string; tone: Tone }; score?: number; weight?: string; caption: string; muted?: boolean }[] = [
-    { k: 'quant', label: quantLabel, word: L.quant.available === false ? { w: 'Not scored', tone: 'neutral' } : wordOf(L.quant.score), score: L.quant.available === false ? undefined : L.quant.score, weight: L.quant.available === false ? undefined : pct(L.quant.weight), caption: first(L.quant.notes), muted: L.quant.available === false },
+  const tiles: { k: LensKey; label: string; word: { w: string; tone: Tone }; score?: number; weight?: string; caption: string; muted?: boolean; link?: string }[] = [
+    { k: 'quant', label: quantLabel, word: L.quant.available === false ? { w: 'Not scored', tone: 'neutral' } : wordOf(L.quant.score), score: L.quant.available === false ? undefined : L.quant.score, weight: L.quant.available === false ? undefined : pct(L.quant.weight), caption: quantNote || first(L.quant.notes), muted: L.quant.available === false, link: !isStock ? 'Open the Quant tab →' : undefined },
     { k: 'technical', label: 'Technical', word: wordOf(L.technical.score), score: L.technical.score, weight: pct(L.technical.weight), caption: first(L.technical.notes) || 'context only' },
     { k: 'fundamental', label: 'Fundamental', word: L.fundamental.available === false ? { w: 'Not scored', tone: 'neutral' } : wordOf(L.fundamental.score), score: L.fundamental.available === false ? undefined : L.fundamental.score, weight: L.fundamental.available === false ? undefined : pct(L.fundamental.weight), caption: L.fundamental.available === false ? 'fund / no company data' : first(L.fundamental.notes), muted: L.fundamental.available === false },
     { k: 'event', label: 'Event risk', word: L.event.clear ? { w: 'Clear', tone: 'good' } : { w: `${evAdj > 0 ? '+' : ''}${evAdj} pts`, tone: evAdj < -6 ? 'bad' : evAdj < 0 ? 'warn' : 'good' }, caption: first(L.event.notes) || 'nothing scheduled that changes the trade' },
   ];
   return (
     <div className="rounded-xl border border-white/[0.08] bg-base-200/25 p-3 space-y-3">
-      <div className="text-xs font-semibold text-base-content/70">How the score is built <span className="font-normal text-base-content/40">· tap a lens for its evidence</span></div>
+      <div className="text-xs font-semibold text-base-content/70">How the score is built <span className="font-normal text-base-content/40">· tap a lens for what is behind it</span></div>
       <ScoreScale score={d.score} />
       <div className="grid grid-cols-2 gap-2">
         {tiles.map(t => (
-          <button key={t.k} onClick={() => onLens(t.k)} title="See what is behind this"
+          <button key={t.k} onClick={() => onLens(t.k)} title={t.link ? 'This score comes from the Quant tab — open it for the full breakdown' : 'See what is behind this'}
             className={`text-left rounded-lg border border-white/[0.07] bg-base-100/30 px-2.5 py-2 hover:bg-base-100/60 transition-colors ${t.muted ? 'opacity-60' : ''}`}>
             <div className="flex items-baseline justify-between gap-2">
               <span className="text-xs text-base-content/60 truncate">{t.label}{t.weight && <span className="text-base-content/35"> · {t.weight}</span>}</span>
@@ -183,6 +171,7 @@ function ScoreBuild({ res, onLens }: { res: TradeManagerResult; onLens: (k: Lens
             <div className={`text-sm font-semibold ${TONE[t.word.tone].text}`}>{t.word.w}</div>
             {t.score != null && <Meter value={t.score} tone={t.word.tone} className="my-1.5" />}
             <div className="text-[11px] text-base-content/50 leading-snug line-clamp-2 min-h-[2.4em]">{t.caption}</div>
+            {t.link && <div className="text-[11px] text-secondary/80 mt-1">{t.link}</div>}
           </button>
         ))}
       </div>
@@ -349,31 +338,52 @@ function WatchNext({ res }: { res: TradeManagerResult }) {
 }
 
 // ── panel ────────────────────────────────────────────────────────────────────
-export default function BetaUnderlyingAnalysis({ trade, pnl }: { trade: SavedStrategyItem; pnl: LivePnlResponse }) {
+export default function BetaUnderlyingAnalysis({ trade, pnl, desk, onOpenQuant }: {
+  trade: SavedStrategyItem; pnl: LivePnlResponse;
+  /** The inspector's shared desk-score run (the Quant tab's result). Absent / 'na' for shares and structures with no desk score. */
+  desk?: DeskState;
+  /** Jump to the Quant tab — where an option position's quant score is explained in full. */
+  onOpenQuant?: () => void;
+}) {
   const [res, setRes] = useState<TradeManagerResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [lens, setLens] = useState<LensKey>('quant');
+  const [lens, setLens] = useState<LensKey | null>(null);
   const [evidenceSignal, setEvidenceSignal] = useState(0);
   const [ai, setAi] = useState<TradeManagerAI | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiErr, setAiErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const startedFor = useRef<number | null>(null);
+  const deskRef = useRef(desk); deskRef.current = desk;
+  const loadedWith = useRef<unknown>(null);                      // the desk result the current read was computed with
+  // The quant lens must equal the Quant tab's number, so the read waits for the desk run (it never blocks on one that cannot exist).
+  const deskStatus = desk?.status;
+  const deskReady = deskSettled(deskStatus);
 
   const load = useCallback(async () => {
     setLoading(true); setErr(null);
-    try { setRes(await fetchTradeManager(trade.id, pnl)); }
+    try {
+      const d = deskRef.current?.desk ?? null;
+      loadedWith.current = d;
+      setRes(await fetchTradeManager(trade.id, pnl, deskForManager(d)));
+    }
     catch (e: any) { setErr(e?.message || 'Trade manager failed'); }
     finally { setLoading(false); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trade.id]);
   useEffect(() => {
-    if (startedFor.current === trade.id) return;     // StrictMode double-invoke must not fire the heavy read twice
+    if (!deskReady || startedFor.current === trade.id) return;     // StrictMode double-invoke must not fire the heavy read twice
     startedFor.current = trade.id;
-    setRes(null); setAi(null);
+    setRes(null); setAi(null); setLens(null);
     load();
-  }, [load, trade.id]);
+  }, [load, trade.id, deskReady]);
+
+  // The user re-ran the desk (Quant tab → "Re-run with current prices"): the quant lens here must follow the new number.
+  const sharedDesk = desk?.status === 'ready' ? desk.desk : null;
+  useEffect(() => {
+    if (sharedDesk && startedFor.current === trade.id && loadedWith.current !== sharedDesk) load();
+  }, [sharedDesk, trade.id, load]);
 
   const askAI = async () => {
     setAiLoading(true); setAiErr(null);
@@ -385,7 +395,6 @@ export default function BetaUnderlyingAnalysis({ trade, pnl }: { trade: SavedStr
     if (!res) return;
     try { await navigator.clipboard.writeText(JSON.stringify(res.evidence_json, null, 2)); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ }
   };
-  const openLens = (k: LensKey) => { setLens(k); setEvidenceSignal(s => s + 1); };
 
   const spot = Number((pnl as any)?.underlying_price) > 0 ? Number((pnl as any).underlying_price) : null;
   const isStock = res?.profile?.kind === 'stock';
@@ -394,19 +403,29 @@ export default function BetaUnderlyingAnalysis({ trade, pnl }: { trade: SavedStr
   const planItems = res?.exit_plan.items || [];
   const nExit = planItems.filter(i => i.action === 'EXIT' || i.action === 'DEFEND_OR_EXIT').length;
   const nProfit = planItems.filter(i => i.action === 'TAKE_PROFIT').length;
+  // Option positions: the quant evidence IS the Quant tab, so Evidence only carries the other three lenses.
+  const pills: [LensKey, string][] = [...(isStock ? [['quant', quantLabel] as [LensKey, string]] : []), ['technical', 'Technical'], ['fundamental', 'Fundamental'], ['event', 'News & events']];
+  const active: LensKey = lens && pills.some(([k]) => k === lens) ? lens : pills[0][0];
+  const openLens = (k: LensKey) => {
+    if (k === 'quant' && !isStock && onOpenQuant) { onOpenQuant(); return; }
+    setLens(k); setEvidenceSignal(s => s + 1);
+  };
+  const quantNote = !isStock && L
+    ? (L.quant.source === 'full_desk' ? 'The Quant tab’s desk score — the same number.'
+      : deskStatus === 'error' ? `Light read — the full desk score could not run (${desk?.error || 'unavailable'}).` : undefined)
+    : undefined;
   const lensBody = (k: LensKey) => !res || !L ? null
-    : k === 'quant' ? <QuantView lens={L.quant} isStock={!!isStock} />
-    : k === 'technical' ? <TechnicalView res={res} lens={L.technical} isStock={!!isStock} />
-    : k === 'fundamental' ? <FundamentalView res={res} lens={L.fundamental} /> : <EventView res={res} lens={L.event} />;
+    : k === 'quant' ? <PositionRiskEvidence res={res} lens={L.quant} />
+    : k === 'technical' ? <TechnicalEvidence res={res} lens={L.technical} isStock={!!isStock} />
+    : k === 'fundamental' ? <FundamentalEvidence res={res} lens={L.fundamental} /> : <EventsEvidence res={res} lens={L.event} isStock={!!isStock} />;
+  const waitingDesk = !deskReady && !res;
 
   return (
     <div className="space-y-3">
-      {/* the underlying's chart read — on top, collapsed */}
-      <LazyTechnicals ticker={trade.ticker} />
-
-      {loading && !res && (
+      {(loading || waitingDesk) && !res && (
         <div className="rounded-xl border border-white/[0.07] bg-base-200/25 p-4 space-y-2" aria-live="polite">
-          <div className="flex items-center gap-2 text-sm text-base-content/70"><Loader2 className="w-4 h-4 animate-spin text-primary" /> Reading structure, volatility, fundamentals and events for {trade.ticker}…</div>
+          <div className="flex items-center gap-2 text-sm text-base-content/70"><Loader2 className="w-4 h-4 animate-spin text-primary" />
+            {waitingDesk ? `Running the quant desk on this exact trade, then reading structure, volatility, fundamentals and events for ${trade.ticker}…` : `Reading structure, volatility, fundamentals and events for ${trade.ticker}…`}</div>
           <div className="text-xs text-base-content/40">Up to ~30s on a cold read, instant when cached.</div>
           <div className="h-24 rounded-lg bg-base-content/[0.05] animate-pulse" /><div className="h-16 rounded-lg bg-base-content/[0.05] animate-pulse" />
         </div>
@@ -416,7 +435,7 @@ export default function BetaUnderlyingAnalysis({ trade, pnl }: { trade: SavedStr
       {res && (
         <>
           <Hero res={res} loading={loading} onRefresh={load} />
-          <ScoreBuild res={res} onLens={openLens} />
+          <ScoreBuild res={res} onLens={openLens} quantNote={quantNote} />
           <Accordion title="Exit plan" icon={<Target className="w-4 h-4" />} defaultOpen
             summary={`${planItems.length} levels & rules${nExit ? ` · ${nExit} defend/exit` : ''}${nProfit ? ` · ${nProfit} take-profit` : ''}`}>
             <ExitPlan res={res} spot={spot} />
@@ -425,15 +444,16 @@ export default function BetaUnderlyingAnalysis({ trade, pnl }: { trade: SavedStr
             summary={`${res.monitor.up.length} above · ${res.monitor.down.length} below · ${res.monitor.indicators.length} indicators`}>
             <WatchNext res={res} />
           </Accordion>
-          <Accordion title="Evidence" icon={<Layers className="w-4 h-4" />} summary={`${quantLabel} · Technical · Fundamental · Event & news`} openSignal={evidenceSignal}>
+          <Accordion title="Evidence" icon={<Layers className="w-4 h-4" />} summary={pills.map(([, l]) => l).join(' · ')} openSignal={evidenceSignal}>
             <div className="space-y-3">
-              <div className="flex gap-1.5 flex-wrap">
-                {([['quant', quantLabel], ['technical', 'Technical'], ['fundamental', 'Fundamental'], ['event', 'Event & news']] as [LensKey, string][]).map(([k, lab]) => (
-                  <button key={k} onClick={() => setLens(k)}
-                    className={`px-3 py-1 rounded-full text-xs border transition-colors ${lens === k ? 'border-primary/50 bg-primary/15 text-primary font-semibold' : 'border-white/10 text-base-content/60 hover:border-white/25'}`}>{lab}</button>
+              <div className="flex gap-1.5 flex-wrap" role="tablist" aria-label="Evidence">
+                {pills.map(([k, lab]) => (
+                  <button key={k} role="tab" aria-selected={active === k} onClick={() => setLens(k)}
+                    className={`px-3 py-1 rounded-full text-xs border transition-colors ${active === k ? 'border-primary/50 bg-primary/15 text-primary font-semibold' : 'border-white/10 text-base-content/60 hover:border-white/25'}`}>{lab}</button>
                 ))}
               </div>
-              <div className="beta-readable">{lensBody(lens)}</div>
+              {!isStock && onOpenQuant && <div className="text-[11px] text-base-content/40">The quant evidence lives in the <button className="underline hover:text-base-content/70" onClick={onOpenQuant}>Quant tab</button> — it is not repeated here.</div>}
+              <div className="beta-readable">{lensBody(active)}</div>
             </div>
           </Accordion>
           <Accordion title="AI assist" icon={<Sparkles className="w-4 h-4" />} summary="on demand · sends facts only, none of our verdict">

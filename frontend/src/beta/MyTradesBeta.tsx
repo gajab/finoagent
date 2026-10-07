@@ -16,11 +16,13 @@ import { Loader2, RefreshCw, AlertCircle, X, List, LayoutGrid, CheckCircle2, Che
 import type { SavedStrategyItem, LivePnlResponse, ClosedMonthSummary } from '../api';
 import { fetchActiveTrades, fetchTradeLivePnl, saveTradePnlSnapshot, fetchClosedLedger, appendTradeTransaction } from '../api';
 import { fmtMoney, fmtPct } from '../lib/tradeFormat';
+import { effectivePnl } from '../lib/tradePnl';
 import {
-  tradePurpose, PURPOSE_META, PURPOSE_ORDER, tradeStructure, daysHeld, effectivePnl, deployedCapital,
+  tradePurpose, PURPOSE_META, PURPOSE_ORDER, tradeStructure, daysHeld, deployedCapital,
   trimPnl, ClosedLedger,
 } from '../components/trades/MyTradesV2';
 import BetaBookRisk from './BetaBookRisk';
+import { rowDeployed, structureCounts, filterByStructure, compactMoney } from './betaRows';
 import PaperTraderPanel from '../components/trades/PaperTraderPanel';
 import UpdatePositionModal from '../components/trades/UpdatePositionModal';
 import CloseTradeModal from '../components/trades/CloseTradeModal';
@@ -65,6 +67,7 @@ export default function MyTradesBeta({ initialSelectedId = null }: { initialSele
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(initialSelectedId);
   const [filter, setFilter] = useState<Filter>('all');
+  const [typeFilter, setTypeFilter] = useState<string>('all');   // trade TYPE (covered call, naked call, straddle, CSP …)
   const [sortBy, setSortBy] = useState<SortKey>('urgency');
   const [groupByPurpose, setGroupByPurpose] = useState(true);
   const [updateTrade, setUpdateTrade] = useState<SavedStrategyItem | null>(null);
@@ -154,15 +157,19 @@ export default function MyTradesBeta({ initialSelectedId = null }: { initialSele
   }, [trades, pnlMap]);
   const summary = useMemo(() => summarizeBook(trades, pnlMap, states), [trades, pnlMap, states]);
   const deployed = useMemo(() => trades.reduce((s, t) => s + deployedCapital(t, pnlMap[t.id]), 0), [trades, pnlMap]);
+  const typeCounts = useMemo(() => structureCounts(trades), [trades]);
+  // A type that no longer exists (its last trade closed) must not leave the list empty behind an invisible filter.
+  const activeType = typeFilter !== 'all' && !typeCounts.some(c => c.key === typeFilter) ? 'all' : typeFilter;
+  const typed = useMemo(() => filterByStructure(trades, activeType), [trades, activeType]);
   const counts = useMemo(() => {
-    const c: Record<string, number> = { all: trades.length };
+    const c: Record<string, number> = { all: typed.length };
     for (const s of STATE_ORDER) c[s] = 0;
-    for (const t of trades) c[states[t.id]?.state ?? 'pending']++;
+    for (const t of typed) c[states[t.id]?.state ?? 'pending']++;
     return c;
-  }, [trades, states]);
+  }, [typed, states]);
 
   const shown = useMemo(() => {
-    const list = filter === 'all' ? trades : trades.filter(t => states[t.id]?.state === filter);
+    const list = filter === 'all' ? typed : typed.filter(t => states[t.id]?.state === filter);
     const n = (v: number | null | undefined) => (v == null ? -Infinity : v);
     const cmp: Record<SortKey, (a: SavedStrategyItem, b: SavedStrategyItem) => number> = {
       urgency: (a, b) => urgencyCompare(a, b, states),
@@ -171,7 +178,7 @@ export default function MyTradesBeta({ initialSelectedId = null }: { initialSele
       ticker: (a, b) => a.ticker.localeCompare(b.ticker),
     };
     return [...list].sort(cmp[sortBy]);
-  }, [trades, states, pnlMap, filter, sortBy]);
+  }, [typed, states, pnlMap, filter, sortBy]);
 
   const attention = useMemo(
     () => trades.filter(t => ['act', 'noquote', 'harvest'].includes(states[t.id]?.state))
@@ -322,6 +329,15 @@ export default function MyTradesBeta({ initialSelectedId = null }: { initialSele
               ))}
             </div>
             <div className="ml-auto flex items-center gap-2">
+              {typeCounts.length > 1 && (
+                <label className="flex items-center gap-1.5 text-xs text-base-content/60">
+                  Type
+                  <select className="select select-xs select-bordered max-w-[11rem]" value={activeType} onChange={e => setTypeFilter(e.target.value)} aria-label="Filter by trade type">
+                    <option value="all">All types ({trades.length})</option>
+                    {typeCounts.map(c => <option key={c.key} value={c.key}>{c.label} ({c.n})</option>)}
+                  </select>
+                </label>
+              )}
               <label className="flex items-center gap-1.5 text-xs text-base-content/60">
                 Sort
                 <select className="select select-xs select-bordered" value={sortBy} onChange={e => setSortBy(e.target.value as SortKey)}>
@@ -352,7 +368,7 @@ export default function MyTradesBeta({ initialSelectedId = null }: { initialSele
             // Positions | inspector with a draggable divider — widen the inspector while digging into one trade.
             <SplitPane storageKey="finoagent.beta.split.trades" defaultLeft={50}>
               <div className="min-w-0">
-                {shown.length === 0 ? <div className="text-center py-10 text-sm text-base-content/45">No positions in this state.</div>
+                {shown.length === 0 ? <div className="text-center py-10 text-sm text-base-content/45">No {activeType !== 'all' ? `${typeCounts.find(c => c.key === activeType)?.label ?? ''} ` : ''}positions{filter !== 'all' ? ' in this state' : ''}. {activeType !== 'all' && <button className="underline" onClick={() => setTypeFilter('all')}>Show all types</button>}</div>
                   : view === 'table'
                     ? <PositionTable groups={groups} rows={shown} states={states} pnlMap={pnlMap} selectedId={selectedId} onSelect={setSelectedId} />
                     : <Board rows={shown} states={states} pnlMap={pnlMap} selectedId={selectedId} onSelect={setSelectedId} />}
@@ -419,9 +435,22 @@ function PositionTable({ groups, rows, states, pnlMap, selectedId, onSelect }: {
   selectedId: number | null; onSelect: (id: number) => void;
 }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // The list sits in a draggable split pane, so optional columns follow the table's OWN width, not the viewport's.
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [w, setW] = useState(900);
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(es => setW(es[0].contentRect.width));
+    ro.observe(el); setW(el.getBoundingClientRect().width || 900);
+    return () => ro.disconnect();
+  }, []);
+  const showDeployed = w >= 560, showKept = w >= 660;
+  const nCols = 4 + (showDeployed ? 1 : 0) + (showKept ? 1 : 0);
   const renderRow = (t: SavedStrategyItem) => {
     const st = states[t.id]; const pnl = pnlMap[t.id];
     const sel = t.id === selectedId;
+    const dep = rowDeployed(t, pnl);
     return (
       <tr key={t.id} id={`beta-trade-${t.id}`} tabIndex={0}
         onClick={() => onSelect(t.id)} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(t.id); } }}
@@ -432,32 +461,42 @@ function PositionTable({ groups, rows, states, pnlMap, selectedId, onSelect }: {
             <span className="font-semibold">{t.ticker}</span>
             <span className="text-xs text-base-content/55 truncate">{tradeStructure(t).label}</span>
             {t.roll && (t.roll.count || 0) > 0 && <span className="text-[11px] text-warning" title="Rolled — one continuing campaign">↻{t.roll.count}</span>}
+            {!showDeployed && dep.value != null && <span className="text-[11px] text-base-content/45 tabular-nums ml-auto" title={dep.title}>{compactMoney(dep.value)}</span>}
           </div>
           <div className="text-xs text-base-content/45 truncate" title={st.headline}>{st.headline}</div>
         </td>
         <td className="px-2 py-2.5 whitespace-nowrap"><DteCell trade={t} st={st} /></td>
+        {showDeployed && (
+          <td className="px-2 py-2.5 whitespace-nowrap text-right" title={dep.title} data-testid="deployed-cell">
+            {dep.value != null
+              ? <div className="leading-tight"><div className="text-sm tabular-nums font-semibold">{compactMoney(dep.value)}</div><div className="text-[11px] text-base-content/45">{dep.tag}</div></div>
+              : <div className="leading-tight"><div className="text-base-content/30">—</div><div className="text-[11px] text-base-content/35">{dep.tag === '—' ? '' : dep.tag}</div></div>}
+          </td>
+        )}
         <td className="px-2 py-2.5 whitespace-nowrap text-right"><PnlCell trade={t} st={st} pnl={pnl} /></td>
-        <td className="pl-2 pr-3 py-2.5 whitespace-nowrap hidden md:table-cell">
+        {showKept && <td className="pl-2 pr-3 py-2.5 whitespace-nowrap">
           {st.capturedPct != null && st.capturedPct >= 0 && st.state !== 'noquote'
             ? <div className="min-w-[44px]"><div className="text-xs tabular-nums text-base-content/70">{st.capturedPct.toFixed(0)}%</div>
                 <div className="h-1 rounded-full bg-base-content/10 mt-1 overflow-hidden"><div className="h-full rounded-full bg-base-content/40" style={{ width: `${Math.max(0, Math.min(100, st.capturedPct))}%` }} /></div></div>
             : <span className="text-base-content/25" title={st.capturedPct != null && st.capturedPct < 0 ? `Under water: ${st.capturedPct.toFixed(0)}% of max profit` : undefined}>—</span>}
-        </td>
+        </td>}
       </tr>
     );
   };
 
   return (
-    <div className="rounded-xl border border-white/[0.07] bg-base-200/20 overflow-hidden">
+    <div ref={wrapRef} className="rounded-xl border border-white/[0.07] bg-base-200/20 overflow-hidden">
       <table className="w-full text-sm table-fixed">
         <colgroup>
-          <col style={{ width: 104 }} /><col /><col style={{ width: 84 }} /><col style={{ width: 112 }} /><col className="hidden md:table-column" style={{ width: 76 }} />
+          <col style={{ width: 104 }} /><col /><col style={{ width: 84 }} />{showDeployed && <col style={{ width: 92 }} />}<col style={{ width: 112 }} />{showKept && <col style={{ width: 76 }} />}
         </colgroup>
         <thead>
           <tr className="text-[11px] text-base-content/45 text-left">
             <th className="pl-3 pr-2 py-2 font-normal">State</th><th className="px-2 py-2 font-normal">Position</th>
-            <th className="px-2 py-2 font-normal">Expiry</th><th className="px-2 py-2 font-normal text-right">P&amp;L</th>
-            <th className="pl-2 pr-3 py-2 font-normal hidden md:table-cell">Kept</th>
+            <th className="px-2 py-2 font-normal">Expiry</th>
+            {showDeployed && <th className="px-2 py-2 font-normal text-right" title="Money tied up: Reg-T margin for options, stock held for covered calls, spread width for defined risk">Deployed</th>}
+            <th className="px-2 py-2 font-normal text-right">P&amp;L</th>
+            {showKept && <th className="pl-2 pr-3 py-2 font-normal">Kept</th>}
           </tr>
         </thead>
         <tbody>
@@ -466,12 +505,13 @@ function PositionTable({ groups, rows, states, pnlMap, selectedId, onSelect }: {
                 const meta = PURPOSE_META[g.p];
                 const priced = g.rows.filter(t => !['noquote', 'pending'].includes(states[t.id]?.state));
                 const sum = priced.reduce((s, t) => s + (effectivePnl(pnlMap[t.id], false) ?? 0), 0);
+                const gDeployed = g.rows.reduce((s, t) => s + (rowDeployed(t, pnlMap[t.id]).value ?? 0), 0);
                 const open = !collapsed.has(g.p);
                 return (
                   <React.Fragment key={g.p}>
                     <tr className="bg-base-200/60 border-t border-white/[0.06] cursor-pointer select-none"
                       onClick={() => setCollapsed(c => { const n = new Set(c); n.has(g.p) ? n.delete(g.p) : n.add(g.p); return n; })}>
-                      <td colSpan={5} className="px-3 py-1.5">
+                      <td colSpan={nCols} className="px-3 py-1.5">
                         <div className="flex items-center gap-2 text-xs">
                           <ChevronDown className={`w-3.5 h-3.5 text-base-content/40 transition-transform ${open ? '' : '-rotate-90'}`} />
                           <span className="text-base-content/60">{meta.icon}</span>
@@ -479,6 +519,7 @@ function PositionTable({ groups, rows, states, pnlMap, selectedId, onSelect }: {
                           <span className="text-base-content/45">{g.rows.length} position{g.rows.length === 1 ? '' : 's'}</span>
                           <span className="ml-auto flex items-center gap-2">
                             {priced.length < g.rows.length && <span className="text-base-content/40">{g.rows.length - priced.length} unpriced</span>}
+                            {gDeployed > 0 && <span className="text-base-content/50 tabular-nums" title="Σ deployed capital of these positions (Reg-T margin for options, stock held for covered calls)">deployed <span className="font-semibold text-base-content/70">{compactMoney(gDeployed)}</span></span>}
                             <span className={`font-semibold tabular-nums ${pnlTone(sum)}`}>{signedMoney(sum)}</span>
                           </span>
                         </div>
@@ -527,7 +568,7 @@ function Board({ rows, states, pnlMap, selectedId, onSelect }: {
                       {st.state === 'noquote' ? <span className="text-xs text-base-content/45">unpriced</span>
                         : <span className={`font-semibold tabular-nums text-sm ${pnlTone(v)}`}>{signedMoney(v)}</span>}
                     </div>
-                    <div className="text-xs text-base-content/50">{tradeStructure(t).label}{st.dte != null ? ` · ${st.dte}d left` : ''}</div>
+                    <div className="text-xs text-base-content/50">{tradeStructure(t).label}{st.dte != null ? ` · ${st.dte}d left` : ''}{(() => { const d = rowDeployed(t, pnlMap[t.id]); return d.value != null ? ` · ${compactMoney(d.value)} ${d.tag}` : ''; })()}</div>
                     {st.dte != null && (
                       <div className="h-1 rounded-full bg-base-content/10 mt-2 overflow-hidden">
                         <div className={`h-full rounded-full ${m.bar}`} style={{ width: `${timeUsedPct(t, st.dte)}%` }} />

@@ -9,22 +9,26 @@
  *   header   → grade · breached / watch / ok · CVaR · Θ · updated, one click to open
  *   Overview → vitals, the verdict, the guardrails (value vs limit, why, the fix) and what to do
  *   Fixes    → BY TRADE: each position once, with every guardrail its fix addresses and the risk it removes
- *   Stress   → crash & melt-up tiles, where a −20% month hits, vol × spot grid, assignment lab
- *   Concentration → by underlying, correlated clusters, sectors, macro loadings
- *   Hedge    → the budget-sized "start here" hedge, the menu, the melt-up caveat, the AI hedge plan (click only)
+ *   Stress   → crash & melt-up tiles, where a −20% month hits, vol × spot grid, assignment lab (+ how to read each)
+ *   Concentration → BetaBookConcentration: independent bets, risk vs capital vs income, what a gapping group does
+ *   Hedge    → BetaBookHedge: what drives the tail → an income-sized budget → only the hedges that cut CVaR → risk→hedge map
  *
- * Nothing the classic panel shows is dropped; every number is copied from the payload, never recomputed.
+ * Covered calls: the shares' gain always offsets the short call in a rally; a checkbox adds the shares' LOSSES on the
+ * downside (the backend ships both variants, so toggling is instant — no live-quote refresh).
+ * Every number is copied from the payload, never recomputed.
  */
 import React, { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  Loader2, ShieldAlert, AlertTriangle, TrendingDown, Layers, Umbrella, Compass, CheckCircle2, Sparkles, RefreshCw, ArrowRight, Grid3x3, ChevronDown,
+  Loader2, ShieldAlert, AlertTriangle, Layers, Compass, CheckCircle2, Sparkles, RefreshCw, ArrowRight, Grid3x3, ChevronDown,
 } from 'lucide-react';
-import { fetchBookTailRisk, fetchBookHedgeAdvice } from '../api';
+import { fetchBookTailRisk } from '../api';
 import type { BookTailRiskResult } from '../api';
 import { Accordion, Callout, Chip, SubHead, Tile, TONE, type Tone } from './BetaKit';
 import { timeAgo } from './BetaChrome';
 import { groupFixesByTrade, riskRemovedPct, type TradeFix, type FixVariant, type GroupedFixes } from './betaBookFixes';
+import BetaBookConcentration from './BetaBookConcentration';
+import BetaBookHedge from './BetaBookHedge';
 
 const money = (v: number | null | undefined, d = 0) =>
   v == null ? '—' : `${v < 0 ? '−' : ''}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
@@ -37,6 +41,12 @@ const LEVEL_TONE: Record<string, Tone> = { Dangerous: 'bad', Elevated: 'bad', Mo
 const STATUS_TONE: Record<string, Tone> = { breach: 'bad', warn: 'warn', pass: 'good' };
 const LEFT: Record<Tone, string> = { good: 'border-l-success/50', warn: 'border-l-warning/60', bad: 'border-l-error/60', info: 'border-l-info/60', accent: 'border-l-secondary/60', neutral: 'border-l-base-content/20' };
 
+const FOLDER_LABEL: Record<string, string> = { income: 'Income', hedge: 'Hedge', trade: 'Trade', managed_floor: 'Managed Floor', managed_buffer: 'Managed Buffer', dual_directional: 'Dual Directional', other: 'Other', untagged: 'Untagged' };
+/** "2 Hedge, 1 Trade" — the folders Manage Book leaves out. */
+const excludedText = (ex: Record<string, number>) => Object.entries(ex).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${FOLDER_LABEL[k] || k}`).join(', ');
+
+const LS_STOCK = 'finoagent.beta.book.stockDownside';
+
 type TabId = 'overview' | 'fixes' | 'stress' | 'concentration' | 'hedge';
 type ScoreCard = NonNullable<BookTailRiskResult['risk_scorecard']>;
 
@@ -48,8 +58,28 @@ function Overview({ data, grouped, onOpenFixes }: { data: BookTailRiskResult; gr
   const passed = sc?.checks.filter(c => c.status === 'pass') ?? [];
   return (
     <div className="space-y-4">
+      {data.scope && (
+        <Callout tone="info" icon={<Layers className="w-3.5 h-3.5" />}>
+          <b>Income trades only</b> — {data.scope.included} trade{data.scope.included === 1 ? '' : 's'} tagged Income{data.coverage ? <>, <b>{data.coverage.analysed} analysed</b></> : ' feed every number here'}.
+          {data.coverage && data.coverage.skipped.length > 0 && (
+            <> Left out of the numbers: {data.coverage.skipped.map(k => <span key={`${k.trade_id}`} className="font-mono">{k.ticker}</span>).reduce<ReactNode[]>((a, x, i) => (i ? [...a, ', ', x] : [x]), [])} — {data.coverage.skipped[0].reason}.</>
+          )}
+          {data.scope.excluded_total > 0
+            ? <> Not included: <b>{excludedText(data.scope.excluded)}</b>. A hedge or directional trade you hold in another folder is not offsetting (or adding to) this risk.</>
+            : <> Nothing else is open in other folders.</>}
+          {(data.scope.excluded.untagged ?? 0) > 0 && <> Untagged trades are not counted — tag them Income in My Trades to include them.</>}
+        </Callout>
+      )}
+      {data.data_quality && (data.data_quality.solved > 0 || data.data_quality.fallback > 0 || data.data_quality.indicative) && (
+        <Callout tone={data.data_quality.fallback > 0 ? 'warn' : 'info'} icon={<AlertTriangle className="w-3.5 h-3.5" />}>
+          <b>{data.data_quality.indicative ? 'Indicative prices — the market looks closed.' : 'Some quotes were unusable.'}</b>{' '}
+          The option chain's own implied vol was missing or inconsistent for {data.data_quality.solved} of {data.data_quality.legs} legs, so each was re-derived from that leg's price.
+          {data.data_quality.fallback > 0 && <> {data.data_quality.fallback} leg{data.data_quality.fallback === 1 ? ' had' : 's had'} no usable price or IV and use a default (the trade's own IV, else 30%).</>}
+          {' '}Greeks and tails are good estimates; press Refresh during market hours for live quotes.
+        </Callout>
+      )}
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
-        <Tile label="Capital" value={money(data.book_capital)} title={data.capital_basis} />
+        <Tile label="Capital" value={money(data.book_capital)} sub="short-strike notional" title={data.capital_basis} />
         <Tile label="Carry" value={data.carry_yield_pct != null ? `${data.carry_yield_pct}%/yr` : '—'} sub="θ yield" tone="good" />
         <Tile label="Net θ / day" value={money(data.net_theta)} tone={(data.net_theta ?? 0) >= 0 ? 'good' : 'bad'} sub={data.theta_net_liq_pct != null ? `${data.theta_net_liq_pct}%/day` : undefined} />
         <Tile label="CVaR · 1 month" value={money(data.cvar_95)} tone="warn" sub={data.cvar_capital_pct != null ? `${data.cvar_capital_pct}% of capital` : undefined} />
@@ -140,9 +170,13 @@ function FixVariantBlock({ tf, v, multi, onManage, toEvaluate }: { tf: TradeFix;
       {multi && <div className="flex items-center gap-1.5 flex-wrap text-xs text-base-content/55">This fix addresses {v.checks.map(c => <Chip key={c.key} tone={STATUS_TONE[c.status]}>{c.label}</Chip>)}</div>}
       <div className="text-xs font-mono text-base-content/60 leading-snug">{rec.legs}</div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        <Tile label="Risk now" value={money(v.tailBefore)} tone="bad" sub="at the stress move" />
+        <Tile label="Risk now" value={money(v.tailBefore)} tone="bad"
+          sub={v.stress ? `at ${sgn(v.stress.name_move_pct, true)}% (${sgn(v.stress.market_move_pct, true)}% mkt × β ${v.stress.beta})` : 'at the stress move'}
+          title={v.stress ? `Full Black-Scholes reprice of THIS position if the market moves ${sgn(v.stress.market_move_pct, true)}%, the name moves β (${v.stress.beta}) × that = ${sgn(v.stress.name_move_pct, true)}%, and vol shifts ${sgn(v.stress.vol_shock_pts, true)} pts. Time unchanged. P&L vs today's value; premium already collected is not netted.` : undefined} />
         <Tile label="After fix" value={money(rec.tail_after)} tone="good" sub={removed != null ? `−${removed.toFixed(0)}% of the loss` : undefined} />
-        <Tile label="Cost" value={money(rec.cost)} tone="warn" />
+        <Tile label="Cost" value={money(rec.cost)} tone={rec.pricing === 'model' ? 'bad' : 'warn'}
+          sub={rec.unit_price != null ? (rec.pricing === 'model' ? `model $${rec.unit_price}/sh — no live quote` : `${rec.pricing} $${rec.unit_price}/sh`) : undefined}
+          title="What the leg costs at the live ask captured when the book was last refreshed (mid if there is no ask). Only a strike with no quote in the chain falls back to a model price." />
         <Tile label="Premium kept" value={money(rec.premium_kept)} />
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -208,8 +242,36 @@ function Fixes({ grouped, onManage, toEvaluate }: { grouped: GroupedFixes; onMan
   );
 }
 
+/** "APP and JBL are 60% of this loss — cap, roll or hedge those first." */
+function byNameRead(rows: { ticker: string; pnl: number }[]): string {
+  const losers = rows.filter(r => r.pnl < 0).sort((a, b) => a.pnl - b.pnl);
+  const tot = losers.reduce((s, r) => s + r.pnl, 0);
+  if (losers.length === 0 || tot >= 0) return 'no name loses in a −20% month — the risk is on the other side (see the melt-up tiles).';
+  const top = losers.slice(0, 2); const share = top.reduce((s, r) => s + r.pnl, 0) / tot * 100;
+  return `${top.map(r => r.ticker).join(' and ')} ${top.length === 1 ? 'is' : 'are'} ${share.toFixed(0)}% of this loss — cap, roll or hedge ${top.length === 1 ? 'that one' : 'those'} first (Fixes tab). A short, even spread of small bars means no single name needs fixing.`;
+}
+
+/** A deterministic read of the vol × spot grid: which side is worse (with vol moving the way it really does), and how much vol alone costs. */
+function gridRead(grid: NonNullable<BookTailRiskResult['scenario_grid']>, capital: number | undefined): string | null {
+  if (!grid || grid.rows.length === 0 || grid.vol_shocks.length === 0) return null;
+  const hi = grid.vol_shocks.length - 1;
+  const down = grid.rows.filter(r => r.move_pct < 0).map(r => ({ move: r.move_pct, v: r.cells[hi].pnl })).sort((a, b) => a.v - b.v)[0];
+  const up = grid.rows.filter(r => r.move_pct > 0).map(r => ({ move: r.move_pct, v: r.cells[0].pnl })).sort((a, b) => a.v - b.v)[0];
+  if (!down || !up) return null;
+  const flat = grid.rows.find(r => r.move_pct === 0); const i10 = grid.vol_shocks.indexOf(10);
+  const vega10 = flat && i10 >= 0 ? flat.cells[i10].pnl : null;
+  const ratio = Math.abs(up.v) / Math.max(1, Math.abs(down.v));
+  const verdict = ratio >= 1.5 ? `The rally is ${ratio.toFixed(1)}× worse — the upside is your tail: cap the short calls or buy call spreads; an index put does nothing for it.`
+    : ratio <= 1 / 1.5 ? `The selloff is ${(1 / ratio).toFixed(1)}× worse — the downside is your tail: put spreads / a vol hedge fit.`
+    : 'Both sides are of similar size — hedge the one with the cheaper cover.';
+  const vegaText = vega10 != null
+    ? ` Vol on its own (+10 pts, spot flat) costs ${money(vega10)}${capital ? ` (${Math.abs(vega10 / capital * 100).toFixed(1)}% of capital)` : ''} — ${capital && Math.abs(vega10 / capital) < 0.01 ? 'small; not worth a dedicated vol hedge' : 'worth sizing a vol hedge against'}.`
+    : '';
+  return `Pair each move with the vol it really brings — selloffs with vol UP (${sgn(down.move, true)}% & +${grid.vol_shocks[hi]}v: ${money(down.v)}), rallies with vol DOWN (${sgn(up.move, true)}% & ${sgn(grid.vol_shocks[0], true)}v: ${money(up.v)}). ${verdict}${vegaText}`;
+}
+
 // ── Stress ───────────────────────────────────────────────────────────────────
-function Stress({ data }: { data: BookTailRiskResult }) {
+function Stress({ data, withStock }: { data: BookTailRiskResult; withStock: boolean }) {
   const scen = data.crash_scenarios || [];
   const maxLoss = Math.max(1, ...scen.filter(c => c.pnl < 0).map(c => Math.abs(c.pnl)));
   const rows = (data.loss_by_name || []).filter(r => Math.abs(r.pnl) >= 1);
@@ -235,7 +297,14 @@ function Stress({ data }: { data: BookTailRiskResult }) {
             );
           })}
         </div>
-        <p className="text-xs text-base-content/50 mt-2 leading-relaxed">Full reprice of the <b>option overlay only</b> — the shares behind covered calls/collars are a separate core holding, not counted. So short calls <b>print</b> in a selloff (green) and the real risk is the <b>melt-up</b> (red). Stock is used only to mark a call covered and to size assignment capital.</p>
+        <p className="text-xs text-base-content/50 mt-2 leading-relaxed">
+          Each name moves the scenario × its β, vol shifts as shown, and every option leg is fully repriced (Black-Scholes at the quoted IV; an instant move, no time decay).
+          {data.has_covered_stock
+            ? <> <b>Covered calls:</b> the shares' gain always offsets the short call in a rally, so a covered call is not shown as a melt-up loss. {withStock
+              ? <>Downside moves <b>include the shares' losses</b> on covered positions.</>
+              : <>Downside moves count the <b>option overlay only</b> — the shares behind covered calls are a separate core holding (tick “Include stock losses” above to add them), so a covered call looks like it profits in a selloff.</>}</>
+            : <> Short calls <b>print</b> in a selloff (green); the real risk is the <b>melt-up</b> (red).</>}
+        </p>
       </div>
 
       {rows.length > 0 && (
@@ -253,7 +322,10 @@ function Stress({ data }: { data: BookTailRiskResult }) {
               );
             })}
           </div>
-          <p className="text-xs text-base-content/45 mt-1.5">A red bar loses, green gains. Sums to the −20% tile above.</p>
+          <div className="text-xs text-base-content/50 mt-1.5 leading-relaxed space-y-1">
+            <p><b>How it's calculated:</b> for each name, a −20% market move × its β (a β 1.4 name falls 28%) with vol +15 pts, then a full reprice of that name's option legs; names are summed from their trades and the bars add up to the −20% tile above. Red loses, green gains.</p>
+            <p className="flex items-start gap-1.5"><Compass className="w-3.5 h-3.5 mt-0.5 shrink-0 text-secondary" /><span><b>How to use it:</b> {byNameRead(rows)}</span></p>
+          </div>
         </div>
       )}
 
@@ -278,7 +350,10 @@ function Stress({ data }: { data: BookTailRiskResult }) {
               </tbody>
             </table>
           </div>
-          <p className="text-xs text-base-content/45 mt-1.5 leading-relaxed">Read <b>down a column</b> for gamma (a move either way), <b>across a row</b> for vega (loss as vol rises). Deepest-red cell = your worst corner.</p>
+          <div className="text-xs text-base-content/50 mt-1.5 leading-relaxed space-y-1">
+            <p><b>How to read it:</b> each cell is the option-overlay P&amp;L if the market moves by the row (× each name's β) and every leg's IV shifts by the column, repriced instantly. <b>Down a column</b> = gamma (a bigger move costs disproportionately more); <b>across a row</b> = vega (loss as vol rises); the 0% / 0v cell is $0 by construction.</p>
+            {gridRead(grid, data.book_capital) && <p className="flex items-start gap-1.5"><Compass className="w-3.5 h-3.5 mt-0.5 shrink-0 text-secondary" /><span><b>How to use it:</b> {gridRead(grid, data.book_capital)}</span></p>}
+          </div>
         </div>
       )}
 
@@ -295,7 +370,7 @@ function Stress({ data }: { data: BookTailRiskResult }) {
             )}
             <div className="overflow-x-auto rounded-lg border border-white/[0.06]">
               <table className="w-full text-xs">
-                <thead><tr className="text-base-content/45 text-left"><th className="px-3 py-1.5 font-normal">Market</th><th className="px-3 font-normal">Book P&amp;L</th><th className="px-3 font-normal" title="Cash to take delivery on ITM short puts (strike ×100)">Put assignment</th><th className="px-3 font-normal" title="Intrinsic to deliver / buy back ITM short calls">Call cover</th><th className="px-3 font-normal">ITM</th></tr></thead>
+                <thead><tr className="text-base-content/45 text-left"><th className="px-3 py-1.5 font-normal" title="Market move; each name moves this × its β">Market (× β)</th><th className="px-3 font-normal">Book P&amp;L</th><th className="px-3 font-normal" title="Cash to take delivery on in-the-money NAKED short puts (strike ×100 × contracts)">Put assignment</th><th className="px-3 font-normal" title="Intrinsic to deliver / buy back in-the-money NAKED short calls">Call cover</th><th className="px-3 font-normal" title="Naked short put (P) and call (C) CONTRACTS in the money at that move">ITM contracts</th></tr></thead>
                 <tbody>
                   {data.assignment_ladder!.map((r, i) => (
                     <tr key={i} className={`border-t border-white/[0.05] ${Math.abs(r.move_pct) <= 5 ? 'bg-base-content/[0.05]' : ''}`}>
@@ -309,179 +384,10 @@ function Stress({ data }: { data: BookTailRiskResult }) {
                 </tbody>
               </table>
             </div>
-            <p className="text-xs text-base-content/45 leading-relaxed"><b>Put assignment</b> = cash to buy the shares you're put (strike ×100); <b>Call cover</b> = intrinsic to deliver/buy back at that move. Only the binding wing is ITM at a given move — a strangle never demands both at once. Shaded row ≈ spot today.</p>
+            <p className="text-xs text-base-content/45 leading-relaxed"><b>Put assignment</b> = cash to buy the shares you're put (strike ×100 × contracts); <b>Call cover</b> = intrinsic to deliver/buy back at that move. <b>ITM contracts</b>: <b>P</b> = naked short puts, <b>C</b> = naked short calls that are in the money at that move (e.g. “12P” = 12 contracts). Covered calls and spread-protected shorts are excluded — they are covered, or capped at the spread width, so they never demand this cash. The market column is the move × each name's β. Shaded row ≈ spot today.</p>
           </div>
         </Accordion>
       )}
-    </div>
-  );
-}
-
-// ── Concentration ────────────────────────────────────────────────────────────
-function Concentration({ data }: { data: BookTailRiskResult }) {
-  const conc = data.concentration || [];
-  const fe = data.factor_exposure;
-  const clusters = (fe?.clusters || []).filter(c => c.tickers.length >= 2);
-  const sectors = (fe?.sectors || []).filter(s => s.capital > 0).slice(0, 8);
-  const macro = fe?.macro || [];
-  if (!conc.length && !clusters.length && sectors.length <= 1 && !macro.length) return <Callout tone="good" icon={<CheckCircle2 className="w-4 h-4" />}>No concentration to report.</Callout>;
-  const maxCap = Math.max(1, ...sectors.map(s => s.capital));
-  return (
-    <div className="space-y-4">
-      {conc.length > 0 && (
-        <div>
-          <SubHead hint="share of book gamma">By underlying</SubHead>
-          <div className="space-y-2">
-            {conc.map(c => (
-              <div key={c.ticker} className={`rounded-xl border p-3 ${c.flags.length ? 'border-warning/30 bg-warning/[0.05]' : 'border-white/[0.07] bg-base-100/20'}`}>
-                <div className="flex items-baseline gap-2 flex-wrap text-[13px]">
-                  <span className="font-mono font-semibold">{c.ticker}</span>
-                  {c.beta != null && <span className={`text-xs ${c.beta >= 1.3 ? 'text-warning' : 'text-base-content/45'}`}>β {c.beta}</span>}
-                  <span className="text-xs text-base-content/45">{c.trades} trade{c.trades !== 1 ? 's' : ''} · {c.short_legs} short leg{c.short_legs !== 1 ? 's' : ''}</span>
-                  <span className="ml-auto font-mono text-xs text-base-content/65">{c.gamma_share_pct}% of book Γ</span>
-                </div>
-                {c.flags.map((f, i) => <div key={i} className="text-xs text-warning flex items-start gap-1.5 mt-1.5"><AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />{f}</div>)}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      {(clusters.length > 0 || sectors.length > 1 || macro.length > 0) && (
-        <div className="space-y-3">
-          <SubHead hint="measured ρ · GICS — not opinion"><span className="inline-flex items-center gap-1.5"><Layers className="w-3.5 h-3.5" /> Factor &amp; correlation — your real concentration</span></SubHead>
-          {clusters.length > 0 && (
-            <div className="space-y-1.5">
-              {clusters.map((c, i) => (
-                <div key={i} className="flex items-center gap-2 text-[13px] rounded-lg bg-warning/[0.06] border border-warning/25 px-3 py-2">
-                  <AlertTriangle className="w-3.5 h-3.5 text-warning shrink-0" /><span className="font-semibold">{c.tickers.join(' · ')}</span>
-                  {c.avg_rho != null && <span className="text-warning text-xs">move together ρ {c.avg_rho}</span>}
-                  <span className="ml-auto text-base-content/55 tabular-nums text-xs">{money(c.capital)} at work</span>
-                </div>
-              ))}
-              <p className="text-xs text-base-content/50">These names are <b>one bet</b> — a shock to any of them hits the whole cluster at once. That's the concentration a per-name view hides.</p>
-            </div>
-          )}
-          {sectors.length > 1 && (
-            <div>
-              <div className="text-[11px] text-base-content/45 mb-1.5">Capital by sector</div>
-              <div className="space-y-2">
-                {sectors.map(s => (
-                  <div key={s.sector}>
-                    <div className="flex items-baseline gap-2 text-xs"><span className="truncate flex-1">{s.sector}</span><span className="text-base-content/45 font-mono">{s.n}</span><span className="tabular-nums font-mono w-20 text-right">{money(s.capital)}</span></div>
-                    <div className="h-1.5 rounded-full bg-base-content/10 overflow-hidden my-1"><div className="h-full rounded-full bg-secondary/60" style={{ width: `${Math.max(3, (s.capital / maxCap) * 100)}%` }} /></div>
-                    {(s.tickers?.length ?? 0) > 0 && <div className="font-mono text-[11px] text-base-content/45 truncate" title={s.tickers.join(' · ')}>{s.tickers.join(' · ')}</div>}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          {macro.length > 0 && (
-            <div>
-              <div className="text-[11px] text-base-content/45 mb-1.5">Macro the book loads on (measured ρ)</div>
-              <div className="flex flex-wrap gap-1.5">{macro.map(m => <Chip key={m.factor} tone={Math.abs(m.rho) >= 0.6 ? 'warn' : 'neutral'} title={`Book return vs ${m.label}: measured ρ = ${sgn(m.rho)}`}>{m.label} {sgn(m.rho, true)}</Chip>)}</div>
-              <p className="text-xs text-base-content/45 mt-1.5">A move in these factors pushes the whole book one way — that's your shared driver.</p>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Hedge ────────────────────────────────────────────────────────────────────
-function HedgeHero({ data }: { data: BookTailRiskResult }) {
-  const [copied, setCopied] = useState(false);
-  const menu = data.hedge_menu || [];
-  const rec = menu.find(c => c.recommended) || menu.find(c => c.cost_effective) || menu[0];
-  if (!rec) return null;
-  const before = Math.abs(data.crash_scenarios?.find(s => Math.abs(s.move_pct + 0.2) < 0.001)?.pnl ?? 0);
-  const after = Math.max(0, before - (rec.crash_payoff_20 || 0));
-  const carry = data.annual_income || 0;
-  const budgetPct = carry > 0 ? (rec.annual_bleed / carry) * 100 : null;
-  const lo = rec.long_strike ?? rec.long_put, sh = rec.short_strike ?? rec.short_put;
-  const isVixy = rec.instrument === 'VIXY';
-  const inst = rec.instrument ?? 'SPX';
-  const strikes = lo != null ? `${lo}${sh ? `/${sh}` : ''}` : '';
-  const size = isVixy ? `${money(rec.sleeve_capital)} cash` : `${rec.contracts}× ${inst} ${strikes}`.trim();
-  const ticket = isVixy
-    ? `Dynamic VIXY sleeve — ${money(rec.sleeve_capital)} cash, deploy on VIX backwardation (~${money(rec.annual_bleed)}/yr drag)`
-    : `BUY ${rec.contracts}× ${inst} ${strikes} put spread (~${rec.dte_days}d) — tail hedge, ~${money(rec.annual_bleed)}/yr`;
-  const stage = async () => { try { await navigator.clipboard.writeText(ticket); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* clipboard blocked */ } };
-  return (
-    <div className="rounded-2xl border border-success/30 bg-success/[0.06] p-4 space-y-3">
-      <div className="flex items-center gap-2 flex-wrap"><Chip tone="good">Start here</Chip><span className="text-sm font-semibold">{rec.label}</span><span className="ml-auto text-xs text-base-content/50">{rec.dte_days ? `~${rec.dte_days}d` : 'signal-based'}</span></div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        <Tile label="Trade" value={size} />
-        <Tile label="Cost" tone="warn" value={`${money(rec.annual_bleed)}/yr${isVixy ? '*' : ''}`} sub={budgetPct != null ? `${budgetPct.toFixed(0)}% of carry` : undefined} />
-        <Tile label="−20% month" value={<span><span className="text-error">{money(-before)}</span> → <span className="text-success">{money(-after)}</span></span>} sub={rec.offsets_pct != null ? `${rec.offsets_pct}% capped` : undefined} />
-        <Tile label="Compounding" tone={rec.cost_effective ? 'good' : undefined} value={`${sgn(rec.cagr_lift_pct, true)}% CAGR`} sub={rec.cost_effective ? 'pays for itself' : 'insurance'} />
-      </div>
-      <div className="flex items-center gap-2 flex-wrap">
-        <button onClick={stage} className={`btn btn-sm gap-1.5 normal-case ${copied ? 'btn-success' : 'btn-success btn-outline'}`}>
-          {copied ? <><CheckCircle2 className="w-4 h-4" /> Ticket copied</> : <>Stage {inst} trade <ArrowRight className="w-4 h-4" /></>}
-        </button>
-        <span className="text-xs text-base-content/45">copies the exact ticket to paste into your broker</span>
-      </div>
-    </div>
-  );
-}
-
-function Hedge({ data, quoteSource }: { data: BookTailRiskResult; quoteSource: string }) {
-  const [advice, setAdvice] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const menu = data.hedge_menu || [];
-  const cs = data.crash_scenarios || [];
-  const wd = Math.min(0, ...cs.filter(s => s.move_pct < 0).map(s => s.pnl));
-  const wu = cs.filter(s => s.move_pct > 0).reduce<{ pnl: number; label: string } | null>((m, s) => (m == null || s.pnl < m.pnl ? { pnl: s.pnl, label: s.label } : m), null);
-  const meltUp = !!wu && Math.abs(wu.pnl) > Math.abs(wd);
-  const ask = async () => {
-    setLoading(true); setErr(null);
-    try { const r = await fetchBookHedgeAdvice(quoteSource); if (r.error) setErr(r.error); else setAdvice(r.advice || null); }
-    catch (e: any) { setErr(e?.message || 'Failed to get hedging strategy'); } finally { setLoading(false); }
-  };
-  return (
-    <div className="space-y-4">
-      {menu.length > 0 && <HedgeHero data={data} />}
-      {meltUp && wu && <Callout tone="warn" icon={<AlertTriangle className="w-3.5 h-3.5" />}>Your <b>bigger tail is the upside</b> — a {wu.label} loses {money(wu.pnl)} vs {money(wd)} for the worst downside. The hedges below protect the <b>downside</b>; for the squeeze, cap short calls / add call spreads or a small long-call (see the Fixes tab).</Callout>}
-      {menu.length > 0 && (
-        <div className="space-y-2">
-          <SubHead hint={`~${menu[0].dte_days}d · ranked by CVaR reduced per $/yr, then Spitznagel cost-vs-drag`}>SPX puts + VIX black-swan</SubHead>
-          {menu.map((c, i) => {
-            const lo = c.long_strike ?? c.long_put, sh = c.short_strike ?? c.short_put; const isVixy = c.instrument === 'VIXY';
-            const tone: Tone = c.instrument === 'VIX' ? 'accent' : isVixy ? 'info' : 'neutral';
-            return (
-              <div key={i} className={`rounded-xl border p-3 ${c.recommended ? 'border-success/40 bg-success/[0.05]' : 'border-white/[0.07] bg-base-100/20'}`} title={isVixy ? c.signal : undefined}>
-                <div className="flex items-center gap-2 flex-wrap">
-                  {c.recommended && <CheckCircle2 className="w-3.5 h-3.5 text-success" />}
-                  <Chip tone={tone}>{c.instrument ?? 'SPX'}</Chip><span className="text-[13px] font-semibold">{c.label}</span>
-                  <span className="ml-auto font-mono text-xs text-base-content/60">{isVixy ? `${money(c.sleeve_capital)} cash` : (lo != null ? `${lo}${sh ? `/${sh}` : ''}` : '—')}{!isVixy && c.contracts != null ? ` · ×${c.contracts}` : ''}</span>
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-2 mt-2.5">
-                  <div><div className="text-[11px] text-base-content/45">Cost / yr</div><div className={`text-xs font-semibold tabular-nums ${isVixy ? 'text-success' : 'text-warning'}`}>{money(c.annual_bleed)}{isVixy ? '*' : ''}</div></div>
-                  <div><div className="text-[11px] text-base-content/45">Offsets −20%</div><div className="text-xs font-semibold tabular-nums">{c.offsets_pct != null ? `${c.offsets_pct}%` : '—'}</div></div>
-                  <div><div className="text-[11px] text-base-content/45" title="Book CVaR-95 reduction">CVaR cut</div><div className="text-xs font-semibold tabular-nums text-success">{money(c.cvar_reduction)}</div></div>
-                  <div><div className="text-[11px] text-base-content/45" title="Spitznagel: compound-growth lift">CAGR</div><div className={`text-xs font-semibold tabular-nums ${c.cagr_lift_pct >= 0 ? 'text-success' : 'text-error'}`}>{sgn(c.cagr_lift_pct, true)}%</div></div>
-                </div>
-              </div>
-            );
-          })}
-          <details className="text-xs text-base-content/45">
-            <summary className="cursor-pointer select-none">How to read the menu</summary>
-            <p className="mt-1.5 leading-relaxed"><b className="text-info">SPX puts</b> = linear crash protection. <b className="text-secondary">VIX call spreads</b> = cheap convexity that only pays when vol EXPLODES (a −20% month implies VIX ≈ {menu.find(c => c.instrument === 'VIX')?.vix_at_minus20 ?? '—'}). <b className="text-accent">Dynamic VIXY</b> = a cash sleeve deployed into VIXY ONLY when the VIX term structure inverts (backwardation), so it avoids permanent roll-decay — <b>*near-zero cost</b>, but it ties up cash and its payoff is haircut ~35% for signal/gap lag. A <b>positive CAGR</b> means capping the crash lifts compound growth; negative = pure insurance.</p>
-          </details>
-        </div>
-      )}
-      {data.hedge_note && <div className="text-xs text-base-content/60">{data.hedge_note}</div>}
-
-      <div className="rounded-2xl border border-secondary/25 bg-secondary/[0.04] p-4 space-y-3">
-        <div className="flex items-center gap-2"><Sparkles className="w-4 h-4 text-secondary" /><span className="text-sm font-semibold">AI hedging strategy · whole book</span>
-          <button className="btn btn-secondary btn-sm gap-1.5 ml-auto" disabled={loading} onClick={ask}>{loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}{loading ? 'Analyzing…' : advice ? 'Regenerate' : 'Get AI hedge plan'}</button>
-        </div>
-        {err && <Callout tone="bad" icon={<AlertTriangle className="w-3.5 h-3.5" />}>{err}</Callout>}
-        {advice && <div className="text-[13px] whitespace-pre-wrap leading-relaxed">{advice}</div>}
-        {!advice && !err && !loading && <p className="text-xs text-base-content/55 leading-relaxed">Sends only computed data — greeks, CVaR, crash P&amp;Ls, the per-name loss waterfall, and the <b>deterministic factor read</b> (GICS sectors, measured-ρ correlated clusters, macro loadings) — plus the hedge menu. The model reasons over your real concentration to say what to trim/hedge; it does no arithmetic and can't invent a correlation the data didn't measure. It runs only when you press the button.</p>}
-      </div>
     </div>
   );
 }
@@ -493,15 +399,19 @@ export default function BetaBookRisk({ quoteSource, onManageTrade }: { quoteSour
   const [tab, setTab] = useState<TabId>('overview');
   const [loading, setLoading] = useState(false);       // initial STORED-snapshot load
   const [refreshing, setRefreshing] = useState(false); // user-triggered live recompute
-  const [data, setData] = useState<BookTailRiskResult | null>(null);
+  const [raw, setRaw] = useState<BookTailRiskResult | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // "Include stock losses" (covered calls, downside): remembered per browser; the backend ships both variants.
+  const [withStock, setWithStockState] = useState<boolean>(() => { try { return localStorage.getItem(LS_STOCK) === '1'; } catch { return false; } });
+  const setWithStock = (v: boolean) => { setWithStockState(v); try { localStorage.setItem(LS_STOCK, v ? '1' : '0'); } catch { /* private mode */ } };
+  const data = useMemo(() => (raw && withStock && raw.with_stock_downside ? { ...raw, ...raw.with_stock_downside } as BookTailRiskResult : raw), [raw, withStock]);
 
   // On mount: the STORED snapshot (no recompute), so the header shows last-known numbers immediately.
   useEffect(() => {
     let alive = true;
     (async () => {
       setLoading(true);
-      try { const r = await fetchBookTailRisk(quoteSource, false); if (alive && r.stored && !r.error) setData(r); }
+      try { const r = await fetchBookTailRisk(quoteSource, false); if (alive && r.stored && !r.error) setRaw(r); }
       catch { /* no stored snapshot — the user can Analyze */ }
       finally { if (alive) setLoading(false); }
     })();
@@ -511,7 +421,7 @@ export default function BetaBookRisk({ quoteSource, onManageTrade }: { quoteSour
   // Refresh = recompute from live quotes AND overwrite the stored snapshot.
   const refresh = async () => {
     setRefreshing(true); setErr(null); setOpen(true);
-    try { const r = await fetchBookTailRisk(quoteSource, true); if (r.error) setErr(r.error); else setData(r); }
+    try { const r = await fetchBookTailRisk(quoteSource, true); if (r.error) setErr(r.error); else setRaw(r); }
     catch (e: any) { setErr(e?.message || 'Failed'); }
     finally { setRefreshing(false); }
   };
@@ -544,12 +454,13 @@ export default function BetaBookRisk({ quoteSource, onManageTrade }: { quoteSour
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-sm font-semibold">Book risk</span>
+              <Chip tone="accent" title={data?.scope ? `${data.scope.included} Income trades${data.scope.excluded_total > 0 ? ` · not included: ${excludedText(data.scope.excluded)}` : ''}` : 'Only trades tagged Income are analysed'}>Income only</Chip>
               {sc && <Chip tone={gradeTone}>{sc.grade}</Chip>}
               {sc && <span className="text-xs text-base-content/55">{sc.n_breach > 0 ? `${sc.n_breach} breached` : '0 breached'} · {sc.n_warn} watch · {passed} ok</span>}
             </div>
             <div className="text-xs text-base-content/45 truncate">
               {data ? `CVaR 1-mo ${money(data.cvar_95)}${data.cvar_capital_pct != null ? ` (${data.cvar_capital_pct}% of capital)` : ''} · θ ${money(data.net_theta)}/day${data.computed_at ? ` · updated ${timeAgo(data.computed_at)}` : ''}`
-                : 'Guardrails · stress tests · concentration · the cheapest fix per breach'}
+                : 'Your Income trades · guardrails · stress tests · concentration · the cheapest fix per breach'}
             </div>
           </div>
         </button>
@@ -584,11 +495,25 @@ export default function BetaBookRisk({ quoteSource, onManageTrade }: { quoteSour
                 ))}
               </div>
               <div className="p-4">
+                {raw?.has_covered_stock && (
+                  <label className="flex items-start gap-2.5 mb-4 rounded-lg border border-white/[0.08] bg-base-100/20 px-3 py-2 cursor-pointer">
+                    <input type="checkbox" className="checkbox checkbox-sm mt-0.5" checked={withStock} onChange={e => setWithStock(e.target.checked)} aria-label="Include stock losses on covered calls" />
+                    <span className="text-xs leading-relaxed">
+                      <b className="text-[13px]">Include stock losses on covered calls (downside)</b>
+                      <span className="block text-base-content/55">
+                        {withStock
+                          ? `On: a selloff also counts the loss on the ~${money(raw.stock_notional)} of shares behind your covered calls — CVaR, the tiles, fixes and hedges all use it.`
+                          : `Off: a selloff counts the option overlay only. In a rally the shares' gain always offsets the short call, so covered calls never show a melt-up loss either way.`}
+                      </span>
+                    </span>
+                  </label>
+                )}
                 {tab === 'overview' && <Overview data={data} grouped={grouped} onOpenFixes={() => setTab('fixes')} />}
                 {tab === 'fixes' && <Fixes grouped={grouped} onManage={onManageTrade} toEvaluate={toEvaluate} />}
-                {tab === 'stress' && <Stress data={data} />}
-                {tab === 'concentration' && <Concentration data={data} />}
-                {tab === 'hedge' && <Hedge data={data} quoteSource={quoteSource} />}
+                {tab === 'stress' && <Stress data={data} withStock={withStock} />}
+                {tab === 'concentration' && <BetaBookConcentration data={data} />}
+                {tab === 'hedge' && <BetaBookHedge data={data} quoteSource={quoteSource} withStock={withStock && !!raw?.with_stock_downside}
+                  fixes={grouped.trades.length ? { trades: grouped.trades.length, cost: grouped.trades.reduce((s, t) => s + (t.variants[0]?.rec.cost ?? 0), 0) } : null} />}
                 <p className="text-[11px] text-base-content/35 mt-4 leading-relaxed">
                   {data.assumptions?.beta}; {data.assumptions?.tail}; market vol {data.assumptions?.mkt_vol_pct}%; VaR/CVaR over {data.horizon}; crash prob {data.assumptions?.crash_prob_annual_pct}%/yr; hedge rolled {data.assumptions?.hedge_rolls_per_year}×/yr.
                   {' '}θ/Net-Liq &amp; carry use committed capital ({money(data.book_capital)}, Σ cash-secured notional) as the net-liq base, and annualize decay at current pace. Option-layer greeks only. Model estimate — not an order.

@@ -15,7 +15,7 @@ import type { Candle, CandleInterval } from '../../types';
 import { COLOR, yRange, inRange, labelVisible, type ChartLevel } from './betaTaChartModel';
 import { layoutGutter, type GutterPlaced } from './betaTaModel';
 
-export const GUTTER_W = 126;
+export const GUTTER_W = 134;
 const LABEL_GAP = 15;
 const DEFAULT_BARS: Record<CandleInterval, number> = { '15m': 130, '1h': 150, '1d': 120, '1wk': 104 };
 const IV_LABEL: Record<CandleInterval, string> = { '15m': '15-minute', '1h': 'hourly', '1d': 'daily', '1wk': 'weekly' };

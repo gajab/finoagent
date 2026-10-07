@@ -16,7 +16,8 @@
  * present a verdict built on a missing quote.
  */
 import type { SavedStrategyItem, LivePnlResponse } from '../api';
-import { effectivePnl, expiryFrom, dteFrom, tradeHasStock } from '../components/trades/MyTradesV2';
+import { expiryFrom, dteFrom, tradeHasStock } from '../components/trades/MyTradesV2';
+import { effectivePnl } from '../lib/tradePnl';
 
 import { STATE_META, STATE_ORDER, type ActionState } from './betaStateMeta';
 export { STATE_META, STATE_ORDER };

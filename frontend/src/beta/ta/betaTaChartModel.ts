@@ -86,7 +86,7 @@ const layerIds = (layer: LayerKey, tier: Tier): ((id: string) => boolean) => {
     default: return () => false;
   }
 };
-const PRIORITY: Record<LayerKey, number> = { plan: 9, levels: 6, dealer: 5, value: 4, blocks: 4, structure: 3, liquidity: 3 };
+const PRIORITY: Record<LayerKey, number> = { plan: 9, strategy: 8, levels: 6, dealer: 5, value: 4, blocks: 4, structure: 3, liquidity: 3 };
 
 /** One method layer -> chart levels, at the tier matching the candles on screen. */
 export function levelsFromLayers(layers: TALayer[] | undefined, layer: LayerKey, tier: Tier): ChartLevel[] {

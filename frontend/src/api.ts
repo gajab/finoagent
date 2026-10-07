@@ -149,6 +149,15 @@ export async function fetchMomentumSetups(
   );
 }
 
+// The 15 famous-trader rule-sets (Minervini, O'Neil, Weinstein, Turtles, …) run on this ticker — lazy, deterministic.
+export async function fetchTraderStrategies(
+  ticker: string,
+): Promise<import('./types').TraderStrategiesResponse> {
+  return apiFetch<import('./types').TraderStrategiesResponse>(
+    `/api/stock/${encodeURIComponent(ticker)}/trader-strategies`,
+  );
+}
+
 // OHLC candles for the interactive Advanced-tab charts (interval: 15m · 1h · 1d · 1wk)
 export async function fetchCandles(
   ticker: string,
@@ -1843,6 +1852,7 @@ export interface BookHedgeCandidate {
   index?: string; pricing?: string; dte_days?: number | null; expiry?: string | null;
   vix_at_minus20?: number;                                // VIX future level a −20% month implies
   sleeve_capital?: number; signal?: string; capture_pct?: number;   // VIXY dynamic sleeve
+  standby?: boolean;   // a rule that arms on a signal (VIXY) — never "the trade to put on today"
 }
 // One concrete remediation leg-set (close, or a real-strike spread), priced from live data.
 export interface RemediationLeg {
@@ -1852,8 +1862,68 @@ export interface RemediationLeg {
   tail_after: number;      // position P&L at the stress move AFTER the fix
   premium_kept: number;    // $ premium still collected after the fix
   detail?: string;
+  unit_price?: number;     // $ per share-equivalent actually paid — the live ask captured at Refresh
+  pricing?: string;        // 'live ask' | 'live mid' | 'model' (no quote in the chain)
   // Structured legs for the Evaluate deep-dive (exact live-chain pricing). Present on 'cap'.
   prefill?: { ticker: string; legs: { action: 'BUY' | 'SELL'; type: 'CALL' | 'PUT'; strike: number; expiration: string | null; qty: number }[] };
+}
+
+export interface EtfScenario { move_pct: number; group_pnl: number; hedge_pnl: number; net: number }
+export interface EtfVariant {
+  key: 'put' | 'collar50' | 'collar100' | 'putspread'; label: string; qty: number;
+  put: { strike: number; ask: number; iv: number }; short: { right: 'C' | 'P'; strike: number; bid: number } | null;
+  net_debit: number; is_credit: boolean; annual_cost: number; cost_pct_income: number | null; within_budget: boolean; n_within_budget: number | null;
+  funded_pct: number; offset_pct: number; net_at_ref: number; scenarios: EtfScenario[];
+  adds_upside_risk: boolean; upside_given_up: number; tail_is_upside: boolean;
+}
+export interface EtfCandidate {
+  etf: string; label: string; spot: number; expiry: string; dte: number; indicative: boolean;
+  members: { ticker: string; rho: number; beta: number; loss_ref: number }[]; n_members: number;
+  avg_rho: number; strength: 'strong' | 'good' | 'loose' | 'weak'; loss_ref: number; ref_move: number; capital: number; theta: number;
+  group_label: string; member_rho_min: number; member_rho_max: number;   // avg_rho = the BASKET's correlation with the ETF
+  group_pnl: Record<string, number>; variants: EtfVariant[];
+}
+export interface EtfHedges {
+  candidates: EtfCandidate[]; skipped: { etf: string; label: string; loss_ref: number; reason: string }[];
+  target_offset_pct: number; budget_pct: number;
+  mapping: { ticker: string; etf: string; rho: number; beta: number; alts: { etf: string; rho: number }[]; self: boolean; group?: string }[]; unmapped: string[];
+  groups: { etf: string; label: string | null; names: string[]; basket_rho: number; alts: { etf: string; rho: number }[] }[];
+}
+export interface ConcentrationName {
+  ticker: string; trades: number; beta: number; capital: number; capital_pct: number; theta: number; theta_pct: number;
+  down_pnl: number; up_pnl: number; tail_loss: number; tail_pct: number; gamma_pct: number;
+  risk_ratio: number | null; payback_days: number | null;
+}
+export interface ConcentrationGroup {
+  kind: 'book' | 'cluster' | 'sector'; label: string; tickers: string[]; capital: number; capital_pct: number; theta: number;
+  shocks: Record<string, number>; worst_move: string; worst: number; worst_pct_capital: number | null; carry_years: number | null; avg_rho?: number | null;
+}
+export interface ConcentrationView {
+  side: 'up' | 'down' | null; side_label: string; names: ConcentrationName[]; groups: ConcentrationGroup[];
+  effective_bets: number | null; effective_names: number | null; n_names: number; n_groups: number; shock_moves: number[];
+}
+export interface TailAttribution {
+  avg_tail_pnl: number; n_sims: number; delta: number; gamma: number; vega: number; theta: number; other: number;
+  up_pct: number; down_pct: number; side: 'up' | 'down';
+}
+export interface HedgePlanOption {
+  budget_pct: number; units: number; annual_cost?: number; cost_pct_income?: number; cvar_after?: number; cvar_reduction?: number;
+  reduction_pct?: number | null; closes_gap_pct?: number | null; per_dollar?: number | null;
+}
+export interface HedgePlanCandidate {
+  label: string; instrument: 'SPX' | 'VIX' | 'VIXY'; kind: string; long_strike?: number | null; short_strike?: number | null;
+  cost_per_spread?: number; pricing?: string; index?: string; dte_days?: number | null; expiry?: string | null; signal?: string;
+  unit: string; unit_annual: number; targets: string[]; plans: HedgePlanOption[]; helps: boolean; reason: string | null;
+  recommended: boolean; standby: boolean;
+}
+export interface ExposureRow {
+  key: 'delta' | 'vega' | 'gamma'; label: string; value: string; shock: string; impact_down?: number | null; impact_up?: number | null;
+  worst: number; worst_pct_capital: number;
+  hedge: { instrument: string; action: string; units: number | null; notional?: number | null; annual_cost: number | null; note: string; vega_per_contract?: number } | null;
+}
+export interface HedgePlan {
+  budgets: number[]; default_budget: number; income_ok: boolean; annual_income: number; cvar_now: number; cvar_pct_capital: number;
+  limit_warn: number; limit_breach: number; gap: number; tail: TailAttribution | null; candidates: HedgePlanCandidate[]; exposures?: ExposureRow[];
 }
 
 export interface BookTailRiskResult {
@@ -1874,6 +1944,23 @@ export interface BookTailRiskResult {
   loss_by_name?: { ticker: string; pnl: number; beta: number }[];
   // 2-D risk array: book P&L for each (spot move × vol-point shock).
   scenario_grid?: { spot_moves: number[]; vol_shocks: number[]; rows: { move_pct: number; cells: { pnl: number; pct: number | null }[] }[] };
+  // Covered calls: the shares' gain always offsets the short call in a rally; their LOSS on a down move is the optional
+  // "include stock losses" variant. `with_stock_downside` carries only the fields that change; overlay it on the result.
+  has_covered_stock?: boolean;
+  with_stock_downside?: Partial<BookTailRiskResult>;
+  // Concentration that means something: tail share vs capital share vs income share per name, and per-group shocks.
+  concentration_view?: ConcentrationView | null;
+  // Budget-sized hedge plan + tail attribution + the risk → hedge exposure map.
+  hedge_plan?: HedgePlan | null;
+  // Hedges built on the nearest ETFs to the book's holdings (put on the ETF, funded by a sold call / lower put).
+  etf_hedges?: EtfHedges | null;
+  // What the engine actually analysed vs left out (a tagged trade can yield no position: stock-only, closed options, no price).
+  coverage?: { requested: number; analysed: number; skipped: { trade_id: number | null; ticker: string | null; reason: string }[] };
+  // Where each leg's IV came from: the chain (cross-checked against its price), re-solved from the price (junk/missing chain IV —
+  // typically after hours), or a fallback (no usable price or IV). `indicative` = chains filled from last-trade prices.
+  data_quality?: { legs: number; chain: number; solved: number; fallback: number; indicative: boolean };
+  // Manage Book covers ONLY trades explicitly tagged Income; `excluded` counts the rest by folder (e.g. {hedge: 2, untagged: 1}).
+  scope?: { purpose: string; included: number; excluded: Record<string, number>; excluded_total: number };
   // Institutional risk scorecard: standardized guardrails, book value vs limit, cheapest fix per breach.
   risk_scorecard?: {
     grade: string; n_breach: number; n_warn: number; n_checks: number;
@@ -1888,6 +1975,7 @@ export interface BookTailRiskResult {
           risk: number; premium_left: number; why: string; tail_before: number;
           recommended: RemediationLeg; alt?: RemediationLeg | null;
           short?: { strike: number; right: string; qty: number } | null;   // targeted short leg — always closeable
+          stress?: { market_move_pct: number; beta: number; name_move_pct: number; vol_shock_pts: number };   // the move behind `tail_before`
         }[];
       };
     }[];
@@ -1913,8 +2001,8 @@ export async function fetchBookTailRisk(quoteSource = 'yfinance', refresh = fals
 }
 
 // LLM hedging strategy for the whole book — model is fed ONLY the computed numbers.
-export async function fetchBookHedgeAdvice(quoteSource = 'yfinance'): Promise<{ advice?: string; error?: string; data_sent?: any }> {
-  return apiFetch(`/api/saved-strategies/book-hedge-advice?quote_source=${encodeURIComponent(quoteSource)}`);
+export async function fetchBookHedgeAdvice(quoteSource = 'yfinance', includeStockDownside = false): Promise<{ advice?: string; error?: string; data_sent?: any }> {
+  return apiFetch(`/api/saved-strategies/book-hedge-advice?quote_source=${encodeURIComponent(quoteSource)}&include_stock_downside=${includeStockDownside ? 1 : 0}`);
 }
 
 export interface RepairAlternative {
@@ -2286,7 +2374,12 @@ export async function runLifecycleManager(id: number, pnlSnapshot: LivePnlRespon
 
 // ── Trade Manager: hold / exit desk (quant + technical + fundamental + events) ────────────────
 export type ManagerSignal = 'STRONG_HOLD' | 'HOLD' | 'EXIT' | 'STRONG_EXIT';
-export interface ManagerLens { score: number; weight: number; vol?: any; detail?: any; label?: string; adjustment?: number; clear?: boolean; pts?: number; scope?: string; notes?: string[]; signal?: string | null; source?: string; overrides?: string[]; dir?: number; available?: boolean; items?: any[]; signals?: { family: string; name: string; d: number; w: number; note: string }[]; factors?: any[] }
+/** The arithmetic behind a lens score, as data (so the UI shows the real sum, not a re-derivation). Absent on older reads. */
+export interface PositionStop { cost: number; level: number; pct: number; crossed: boolean; z: number | null; p_touch: number; sigma21_pct: number }
+export type LensBuild =
+  | { kind: 'alignment'; dir: number; aligned: number; k: number; gain: number; base: number; points: number; lo: number; hi: number; weight_total: number; adjust: number }
+  | { kind: 'position_risk'; base: number; terms: { label: string; pts: number; note: string }[]; stop: PositionStop | null; clamped: boolean };
+export interface ManagerLens { score: number; weight: number; build?: LensBuild | null; vol?: any; detail?: any; label?: string; adjustment?: number; clear?: boolean; pts?: number; scope?: string; notes?: string[]; signal?: string | null; source?: string; overrides?: string[]; dir?: number; available?: boolean; items?: any[]; signals?: { family: string; name: string; d: number; w: number; note: string }[]; factors?: any[] }
 export interface ManagerExitItem {
   kind: 'stop' | 'trail' | 'target' | 'guard' | 'strike' | 'pnl' | 'time' | 'event' | 'breakeven' | 'level' | 'note';
   level: number | null; basis: string; action: string; why: string; sources: string[];
