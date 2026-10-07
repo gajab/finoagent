@@ -26,7 +26,7 @@ const money = (n?: number | null) => (n == null ? '—' : `$${n.toFixed(2)}`);
 const pctFrom = (n?: number | null) => (n == null ? '—' : `${n > 0 ? '+' : ''}${n}%`);
 const d0 = (n?: number | null) => (n == null ? '—' : `${n < 0 ? '-$' : '$'}${Math.abs(Math.round(n)).toLocaleString()}`);
 
-const TYPE_LABEL: Record<string, string> = {
+export const TYPE_LABEL: Record<string, string> = {
   trend_continuation: 'Trend Pullback', mean_reversion_fade: 'Mean-Reversion Fade',
   range_income: 'Range Income', range_bracket: 'Range Rotation', breakout: 'Breakout',
   trend_momentum: 'Momentum (enter now)', position_accumulate: 'Position Accumulate',
@@ -230,7 +230,7 @@ function VerdictView({ v }: { v: SetupVerification }) {
   );
 }
 
-function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker: string; spot: number | null; dossier: Record<string, unknown> }) {
+export function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup; ticker: string; spot: number | null; dossier: Record<string, unknown> }) {
   const navigate = useNavigate();
   const [showWhy, setShowWhy] = useState(false);
   const [showAI, setShowAI] = useState(false);

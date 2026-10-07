@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
 import {
   AlertTriangle, TrendingUp, BarChart3, Activity,
@@ -38,6 +38,10 @@ import { ExitTab } from '../components/ExitTab';
 import { FundFundamentals } from '../components/FundFundamentals';
 import { useAuth } from '../contexts/AuthContext';
 import { PortfolioHighlights } from '../components/PortfolioHighlights';
+import { useBetaUi, TryBetaButton } from '../beta/BetaChrome';
+
+// Opt-in Beta layout for the Technical tab (?ui=beta) — code-split so classic never pays for it.
+const BetaTechnical = lazy(() => import('../beta/ta/BetaTechnical'));
 
 const QUICK_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA'];
 
@@ -223,6 +227,7 @@ function FeatureCard({ feature }: { feature: typeof FEATURES[0] }) {
 export default function DashboardPage() {
   const { isPremium } = useAuth();
   const [searchParams] = useSearchParams();
+  const { isBeta, enterBeta, leaveBeta } = useBetaUi();   // classic is the default; ?ui=beta opts the Technical tab into the Beta layout
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stockData, setStockData] = useState<StockData | null>(null);
@@ -559,8 +564,17 @@ export default function DashboardPage() {
             {activeTab === 'technical' && (
               <div className="space-y-5">
                 <ErrorBoundary label="Technical analysis">
-                  <TechnicalAnalysis technical={stockData.technical} ticker={stockData.ticker} />
-                  <PricePrediction ticker={stockData.ticker} />
+                  {isBeta ? (
+                    <Suspense fallback={<div className="glass-card p-6 text-sm text-base-content/60">Loading the new Technical view…</div>}>
+                      <BetaTechnical ticker={stockData.ticker} technical={stockData.technical} onLeave={leaveBeta} />
+                    </Suspense>
+                  ) : (
+                    <>
+                      <div className="flex justify-end"><TryBetaButton onClick={enterBeta} label="Try the new Technical view" /></div>
+                      <TechnicalAnalysis technical={stockData.technical} ticker={stockData.ticker} />
+                      <PricePrediction ticker={stockData.ticker} />
+                    </>
+                  )}
                 </ErrorBoundary>
               </div>
             )}
