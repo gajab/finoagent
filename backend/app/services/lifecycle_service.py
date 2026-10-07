@@ -558,6 +558,21 @@ def algorithmic_exit(pm: dict, cvar95: Optional[float], capital: float, max_loss
     }
 
 
+# A hard override (≥90% captured, near max loss, tested strike, ≤2 DTE …) can demote the SIGNAL past what the points
+# alone say. The number shown beside it must not contradict the label — "53/100 STRONG CLOSE" sits in the 45–68 HOLD
+# band — so an override also caps the SCORE at the top of the band the final signal belongs to (STRONG_HOLD ≥68 ·
+# HOLD ≥45 · CLOSE ≥28 · STRONG_CLOSE <28). The Trade Manager's quant lens already floored its blended score this way;
+# this is the ONE definition all three (light overlay, deep desk score, Trade Manager) share, and `raw_score` keeps the
+# pre-override points for audit.
+SIGNAL_SCORE_CEILING = {"HOLD": 67, "CLOSE": 44, "STRONG_CLOSE": 27}
+
+
+def clamp_score_to_signal(score: float, signal: str) -> int:
+    """`score` capped at the ceiling of `signal`'s band (STRONG_HOLD has none). Never raises a score."""
+    cap = SIGNAL_SCORE_CEILING.get(signal)
+    return int(min(score, cap)) if cap is not None else int(score)
+
+
 def lifecycle_overlay(base_score: float, captured_pct: Optional[float], dte_days: Optional[int],
                       unrealized_pnl: Optional[float], max_loss) -> dict:
     """Turn ANY 0-100 quality score for a PLACED trade into the 4-level exit signal.
@@ -601,7 +616,8 @@ def lifecycle_overlay(base_score: float, captured_pct: Optional[float], dte_days
         signal = "CLOSE"
         overrides.append("≤2 DTE — gamma/pin/assignment risk")
 
-    return {"signal": signal, "score": hold_score, "adjustments": adjustments, "overrides": overrides}
+    return {"signal": signal, "score": clamp_score_to_signal(hold_score, signal), "raw_score": hold_score,
+            "adjustments": adjustments, "overrides": overrides}
 
 
 def _management_factors(*, iv_pct, hv_pct, pop_pct, keep_drift_pct, cushion_pct,
@@ -1046,7 +1062,7 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
         overrides.append("≤2 DTE — gamma/pin/assignment risk")
 
     return {
-        "signal": signal, "score": score,
+        "signal": signal, "score": clamp_score_to_signal(score, signal), "raw_score": score,
         "anchor": int(round(base)),
         "anchor_label": "hold quality · remaining risk vs reward",
         "base_lenses": base_read["lenses"],   # the 5 computed lenses behind the base

@@ -31,6 +31,7 @@ from scipy.stats import norm
 
 from .lifecycle_service import higher_order_greeks
 from .stock_service import bs_price
+from .trade_math import stock_position
 
 logger = logging.getLogger(__name__)
 _MULT = 100
@@ -313,29 +314,18 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
     # structure + stock presence → so a short CALL can be flagged COVERED (excluded from the
     # naked-assignment total) vs naked. Any non-option long-share leg also counts as cover.
     structure = getattr(strategy, "strategy_type", None) or getattr(strategy, "structure", None)
-    # Signed share exposure behind the overlay (covered-call/collar long stock, or any holding) —
-    # the economic leg the crash / CVaR / ladder must revalue. Prefer parameters.shares (how the
-    # combo P&L path stores it); fall back to a stock/share leg in legs_data. long>0, short<0.
-    shares = 0.0
-    _sparams: dict = {}
+    # Signed share exposure behind the overlay (covered-call/collar long stock, or any holding) — the economic leg the
+    # crash / CVaR / ladder must revalue. ONE reading shared with Defend (`trade_math.stock_position`): parameters.shares
+    # first (how the combo P&L path stores it), a stock/share leg in legs_data as the fallback; long>0, short<0.
     try:
         _sparams = json.loads(strategy.parameters or "{}")
-        shares = float(_sparams.get("shares") or 0)
     except (ValueError, TypeError):
-        shares = 0.0
+        _sparams = {}
+    shares = float(stock_position(_sparams, legs, None, structure)["shares"])
     # Explicit "covered" mark — the user holds the shares ELSEWHERE (not added to the income book), so a
     # short call is covered for risk/assignment even with no stock leg here. Respected like a covered_call
     # structure / a real stock leg (see _is_covered).
     covered_flag = bool(_sparams.get("covered"))
-    if not shares:
-        for l in legs:
-            if "stock" in str(l.get("type", "")).lower() or "share" in str(l.get("type", "")).lower():
-                try:
-                    q = abs(float(l.get("shares") or l.get("qty") or 0))
-                except (ValueError, TypeError):
-                    q = 0.0
-                if q:
-                    shares += (-1 if any(k in str(l.get("action", "")).upper() for k in ("SELL", "SHORT")) else 1) * q
     has_stock = bool(shares)
     return {"ticker": ticker, "name": strategy.name, "trade_id": getattr(strategy, "id", None),
             "spot": spot, "iv": avg_iv,

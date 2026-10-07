@@ -64,6 +64,7 @@ const LEG_ACTION_STYLE: Record<LegActionKind, { label: string; cls: string }> = 
   ROLL:       { label: 'ROLL',   cls: 'badge-error' },
   HOLD:       { label: 'HOLD',   cls: 'badge-success' },
   LET_EXPIRE: { label: 'EXPIRE', cls: 'badge-ghost' },
+  NO_QUOTE:   { label: 'NO QUOTE', cls: 'badge-ghost text-warning' },
 };
 
 function LegActionBadge({ advice }: { advice?: LegAdvice }) {
@@ -2423,14 +2424,19 @@ function TradeCard({
 
           {/* Quant advisor — overall recommendation folding per-leg + structure */}
           {pnl?.analysis?.recommendation && (() => {
+            const withheld = !!pnl.analysis.verdict_withheld;       // an option leg has no quote → no verdict at all (never a green HOLD)
             const exitSig = pnl.analysis.exit_signal || 'HOLD';
-            const tone = exitSig === 'STRONG_CLOSE' ? 'error' : exitSig === 'CLOSE' ? 'warning' : 'success';
+            const tone = withheld ? 'warning' : exitSig === 'STRONG_CLOSE' ? 'error' : exitSig === 'CLOSE' ? 'warning' : 'success';
             return (
             <div className={`rounded-lg p-3 border bg-${tone}/5 border-${tone}/20`}>
               <div className="flex items-center gap-2 mb-1.5 flex-wrap">
-                <span className={`badge badge-sm font-semibold ${EXIT_STYLE[exitSig]?.cls || 'badge-ghost'}`}>
-                  {EXIT_STYLE[exitSig]?.label || exitSig}
-                </span>
+                {withheld ? (
+                  <span className="badge badge-sm font-semibold badge-warning badge-outline" title={pnl.pricing_warning || undefined}>NO QUOTE · verdict withheld</span>
+                ) : (
+                  <span className={`badge badge-sm font-semibold ${EXIT_STYLE[exitSig]?.cls || 'badge-ghost'}`}>
+                    {EXIT_STYLE[exitSig]?.label || exitSig}
+                  </span>
+                )}
                 <span className="text-[9px] uppercase tracking-wider text-base-content/40">Deterministic rules · whole-trade exit call</span>
                 {pnl.analysis.captured_pct != null && (
                   <span className="text-[9px] text-base-content/40">{pnl.analysis.captured_pct.toFixed(0)}% of max profit captured</span>

@@ -1381,7 +1381,7 @@ async def close_position(
 
     # entry-price index convention: on a combo (stock + options), the stock's entry
     # sits at entry_prices[0] and option leg i is at entry_prices[i+1].
-    offset = 1 if (shares > 0 and len(entry_prices) == len(legs) + 1) else 0
+    offset = _entry_price_offset(shares, legs, entry_prices)
 
     def _leg_entry(i: int, leg: dict) -> float:
         # Robust entry premium — the SAME resolver get_live_pnl uses (leg's own premium →
@@ -1546,7 +1546,7 @@ async def roll_position(
     params = json.loads(strategy.parameters) if strategy.parameters else {}
     entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
     shares = float(params.get("shares") or 0)
-    offset = 1 if (shares > 0 and len(entry_prices) == len(legs) + 1) else 0
+    offset = _entry_price_offset(shares, legs, entry_prices)
 
     def _leg_entry(i: int, leg: dict) -> float:
         # SAME robust resolver as close_position / live P&L (leg premium → strike/right → positional).
@@ -2613,6 +2613,14 @@ def _leg_entry_premium(leg: dict, idx: int, entry_prices_list: list) -> float | 
     return None
 
 
+def _entry_price_offset(shares_in_params: float, legs: list, entry_prices: list) -> int:
+    """Where option leg 0's row sits in `entry_prices`. A combo / covered-call trade keeps its shares in
+    `parameters` and ONLY the option legs in `legs_data`, with `entry_prices = [stock row, *option rows]`, so option leg i
+    is at i+1 (offset 1); every other shape is positional (offset 0). ONE rule for close, roll and Defend — indexing
+    `entry_prices[i]` on a combo hands the call the STOCK's basis as its credit."""
+    return 1 if (shares_in_params and shares_in_params > 0 and len(entry_prices) == len(legs) + 1) else 0
+
+
 def option_legs_net_debit(leg_metas: list[dict], entry_prices_list: list) -> float | None:
     """Net entry debit for a set of option legs, from per-leg entry premiums.
 
@@ -2794,32 +2802,38 @@ async def save_pnl_snapshot(
 
 def _parse_defend_position(strategy) -> tuple:
     """The Defend desk's view of a saved trade → (option legs, nearest expiry, long-share count, share basis).
-    Every option leg carries its sign + per-share entry credit/debit; LONG stock legs are kept so a covered
-    call is modeled COVERED (defined), not naked. ONE parser for the menu and the roll search — they had
-    drifted into two copies."""
-    raw = json.loads(strategy.legs_data) if strategy.legs_data else []
-    entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
+    Every option leg carries its sign + per-share entry credit/debit; the LONG shares behind them are kept so a covered
+    call is modeled COVERED (defined), not naked. ONE parser for the menu and the roll search — they had drifted into
+    two copies.
+
+    Shares come from `trade_math.stock_position` (parameters.shares / avg_cost first, a stock leg in legs_data as the
+    fallback — the same reading book tail risk uses), and each option's entry premium from the SAME resolver the live P&L
+    and close paths use (`_leg_entry_premium`: the leg's own premium → strike/right-tagged row → positional WITH the
+    stock-row offset). Indexing `entry_prices[i]` by the option's position in legs_data handed a covered call the
+    stock's $60 basis as its credit, and ignoring parameters.shares modeled the same call as naked."""
+    from ..services.trade_math import stock_position
+    raw = json.loads(strategy.legs_data) if getattr(strategy, "legs_data", None) else []
+    entry_prices = json.loads(strategy.entry_prices) if getattr(strategy, "entry_prices", None) else []
+    try:
+        params = json.loads(strategy.parameters) if getattr(strategy, "parameters", None) else {}
+    except (ValueError, TypeError):
+        params = {}
+    pos = stock_position(params, raw, entry_prices, getattr(strategy, "strategy_type", None))
+    # the stock row only shifts the option rows when the shares live in parameters (not as a leg of legs_data)
+    offset = _entry_price_offset(abs(pos["shares"]) if pos["source"] == "parameters" else 0.0, raw, entry_prices)
     legs, near_exp = [], None
-    covered_shares, stock_basis = 0.0, None
     for i, l in enumerate(raw):
         typ = str(l.get("type", "")).lower()
         act = str(l.get("action", "")).upper()
         if l.get("strike") and ("call" in typ or "put" in typ):
             right = "P" if "put" in typ else "C"
             sign = -1 if "SELL" in act else 1
-            ep = entry_prices[i].get("price") if i < len(entry_prices) and isinstance(entry_prices[i], dict) else None
-            entry = abs(float(ep)) if ep else abs(float(l.get("premium") or l.get("mid") or 0.0))
+            ep = _leg_entry_premium(l, i + offset, entry_prices)
+            entry = ep if ep else abs(float(l.get("mid") or 0.0))
             legs.append({"strike": float(l["strike"]), "right": right, "sign": sign,
                          "qty": int(l.get("qty") or l.get("contracts") or 1), "entry": entry})
             near_exp = near_exp or str(l.get("expiration") or l.get("expiry") or "")[:10]
-        elif ("stock" in typ or "share" in typ or "equity" in typ) and ("SELL" not in act):
-            covered_shares += abs(float(l.get("qty") or l.get("shares") or 0.0))
-            bp = entry_prices[i].get("price") if i < len(entry_prices) and isinstance(entry_prices[i], dict) else None
-            if bp:
-                stock_basis = float(bp)
-            elif l.get("premium") or l.get("mid") or l.get("price"):
-                stock_basis = float(l.get("premium") or l.get("mid") or l.get("price"))
-    return legs, near_exp, covered_shares, stock_basis
+    return legs, near_exp, max(0.0, pos["shares"]), pos["basis"]
 
 
 @router.get("/{strategy_id}/repair-menu")
@@ -3600,7 +3614,7 @@ async def get_live_pnl(
     from ..services.trade_math import (
         classify_leg_action, summarize_trade_actions, prob_itm_lognormal, dte_from_expiry,
         structure_payoff_extremes, structure_breakevens, exit_recommendation,
-        leg_mark_to_market, clipped_annualized_pct,
+        leg_mark_to_market, clipped_annualized_pct, withheld_verdict,
     )
     from ..services.lifecycle_service import (
         higher_order_greeks, pm_ratios, payoff_distribution_metrics,
@@ -4472,9 +4486,7 @@ async def get_live_pnl(
             _cw = (f"No live quote for {len(combo_unpriced)} of {len(combo_leg_meta)} option leg(s) — "
                    "the option P&L is not computed; the stock P&L is unaffected.")
             _combo_resp["pricing_warning"] = _cw
-            _combo_resp["analysis"]["captured_pct"] = None
-            _combo_resp["analysis"]["hold_vs_close_reasons"] = [_cw] + list(_combo_resp["analysis"].get("hold_vs_close_reasons") or [])
-            _combo_resp["analysis"]["exit_reasons"] = [_cw] + list(_combo_resp["analysis"].get("exit_reasons") or [])
+            _combo_resp["analysis"].update(withheld_verdict(_cw))      # no mark → no exit/hold/quant verdict (stock P&L unaffected)
         return _combo_resp
 
     # --- Fetch underlying price (options strategies) ---
@@ -5162,9 +5174,7 @@ async def get_live_pnl(
             f"No live quote for {len(unpriced_legs)} of {len(leg_meta)} leg(s)"
             f"{f' ({_why})' if _why else ''} — P&L is not computed and the signals below are not P&L-aware."
         )
-        analysis["captured_pct"] = None
-        analysis["hold_vs_close_reasons"] = [pricing_warning] + list(analysis.get("hold_vs_close_reasons") or [])
-        analysis["exit_reasons"] = [pricing_warning] + list(analysis.get("exit_reasons") or [])
+        analysis.update(withheld_verdict(pricing_warning))             # no mark → no exit/hold/quant verdict
 
     return {
         "strategy_id": strategy_id,
