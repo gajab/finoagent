@@ -551,12 +551,12 @@ async def gather_market_evidence(db, ticker: str, dte: Optional[int]) -> dict:
         # trade-setup dossier (MTF structure · VP · AVWAP · regime · dealer gamma · patterns) — shared cache
         try:
             import yfinance as yf
-            from .trade_setup_service import compute_trade_setups
-            ts = await get_cached(db, f"setups:{sym}:v3")
+            from .trade_setup_service import compute_trade_setups, setups_cache_key
+            ts = await get_cached(db, setups_cache_key(sym))
             if ts is None:
                 ts = await asyncio.to_thread(lambda: compute_trade_setups(yf.Ticker(sym)))
                 if ts:
-                    await set_cached(db, f"setups:{sym}:v3", _clean(ts), ttl_seconds=900)
+                    await set_cached(db, setups_cache_key(sym), _clean(ts), ttl_seconds=900)
             ev["structure"] = _clean(_setup_digest(ts)) if ts else {}
         except Exception as exc:  # noqa: BLE001
             logger.info("trade-manager setups failed %s: %s", sym, exc)

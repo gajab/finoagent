@@ -1122,7 +1122,7 @@ function ExposureCard({ data }: { data: BookExposureResult }) {
   );
 }
 
-function TradeExplorer({ t, ticker, params, evaluate, spot, nextEarnings }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams; evaluate?: DeskEvaluateParams; spot?: number | null; nextEarnings?: string | null }) {
+export function TradeExplorer({ t, ticker, params, evaluate, spot, nextEarnings }: { t: DeskRankedTrade; ticker: string; params: DeskReviewParams; evaluate?: DeskEvaluateParams; spot?: number | null; nextEarnings?: string | null }) {
   const dm = t.desk_metrics;
   const q = dm.quant || {};
   // Paper trade — one click "places" THIS opportunity (snapshotting its Quant Analysis) so the

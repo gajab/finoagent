@@ -5,6 +5,10 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { CollapsibleSidebar } from '../components/CollapsibleSidebar';
+import { useBetaUi, TryBetaButton, BackToClassicButton, BetaBadge } from '../beta/BetaChrome';
+
+// Beta is code-split: classic users never download it.
+const StrategiesBeta = lazy(() => import('../beta/StrategiesBeta'));
 
 // Each strategy is a heavy component (charts, quant panels); load only the selected one so the
 // Strategies chunk isn't one giant bundle. Named exports → unwrap to default for React.lazy.
@@ -94,6 +98,7 @@ const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; descript
 
 export default function StrategiesPage() {
   const { isPremium } = useAuth();
+  const { isBeta, enterBeta, leaveBeta } = useBetaUi();   // classic is the default; ?ui=beta opts into the Beta layout
   const [activeStrategy, setActiveStrategy] = useState<Strategy>('derivative_income');
   const [searchParams] = useSearchParams();
   useEffect(() => {                                   // deep-link: /strategies?strategy=derivative_income
@@ -132,6 +137,22 @@ export default function StrategiesPage() {
     );
   }
 
+  if (isBeta) {
+    return (
+      <div className="mx-auto w-full max-w-[1680px] px-4 sm:px-6 lg:px-8 py-6 sm:py-8 animate-fade-in">
+        <div className="page-header mb-4">
+          <h1 className="page-title tracking-tight flex items-center gap-3">
+            <Layers className="w-7 h-7 text-secondary" />
+            Advanced Strategies
+            <BetaBadge />
+          </h1>
+          <BackToClassicButton onClick={leaveBeta} />
+        </div>
+        <Suspense fallback={<div className="flex justify-center py-16"><span className="loading loading-spinner loading-md text-base-content/30" /></div>}><StrategiesBeta /></Suspense>
+      </div>
+    );
+  }
+
   return (
     <div className="container-app py-6 sm:py-8 animate-fade-in">
       {/* Page Header */}
@@ -140,6 +161,7 @@ export default function StrategiesPage() {
           <Layers className="w-7 h-7 text-secondary" />
           Advanced Strategies
         </h1>
+        <TryBetaButton onClick={enterBeta} />
       </div>
 
       <div className="flex flex-col lg:flex-row gap-6">

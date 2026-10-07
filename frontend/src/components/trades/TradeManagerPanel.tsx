@@ -18,7 +18,7 @@ import type {
   ManagerSignal, ManagerTraderLens, ManagerWatchLevel, ManagerSinceEntry,
 } from '../../api';
 
-type LensKey = 'quant' | 'technical' | 'fundamental' | 'event';
+export type LensKey = 'quant' | 'technical' | 'fundamental' | 'event';
 
 const SIGNAL: Record<ManagerSignal, { label: string; cls: string; box: string }> = {
   STRONG_HOLD: { label: 'STRONG HOLD', cls: 'badge-success', box: 'border-success/30 bg-success/[0.06]' },
@@ -103,7 +103,7 @@ const GLOSS: [RegExp, string][] = [
   [/last earnings|ytd open/i, 'A reference price many holders anchor to (the price at the last earnings report / the year\'s open).'],
   [/bull fvg|demand/i, 'A zone where buyers stepped in before.'],
 ];
-const gloss = (label: string) => GLOSS.find(([re]) => re.test(label))?.[1];
+export const gloss = (label: string) => GLOSS.find(([re]) => re.test(label))?.[1];
 
 /* ───────────────────────── small building blocks ───────────────────────── */
 
@@ -358,7 +358,7 @@ function TraderCard({ l }: { l: ManagerTraderLens }) {
   );
 }
 
-function QuantView({ lens, isStock }: { lens: any; isStock: boolean }) {
+export function QuantView({ lens, isStock }: { lens: any; isStock: boolean }) {
   const d = lens.detail;
   if (!d) return null;
   const desk = d.desk || {};
@@ -415,7 +415,7 @@ function QuantView({ lens, isStock }: { lens: any; isStock: boolean }) {
   );
 }
 
-function TechnicalView({ res, lens, isStock }: { res: TradeManagerResult; lens: any; isStock: boolean }) {
+export function TechnicalView({ res, lens, isStock }: { res: TradeManagerResult; lens: any; isStock: boolean }) {
   const tech = res.technical || {};
   const suite = tech.suite || {};
   const bt = res.backtest;
@@ -486,7 +486,7 @@ function TechnicalView({ res, lens, isStock }: { res: TradeManagerResult; lens: 
   );
 }
 
-function FundamentalView({ res, lens }: { res: TradeManagerResult; lens: any }) {
+export function FundamentalView({ res, lens }: { res: TradeManagerResult; lens: any }) {
   const f = res.fundamental || {};
   return (
     <div className="space-y-2">
@@ -516,7 +516,7 @@ function FundamentalView({ res, lens }: { res: TradeManagerResult; lens: any }) 
   );
 }
 
-function EventView({ res, lens }: { res: TradeManagerResult; lens: any }) {
+export function EventView({ res, lens }: { res: TradeManagerResult; lens: any }) {
   const ev = res.events || {};
   const mk = res.market || {};
   const List = ({ rows, k }: { rows: any[]; k: string }) => <>{rows.map((x, i) => <div key={`${k}${i}`} className="text-[11px] text-base-content/65 py-1 border-b border-white/[0.04] last:border-0">{x.title} <span className="text-base-content/30">— {x.publisher}</span></div>)}</>;
@@ -551,7 +551,7 @@ function EventView({ res, lens }: { res: TradeManagerResult; lens: any }) {
 
 /* ───────────────────────── AI ───────────────────────── */
 
-function AIResult({ r }: { r: TradeManagerAI }) {
+export function AIResult({ r }: { r: TradeManagerAI }) {
   if (r.parse_error) return <pre className="text-[11px] whitespace-pre-wrap text-base-content/70">{r.raw}</pre>;
   const s = r.verdict ? SIGNAL[r.verdict] : null;
   const Sec = ({ t, children }: { t: string; children: ReactNode }) => (<div className="mt-3"><div className="text-[10px] uppercase tracking-wider text-base-content/40 font-semibold mb-1">{t}</div>{children}</div>);

@@ -1,13 +1,18 @@
 """Tests for the trade-setup fusion engine (pure functions)."""
+import math
+
+import numpy as np
 import pandas as pd
+import pytest
 
 from app.services.trade_setup_service import (
     _collect_levels, _cluster_zones, _make_zone, _rr, _derive_bias, _build_setups,
     _snap, _option_play, compute_trade_setups,
     _equity_plan, _options_plan, _second_target, _edge, _event_risk, _candidate_plans,
     _passes_quality, _enrich_setup, _MIN_RR,
-    _meaningful_target, _position_setups,
+    _meaningful_target, _position_setups, _plan_pop_ev, _p_above, setups_cache_key,
 )
+from app.services.zebra_service import DEFAULT_RISK_FREE
 
 # a realistic (whole + half dollar) strike board near spot 100
 _STRIKES = [80, 85, 90, 92, 94, 95, 96, 97, 98, 99, 100, 101, 102, 104, 105, 108, 110, 112, 115, 120]
@@ -141,16 +146,88 @@ class TestOptionsPayoff:
         assert any(abs(b - 102.0) < 0.6 for b in plan["breakevens"])  # BE = long + debit
 
 
+# the regression plan: tight stop (1.6% below entry), far target (11% above), pullback limit entry
+_NVDA = {"direction": "long", "entry": {"level": 233.67}, "stop": {"level": 229.87}, "targets": [{"level": 259.31}]}
+_REMOVED_EDGE_KEYS = {"pop_pct", "ev_per_share", "kelly_pct", "half_kelly_risk_pct"}
+
+
 class TestEdge:
-    def test_pop_ev_kelly(self):
-        setup = {"direction": "long", "entry": {"level": 100}, "stop": {"level": 95}, "targets": [{"level": 110}],
-                 "options_plan": {"available": True, "structure": "Bull Call Spread",
-                                  "legs": [{"action": "Buy", "right": "Call"}], "breakevens": [102],
-                                  "max_profit": 300, "max_loss": -200}}
-        e = _edge(setup, 100.0, 0.30, 30)
-        assert 0 <= e["equity"]["pop_pct"] <= 100 and "ev_per_share" in e["equity"]
-        assert e["equity"]["kelly_pct"] is not None and e["equity"]["half_kelly_risk_pct"] <= 2.0
-        assert 0 <= e["options"]["pop_pct"] <= 100 and "ev" in e["options"]
+    """Equity odds are FIRST-PASSAGE (target-before-stop inside the window, given the fill), reported against the
+    break-even they must beat. No EV / Kelly / half-Kelly is derived from market-implied odds."""
+
+    def test_equity_is_first_passage_odds_not_terminal_probabilities(self):
+        e = _edge(_NVDA, 238.90, 0.30, 30)["equity"]
+        assert e["available"] and e["window_days"] == 30 and e["iv_pct"] == 30.0
+        assert e["fill_kind"] == "pullback" and e["fill_pct"] == pytest.approx(79.7, abs=0.5)
+        # ~10% reach T1 first, ~82% are stopped out first, ~9% are unresolved (all GIVEN the fill)
+        assert e["win_pct"] == pytest.approx(9.8, abs=0.5)
+        assert e["loss_pct"] == pytest.approx(81.7, abs=0.5)
+        assert e["open_pct"] == pytest.approx(8.5, abs=0.5)
+        assert e["win_pct"] + e["loss_pct"] + e["open_pct"] == pytest.approx(100, abs=0.2)
+        # the plan needs 3.80 / 29.44 = 12.9% (reward:risk 6.75) and the resolved win share (10.7%) is BELOW it
+        assert e["payoff_ratio"] == 6.75 and e["break_even_pct"] == 12.9
+        assert e["resolved_win_pct"] == pytest.approx(10.7, abs=0.5) and e["vs_break_even_pts"] < 0
+        # the old terminal-probability read of the SAME plan: win 16.9%, EV +$3.09/share, Kelly 4.6%
+        t = 30 / 365
+        p_win, p_lose = _p_above(238.90, 259.31, t, 0.30), 1 - _p_above(238.90, 229.87, t, 0.30)
+        assert p_win == pytest.approx(0.169, abs=0.002)
+        assert p_win * 25.64 - p_lose * 3.80 > 3.0                     # the +EV the old card reported
+        assert e["win_pct"] < p_win * 100 - 5                          # ...which first-passage does not support
+
+    def test_no_ev_or_kelly_is_derived_from_market_implied_odds(self):
+        e = _edge(_NVDA, 238.90, 0.30, 30)["equity"]
+        assert not (_REMOVED_EDGE_KEYS & set(e)), "EV/Kelly/half-Kelly keys must not exist on the equity odds"
+        assert "ev" not in e and "kelly" not in " ".join(e).lower()
+
+    def test_short_mirrors_the_long(self):
+        s = {"direction": "short", "entry": {"level": 52.0}, "stop": {"level": 54.5}, "targets": [{"level": 45.0}]}
+        e = _edge(s, 50.0, 0.40, 25)["equity"]
+        assert e["fill_kind"] == "pullback" and e["fill_pct"] == pytest.approx(70.2, abs=1.0)   # rally-fill short
+        assert e["win_pct"] == pytest.approx(10.2, abs=1.2) and e["loss_pct"] == pytest.approx(57.5, abs=1.5)
+
+    def test_missing_iv_is_unavailable_not_a_silent_30pct_default(self):
+        e = _edge(_NVDA, 238.90, None, 30)["equity"]
+        assert e["available"] is False and e["reason"] == "no-iv" and e["note"]
+        assert "win_pct" not in e and "loss_pct" not in e
+        assert e["payoff_ratio"] == 6.75 and e["break_even_pct"] == 12.9      # pure arithmetic still shown
+        assert _edge(_NVDA, 238.90, 0.0, 30)["equity"]["reason"] == "no-iv"
+        # and it is NOT the same answer as quoting IV = 30%
+        assert _edge(_NVDA, 238.90, 0.30, 30)["equity"].get("win_pct") is not None
+
+    def test_missing_expiry_is_unavailable_not_a_silent_30_days(self):
+        for dte in (None, 0):
+            e = _edge(_NVDA, 238.90, 0.30, dte)["equity"]
+            assert e["available"] is False and e["reason"] == "no-window"
+
+    def test_misordered_levels_are_unavailable(self):
+        s = {"direction": "long", "entry": {"level": 100}, "stop": {"level": 105}, "targets": [{"level": 110}]}
+        assert _edge(s, 100.0, 0.30, 30)["equity"]["reason"] == "bad-levels"
+
+    def test_neutral_and_zero_risk_have_no_equity_odds(self):
+        assert "equity" not in _edge({"direction": "neutral"}, 100.0, 0.30, 30)
+        flat = {"direction": "long", "entry": {"level": 100}, "stop": {"level": 100}, "targets": [{"level": 110}]}
+        assert "equity" not in _edge(flat, 100.0, 0.30, 30)
+
+    def test_odds_start_from_the_entry_and_a_pullback_fill_spends_window(self):
+        near = _edge(_NVDA, 234.0, 0.30, 30)["equity"]       # entry 0.14% below spot → at the market
+        far = _edge(_NVDA, 250.0, 0.30, 30)["equity"]        # needs a 6.5% pullback to fill first
+        assert near["fill_kind"] == "market" and near["fill_pct"] is None
+        # at the market the odds are the pure two-barrier exit odds from the ENTRY (PDE golden: 11.49% / 84.25%)
+        assert near["win_pct"] == pytest.approx(11.5, abs=0.1) and near["loss_pct"] == pytest.approx(84.2, abs=0.1)
+        # a far pullback may never fill, and once it does less of the window is left to reach T1
+        assert far["fill_kind"] == "pullback" and far["fill_pct"] < 60
+        assert far["win_pct"] < near["win_pct"] and far["open_pct"] > near["open_pct"]
+
+    def test_options_pop_and_model_pnl(self):
+        setup = {"direction": "long", **{k: _NVDA[k] for k in ("entry", "stop", "targets")},
+                 "options_plan": _bull_call_plan()}
+        o = _edge(setup, 100.0, 0.30, 30)["options"]
+        assert 0 <= o["pop_pct"] <= 100 and "ev" in o and o["basis"]
+
+    def test_options_missing_iv_or_expiry_yields_no_stats(self):
+        setup = {"direction": "long", "options_plan": _bull_call_plan()}
+        assert "options" not in _edge(setup, 100.0, None, 30)
+        assert "options" not in _edge(setup, 100.0, 0.30, None)
 
     def test_earnings_guard_flags_in_window(self):
         import datetime as dt
@@ -160,6 +237,144 @@ class TestEdge:
         assert er and er["type"] == "earnings" and er["in_days"] == 10
         # earnings AFTER expiry → no flag
         assert _event_risk((dt.date.today() + dt.timedelta(days=60)).isoformat(), exp) is None
+
+
+def _bull_call_plan(spot=100.0, iv=0.30, dte=30):
+    """A BS-priced 100/105 bull call spread as ``_options_plan`` would produce it."""
+    from app.services.zebra_service import _bs_price
+    t = dte / 365
+    q = {float(k): {"C": {"mid": round(_bs_price(spot, k, t, iv, True), 2), "iv": iv},
+                    "P": {"mid": round(_bs_price(spot, k, t, iv, False), 2), "iv": iv}} for k in range(70, 131)}
+    op = {"structure": "Bull Call Spread / Cash-Secured Put", "strikes": {"long_call": 100.0, "short_call": 105.0}}
+    return _options_plan(op, {"date": "2026-09-19", "dte": dte}, q, spot, None)
+
+
+def _numeric_pop_ev(plan, spot, dte, iv, r=DEFAULT_RISK_FREE):
+    """Independent reference: integrate the payoff against the risk-neutral lognormal on a fine z-grid."""
+    t = dte / 365
+    z = np.linspace(-9.0, 9.0, 600_001)
+    w = np.exp(-z * z / 2) / math.sqrt(2 * math.pi) * (z[1] - z[0])
+    S = np.exp(math.log(spot) + (r - 0.5 * iv * iv) * t + iv * math.sqrt(t) * z)
+    pnl = -plan["net_cost"] / 100.0 * np.ones_like(S)
+    for lg in plan["legs"]:
+        sign = 1.0 if lg["action"] == "Buy" else -1.0
+        pnl += sign * (np.maximum(S - lg["strike"], 0) if lg["right"] == "Call" else np.maximum(lg["strike"] - S, 0))
+    pnl *= 100.0
+    return float(((pnl > 0) * w).sum()), float((pnl * w).sum())
+
+
+def _plan(legs, net_cost):
+    return {"available": True, "legs": [{"action": a, "right": r, "strike": k, "price": None} for a, r, k in legs],
+            "net_cost": net_cost}
+
+
+class TestPlanPopEv:
+    """Expiry-held option structures: exact PoP (every profitable region) and the exact payoff expectation —
+    NOT ``pop·max_profit + (1−pop)·max_loss`` and NOT a lower-breakeven-only PoP for a two-breakeven condor."""
+
+    @pytest.mark.parametrize("name,plan", [
+        ("bull call spread", _plan([("Buy", "Call", 100.0), ("Sell", "Call", 105.0)], 200.0)),
+        ("put credit spread", _plan([("Sell", "Put", 92.0), ("Buy", "Put", 88.0)], -105.0)),
+        ("iron condor (profit BETWEEN two breakevens)",
+         _plan([("Buy", "Put", 90.0), ("Sell", "Put", 95.0), ("Sell", "Call", 105.0), ("Buy", "Call", 110.0)], -150.0)),
+        ("long straddle (profit OUTSIDE two breakevens)", _plan([("Buy", "Call", 100.0), ("Buy", "Put", 100.0)], 600.0)),
+        ("long call (rising tail)", _plan([("Buy", "Call", 100.0)], 330.0)),
+        ("short call (falling tail)", _plan([("Sell", "Call", 105.0)], -200.0)),
+        ("bear put spread", _plan([("Buy", "Put", 100.0), ("Sell", "Put", 95.0)], 230.0)),
+    ])
+    def test_matches_numerical_integration_of_the_payoff(self, name, plan):
+        pop, ev = _plan_pop_ev(plan, 30, 0.30, 100.0)
+        ref_pop, ref_ev = _numeric_pop_ev(plan, 100.0, 30, 0.30)
+        assert pop == pytest.approx(ref_pop, abs=2e-4), name
+        assert ev == pytest.approx(ref_ev, abs=0.05), name
+
+    def test_condor_pop_uses_both_breakevens(self):
+        """The old code read P(S_T <= LOWER breakeven) = 23% for a condor that is profitable ~53% of the time."""
+        plan = _plan([("Buy", "Put", 90.0), ("Sell", "Put", 95.0), ("Sell", "Call", 105.0), ("Buy", "Call", 110.0)], -150.0)
+        pop, _ = _plan_pop_ev(plan, 30, 0.30, 100.0)
+        assert pop > 0.45
+        lower_be_only = 1 - _p_above(100.0, 95.0 - 1.50, 30 / 365, 0.30)
+        assert pop > 2 * lower_be_only
+
+    def test_fairly_priced_structure_has_about_zero_model_pnl(self):
+        """Priced at the model's own IV the structure is a fair bet: model P&L ≈ carry, not the binary-formula
+        +$12 the old pop·max_profit − (1−pop)·|max_loss| produced for this very spread."""
+        plan = _bull_call_plan()
+        pop, ev = _plan_pop_ev(plan, 30, 0.30, 100.0)
+        assert abs(ev) < 2.0
+        binary = pop * plan["max_profit"] + (1 - pop) * plan["max_loss"]
+        assert abs(binary) > 8 * abs(ev)             # the formula that was replaced is nowhere near the expectation
+
+    def test_unknown_inputs_return_none_never_a_default(self):
+        plan = _bull_call_plan()
+        assert _plan_pop_ev(plan, 30, None, 100.0) == (None, None)
+        assert _plan_pop_ev(plan, None, 0.30, 100.0) == (None, None)
+        assert _plan_pop_ev(plan, 30, 0.30, None) == (None, None)
+        assert _plan_pop_ev({"legs": [], "net_cost": 0.0}, 30, 0.30, 100.0) == (None, None)
+
+    def test_candidate_plans_and_edge_share_one_helper(self):
+        strikes = [285, 290, 295, 300, 305, 310, 315, 320, 325]
+        quotes = {float(k): {"C": {"mid": max(0.2, 320 - k + 2), "iv": 0.30},
+                             "P": {"mid": max(0.2, k - 290 + 2), "iv": 0.30}} for k in strikes}
+        exp = {"date": "2026-09-19", "dte": 30}
+        cands = _candidate_plans("short", "trend_continuation", 305.0, 310.0, 295.0, 295.0, 310.0, None, strikes, quotes, exp, 0.30)
+        assert cands
+        for c in cands:
+            e = _edge({"direction": "neutral", "options_plan": c}, 305.0, 0.30, 30)["options"]
+            assert e["pop_pct"] == c["pop_pct"] and e["ev"] == c["ev"]
+        # without an IV the candidates still price (the BS fallback needs a vol) but quote NO probability
+        for c in _candidate_plans("short", "trend_continuation", 305.0, 310.0, 295.0, 295.0, 310.0, None, strikes, quotes, exp, None):
+            assert c["pop_pct"] is None and c["ev"] is None
+
+
+class TestEquitySizing:
+    """Position size is a FLAT 1% risk, never derived from market-implied odds (which are zero-edge by construction)."""
+
+    def test_equity_plan_has_no_edge_based_sizing_path(self):
+        with pytest.raises(TypeError):
+            _equity_plan("long", 233.67, 229.87, [{"level": 259.31}], 238.9, 2.0)        # no risk_pct argument any more
+
+    @staticmethod
+    def _regression_setup():
+        return {"direction": "long", "type": "trend_continuation",
+                "entry": {"level": 233.67, "low": 233.0, "high": 234.0, "label": "x"}, "stop": {"level": 229.87, "label": "y"},
+                "targets": [{"level": 259.31, "label": "z", "rr": 6.75}],
+                "options": {"structure": "", "detail": "", "bias": "bullish"}}
+
+    def test_enriched_setup_is_sized_flat_even_for_the_regression_plan(self):
+        """Old: half-Kelly of 2% of book → $500 budget → 131 shares. Now: 1% flat → $250 → 65 shares."""
+        s = self._regression_setup()
+        _enrich_setup(s, spot=238.9, atr=4.0, em_pct=None, zones=[], quotes={}, expiry={"date": "2026-09-19", "dte": 30},
+                      dealer=None, atm_iv=0.30, next_earnings=None, strikes=None)
+        eq = s["equity_plan"]
+        assert eq["sizing_basis"] == "1% flat" and eq["risk_budget"] == 250
+        assert eq["suggested_shares"] == int(250 / 3.80) == 65
+        assert s["edge"]["equity"]["available"] and not (_REMOVED_EDGE_KEYS & set(s["edge"]["equity"]))
+
+    def test_sizing_is_identical_with_and_without_odds(self):
+        flat = _equity_plan("long", 233.67, 229.87, [{"level": 259.31}], 238.9)
+        s = self._regression_setup()
+        _enrich_setup(s, spot=238.9, atr=4.0, em_pct=None, zones=[], quotes={}, expiry=None,
+                      dealer=None, atm_iv=None, next_earnings=None, strikes=None)      # no IV, no expiry → odds unavailable
+        assert s["edge"]["equity"]["available"] is False
+        assert s["equity_plan"]["suggested_shares"] == flat["suggested_shares"]
+        assert s["equity_plan"]["risk_budget"] == flat["risk_budget"]
+
+
+class TestSetupsCacheKey:
+    """The /trade-setups payload is cached under ONE key shared by the router and the trade manager: a response-shape
+    change must bump it in exactly one place (the old payload had no `edge.equity.win_pct`)."""
+
+    def test_key_is_versioned_past_the_old_shape(self):
+        assert setups_cache_key("NVDA") == "setups:NVDA:v4"      # v3 held edge.equity.{pop_pct, ev_per_share, kelly_pct}
+
+    def test_no_consumer_hardcodes_the_key(self):
+        import pathlib
+        app = pathlib.Path(__file__).resolve().parents[1] / "app"
+        for rel in ("routers/stock_router.py", "services/trade_manager_service.py"):
+            src = (app / rel).read_text()
+            assert "setups_cache_key(" in src, rel
+            assert 'f"setups:{' not in src.replace('f"day-setups:{', "").replace('f"qm-setups:{', "").replace('f"connors-setups:{', ""), rel
 
 
 class TestCandidatePlans:

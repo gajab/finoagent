@@ -37,6 +37,7 @@ import {
 import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind, ClosedMonthSummary } from '../../api';
 import { fmtMoney, fmtPct, fmtAnnualized, isMeaningfulAnnualized, fmtDTE, fmtDate, fmtQty, pnlSummary } from '../../lib/tradeFormat';
 import { type PricedPnl, isUnpriced, hasMark, effectivePnl, pnlTotals, optionIncome, closedRowDeletion } from '../../lib/tradePnl';
+import { rollPreview } from '../../lib/rollMath';
 import UpdatePositionModal from './UpdatePositionModal';
 import TransactionHistoryPanel from './TransactionHistoryPanel';
 import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
@@ -153,11 +154,11 @@ const GROUP_META: Record<TradeGroup, {
 
 // ── Purpose (what the trade is FOR — the new top-level grouping) ──────────────
 
-type TradePurpose = 'income' | 'hedge' | 'trade' | 'managed_floor' | 'managed_buffer' | 'dual_directional' | 'other';
+export type TradePurpose = 'income' | 'hedge' | 'trade' | 'managed_floor' | 'managed_buffer' | 'dual_directional' | 'other';
 
-const PURPOSE_ORDER: TradePurpose[] = ['income', 'hedge', 'managed_floor', 'managed_buffer', 'dual_directional', 'trade', 'other'];
+export const PURPOSE_ORDER: TradePurpose[] = ['income', 'hedge', 'managed_floor', 'managed_buffer', 'dual_directional', 'trade', 'other'];
 
-const PURPOSE_META: Record<TradePurpose, { label: string; color: string; icon: React.ReactNode; desc: string }> = {
+export const PURPOSE_META: Record<TradePurpose, { label: string; color: string; icon: React.ReactNode; desc: string }> = {
   income:           { label: 'Income',            color: 'success',      icon: <Percent className="w-4 h-4" />,      desc: 'Premium-selling / carry — covered calls, CSPs, credit spreads' },
   hedge:            { label: 'Hedge',             color: 'info',         icon: <Shield className="w-4 h-4" />,       desc: 'Downside protection / risk offset' },
   managed_floor:    { label: 'Managed Floor',     color: 'primary',      icon: <TrendingUp className="w-4 h-4" />,   desc: 'Floored downside with participation' },
@@ -168,13 +169,13 @@ const PURPOSE_META: Record<TradePurpose, { label: string; color: string; icon: R
 };
 
 /** The trade's purpose (from parameters.purpose); legacy trades default to Income. */
-function tradePurpose(trade: SavedStrategyItem): TradePurpose {
+export function tradePurpose(trade: SavedStrategyItem): TradePurpose {
   const p = String(trade.parameters?.purpose || '').toLowerCase();
   return (p in PURPOSE_META) ? (p as TradePurpose) : 'income';
 }
 
 /** Infer the strategy_type to store when legs change. */
-function inferStrategyType(
+export function inferStrategyType(
   baseType: string,
   allLegs: any[],
   hasStock: boolean,
@@ -191,7 +192,7 @@ function inferStrategyType(
   return allShortCalls ? 'covered_call' : 'stock_combo';
 }
 
-function classifyTrade(trade: SavedStrategyItem): TradeGroup {
+export function classifyTrade(trade: SavedStrategyItem): TradeGroup {
   const t = (trade.strategy_type || '').toLowerCase();
   if (t === 'futures') return 'futures';
   const legs = (trade.legs_data || []) as any[];
@@ -248,7 +249,7 @@ function classifyTrade(trade: SavedStrategyItem): TradeGroup {
 // Map a saved trade's legs to a Desk-Review structure + primary short strike, so
 // the desk debate can focus on THIS trade. Returns null for shapes the desk review
 // doesn't rank (pure stock, box, long-only options) — the debate is hidden there.
-function deskFocusForTrade(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): DeskFocusTrade | null {
+export function deskFocusForTrade(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): DeskFocusTrade | null {
   const legs = (trade.legs_data || []) as any[];
   const opts = legs.filter(l => /call|put/i.test(l.type || ''));
   if (opts.length === 0) return null;
@@ -289,7 +290,7 @@ function deskFocusForTrade(trade: SavedStrategyItem, pnl?: LivePnlResponse | nul
 }
 
 // User-facing option STRUCTURE of a trade (for filtering within a group).
-function tradeStructure(trade: SavedStrategyItem): { key: string; label: string } {
+export function tradeStructure(trade: SavedStrategyItem): { key: string; label: string } {
   const legs = (trade.legs_data || []) as any[];
   const opts = legs.filter(l => /call|put/i.test(l.type || ''));
   const hasStock = (Number(trade.parameters?.shares) || 0) > 0;
@@ -320,12 +321,12 @@ function tradeStructure(trade: SavedStrategyItem): { key: string; label: string 
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
-function daysHeld(entryDate: string | null | undefined): number {
+export function daysHeld(entryDate: string | null | undefined): number {
   if (!entryDate) return 0;
   return Math.max(0, Math.floor((Date.now() - new Date(entryDate).getTime()) / 86400000));
 }
 
-function expiryFrom(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): string | null {
+export function expiryFrom(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): string | null {
   return pnl?.expiration_date
     || trade.result_snapshot?.expirationDate
     || trade.result_snapshot?.spread?.expiration
@@ -333,16 +334,21 @@ function expiryFrom(trade: SavedStrategyItem, pnl?: LivePnlResponse | null): str
     || null;
 }
 
-function dteFrom(expiry: string | null): number | null {
+export function dteFrom(expiry: string | null): number | null {
   if (!expiry) return null;
-  const d = Math.floor((new Date(expiry).getTime() - Date.now()) / 86400000);
-  return Math.max(0, d);
+  // Calendar days from TODAY to the expiry DATE (same as the Income Desk and the backend's dte_remaining). The old
+  // `floor((UTC-midnight expiry − now) / 1 day)` under-counted by a day and read a day early in US timezones.
+  const day = String(expiry).slice(0, 10);
+  const exp = /^\d{4}-\d{2}-\d{2}$/.test(day) ? new Date(`${day}T00:00:00`) : new Date(expiry);
+  if (Number.isNaN(exp.getTime())) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return Math.max(0, Math.round((exp.getTime() - today.getTime()) / 86400000));   // round: DST days are 23/25h
 }
 
 // Trimmed P&L snapshot persisted server-side so collapsed rows show last-known numbers on
 // landing (a full live refresh runs on expand / Refresh all). `_cached` marks a seeded-from-DB
 // entry so the expand effect knows to fetch the full detail.
-function trimPnl(p: LivePnlResponse): Record<string, any> {
+export function trimPnl(p: LivePnlResponse): Record<string, any> {
   const a: any = (p as any).analysis || {};
   return {
     unrealized_pnl: p.unrealized_pnl, pnl_pct: (p as any).pnl_pct, underlying_price: (p as any).underlying_price,
@@ -392,8 +398,24 @@ function Chip({ label, value, color = '', hint }: { label: string; value: string
 // Does this trade hold underlying stock (covered call / collar / combo)? Keyed on
 // `parameters.shares` — the SAME field the backend uses to compute the stock/option P&L split,
 // so the toggle only appears when a real split can actually be produced.
-function tradeHasStock(t: SavedStrategyItem): boolean {
+export function tradeHasStock(t: SavedStrategyItem): boolean {
   return (Number(t.parameters?.shares) || 0) > 0;
+}
+
+// P&L to show: total by default, or DERIVATIVE-ONLY (strip the stock leg's P&L) when the user
+// unchecks "include stock". A stock-less income trade's unrealized_pnl is already options-only.
+// Prefer the backend's options_pnl; else derive it as total − stock_pnl (both persisted in the
+// snapshot). If NEITHER split field is present (a pre-feature cached snapshot) we can't strip —
+// a refresh repopulates them.
+export function effectivePnl(p: LivePnlResponse | null | undefined, excludeStock: boolean): number | null {
+  if (!p) return null;
+  const total = p.unrealized_pnl ?? null;
+  if (!excludeStock) return total;
+  const op = (p as any).options_pnl;
+  if (op != null) return Number(op);
+  const sp = (p as any).stock_pnl;
+  if (sp != null && total != null) return total - Number(sp);
+  return total;
 }
 
 // Does the snapshot carry the stock/option P&L split needed for the "derivatives only" toggle?
@@ -401,7 +423,7 @@ function hasPnlSplit(p: LivePnlResponse | null | undefined): boolean {
   return !!p && ((p as any).options_pnl != null || (p as any).stock_pnl != null);
 }
 
-function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): number {
+export function deployedCapital(t: SavedStrategyItem, p?: LivePnlResponse | null): number {
   const shares = Number(t.parameters?.shares) || 0;
   const avgCost = Number(t.parameters?.avg_cost ?? t.entry_prices?.[0]?.price) || 0;
   if (t.strategy_type === 'futures') {
@@ -2251,23 +2273,15 @@ function TradeCard({
                                     const isShortOld = /sell|short/i.test(rl.action || '');
                                     const epIdx = isComboLike ? rollState.legIdx + 1 : rollState.legIdx;
                                     const oldEntry = Number(trade.entry_prices?.[epIdx]?.price ?? rl.premium ?? rl.mid ?? rl.price ?? 0) || 0;
-                                    const buyback = parseFloat(rollState.closePrice);
-                                    const newPrem = parseFloat(rollState.newPremium);
-                                    const newQty = Number(rollState.newContracts) || 1;
-                                    const priorRoll = Number(trade.roll?.roll_realized_pnl ?? 0);
-                                    const priorCount = Number(trade.roll?.count ?? 0);
-                                    const hasBB = isFinite(buyback), hasNP = isFinite(newPrem);
-                                    if (!hasBB && !hasNP) return null;
-                                    const realizedClose = hasBB ? (isShortOld ? oldEntry - buyback : buyback - oldEntry) * 100 * oldQty : null;
-                                    const buybackCost = hasBB ? buyback * 100 * oldQty : null;
-                                    const oldEntryCredit = (isShortOld ? oldEntry : -oldEntry) * 100 * oldQty;
-                                    const netBasisBefore = oldEntryCredit + priorRoll;
-                                    const targetCredit = buybackCost != null ? buybackCost - netBasisBefore : null;
-                                    const targetPerShare = targetCredit != null && newQty > 0 ? targetCredit / (100 * newQty) : null;
-                                    const newCredit = hasNP ? (rollState.newAction === 'sell' ? 1 : -1) * newPrem * 100 * newQty : null;
-                                    const campaignAfter = realizedClose != null ? priorRoll + realizedClose : null;
-                                    const netRollCash = buybackCost != null && newCredit != null ? (isShortOld ? -buybackCost : buybackCost) + newCredit : null;
-                                    const meets = newCredit != null && targetCredit != null ? newCredit >= targetCredit - 0.005 : null;
+                                    // The maths lives in lib/rollMath.ts — shared with the Beta roll form so both always agree.
+                                    const rp = rollPreview({
+                                      oldIsShort: isShortOld, oldQty, oldEntry,
+                                      buyback: parseFloat(rollState.closePrice), newAction: rollState.newAction,
+                                      newPremium: parseFloat(rollState.newPremium), newQty: Number(rollState.newContracts) || 1,
+                                      priorRoll: Number(trade.roll?.roll_realized_pnl ?? 0), priorCount: Number(trade.roll?.count ?? 0),
+                                    });
+                                    if (!rp.hasAny) return null;
+                                    const { realizedClose, netRollCash, campaignAfter, newCredit, targetCredit, targetPerShare, meets, priorCount, newQty } = rp;
                                     const sign = (v: number) => `${v >= 0 ? '+' : '−'}${fmtMoney(Math.abs(v))}`;
                                     return (
                                       <div className="rounded-md bg-base-100/60 border border-warning/10 p-2 space-y-1 text-[10px]">
@@ -2861,7 +2875,7 @@ interface DisplayMonth {
   count: number; cost: number; proceeds: number; realized: number; bpr: number; wins: number; scored: number;
 }
 
-function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, includeRolls = false, onDeleteTrade }: {
+export function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, includeRolls = false, onDeleteTrade }: {
   trades: SavedStrategyItem[];
   pnlMap: Record<number, LivePnlResponse>;
   frozenMonths?: ClosedMonthSummary[];   // prior immutable months, stored server-side — summary only
@@ -3395,14 +3409,14 @@ interface AdvisorState {
   question: string;
 }
 
-export default function MyTradesV2() {
+export default function MyTradesV2({ openId = null }: { openId?: number | null } = {}) {
   const [activeStatus, setActiveStatus] = useState<'active' | 'closed' | 'paper'>('active');
   const [trades, setTrades] = useState<SavedStrategyItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   // Each expanded / history panel is tracked independently — opening one card
   // never collapses another. User must explicitly click to close each one.
-  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(() => new Set(openId != null ? [openId] : []));
   const [openHistoryIds, setOpenHistoryIds] = useState<Set<number>>(new Set());
   const [pnlMap, setPnlMap] = useState<Record<number, LivePnlResponse>>({});
   const [pnlLoadingMap, setPnlLoadingMap] = useState<Record<number, boolean>>({});
@@ -3463,6 +3477,14 @@ export default function MyTradesV2() {
   }, [activeStatus, showRollPartials]);
 
   useEffect(() => { loadTrades(); }, [loadTrades]);
+
+  // Deep link from the Beta inspector ("Classic ↗"): that card is pre-expanded; scroll to it once the book loads.
+  const scrolledToOpenId = React.useRef(false);
+  useEffect(() => {
+    if (openId == null || loading || scrolledToOpenId.current) return;
+    scrolledToOpenId.current = true;
+    requestAnimationFrame(() => document.getElementById(`trade-card-${openId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+  }, [openId, loading]);
 
   // Auto-fetch P&L for any newly expanded card that doesn't have data yet.
   // We watch a stable string key derived from the set so the effect fires

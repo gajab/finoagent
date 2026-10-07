@@ -1063,12 +1063,22 @@ function WatchList({ onSelect }: { onSelect: (ticker: string) => void }) {
   );
 }
 
-export function DerivativeIncome() {
+export type DerivativeIncomeMode = 'single' | 'portfolio' | 'evaluate' | 'watchlist' | 'screener';
+
+// Beta hosts the non-scan modes (Evaluate / WatchList / Screener / Portfolio) inside its own chrome:
+// `initialMode` pins the mode, `hideChrome` drops the intro + mode toggle, and `onOpenTicker` lets a
+// WatchList / Screener pick open the Beta scan instead of switching to this component's classic single view.
+export function DerivativeIncome({ initialMode, hideChrome = false, onOpenTicker }: {
+  initialMode?: DerivativeIncomeMode;
+  hideChrome?: boolean;
+  onOpenTicker?: (ticker: string, opts?: { expiry?: string | null; minProb?: number; minIncome?: number }) => void;
+} = {}) {
   const { isPremium } = useAuth();
-  const [mode, setMode] = useState<Mode>('single');
+  const [mode, setMode] = useState<Mode>(initialMode ?? 'single');
   const [ticker, setTicker] = useState('AAPL');
   const [searchParams] = useSearchParams();
   useEffect(() => {                                   // deep-link: ?mode=evaluate (from a TA setup card)
+    if (initialMode) return;                          // hosted by the Beta tabs: the host owns the mode, not the URL
     const m = searchParams.get('mode');
     if (m === 'single' || m === 'portfolio' || m === 'evaluate' || m === 'screener') setMode(m);
   }, [searchParams]);
@@ -1175,6 +1185,7 @@ export function DerivativeIncome() {
   useEffect(() => { if (mode === 'screener') setScreenerVisited(true); }, [mode]);
   const pendingScan = useRef(false);
   const openFromScreener = (t: string, o: { expiry?: string | null; minProb: number; minIncome: number }) => {
+    if (onOpenTicker) { onOpenTicker(t, o); return; }
     setTicker(t); setSelectedExpiry(o.expiry || ''); setMinProb(o.minProb); setMinIncome(o.minIncome);
     setOwnsShares(false); setMode('single');
     pendingScan.current = true;
@@ -1196,6 +1207,7 @@ export function DerivativeIncome() {
 
   return (
     <div className="space-y-4">
+      {!hideChrome && (<>
       {/* Intro */}
       <div className="bg-base-200/40 rounded-xl p-4 border border-white/[0.03]">
         <div className="flex items-start gap-3">
@@ -1230,9 +1242,10 @@ export function DerivativeIncome() {
           <ScanSearch className="w-3.5 h-3.5" /> Screener
         </button>
       </div>
+      </>)}
 
       {mode === 'evaluate' && <EvaluateForm defaultQuoteSource={quoteSource} />}
-      {mode === 'watchlist' && <WatchList onSelect={(t) => { setTicker(t); setMode('single'); }} />}
+      {mode === 'watchlist' && <WatchList onSelect={(t) => { if (onOpenTicker) { onOpenTicker(t); return; } setTicker(t); setMode('single'); }} />}
       {/* Kept mounted once opened so a long screen / evaluation survives switching tabs. */}
       {screenerVisited && <div hidden={mode !== 'screener'}><IncomeScreener onOpenTicker={openFromScreener} /></div>}
 

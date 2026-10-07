@@ -93,11 +93,20 @@ export function fmtQty(n: number | null | undefined): string {
   return Math.round(n).toLocaleString('en-US');
 }
 
+/**
+ * A date-only string ('2026-11-20' — an option expiry, an entry date) is a CALENDAR day, not an instant.
+ * `new Date('2026-11-20')` is UTC midnight, which a browser west of UTC renders as Nov 19 — one day early.
+ * Parse date-only strings as LOCAL calendar days; real timestamps keep their instant.
+ */
+export function parseDay(iso: string): Date {
+  return /^\d{4}-\d{2}-\d{2}$/.test(iso.trim()) ? new Date(`${iso.trim()}T00:00:00`) : new Date(iso);
+}
+
 /** Format date as a short user-readable form: "Apr 22, 2026". */
 export function fmtDate(iso: string | null | undefined): string {
   if (!iso) return '—';
   try {
-    const d = new Date(iso);
+    const d = parseDay(iso);
     return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
   } catch {
     return iso;

@@ -577,13 +577,13 @@ async def get_trade_setups(
     expected move, filtered by regime). Cached + executor-run (fans out to all four)."""
     import asyncio
     import yfinance as yf
-    from ..services.trade_setup_service import compute_trade_setups
+    from ..services.trade_setup_service import compute_trade_setups, setups_cache_key
 
     if ticker.startswith("."):
         ticker = "^" + ticker[1:]
     ticker = ticker.upper()
 
-    cache_key = f"setups:{ticker}:v3"          # v3: VP levels now Daily·4H·1H (was macro/swing/micro); v2: multi-style + meaningful targets
+    cache_key = setups_cache_key(ticker)       # shared with trade_manager_service — version lives there
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return {"ticker": ticker, "trade_setups": cached, "cached": True}

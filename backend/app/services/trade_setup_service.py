@@ -32,11 +32,20 @@ from .dealer_positioning_service import compute_dealer_positioning
 from .chart_pattern_service import compute_chart_patterns
 from .stock_service import safe_float
 from .zebra_service import _bs_price, _norm_cdf, DEFAULT_RISK_FREE
+from .first_passage import trade_odds
 
 
 # ---------------------------------------------------------------------------
-# probability & edge — market-implied (risk-neutral lognormal), consistent with the
-# income desk's BS-prob fallback (stock_service.bs_prob_otm / hedging RND use the same basis)
+# probability — market-implied (risk-neutral lognormal), consistent with the income desk's
+# BS-prob fallback (stock_service.bs_prob_otm / hedging RND use the same basis).
+#
+# Two DIFFERENT questions, two different (correct) tools:
+#   * an equity stop/target plan is decided by which level is TOUCHED FIRST at any time before the
+#     horizon → first-passage odds (first_passage.trade_odds), NOT the terminal distribution;
+#   * an option structure held to expiry is decided by the TERMINAL price → terminal probabilities
+#     and an exact payoff expectation (_plan_pop_ev).
+# Market-implied odds make every stop/target rule a fair bet, so NO expected value, Kelly fraction or
+# position size is derived from them — only the odds themselves and the break-even they must beat.
 # ---------------------------------------------------------------------------
 
 def _p_above(spot, level, t, iv, r=DEFAULT_RISK_FREE):
@@ -47,45 +56,127 @@ def _p_above(spot, level, t, iv, r=DEFAULT_RISK_FREE):
     return _norm_cdf(d2)
 
 
-def _p_below(spot, level, t, iv, r=DEFAULT_RISK_FREE):
-    p = _p_above(spot, level, t, iv, r)
-    return (1.0 - p) if p is not None else None
+_ODDS_BASIS = "First-passage · market-implied (risk-neutral)"
+_ODDS_UNAVAILABLE = {
+    "no-iv": "No implied vol available for this name, so the odds are not computed (no default is assumed).",
+    "no-window": "No options expiry to set the holding window, so the odds are not computed.",
+    "bad-levels": "Entry / stop / target are not in a valid order, so the odds are not computed.",
+    "numerical": "The odds could not be computed reliably for these levels.",
+}
+
+
+def _equity_odds(direction, entry, stop, t1, spot, atm_iv, dte) -> dict:
+    """Odds that the equity plan reaches T1 before the stop (or neither) inside the options-expiry window.
+
+    Probabilities are GIVEN the entry fills (a pullback limit may never fill — ``fill_pct`` says how likely
+    it is) and are measured from where the plan actually starts (the entry), not from spot. ``break_even_pct``
+    is the win rate the reward:risk needs; ``vs_break_even_pts`` compares the resolved win share to it. Nothing
+    here is a Kelly size or an expected value: under market-implied odds those are zero-edge by construction.
+    """
+    risk, reward = abs(entry - stop), abs(t1 - entry)
+    out: dict = {"payoff_ratio": _r(reward / risk, 2), "break_even_pct": _r(risk / (risk + reward) * 100, 1),
+                 "basis": _ODDS_BASIS}
+    o = trade_odds(direction, spot, entry, stop, t1, atm_iv, dte)
+    if not o["ok"]:
+        return {**out, "available": False, "reason": o["reason"], "note": _ODDS_UNAVAILABLE.get(o["reason"])}
+    return {
+        **out, "available": True, "window_days": dte, "iv_pct": _r(o["iv"] * 100, 1),
+        "fill_kind": o["fill_kind"], "fill_pct": _r(o["fill_prob"] * 100, 1) if o["fill_prob"] is not None else None,
+        "win_pct": _r(o["win"] * 100, 1), "loss_pct": _r(o["loss"] * 100, 1), "open_pct": _r(o["inside"] * 100, 1),
+        "resolved_win_pct": _r(o["resolved_win"] * 100, 1) if o["resolved_win"] is not None else None,
+        "vs_break_even_pts": _r(o["vs_break_even_pts"], 1) if o["vs_break_even_pts"] is not None else None,
+    }
+
+
+def _plan_pop_ev(plan, dte, iv, spot, r=DEFAULT_RISK_FREE):
+    """EXACT expiry statistics of a priced option structure under the market-implied lognormal:
+    ``(pop, ev_per_contract)`` or ``(None, None)`` when the IV / expiry / legs are unknown (no defaults).
+
+    * PoP = P(P&L > 0 at expiry) — the probability mass of every profitable region of the piecewise-linear
+      payoff, so a condor (profit BETWEEN two breakevens) is right, not just a single-breakeven spread.
+    * EV  = E[P&L] — the payoff expectation in closed form (E[(S_T−K)⁺] = F·N(d1) − K·N(d2), F = S·e^{rT}),
+      not ``pop·max_profit + (1−pop)·max_loss``, which treats every profitable outcome as max profit and
+      every loss as max loss. Under market-implied odds it is ≈ 0 (carry + skew/model-vs-mid residue):
+      it is the model's read of the structure's pricing, NOT an edge.
+
+    Works off the plan dict (legs as Buy/Sell · Call/Put · strike, ``net_cost`` signed $ per contract) so
+    ``_plan_from_legs`` and ``_edge`` share this one implementation.
+    """
+    legs = [(1.0 if lg.get("action") == "Buy" else -1.0, lg.get("right") == "Call", float(lg["strike"]))
+            for lg in (plan.get("legs") or []) if lg.get("strike")]
+    net_cost = plan.get("net_cost")
+    if not (legs and net_cost is not None and spot and spot > 0 and dte and dte > 0 and iv and iv > 0):
+        return None, None
+    t = dte / 365.0
+    debit = float(net_cost) / 100.0
+
+    def pnl(x: float) -> float:
+        return sum(sg * (max(0.0, x - k) if call else max(0.0, k - x)) for sg, call, k in legs) - debit
+
+    # profitable regions: the payoff is linear between the strikes (and beyond the last one)
+    nodes = [0.0] + sorted({k for _, _, k in legs})
+    ys = [pnl(x) for x in nodes]
+    tail_slope = pnl(nodes[-1] + 1.0) - ys[-1]
+    regions: list[tuple[float, float]] = []
+    for (x0, y0), (x1, y1) in zip(zip(nodes, ys), zip(nodes[1:], ys[1:])):
+        if y0 > 0 and y1 > 0:
+            regions.append((x0, x1))
+        elif y0 > 0 or y1 > 0:
+            xr = x0 - y0 * (x1 - x0) / (y1 - y0)
+            regions.append((x0, xr) if y0 > 0 else (xr, x1))
+    if ys[-1] > 0 and tail_slope >= 0:
+        regions.append((nodes[-1], math.inf))
+    elif ys[-1] > 0:
+        regions.append((nodes[-1], nodes[-1] - ys[-1] / tail_slope))
+    elif tail_slope > 0:
+        regions.append((nodes[-1] - ys[-1] / tail_slope, math.inf))
+
+    def above(x: float) -> float:
+        return 1.0 if x <= 0 else (0.0 if math.isinf(x) else _p_above(spot, x, t, iv, r))
+
+    pop = sum(above(a) - above(b) for a, b in regions)
+
+    sd = iv * math.sqrt(t)
+    fwd = spot * math.exp(r * t)
+    ev = -debit
+    for sg, call, k in legs:
+        d1 = (math.log(fwd / k) + 0.5 * sd * sd) / sd
+        d2 = d1 - sd
+        ev += sg * ((fwd * _norm_cdf(d1) - k * _norm_cdf(d2)) if call else (k * _norm_cdf(-d2) - fwd * _norm_cdf(-d1)))
+    return min(1.0, max(0.0, pop)), ev * 100.0
 
 
 def _edge(setup, spot, atm_iv, dte) -> dict:
-    """PoP + expected value + Kelly for the equity and options expressions of the trade."""
-    t = max(dte or 30, 1) / 365.0
-    iv = atm_iv if (atm_iv and atm_iv > 0) else 0.30
+    """Odds for the equity and options expressions of the trade.
+
+    ``equity`` — first-passage odds that the stop/target plan reaches T1 / the stop / neither (see
+    :func:`_equity_odds`); ``options`` — expiry PoP and the model P&L of the priced structure
+    (:func:`_plan_pop_ev`). Neither is an edge: they are the market's own odds, shown against the break-even
+    they have to beat. ``atm_iv`` is a DECIMAL; a missing IV or expiry yields "unavailable", never a default.
+    """
     out: dict = {}
     direction = setup.get("direction")
     entry = (setup.get("entry") or {}).get("level")
     stop = (setup.get("stop") or {}).get("level")
     t1 = (setup.get("targets") or [{}])[0].get("level")
 
-    if direction in ("long", "short") and entry and stop and t1:
-        if direction == "long":
-            p_win, p_lose = _p_above(spot, t1, t, iv), _p_below(spot, stop, t, iv)
-        else:
-            p_win, p_lose = _p_below(spot, t1, t, iv), _p_above(spot, stop, t, iv)
-        risk, reward = abs(entry - stop), abs(t1 - entry)
-        b = reward / risk if risk > 0 else 0.0
-        if p_win is not None and p_lose is not None:
-            ev = p_win * reward - p_lose * risk
-            kelly = (p_win - (1 - p_win) / b) if b > 0 else 0.0
-            out["equity"] = {"pop_pct": _r(p_win * 100, 1), "ev_per_share": _r(ev, 2),
-                             "payoff_ratio": _r(b, 2), "kelly_pct": _r(max(0.0, kelly) * 100, 1),
-                             "half_kelly_risk_pct": _r(min(2.0, max(0.0, kelly) / 2 * 100), 2)}
+    if direction in ("long", "short") and entry and stop and t1 and abs(entry - stop) > 0 and abs(t1 - entry) > 0:
+        out["equity"] = _equity_odds(direction, entry, stop, t1, spot, atm_iv, dte)
 
     op = setup.get("options_plan") or {}
     if op.get("available") and op.get("breakevens") and op.get("max_profit") is not None:
-        be = op["breakevens"][0]
-        legs = op.get("legs") or []
-        bull = ("Call" in (op.get("structure") or "")) or (legs and legs[0].get("right") == "Call" and legs[0].get("action") == "Buy")
-        pop = _p_above(spot, be, t, iv) if bull else _p_below(spot, be, t, iv)
+        pop, ev = _plan_pop_ev(op, dte, atm_iv, spot)
         if pop is not None:
-            ev = pop * op["max_profit"] + (1 - pop) * op["max_loss"]
             out["options"] = {"pop_pct": _r(pop * 100, 1), "ev": _r(ev, 0), "basis": "BS-implied (ATM IV)"}
     return out
+
+def setups_cache_key(ticker: str) -> str:
+    """Cache key of the ``/trade-setups`` payload. The router AND the trade manager read/write the SAME entry,
+    so both go through this one function. Bump the version whenever the payload SHAPE changes.
+    v4: ``edge.equity`` = first-passage odds (no EV/Kelly), flat 1% sizing, exact options PoP / model P&L;
+    v3: VP levels now Daily·4H·1H (was macro/swing/micro); v2: multi-style + meaningful targets."""
+    return f"setups:{ticker}:v4"
+
 
 _RISK_BUDGET = 250.0        # $ risked per trade = 1% of a nominal $25k book (share-sizing basis)
 _MIN_RR = 1.0               # never surface a directional trade you can't make at least 1:1 on
@@ -783,15 +874,13 @@ def _second_target(zones, spot, direction, t1) -> float | None:
     return max(cands) if cands else round(t1 - (spot - t1), 2)
 
 
-def _equity_plan(direction, entry, stop, targets, spot, risk_pct=None) -> dict | None:
+def _equity_plan(direction, entry, stop, targets, spot) -> dict | None:
     risk = abs(entry - stop)
     if risk <= 0:
         return None
-    # edge-based budget (half-Kelly %, capped 0.2–2% of a $25k book); default flat 1%
+    # FLAT 1% risk per trade. Deliberately NOT edge-based: the only odds available are market-implied, which
+    # make every stop/target rule a zero-edge bet, so a Kelly size computed from them would be meaningless.
     budget, basis = _RISK_BUDGET, "1% flat"
-    if risk_pct and risk_pct > 0:
-        budget = max(50.0, min(500.0, risk_pct / 100.0 * 25000.0))
-        basis = f"half-Kelly ({risk_pct}% of book)"
     shares = max(1, int(budget / risk))
     tgs = [t for t in targets if t.get("level") is not None]
     t1 = tgs[0]["level"] if tgs else entry
@@ -916,9 +1005,9 @@ def _options_plan(op, expiry, quotes, spot, dealer) -> dict:
     }
 
 
-def _plan_from_legs(name, kind, legs, quotes, spot, expiry, direction, atm_iv) -> dict | None:
-    """Price an explicit leg set (real chain mid, BS fallback) → payoff + PoP + EV. Used to
-    compare candidate structures (debit vs credit) and pick the best by expected value."""
+def _plan_from_legs(name, kind, legs, quotes, spot, expiry, atm_iv) -> dict | None:
+    """Price an explicit leg set (real chain mid, BS fallback) → payoff + expiry PoP + model P&L
+    (:func:`_plan_pop_ev`). Used to compare candidate structures (debit vs credit)."""
     if not legs or not spot:
         return None
     dte = (expiry or {}).get("dte")
@@ -938,22 +1027,19 @@ def _plan_from_legs(name, kind, legs, quotes, spot, expiry, direction, atm_iv) -
         priced.append({**lg, "price": round(float(mid), 2)})
     curve = _payoff_curve(priced, net, spot)
     pnls = [c["pnl"] for c in curve]
-    bes = _breakevens_from_curve(curve)
     mp, ml = round(max(pnls), 2), round(min(pnls), 2)
-    pop = ev = None
-    if bes:
-        pop = _p_above(spot, bes[0], t, iv0) if direction == "long" else _p_below(spot, bes[0], t, iv0)
-        if pop is not None:
-            ev = round(pop * mp + (1 - pop) * ml, 0)
-    return {
+    plan = {
         "available": True, "structure": name, "kind": kind, "expiry": expiry,
         "priced_from": "live chain" if any_real else "model (thin quotes)",
         "legs": [{"action": "Buy" if l["sign"] > 0 else "Sell", "right": "Call" if l["right"] == "C" else "Put",
                   "strike": l["strike"], "price": l["price"]} for l in priced],
         "net_cost": round(net * 100.0, 2), "net_cost_label": "debit" if net >= 0 else "credit",
-        "max_profit": mp, "max_loss": ml, "breakevens": bes, "payoff": curve,
-        "pop_pct": _r(pop * 100, 1) if pop is not None else None, "ev": ev,
+        "max_profit": mp, "max_loss": ml, "breakevens": _breakevens_from_curve(curve), "payoff": curve,
     }
+    pop, ev = _plan_pop_ev(plan, dte, atm_iv, spot)         # exact expiry PoP / model P&L — same helper as _edge
+    plan["pop_pct"] = _r(pop * 100, 1) if pop is not None else None
+    plan["ev"] = _r(ev, 0) if ev is not None else None
+    return plan
 
 
 def _candidate_plans(direction, setup_type, spot, entry, target, ssup, sres, dealer, strikes, quotes, expiry, atm_iv) -> list[dict]:
@@ -994,7 +1080,7 @@ def _candidate_plans(direction, setup_type, spot, entry, target, ssup, sres, dea
     # Premium-selling setups (pullback/fade INTO a level) prefer the credit spread; only a
     # breakout (entering ON a break) prefers the debit spread's convexity.
     prefer_credit = setup_type != "breakout"
-    built = [p for p in (_plan_from_legs(n, k, legs, quotes, spot, expiry, direction, atm_iv) for n, k, legs in specs) if p]
+    built = [p for p in (_plan_from_legs(n, k, legs, quotes, spot, expiry, atm_iv) for n, k, legs in specs) if p]
     for p in built:
         p["preferred"] = (p["kind"] == "credit") if prefer_credit else (p["kind"] == "debit")
         p["why"] = ("Sells premium AT the level you're trading into — positive theta and a wider margin of "
@@ -1002,7 +1088,7 @@ def _candidate_plans(direction, setup_type, spot, entry, target, ssup, sres, dea
                     if p["kind"] == "credit" else
                     "Directional debit spread — defined risk with convexity if the move runs; best when you "
                     "enter ON a break, not on a fade into a level.")
-    # primary = structurally preferred first, then higher EV as the tiebreak
+    # primary = structurally preferred first, then higher model P&L as the tiebreak
     built.sort(key=lambda p: (1 if p.get("preferred") else 0, p.get("ev") if p.get("ev") is not None else -1e9), reverse=True)
     return built
 
@@ -1140,8 +1226,7 @@ def _enrich_setup(s, spot, atr, em_pct, zones, quotes, expiry, dealer, atm_iv, n
 
     s["edge"] = _edge(s, spot, atm_iv, (expiry or {}).get("dte"))
     if direction in ("long", "short") and entry is not None and stop is not None:
-        risk_pct = ((s["edge"].get("equity") or {}).get("half_kelly_risk_pct"))
-        s["equity_plan"] = _equity_plan(direction, entry, stop, s["targets"], spot, risk_pct)
+        s["equity_plan"] = _equity_plan(direction, entry, stop, s["targets"], spot)
     s["event_risk"] = _event_risk(next_earnings, expiry)
     s["what_to_watch"] = _what_to_watch(s, dealer)
     # make the trade self-explain: how you get in (pullback/market/breakout) + holding horizon,

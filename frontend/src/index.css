@@ -362,3 +362,13 @@ canvas {
   transform: translateY(0);
   transition: opacity 300ms ease-out, transform 300ms ease-out;
 }
+
+
+/* Beta: panels reused from the classic screens were written at 7–10px; inside a .beta-readable container they are
+   lifted to a readable floor (11–12px). Scoped, so classic screens are unaffected. */
+.beta-readable .text-\[7px\],
+.beta-readable .text-\[8px\],
+.beta-readable .text-\[9px\],
+.beta-readable .text-\[9\.5px\] { font-size: 11px; line-height: 1.4; }
+.beta-readable .text-\[10px\] { font-size: 11.5px; }
+.beta-readable .text-\[11px\] { font-size: 12px; }
