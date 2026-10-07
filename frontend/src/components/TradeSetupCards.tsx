@@ -5,7 +5,7 @@ import {
   LineChart, TrendingUp, ShieldCheck, Loader2, Code2, Eye, FlaskConical, Clock, LogIn,
   CheckCircle2, AlertCircle, XCircle, Award, Rocket, Activity, Timer, History, ChevronsUpDown,
 } from 'lucide-react';
-import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg, QullamaggieData, ConnorsData, ConnorsBacktest, MomentumData } from '../types';
+import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg, EquityOdds, QullamaggieData, ConnorsData, ConnorsBacktest, MomentumData } from '../types';
 
 // Push an option structure's legs into the Income-Desk → Evaluate tab (sessionStorage handoff).
 function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: string, navigate: (to: string) => void) {
@@ -36,14 +36,49 @@ export const TYPE_LABEL: Record<string, string> = {
   qm_breakout: 'Momentum Breakout', qm_episodic_pivot: 'Episodic Pivot', qm_parabolic_short: 'Parabolic Short',
 };
 
-function EdgeStats({ pop, ev, evLabel, extra }: { pop?: number | null; ev?: number | null; evLabel: string; extra?: React.ReactNode }) {
-  if (pop == null && ev == null) return null;
-  const evTone = ev == null ? '' : ev >= 0 ? 'text-success' : 'text-error';
+// Options structure held to expiry: PoP and the model's own P&L read. Both are MARKET-IMPLIED — the P&L is ~$0 for a
+// fairly priced structure, so it is shown neutrally (never green/red, never as an "edge").
+function OptionsOdds({ pop, pnl }: { pop?: number | null; pnl?: number | null }) {
+  if (pop == null && pnl == null) return null;
   return (
     <div className="flex items-center gap-3 flex-wrap text-[11px] rounded-lg border border-white/[0.06] bg-base-200/20 px-2.5 py-1.5">
-      <span className="flex items-center gap-1"><span className="text-base-content/45">PoP</span> <b className="tabular-nums">{pop != null ? `${pop}%` : '—'}</b><InfoTip text="Probability of profit implied by the options market (ATM implied vol / risk-neutral distribution) — the market's own odds this trade pays." /></span>
-      <span className="flex items-center gap-1"><span className="text-base-content/45">{evLabel}</span> <b className={`tabular-nums ${evTone}`}>{ev != null ? d0(ev) : '—'}</b><InfoTip text="Expected value = probability-weighted average outcome. Positive = a mathematical edge; negative = the odds don't justify it." /></span>
-      {extra}
+      <span className="flex items-center gap-1"><span className="text-base-content/45">PoP at expiry</span> <b className="tabular-nums">{pop != null ? `${pop}%` : '—'}</b><InfoTip text="Probability the structure is profitable at expiry (every profitable region counts, e.g. between a condor's two breakevens), from the options market's own odds — ATM implied vol, risk-neutral distribution. Not a forecast." /></span>
+      <span className="flex items-center gap-1"><span className="text-base-content/45">Model P&amp;L</span> <b className="tabular-nums">{pnl != null ? d0(pnl) : '—'}</b><InfoTip text="The structure's expected P&L under those same market-implied odds, per contract. A fairly priced structure is ≈ $0 by construction, so this checks the pricing — it is NOT an edge. A small + or − is skew, bid/ask and carry, not a mathematical advantage." /></span>
+    </div>
+  );
+}
+
+// Equity stop/target plan: odds that price touches T1 before the stop (first passage), against the break-even they must beat.
+function EquityOddsBar({ odds }: { odds: EquityOdds }) {
+  const be = odds.break_even_pct;
+  const beTxt = be != null ? `Needs ${be}% wins to break even (R:R ${odds.payoff_ratio ?? '—'})` : null;
+  const box = 'rounded-lg border border-white/[0.06] bg-base-200/20 px-2.5 py-1.5 text-[11px] space-y-1';
+  if (!odds.available) {
+    return (
+      <div className={box}>
+        <div className="text-base-content/55">Odds not computed — {odds.note ?? 'inputs unavailable.'}</div>
+        {beTxt && <div className="text-base-content/60 tabular-nums">{beTxt}</div>}
+      </div>
+    );
+  }
+  const pts = odds.vs_break_even_pts;
+  const fillWord = odds.fill_kind === 'breakout' ? 'breakout' : 'pullback';
+  const tip = `Odds that price touches T1 before the stop at ANY time inside the ${odds.window_days}-day window (first passage, not the price at one date), measured from your entry${odds.fill_pct != null ? ' and given that it fills' : ''}. They are the options market's own odds (ATM implied vol ${odds.iv_pct ?? '—'}%, risk-neutral), under which every stop/target rule is a fair bet — so compare them to the break-even the reward:risk needs. They are not an edge, and no position size or expected value is derived from them.`;
+  return (
+    <div className={box}>
+      <div className="flex items-center gap-x-3 gap-y-0.5 flex-wrap tabular-nums">
+        <span><span className="text-base-content/45">Reaches T1 first</span> <b className="text-success">{odds.win_pct ?? '—'}%</b></span>
+        <span><span className="text-base-content/45">Stopped out first</span> <b className="text-error">{odds.loss_pct ?? '—'}%</b></span>
+        <span><span className="text-base-content/45">Neither in {odds.window_days}d</span> <b>{odds.open_pct ?? '—'}%</b></span>
+        <InfoTip text={tip} />
+      </div>
+      <div className="flex items-center gap-x-3 gap-y-0.5 flex-wrap text-base-content/60 tabular-nums">
+        {odds.fill_pct != null && <span>Entry fills {odds.fill_pct}% of the time ({fillWord}) — odds above are given a fill</span>}
+        {beTxt && <span>{beTxt}</span>}
+        {odds.resolved_win_pct != null && pts != null && (
+          <span>Of resolved trades {odds.resolved_win_pct}% win — {pts >= 0 ? '+' : '−'}{Math.abs(pts)} pts vs break-even</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -115,6 +150,7 @@ function EquityView({ setup, spot }: { setup: TradeSetup; spot: number | null })
             </div>
             <div className="mt-1.5 pt-1.5 border-t border-white/[0.05] text-[11px] text-base-content/70">
               <b>{eq.suggested_shares}</b> shares · risk <b className="text-error">{d0(eq.dollar_risk)}</b> to make <b className="text-success">{d0(eq.dollar_reward_t1)}</b> at T1.
+              {eq.sizing_basis && <span className="text-base-content/40"> Sized at {eq.sizing_basis} risk per trade.</span>}
             </div>
           </div>
         ) : (
@@ -122,8 +158,7 @@ function EquityView({ setup, spot }: { setup: TradeSetup; spot: number | null })
         )}
       </div>
     </div>
-    {ee && <EdgeStats pop={ee.pop_pct} ev={ee.ev_per_share} evLabel="EV/share"
-      extra={ee.half_kelly_risk_pct != null && <span className="flex items-center gap-1"><span className="text-base-content/45">½-Kelly size</span> <b>{ee.half_kelly_risk_pct}% of book</b><InfoTip text="Edge-based position size: half the Kelly-optimal fraction (capped at 2% of account), from the PoP and payoff ratio." /></span>} />}
+    {ee && <EquityOddsBar odds={ee} />}
     </div>
   );
 }
@@ -176,12 +211,12 @@ function OptionsView({ setup, spot, ticker }: { setup: TradeSetup; spot: number 
     </div>
     {!!setup.options_alternatives?.length && (
       <div className="rounded-lg border border-white/[0.06] bg-base-200/20 p-2 text-[10.5px]">
-        <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1">Alternative structures (primary picked by expected value)</div>
+        <div className="text-[9px] uppercase tracking-wider text-base-content/40 mb-1">Alternative structures (primary picked by structure: credit into a level, debit on a breakout)</div>
         {setup.options_alternatives.map((a, i) => (
           <div key={i} className="py-1 border-t border-white/[0.04] first:border-0">
             <div className="flex items-center justify-between gap-2">
               <span className="text-base-content/75 font-semibold">{a.structure}</span>
-              <span className="tabular-nums whitespace-nowrap">{a.net_cost_label} {d0(Math.abs(a.net_cost ?? 0))} · PoP {a.pop_pct ?? '—'}% · EV <b className={a.ev != null && a.ev >= 0 ? 'text-success' : 'text-error'}>{a.ev != null ? d0(a.ev) : '—'}</b></span>
+              <span className="tabular-nums whitespace-nowrap">{a.net_cost_label} {d0(Math.abs(a.net_cost ?? 0))} · PoP {a.pop_pct ?? '—'}% · model P&amp;L <b>{a.ev != null ? d0(a.ev) : '—'}</b></span>
             </div>
             {!!a.legs?.length && (
               <div className="flex items-center justify-between gap-2 mt-0.5">
@@ -193,7 +228,7 @@ function OptionsView({ setup, spot, ticker }: { setup: TradeSetup; spot: number 
         ))}
       </div>
     )}
-    {oe && <EdgeStats pop={oe.pop_pct} ev={oe.ev} evLabel="EV" />}
+    {oe && <OptionsOdds pop={oe.pop_pct} pnl={oe.ev} />}
     </div>
   );
 }

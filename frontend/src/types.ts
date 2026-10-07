@@ -356,6 +356,18 @@ export interface OptionsAlt {
   max_profit?: number | null; max_loss?: number | null; breakevens?: number[];
   pop_pct?: number | null; ev?: number | null; legs?: OptionLeg[];
 }
+/** First-passage odds that the stop/target plan reaches T1 before the stop inside the options-expiry window, GIVEN the
+ *  entry fills. Market-implied (risk-neutral), so a fair bet by construction: shown against the break-even they must
+ *  beat — never as an expected value, Kelly size or edge. `available:false` means IV or expiry was missing (no default). */
+export interface EquityOdds {
+  available: boolean; basis?: string;
+  reason?: 'no-iv' | 'no-window' | 'bad-levels' | 'numerical' | string; note?: string;
+  payoff_ratio: number | null; break_even_pct: number | null;
+  window_days?: number; iv_pct?: number | null;
+  fill_kind?: 'market' | 'pullback' | 'breakout' | string; fill_pct?: number | null;
+  win_pct?: number | null; loss_pct?: number | null; open_pct?: number | null;
+  resolved_win_pct?: number | null; vs_break_even_pts?: number | null;
+}
 export interface TradeSetup {
   rank?: number;
   type: string;
@@ -374,7 +386,8 @@ export interface TradeSetup {
   options_alternatives?: OptionsAlt[];
   what_to_watch?: string[];
   edge?: {
-    equity?: { pop_pct: number | null; ev_per_share: number | null; payoff_ratio: number | null; kelly_pct: number | null; half_kelly_risk_pct: number | null };
+    equity?: EquityOdds;
+    /** expiry PoP + the structure's model P&L under the same market-implied odds (≈ $0 when fairly priced — NOT an edge) */
     options?: { pop_pct: number | null; ev: number | null; basis: string };
   };
   event_risk?: { type: string; date: string; in_days: number; warning: string } | null;
