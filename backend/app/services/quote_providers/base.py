@@ -9,6 +9,25 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+# Option ROOTS / trading classes that are NOT a tradable underlying of their own — they are the
+# weekly / PM-settled series of a cash index. A position is logged under the root ("SPXW") but the
+# quote vendors only know the index ("^SPX" on yfinance, "SPX" on IBKR); the weekly contracts are
+# listed in the index's own chain. Unmapped, every leg of an SPXW trade is "no quote".
+INDEX_ROOT_ALIASES: dict[str, str] = {
+    "SPXW": "SPX",     # S&P 500 weeklys / PM-settled
+    "SPXPM": "SPX",
+    "NDXP": "NDX",     # Nasdaq-100 PM-settled
+    "RUTW": "RUT",     # Russell 2000 weeklys
+    "VIXW": "VIX",     # VIX weeklys
+}
+
+
+def canonical_index_root(symbol: str) -> str:
+    """Upper-case ``symbol`` with any "." / "^" prefix stripped and a weekly/PM option root
+    folded onto its cash index (SPXW → SPX, .NDXP → NDX). Anything else passes through."""
+    s = symbol.strip().upper().lstrip(".^")
+    return INDEX_ROOT_ALIASES.get(s, s)
+
 
 # ---------------------------------------------------------------------------
 # Data classes

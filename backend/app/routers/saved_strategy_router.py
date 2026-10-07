@@ -496,7 +496,14 @@ async def _sync_stock_ledger(db: AsyncSession, strategy: SavedStrategy) -> None:
     # action AND the net position is flat.  If the user deleted the close row
     # or edited qty back up, reopen the trade automatically.
     has_close_action = any(t["action"] == "close" for t in all_txns)
-    if snap.net_quantity < 1e-9 and has_close_action:
+    # Selling the last share must not close a trade whose OPTION legs are still open — that would
+    # silently drop ongoing option income off the Active book. It stays active (stock-less) instead.
+    try:
+        has_open_options = any(str(l.get("type", "")).upper() in ("CALL", "PUT")
+                               for l in json.loads(strategy.legs_data or "[]"))
+    except (TypeError, ValueError):
+        has_open_options = False
+    if snap.net_quantity < 1e-9 and has_close_action and not has_open_options:
         strategy.trade_status = "closed"
         # Keep exit_date as the latest close transaction's date
         close_objs = [t for t in all_txns_objs if t.action == "close"]
@@ -1007,7 +1014,7 @@ async def closed_ledger_month(
 
 
 class DeleteClosedPartIn(BaseModel):
-    part: str = Field(..., description="'options' | 'stock'")
+    part: str = Field(..., description="'options' | 'stock' | 'all' (all: still-ACTIVE trades only)")
 
 
 @router.post("/{strategy_id}/delete-closed-part", response_model=Optional[SavedStrategyOut])
@@ -1023,8 +1030,8 @@ async def delete_closed_part(
     whole trade is deleted (returns null); a still-active partial just loses its banked chunk and
     stays open. Bumps updated_at, which invalidates the frozen closed-ledger cache signature."""
     part = (body.part or "").lower()
-    if part not in ("options", "stock"):
-        raise HTTPException(status_code=400, detail="part must be 'options' or 'stock'")
+    if part not in ("options", "stock", "all"):
+        raise HTTPException(status_code=400, detail="part must be 'options', 'stock' or 'all'")
     result = await db.execute(select(SavedStrategy).where(
         SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
     strategy = result.scalar_one_or_none()
@@ -1037,7 +1044,16 @@ async def delete_closed_part(
     def _is_stock(l: dict) -> bool:
         return (l.get("type") or "").lower() == "stock"
 
-    keep = [l for l in closed if (_is_stock(l) if part == "options" else not _is_stock(l))]
+    if part == "all":
+        # A single-part journal row of a still-ACTIVE trade (e.g. a covered call's banked option income
+        # while it still holds shares / an open call). Deleting that ROW must drop only the banked
+        # chunk — never the live position. (A fully-closed trade is deleted via DELETE /{id}.)
+        if strategy.trade_status == "closed":
+            raise HTTPException(status_code=400, detail="part='all' is for a still-active trade; delete the closed trade instead")
+        # Roll legs are a cost-basis adjustment on the live campaign, not a journal row — keep them.
+        keep = [l for l in closed if l.get("roll")]
+    else:
+        keep = [l for l in closed if (_is_stock(l) if part == "options" else not _is_stock(l))]
     if len(keep) == len(closed):
         raise HTTPException(status_code=400, detail=f"No {part} legs to delete on this trade")
 
@@ -1057,6 +1073,148 @@ async def delete_closed_part(
             [{"leg_index": r.get("leg_index"), "exit_price": r.get("exit_price")} for r in keep])
     await db.commit()
     await db.refresh(strategy)
+    return _to_out(strategy)
+
+
+_STOCK_CARRYING_TYPES = {"covered_call", "stock_combo", "stock_long", "stock_short"}
+
+
+def _strip_stock_component(legs: list, entry_prices: list, params: dict) -> Optional[dict]:
+    """Pure: take the STOCK out of a stock+options trade and keep every cent of option income.
+
+    The stock lives in three places, all handled here: ``parameters.shares``/``avg_cost``, an optional
+    ``type == 'stock'`` entry in ``legs_data``, and its banked ``closed_legs`` records. On a combo the
+    stock's entry price sits at ``entry_prices[0]`` and option leg *i* at ``[i+1]`` (the same offset
+    convention ``close_position`` uses) — dropping the stock must drop THAT slot or every option leg's
+    entry price shifts by one (the "$278 CSP" misalignment).
+
+    Option income that survives: still-open option legs (ongoing), banked option ``closed_legs``
+    (realized / partial / rolls), and any realized_pnl not accounted for by stock records.
+    Returns None if there is no stock to remove. Otherwise a dict:
+    {legs, entry_prices, params, has_open_options, has_option_income, stock_realized_removed}.
+    """
+    params = dict(params or {})
+    legs = list(legs or [])
+    ep = list(entry_prices or [])
+    is_stock = lambda l: str((l or {}).get("type", "")).lower() == "stock"
+    is_option = lambda l: str((l or {}).get("type", "")).upper() in ("CALL", "PUT")
+
+    try:
+        shares = float(params.get("shares") or 0)
+    except (TypeError, ValueError):
+        shares = 0.0
+    stock_idx = {i for i, l in enumerate(legs) if is_stock(l)}
+    closed = list(params.get("closed_legs") or [])
+    stock_closed = [l for l in closed if is_stock(l)]
+    if shares <= 0 and not stock_idx and not stock_closed:
+        return None
+
+    new_legs = [l for i, l in enumerate(legs) if i not in stock_idx]
+    if stock_idx:                                    # stock is IN legs_data → entry_prices is positional with legs
+        new_ep = [e for i, e in enumerate(ep) if i not in stock_idx]
+    elif len(ep) == len(new_legs) + 1:               # combo convention: stock at entry_prices[0]
+        new_ep = ep[1:]
+    else:
+        new_ep = ep
+
+    stock_realized = round(sum(float(l.get("realized") or 0) for l in stock_closed), 2)
+    try:
+        old_realized = float(params.get("realized_pnl") or 0)
+    except (TypeError, ValueError):
+        old_realized = 0.0
+    # Subtract (don't recompute from closed_legs) so realized that predates closed_legs bookkeeping survives.
+    new_realized = round(old_realized - stock_realized, 2)
+
+    params["shares"] = 0
+    params.pop("avg_cost", None)
+    params["closed_legs"] = [l for l in closed if not is_stock(l)]
+    if not params["closed_legs"]:
+        params.pop("closed_legs")
+    if abs(new_realized) > 0.005:
+        params["realized_pnl"] = new_realized
+    else:
+        params.pop("realized_pnl", None)
+    params.pop("last_pnl", None)                     # stale snapshot — it includes the stock's P&L
+    params.pop("last_pnl_at", None)
+
+    has_open_options = any(is_option(l) for l in new_legs)
+    has_option_income = has_open_options or bool(params.get("closed_legs")) or abs(new_realized) > 0.005
+    return {
+        "legs": new_legs, "entry_prices": new_ep, "params": params,
+        "has_open_options": has_open_options, "has_option_income": has_option_income,
+        "stock_realized_removed": stock_realized,
+    }
+
+
+@router.post("/{strategy_id}/remove-stock", response_model=SavedStrategyOut)
+async def remove_stock(
+    strategy_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the STOCK from an income trade (covered call / stock + options) and KEEP its option income.
+
+    Deleting a covered call used to hard-delete the whole row — taking its realized, partial and
+    still-open option income with it (and out of the Closed tab). This strips only the stock
+    (shares, avg cost, stock records) and leaves the option side exactly as it was:
+      • open option legs remain → the trade stays ACTIVE (ongoing); a leftover covered_call/stock_*
+        type is downgraded to a plain options trade, since it no longer holds shares (otherwise
+        Manage-Book risk math would keep treating the now-bare short call as covered);
+      • no option legs left but option income was banked → the trade moves to CLOSED with that
+        income as its realized P&L, so it still shows in the Closed tab.
+    A trade with no option income at all has nothing to keep — use the normal delete.
+    """
+    import datetime as dt
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id,
+        SavedStrategy.trade_status == "active"))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Active trade not found")
+
+    legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+
+    out = _strip_stock_component(legs, entry_prices, params)
+    if out is None:
+        raise HTTPException(status_code=400, detail="This trade has no stock to remove")
+    if not out["has_option_income"]:
+        raise HTTPException(status_code=400, detail="No option income to keep on this trade — delete it instead")
+
+    strategy.legs_data = json.dumps(out["legs"])
+    strategy.entry_prices = json.dumps(out["entry_prices"]) if out["entry_prices"] else None
+    strategy.parameters = json.dumps(out["params"])
+
+    if out["has_open_options"]:
+        # Ongoing: re-base the cost on the option legs alone (the stored debit included the stock).
+        leg_meta = [{"i": i, "action": str(l.get("action", "")).upper(), "qty": l.get("qty") or l.get("contracts") or 1, "_leg": l}
+                    for i, l in enumerate(out["legs"]) if str(l.get("type", "")).upper() in ("CALL", "PUT")]
+        net = option_legs_net_debit(leg_meta, out["entry_prices"]) if len(leg_meta) == len(out["legs"]) else None
+        if net is not None:
+            strategy.entry_net_debit = net
+            if "options_net_debit" in out["params"]:
+                out["params"]["options_net_debit"] = net
+                strategy.parameters = json.dumps(out["params"])
+        if (strategy.strategy_type or "").lower() in _STOCK_CARRYING_TYPES:
+            strategy.strategy_type = "options_spread"
+    else:
+        # Nothing ongoing — the banked option income is the trade's result; send it to Closed.
+        real = float(out["params"].get("realized_pnl") or 0.0)
+        strategy.trade_status = "closed"
+        strategy.exit_date = dt.datetime.now(dt.timezone.utc)
+        strategy.exit_net = round(real, 2)
+        strategy.exit_prices = json.dumps([
+            {"leg_index": r.get("leg_index"), "exit_price": r.get("exit_price")}
+            for r in (out["params"].get("closed_legs") or [])])
+
+    await db.commit()
+    await db.refresh(strategy)
+    try:                                              # book risk changes (shares gone) → drop the cached snapshot
+        from ..services.cache_service import invalidate
+        await invalidate(db, _book_tr_key(user.id))
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
     return _to_out(strategy)
 
 
@@ -3442,6 +3600,7 @@ async def get_live_pnl(
     from ..services.trade_math import (
         classify_leg_action, summarize_trade_actions, prob_itm_lognormal, dte_from_expiry,
         structure_payoff_extremes, structure_breakevens, exit_recommendation,
+        leg_mark_to_market, clipped_annualized_pct,
     )
     from ..services.lifecycle_service import (
         higher_order_greeks, pm_ratios, payoff_distribution_metrics,
@@ -4063,10 +4222,23 @@ async def get_live_pnl(
                                 self.bid = orig.bid; self.ask = orig.ask; self.mid = orig.mid
                                 self.iv = orig.iv; self.delta = delta; self.gamma = gamma
                                 self.theta = theta; self.vega = vega
+                                # _record_combo_quote reads these — omitting them raised AttributeError, which the
+                                # bare `except` below swallowed, silently dropping EVERY combo option leg on yfinance.
+                                self.oi = getattr(orig, "oi", 0); self.volume = getattr(orig, "volume", 0)
 
                         _record_combo_quote(lm, _QWithBS(q, _gd2, _gg2, _gt2, _gv2))
                     except Exception:
                         pass
+
+        # Did EVERY option leg price? A skipped leg is worth an unknown amount, not $0 — gating the
+        # options P&L here stops an unpriced short call from reading as "kept the whole credit".
+        # (Stock P&L is independent of the option quotes, so it stays known either way.)
+        _combo_mtm = leg_mark_to_market(
+            [{"i": lm["leg_idx"], "action": lm["action"], "qty": lm["qty"]} for lm in combo_leg_meta],
+            opt_quotes, opt_entry_cost,
+        )
+        combo_pnl_known = _combo_mtm["complete"]
+        combo_unpriced = _combo_mtm["unpriced_legs"]
 
         # Portfolio delta: 1 delta per share (long stock) + option deltas × qty × 100
         combo_net_delta = shares  # stock contribution
@@ -4093,7 +4265,8 @@ async def get_live_pnl(
         # total capital deployed = stock cost + abs(options cost) - credit received
         total_entry_cost = stock_cost - opt_entry_cost  # always positive for normal positions
         total_current_value = stock_value + opt_current_net
-        options_pnl = opt_current_net + opt_entry_cost  # gain/loss on options alone
+        # Unknown option mark → P&L-NEUTRAL 0 for the signal code below; the response reports None.
+        options_pnl = (opt_current_net + opt_entry_cost) if combo_pnl_known else 0.0  # gain/loss on options alone
         unrealized_pnl = stock_pnl + options_pnl
         pnl_pct = round((unrealized_pnl / total_entry_cost) * 100, 2) if total_entry_cost > 0 else 0.0
 
@@ -4210,19 +4383,22 @@ async def get_live_pnl(
                 quality_subscores=_combo_aq["subscores"], quality_score=_combo_aq["score"],
             )
 
-        return {
+        _combo_resp = {
             "strategy_id": strategy_id,
             "ticker": strategy.ticker,
             "quote_source": quote_source,
             "underlying_price": round(underlying_price, 2),
             "entry_cost": round(total_entry_cost, 2),
-            "current_value": round(total_current_value, 2),
-            "unrealized_pnl": round(unrealized_pnl, 2),
-            "pnl_pct": pnl_pct,
+            "current_value": round(total_current_value, 2) if combo_pnl_known else None,
+            "unrealized_pnl": round(unrealized_pnl, 2) if combo_pnl_known else None,
+            "pnl_pct": pnl_pct if combo_pnl_known else None,
+            "pricing_complete": combo_pnl_known,
+            "unpriced_legs": combo_unpriced,
+            "pricing_warning": None,
             "days_held": days_held,
             "current_quotes": opt_quotes,
             "stock_pnl": round(stock_pnl, 2),
-            "options_pnl": round(options_pnl, 2),
+            "options_pnl": round(options_pnl, 2) if combo_pnl_known else None,
             "stock_value": round(stock_value, 2),
             "stock_cost": round(stock_cost, 2),
             "greeks": opt_greeks,
@@ -4252,8 +4428,8 @@ async def get_live_pnl(
             # byte-for-byte the same grid a standalone options trade renders.
             "options_breakdown": {
                 "cost_basis": round(abs(opt_entry_cost), 2),
-                "current_value": round(opt_current_net, 2),
-                "options_pnl": round(options_pnl, 2),
+                "current_value": round(opt_current_net, 2) if combo_pnl_known else None,
+                "options_pnl": round(options_pnl, 2) if combo_pnl_known else None,
                 "net_delta": round(combo_net_delta - shares, 4),   # options only (strip stock's +1/share)
                 "net_theta": round(combo_net_theta, 4),
                 "net_vega": round(combo_net_vega, 4),
@@ -4292,6 +4468,14 @@ async def get_live_pnl(
                 "exit_scope": "options_overlay",   # recommendation manages the options, stock held separately
             },
         }
+        if not combo_pnl_known:
+            _cw = (f"No live quote for {len(combo_unpriced)} of {len(combo_leg_meta)} option leg(s) — "
+                   "the option P&L is not computed; the stock P&L is unaffected.")
+            _combo_resp["pricing_warning"] = _cw
+            _combo_resp["analysis"]["captured_pct"] = None
+            _combo_resp["analysis"]["hold_vs_close_reasons"] = [_cw] + list(_combo_resp["analysis"].get("hold_vs_close_reasons") or [])
+            _combo_resp["analysis"]["exit_reasons"] = [_cw] + list(_combo_resp["analysis"].get("exit_reasons") or [])
+        return _combo_resp
 
     # --- Fetch underlying price (options strategies) ---
     underlying_price = 0.0
@@ -4452,16 +4636,17 @@ async def get_live_pnl(
                 current_values.append({"leg": lm["i"], "error": str(e)})
 
     # --- Calculate current portfolio value ---
-    current_net = 0.0
-    for lm in leg_meta:
-        cv = next((v for v in current_values if v.get("leg") == lm["i"] and "mid" in v), None)
-        if cv:
-            if "BUY" in lm["action"]:
-                current_net += cv["mid"] * lm["qty"] * 100
-            else:
-                current_net -= cv["mid"] * lm["qty"] * 100
-
-    unrealized_pnl = current_net + entry_cost
+    # Mark ONLY a fully-priced structure. A leg with no quote has no known value; summing the
+    # priced legs alone values it at $0 → a phantom total loss on a debit structure (and a phantom
+    # full-credit gain on a credit one) — e.g. an SPXW box whose chain failed to load read -100%.
+    _mtm = leg_mark_to_market(leg_meta, current_values, entry_cost)
+    pnl_known = _mtm["complete"]
+    unpriced_legs = _mtm["unpriced_legs"]
+    # Downstream signal code needs a float: when the mark is unknown use the P&L-NEUTRAL value 0 so
+    # no profit-/loss-driven trigger can fire off a number that doesn't exist. The RESPONSE reports
+    # None (below), never this placeholder.
+    current_net = _mtm["current_net"] if pnl_known else 0.0
+    unrealized_pnl = _mtm["unrealized_pnl"] if pnl_known else 0.0
     if strategy.entry_date:
         _ed = strategy.entry_date if strategy.entry_date.tzinfo else strategy.entry_date.replace(tzinfo=dt.timezone.utc)
         days_held = (dt.datetime.now(dt.timezone.utc) - _ed).days
@@ -4808,7 +4993,8 @@ async def get_live_pnl(
             roi_to_exp = exp_pnl_at_current / abs(total_capital)
             try:
                 ann = ((1 + roi_to_exp) ** (365.0 / min_dte_days)) - 1
-                annualized_return = round(max(-9.99, min(9.99, ann)) * 100, 1)
+                # None when it hits the ±999% rail — an extrapolation, not a measurement.
+                annualized_return = clipped_annualized_pct(ann)
             except (ValueError, OverflowError):
                 annualized_return = None
 
@@ -4967,15 +5153,31 @@ async def get_live_pnl(
         "exit_scope": "whole_trade",
     }
 
+    # A structure we couldn't fully price has NO P&L — say so rather than reporting the
+    # P&L-neutral placeholder the signal code ran on. Signals that leaned on it carry the warning.
+    pricing_warning = None
+    if not pnl_known:
+        _why = "; ".join(sorted({r for r in _mtm["reasons"].values()}))[:200]
+        pricing_warning = (
+            f"No live quote for {len(unpriced_legs)} of {len(leg_meta)} leg(s)"
+            f"{f' ({_why})' if _why else ''} — P&L is not computed and the signals below are not P&L-aware."
+        )
+        analysis["captured_pct"] = None
+        analysis["hold_vs_close_reasons"] = [pricing_warning] + list(analysis.get("hold_vs_close_reasons") or [])
+        analysis["exit_reasons"] = [pricing_warning] + list(analysis.get("exit_reasons") or [])
+
     return {
         "strategy_id": strategy_id,
         "ticker": strategy.ticker,
         "quote_source": quote_source,
         "underlying_price": round(underlying_price, 2),
         "entry_cost": entry_cost,
-        "current_value": round(current_net, 2),
-        "unrealized_pnl": round(unrealized_pnl, 2),
-        "pnl_pct": round((unrealized_pnl / abs(total_capital)) * 100, 2) if total_capital != 0 else 0,
+        "current_value": round(current_net, 2) if pnl_known else None,
+        "unrealized_pnl": round(unrealized_pnl, 2) if pnl_known else None,
+        "pnl_pct": (round((unrealized_pnl / abs(total_capital)) * 100, 2) if total_capital != 0 else 0) if pnl_known else None,
+        "pricing_complete": pnl_known,
+        "unpriced_legs": unpriced_legs,
+        "pricing_warning": pricing_warning,
         "days_held": days_held,
         "current_quotes": current_values,
         "greeks": greeks_data,

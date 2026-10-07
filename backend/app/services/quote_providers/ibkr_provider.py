@@ -13,7 +13,7 @@ from datetime import datetime
 from functools import partial
 from typing import TYPE_CHECKING
 
-from .base import QuoteProvider, OptionQuote, UnderlyingQuote, OptionChain
+from .base import QuoteProvider, OptionQuote, UnderlyingQuote, OptionChain, INDEX_ROOT_ALIASES
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,7 +58,8 @@ def _normalize_symbol(symbol: str) -> str:
     s = symbol.strip()
     if s.startswith(".") or s.startswith("^"):
         s = s[1:]
-    return s.upper()
+    s = s.upper()
+    return INDEX_ROOT_ALIASES.get(s, s)      # SPXW → SPX (the weekly class trades off the SPX underlying)
 
 
 def _third_friday(year: int, month: int) -> str:

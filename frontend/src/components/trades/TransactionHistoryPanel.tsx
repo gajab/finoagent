@@ -423,7 +423,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
             <span>
               Realized P&L:{' '}
               <span className={`font-semibold ${totalRealized > 0 ? 'text-success' : totalRealized < 0 ? 'text-error' : ''}`}>
-                {totalRealized >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalRealized))}
+                {fmtMoney(totalRealized, { signed: true })}
               </span>
             </span>
           )}
@@ -431,7 +431,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
             <span>
               Total return:{' '}
               <span className={`font-semibold ${totalReturn >= 0 ? 'text-success' : 'text-error'}`}>
-                {totalReturn >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalReturn))}
+                {fmtMoney(totalReturn, { signed: true })}
               </span>
             </span>
           )}
@@ -470,7 +470,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
             <SummaryCell
               icon={<DollarSign className="w-2.5 h-2.5" />}
               label="Realized P&L"
-              value={`${totalRealized >= 0 ? '+' : ''}${fmtMoney(Math.abs(totalRealized))}`}
+              value={fmtMoney(totalRealized, { signed: true })}
               color={totalRealized > 0 ? 'text-success' : totalRealized < 0 ? 'text-error' : 'text-base-content/50'}
             />
           )}
@@ -566,7 +566,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
                     <td className={`text-right font-mono hidden md:table-cell ${
                       legRealized > 0 ? 'text-success' : legRealized < 0 ? 'text-error' : 'text-base-content/25'
                     }`}>
-                      {legRealized !== 0 ? `${legRealized > 0 ? '+' : ''}${fmtMoney(Math.abs(legRealized))}` : '—'}
+                      {legRealized !== 0 ? `${fmtMoney(legRealized, { signed: true })}` : '—'}
                     </td>
 
                     {/* Note */}
@@ -650,7 +650,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
                 <td className={`text-right hidden md:table-cell font-semibold ${
                   totalRealized > 0 ? 'text-success' : totalRealized < 0 ? 'text-error' : ''
                 }`}>
-                  {totalRealized !== 0 ? `${totalRealized > 0 ? '+' : ''}${fmtMoney(Math.abs(totalRealized))}` : '—'}
+                  {totalRealized !== 0 ? `${fmtMoney(totalRealized, { signed: true })}` : '—'}
                 </td>
                 <td className="hidden lg:table-cell" />
                 <td />
