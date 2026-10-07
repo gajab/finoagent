@@ -129,6 +129,82 @@ def simple_annualized_pct(profit: float, cost: float, days: int) -> float:
     return (profit / cost) * (365.0 / days) * 100.0
 
 
+# Live-pnl clips the annualized return to ±9.99 (±999%) so a 1-day trade can't print
+# 40,000%. A value AT the clip is not a measurement — it's "off the chart" — so it is
+# reported as None (unknown), never as 999.0, which would then be averaged/sorted as if real.
+ANNUALIZED_CLIP = 9.99
+
+
+def clipped_annualized_pct(annualized: float) -> Optional[float]:
+    """Annualized return (decimal, 0.30 = 30%) → percent, or None when it hit the
+    ±ANNUALIZED_CLIP rail (a meaningless extrapolation) or isn't a finite number."""
+    try:
+        a = float(annualized)          # a (1+roi)<0 base with a fractional exponent is complex → not a return
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(a) or abs(a) >= ANNUALIZED_CLIP:
+        return None
+    return round(a * 100.0, 1)
+
+
+# ── Mark-to-market — refuses to value a structure it can't fully price ──
+
+def leg_mark_to_market(legs: list[dict], quotes: list[dict], entry_cost: float,
+                       multiplier: float = 100.0) -> dict:
+    """Mark a multi-leg option structure to market, but ONLY if every leg is priced.
+
+    ``legs``: dicts exposing ``i`` (leg index, matching ``quotes[*]['leg']``), ``action``
+    ("BUY…"/"SELL…") and ``qty``. ``quotes``: one row per leg — a priced leg carries a numeric
+    ``mid``; a failed one carries an ``error`` (or nothing). ``entry_cost`` uses the stored
+    convention: BUY negative (cash paid), SELL positive (credit received).
+
+    A leg with no quote has NO known value. Summing only the legs that DID price silently
+    values the rest at $0 — which turns an unpriced debit structure into a phantom 100% loss
+    and an unpriced credit structure into a phantom full-credit gain (the SPXW-box -$29,645 /
+    -100% bug). A partial mark of a spread is meaningless too (two of four legs is not "half"
+    the position), so an incomplete mark returns ``current_net``/``unrealized_pnl`` = None and
+    names the unpriced legs for the UI to flag as "no quote".
+
+    Returns {complete, current_net, unrealized_pnl, priced_legs, unpriced_legs, reasons}
+    where ``reasons`` maps an unpriced leg index → the provider's error text (or "no quote").
+    """
+    by_leg: dict = {}
+    for q in quotes or []:
+        if not isinstance(q, dict) or q.get("leg") is None:
+            continue
+        # A later priced row wins over an earlier error for the same leg (retry succeeded).
+        if q["leg"] not in by_leg or _is_priced(q):
+            by_leg[q["leg"]] = q
+
+    priced, unpriced, reasons = [], [], {}
+    current_net = 0.0
+    for lm in legs:
+        q = by_leg.get(lm["i"])
+        if q is not None and _is_priced(q):
+            qty = float(lm.get("qty") or 1)
+            leg_value = float(q["mid"]) * qty * multiplier
+            current_net += leg_value if "BUY" in str(lm.get("action", "")).upper() else -leg_value
+            priced.append(lm["i"])
+        else:
+            unpriced.append(lm["i"])
+            reasons[lm["i"]] = str((q or {}).get("error") or "no quote")
+
+    complete = not unpriced
+    return {
+        "complete": complete,
+        "current_net": round(current_net, 2) if complete else None,
+        "unrealized_pnl": round(current_net + entry_cost, 2) if complete else None,
+        "priced_legs": priced,
+        "unpriced_legs": unpriced,
+        "reasons": reasons,
+    }
+
+
+def _is_priced(q: dict) -> bool:
+    mid = q.get("mid")
+    return isinstance(mid, (int, float)) and not isinstance(mid, bool) and math.isfinite(mid)
+
+
 def realized_close_pnl(action: str, entry_price: float, exit_price: float,
                        qty: float, *, is_option: bool = True) -> float:
     """Realized P&L from closing a leg (or the stock) at ``exit_price``.

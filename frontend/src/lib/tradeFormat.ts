@@ -31,6 +31,8 @@ export function fmtMoney(n: number | null | undefined, opts?: { signed?: boolean
   const formatted = opts?.compact && abs >= 1000
     ? (abs >= 1_000_000 ? `$${(abs / 1_000_000).toFixed(2)}M` : `$${(abs / 1000).toFixed(1)}k`)
     : currencyFmt.format(abs);
+  // A value that rounds to $0.00 carries no sign — float residue (−1e‑12) must not read "−$0.00".
+  if (abs < 0.005) return formatted;
   if (n < 0) return `${MINUS}${formatted}`;
   if (opts?.signed && n > 0) return `+${formatted}`;
   return formatted;
@@ -46,9 +48,20 @@ export function fmtPct(n: number | null | undefined, opts?: { signed?: boolean; 
   return formatted;
 }
 
-/** Format an annualized return. Always append "ann." so it's unambiguous. */
+/** The live-P&L engine clips annualised returns at ±999% so a 1-day trade can't print 40,000%.
+ *  A value AT that rail is "off the chart", not a measurement. */
+export const ANNUALIZED_CLIP_PCT = 999;
+
+/** True only for a finite annualised return that did NOT hit the ±999% rail. Averaging, sorting or
+ *  displaying a clipped value as if it were real is the "AVG YIELD 999.00% ann." bug. */
+export function isMeaningfulAnnualized(pct: number | null | undefined): pct is number {
+  return typeof pct === 'number' && Number.isFinite(pct) && Math.abs(pct) < ANNUALIZED_CLIP_PCT;
+}
+
+/** Format an annualized return. Always append "ann." so it's unambiguous; "—" when it isn't meaningful
+ *  (missing, non-finite, or clipped at the ±999% rail). */
 export function fmtAnnualized(pct: number | null | undefined): string {
-  if (pct === null || pct === undefined || Number.isNaN(pct)) return '—';
+  if (!isMeaningfulAnnualized(pct)) return '—';
   return `${fmtPct(pct)} ann.`;
 }
 

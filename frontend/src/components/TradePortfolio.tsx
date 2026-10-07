@@ -462,7 +462,11 @@ export function TradePortfolio() {
 
           {trades.map(trade => {
             const isExpanded = expandedId === trade.id;
-            const pnl = pnlData[trade.id];
+            // (legacy view) an unpriced payload has no P&L — treat it as "no P&L yet", never as a $0 / −100% mark
+            const rawPnl = pnlData[trade.id];
+            const pnl = rawPnl && rawPnl.pricing_complete !== false && rawPnl.unrealized_pnl != null
+              ? (rawPnl as LivePnlResponse & { unrealized_pnl: number; current_value: number; pnl_pct: number })
+              : undefined;
             const isLoadingPnl = loadingPnl[trade.id];
             const isClosing = closingId === trade.id;
             const daysHeld = trade.entry_date

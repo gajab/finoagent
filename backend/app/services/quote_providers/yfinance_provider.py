@@ -12,7 +12,7 @@ from datetime import datetime
 
 import yfinance as yf
 
-from .base import QuoteProvider, OptionQuote, UnderlyingQuote, OptionChain
+from .base import QuoteProvider, OptionQuote, UnderlyingQuote, OptionChain, INDEX_ROOT_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,11 @@ def _safe_float(v, default: float = 0.0) -> float:
 def _normalize_ticker(ticker: str) -> str:
     """Normalize ticker for yfinance: .SPX → ^SPX, /ES → ES=F, etc."""
     t = ticker.strip().upper()
+    # Weekly / PM option roots (SPXW, NDXP…) aren't tickers yfinance knows — their contracts live in
+    # the cash index's own chain, so SPXW/.SPXW/^SPXW → ^SPX.
+    alias = INDEX_ROOT_ALIASES.get(t.lstrip(".^"))
+    if alias:
+        return "^" + alias
     if t.startswith("/"):
         t = t[1:]
         if not ("=" in t or "." in t):

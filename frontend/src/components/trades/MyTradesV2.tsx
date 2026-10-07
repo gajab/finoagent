@@ -32,10 +32,11 @@ import {
 import {
   fetchActiveTrades, fetchClosedLedger, fetchClosedLedgerMonth, deleteClosedPart, reopenTrade, fetchTradeLivePnl, fetchTradeAdvisor,
   appendTradeTransaction, fetchTradeTransactions, createAgent, rollPosition,
-  deleteTrade, updateSavedStrategy, saveTradePnlSnapshot,
+  deleteTrade, removeTradeStock, updateSavedStrategy, saveTradePnlSnapshot,
 } from '../../api';
 import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind, ClosedMonthSummary } from '../../api';
-import { fmtMoney, fmtPct, fmtAnnualized, fmtDTE, fmtDate, fmtQty, pnlSummary } from '../../lib/tradeFormat';
+import { fmtMoney, fmtPct, fmtAnnualized, isMeaningfulAnnualized, fmtDTE, fmtDate, fmtQty, pnlSummary } from '../../lib/tradeFormat';
+import { type PricedPnl, isUnpriced, hasMark, effectivePnl, pnlTotals, optionIncome, closedRowDeletion } from '../../lib/tradePnl';
 import UpdatePositionModal from './UpdatePositionModal';
 import TransactionHistoryPanel from './TransactionHistoryPanel';
 import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
@@ -348,6 +349,7 @@ function trimPnl(p: LivePnlResponse): Record<string, any> {
     options_pnl: (p as any).options_pnl, stock_pnl: (p as any).stock_pnl,   // derivative-only toggle
     options_premium: (p as any).options_breakdown?.cost_basis,             // option-only max gain (premium)
     current_value: (p as any).current_value, cost_basis: (p as any).cost_basis, margin_required: (p as any).margin_required,
+    pricing_complete: p.pricing_complete, unpriced_legs: p.unpriced_legs, pricing_warning: p.pricing_warning,
     expiration_date: (p as any).expiration_date, max_profit: (p as any).max_profit, max_loss: (p as any).max_loss,
     analysis: {
       exit_signal: a.exit_signal, exit_reasons: (a.exit_reasons || []).slice(0, 1),
@@ -392,22 +394,6 @@ function Chip({ label, value, color = '', hint }: { label: string; value: string
 // so the toggle only appears when a real split can actually be produced.
 function tradeHasStock(t: SavedStrategyItem): boolean {
   return (Number(t.parameters?.shares) || 0) > 0;
-}
-
-// P&L to show: total by default, or DERIVATIVE-ONLY (strip the stock leg's P&L) when the user
-// unchecks "include stock". A stock-less income trade's unrealized_pnl is already options-only.
-// Prefer the backend's options_pnl; else derive it as total − stock_pnl (both persisted in the
-// snapshot). If NEITHER split field is present (a pre-feature cached snapshot) we can't strip —
-// a refresh repopulates them.
-function effectivePnl(p: LivePnlResponse | null | undefined, excludeStock: boolean): number | null {
-  if (!p) return null;
-  const total = p.unrealized_pnl ?? null;
-  if (!excludeStock) return total;
-  const op = (p as any).options_pnl;
-  if (op != null) return Number(op);
-  const sp = (p as any).stock_pnl;
-  if (sp != null && total != null) return total - Number(sp);
-  return total;
 }
 
 // Does the snapshot carry the stock/option P&L split needed for the "derivatives only" toggle?
@@ -694,16 +680,22 @@ function GroupSummary({ trades, pnlMap, isIncome = false, excludeStock = false }
 }) {
   const anyFutures = trades.some(t => t.strategy_type === 'futures');
   const totalCapital = trades.reduce((s, t) => s + deployedCapital(t, pnlMap[t.id]), 0);
-  const totalPnl = trades.reduce((s, t) => s + (effectivePnl(pnlMap[t.id], excludeStock) ?? 0), 0);
-  const anyPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
+  // Positions we couldn't price are NOT in the unrealized total (they have no P&L) — count them so the
+  // strip is honest that it covers only the priced rows beneath it.
+  const { totalPnl, noQuote, hasPnl: anyPnl } = pnlTotals(trades, pnlMap, excludeStock);
 
   // Capital-WEIGHTED annualized yield — an arithmetic mean over-weights a tiny high-yield CSP
   // (the misleading "avg 206% ann."). Weight each trade's yield by the capital behind it.
-  let wnum = 0, wden = 0;
+  // A yield pinned at the ±999% rail is an extrapolation, not a measurement — it must not enter the
+  // average (one such trade used to print "AVG YIELD 999.00% ann." for the whole group).
+  let wnum = 0, wden = 0, anyAnn = false, offChart = 0;
   for (const t of trades) {
     const ann = pnlMap[t.id]?.analysis?.annualized_return_to_expiry;
+    if (ann == null) continue;
+    anyAnn = true;
+    if (!isMeaningfulAnnualized(ann)) { offChart++; continue; }
     const c = deployedCapital(t, pnlMap[t.id]);
-    if (ann != null && c > 0) { wnum += ann * c; wden += c; }
+    if (c > 0) { wnum += ann * c; wden += c; }
   }
   const avgAnn = wden > 0 ? wnum / wden : null;
 
@@ -720,17 +712,27 @@ function GroupSummary({ trades, pnlMap, isIncome = false, excludeStock = false }
   };
   const maxGain = isIncome ? trades.reduce((s, t) => s + maxGainOf(pnlMap[t.id]), 0) : 0;
   const leftToCapture = isIncome && maxGain > 0 ? Math.max(0, maxGain - totalPnl) : null;
-  const money = (n: number) => `${n < 0 ? '−' : ''}${fmtMoney(Math.abs(n))}`;
+  const money = (n: number, signed = false) => fmtMoney(n, { signed });
 
   return (
     <div className="flex items-stretch gap-2 flex-wrap px-4 py-2.5">
       <Chip label="Positions" value={`${trades.length}`} />
-      <Chip label={anyFutures ? 'Margin' : 'Deployed'} value={fmtMoney(totalCapital)}
-        hint="Buying power on hold — Reg-T / portfolio margin (naked shorts ≈ 20% of notional, spreads = width, stock = notional). Not the premium collected." />
-      {anyPnl && <Chip label={excludeStock ? 'Unrealized · deriv' : 'Unrealized'} value={`${totalPnl >= 0 ? '+' : ''}${money(totalPnl)}`}
+      {/* One label for every group (futures used to say "Margin") so the tiles read the same everywhere. */}
+      <Chip label="Deployed" value={fmtMoney(totalCapital)}
+        hint={anyFutures
+          ? 'Capital tied up — futures: margin posted; options/stock: buying power on hold (Reg-T / portfolio margin). Not the premium collected.'
+          : 'Buying power on hold — Reg-T / portfolio margin (naked shorts ≈ 20% of notional, spreads = width, stock = notional). Not the premium collected.'} />
+      {anyPnl && <Chip label={excludeStock ? 'Unrealized · deriv' : 'Unrealized'} value={money(totalPnl, true)}
         color={totalPnl >= 0 ? 'text-success' : 'text-error'}
-        hint={excludeStock ? 'Derivative (option) legs only — the underlying stock holding P&L is excluded.' : undefined} />}
-      {avgAnn != null && <Chip label="Avg yield" value={fmtAnnualized(avgAnn)} color={avgAnn >= 0 ? 'text-success' : 'text-error'} />}
+        hint={[
+          excludeStock ? 'Derivative (option) legs only — the underlying stock holding P&L is excluded.' : '',
+          noQuote > 0 ? `Excludes ${noQuote} position${noQuote > 1 ? 's' : ''} with no live quote.` : '',
+        ].filter(Boolean).join(' ') || undefined} />}
+      {noQuote > 0 && <Chip label="No quote" value={`${noQuote}`} color="text-warning"
+        hint={`${noQuote} position${noQuote > 1 ? 's' : ''} couldn't be priced live (a leg had no quote). Their P&L is unknown — NOT counted as a gain or loss in the totals. Open the row for the reason, or Refresh.`} />}
+      {anyAnn && <Chip label="Avg yield" value={avgAnn != null ? fmtAnnualized(avgAnn) : '—'}
+        color={avgAnn != null ? (avgAnn >= 0 ? 'text-success' : 'text-error') : ''}
+        hint={offChart > 0 ? `${offChart} position${offChart > 1 ? 's' : ''} with an off-the-chart (≥999%) annualised yield ${avgAnn != null ? 'excluded from' : 'left out of'} this average — a very short-dated extrapolation, not a meaningful rate.` : undefined} />}
       {isIncome && maxGain > 0 && <Chip label="Max gain" value={fmtMoney(maxGain)} color="text-success/70" />}
       {leftToCapture != null && <Chip label="Left to capture" value={fmtMoney(leftToCapture)} color="text-warning/80" />}
     </div>
@@ -773,6 +775,57 @@ interface RollState {
   newPremium: string;
   saving: boolean;
   error: string | null;
+}
+
+// ── Delete confirmation ─────────────────────────────────────────────────────────────────────────
+// For a stock + option-income trade (covered call etc.) "Delete" is a CHOICE: remove just the stock and
+// keep the option income (realized · partial · still-open), or delete everything. Deleting a stock must
+// never silently take its option income — and its Closed-tab history — with it.
+
+function DeleteConfirm({ keepIncome, income, deleting, error, onRemoveStock, onDeleteAll, onCancel }: {
+  keepIncome: boolean;
+  income: ReturnType<typeof optionIncome>;
+  deleting: boolean;
+  error: string | null;
+  onRemoveStock: (e: React.MouseEvent) => void;
+  onDeleteAll: (e: React.MouseEvent) => void;
+  onCancel: (e: React.MouseEvent) => void;
+}) {
+  const hasRealized = income.closedLegs > 0 || Math.abs(income.realized) > 0.005;
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap bg-error/10 border border-error/20 rounded-lg px-2 py-1"
+      onClick={e => e.stopPropagation()}>
+      {keepIncome ? (
+        <>
+          <span className="text-[10px] text-error font-medium">Remove the stock?</span>
+          <span className="text-[10px] text-base-content/60" data-testid="keep-income-note">
+            Keeps the option income:{' '}
+            {hasRealized && <><b className={income.realized >= 0 ? 'text-success' : 'text-error'}>{fmtMoney(income.realized, { signed: true })}</b> realized</>}
+            {income.openLegs > 0 && `${hasRealized ? ' · ' : ''}${income.openLegs} open option leg${income.openLegs > 1 ? 's' : ''}`}
+          </span>
+          <button className="btn btn-warning btn-xs h-6 min-h-0 gap-1 text-[10px]" onClick={onRemoveStock} disabled={deleting}
+            title="Remove the shares only. Realized, partial and still-open option income stay (open legs on Active, banked income in Closed).">
+            {deleting ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+            Remove stock, keep options
+          </button>
+          <button className="btn btn-error btn-outline btn-xs h-6 min-h-0 text-[10px]" onClick={onDeleteAll} disabled={deleting}
+            title="Delete the whole trade — stock AND all its option income (realized, partial and open). This cannot be undone.">
+            Delete everything
+          </button>
+        </>
+      ) : (
+        <>
+          <span className="text-[10px] text-error font-medium">Delete trade?</span>
+          <button className="btn btn-error btn-xs h-6 min-h-0 gap-1 text-[10px]" onClick={onDeleteAll} disabled={deleting}>
+            {deleting ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+            Yes, delete
+          </button>
+        </>
+      )}
+      <button className="btn btn-ghost btn-xs h-6 min-h-0 text-[10px]" onClick={onCancel} disabled={deleting}>Cancel</button>
+      {error && <span className="text-[10px] text-error">{error}</span>}
+    </div>
+  );
 }
 
 function TradeCard({
@@ -833,6 +886,20 @@ function TradeCard({
       setDeleteConfirm(false);
     }
   };
+  // Remove ONLY the stock; the option income (realized · partial · still-open) is kept.
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const handleRemoveStock = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setDeleting(true); setRemoveError(null);
+    try {
+      await removeTradeStock(trade.id);
+      setDeleting(false); setDeleteConfirm(false);
+      onPositionChanged(trade.id);          // reload: open calls stay Active, banked-only income lands in Closed
+    } catch (err: any) {
+      setDeleting(false);
+      setRemoveError(err?.message || 'Could not remove the stock');
+    }
+  };
 
   const expiry = expiryFrom(trade, pnl);
   const dte = dteFrom(expiry);
@@ -851,6 +918,9 @@ function TradeCard({
   // Show stock+options breakdown when position has both components
   const hasStockLeg = !!(trade.parameters?.shares && parseFloat(trade.parameters.shares) > 0);
   const hasOptionLegsNow = !!(trade.legs_data && trade.legs_data.length > 0);
+  // A stock + option-income trade (covered call etc.): "Delete" must not wipe the option income with the stock.
+  const optIncome = optionIncome(trade);
+  const canKeepOptionIncome = hasStockLeg && optIncome.hasIncome;
   // Covered-call MARK (shares held elsewhere, not added here) — lets a bare short call be treated as
   // covered by Manage-Book risk math without an actual stock leg.
   const hasShortCall = (trade.legs_data || []).some((l: any) =>
@@ -1040,6 +1110,8 @@ function TradeCard({
   const entryPrice = trade.parameters?.avg_cost ?? trade.entry_prices?.[0]?.price ?? null;
 
   const statusColor = pnlAmt == null ? '' : pnlAmt >= 0 ? 'text-success' : 'text-error';
+  const noQuote = isUnpriced(pnl);                        // a leg had no live quote → no P&L, not "−100%"
+  const pricedPnl = hasMark(pnl) ? pnl : null;            // narrowed: the P&L-dependent panels below need a real mark
 
   // Realized P&L — banked at close (whole or partial). Present on closed trades and
   // on active trades that have had a leg/stock closed. exit_net mirrors it for legacy.
@@ -1120,7 +1192,7 @@ function TradeCard({
               <span className="badge badge-xs badge-warning">⚠ {dte}d left</span>
             )}
             {/* Quant recommendation — Strong Hold / Hold / Close / Strong Close */}
-            {pnl?.analysis?.exit_signal && trade.strategy_type !== 'box_spread' && (
+            {pnl?.analysis?.exit_signal && !noQuote && trade.strategy_type !== 'box_spread' && (
               <span className={`badge badge-xs font-semibold ml-auto ${EXIT_STYLE[pnl.analysis.exit_signal]?.cls || 'badge-ghost'}`}
                 title={pnl.analysis.exit_reasons?.[0]}>
                 {EXIT_STYLE[pnl.analysis.exit_signal]?.label || pnl.analysis.exit_signal}
@@ -1151,15 +1223,23 @@ function TradeCard({
           {isClosed ? (
             <>
               <div className={`font-bold text-sm ${realizedPnl != null && realizedPnl >= 0 ? 'text-success' : 'text-error'}`}>
-                {realizedPnl != null ? `${realizedPnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(realizedPnl))}` : '—'}
+                {realizedPnl != null ? fmtMoney(realizedPnl, { signed: true }) : '—'}
               </div>
               <div className="text-[9px] uppercase tracking-wider text-base-content/40">realized</div>
             </>
+          ) : noQuote ? (
+            /* Unpriced: say so — never a $ figure. Colour-neutral (it is not a loss). */
+            <div className="space-y-0.5" title={pnl?.pricing_warning || 'No live quote for one or more legs — P&L not computed'}>
+              <div className="font-bold text-sm text-warning">no quote</div>
+              <div className="text-[9px] uppercase tracking-wider text-base-content/40">
+                {(pnl?.unpriced_legs?.length ?? 0) > 0 ? `${pnl!.unpriced_legs!.length} of ${trade.legs_data?.length ?? '?'} legs` : 'P&L unknown'}
+              </div>
+            </div>
           ) : pnlAmt != null ? (
             /* $ P&L is the headline for EVERY structure (income included), % + annualized secondary */
             <>
               <div className={`font-bold text-sm ${statusColor}`}>
-                {pnlAmt >= 0 ? '+' : ''}{fmtMoney(Math.abs(pnlAmt))}
+                {fmtMoney(pnlAmt, { signed: true })}
               </div>
               <div className={`text-[10px] ${statusColor} opacity-70`}>
                 {pnlPct != null && <>{pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</>}
@@ -1313,7 +1393,7 @@ function TradeCard({
                   {isClosed ? `Realized P&L · closed${trade.exit_date ? ` ${fmtDate(trade.exit_date)}` : ''}` : 'Realized so far · partial close'}
                 </div>
                 <div className={`text-lg font-bold ${realizedPnl >= 0 ? 'text-success' : 'text-error'}`}>
-                  {realizedPnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(realizedPnl))}
+                  {fmtMoney(realizedPnl, { signed: true })}
                 </div>
               </div>
               {closedLegs.length > 0 && (
@@ -1323,7 +1403,7 @@ function TradeCard({
                       {c.type === 'stock' ? `Stock ${fmtQty(c.qty)}sh` : `${c.action} ${c.type} $${c.strike}`}
                       {' @ '}{fmtMoney(c.exit_price)}{' → '}
                       <span className={Number(c.realized) >= 0 ? 'text-success' : 'text-error'}>
-                        {Number(c.realized) >= 0 ? '+' : ''}{fmtMoney(Math.abs(Number(c.realized)))}
+                        {fmtMoney(Number(c.realized), { signed: true })}
                       </span>
                     </div>
                   ))}
@@ -1450,27 +1530,11 @@ function TradeCard({
                 <Trash2 className="w-3 h-3" /> Delete
               </button>
             ) : (
-              <div
-                className="flex items-center gap-1.5 bg-error/10 border border-error/20 rounded-lg px-2 py-1"
-                onClick={e => e.stopPropagation()}
-              >
-                <span className="text-[10px] text-error font-medium">Delete trade?</span>
-                <button
-                  className="btn btn-error btn-xs h-6 min-h-0 gap-1 text-[10px]"
-                  onClick={handleDeleteConfirmed}
-                  disabled={deleting}
-                >
-                  {deleting ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
-                  Yes, delete
-                </button>
-                <button
-                  className="btn btn-ghost btn-xs h-6 min-h-0 text-[10px]"
-                  onClick={e => { e.stopPropagation(); setDeleteConfirm(false); }}
-                  disabled={deleting}
-                >
-                  Cancel
-                </button>
-              </div>
+              <DeleteConfirm
+                keepIncome={canKeepOptionIncome} income={optIncome} deleting={deleting} error={removeError}
+                onRemoveStock={handleRemoveStock} onDeleteAll={handleDeleteConfirmed}
+                onCancel={e => { e.stopPropagation(); setDeleteConfirm(false); setRemoveError(null); }}
+              />
             )}
           </div>
 
@@ -1490,8 +1554,23 @@ function TradeCard({
             />
           )}
 
-          {/* P&L metrics grid */}
-          {pnl && (
+          {/* Unpriced → one clear banner instead of P&L chips computed off a missing mark */}
+          {noQuote && pnl && (
+            <div className="rounded-xl border border-warning/30 bg-warning/[0.06] px-3 py-2.5 flex items-start gap-2 text-xs">
+              <AlertCircle className="w-4 h-4 text-warning shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-warning">No live quote — P&amp;L not computed</div>
+                <div className="text-base-content/60 mt-0.5">
+                  {pnl.pricing_warning || 'One or more legs could not be priced.'} This position is left out of the group and book totals
+                  (it is not counted as a gain or a loss).
+                </div>
+              </div>
+              <button className="btn btn-ghost btn-xs" onClick={e => { e.stopPropagation(); onRefreshPnl(); }} disabled={pnlLoading}>Retry</button>
+            </div>
+          )}
+
+          {/* P&L metrics grid — `pnl` is shadowed by the narrowed (priced) payload for this whole block */}
+          {pricedPnl && ((pnl: PricedPnl) => (
             <div className="space-y-3">
               {/* Main metrics — BOX + income get their own detailed panels below */}
               {trade.strategy_type !== 'box_spread' && !isIncome && (
@@ -1500,7 +1579,7 @@ function TradeCard({
                   <Chip label="Current Value" value={fmtMoney(pnl.current_value)} />
                   <Chip
                     label="Unrealized P&L"
-                    value={`${pnl.unrealized_pnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(pnl.unrealized_pnl))}`}
+                    value={fmtMoney(pnl.unrealized_pnl, { signed: true })}
                     color={pnl.unrealized_pnl >= 0 ? 'text-success' : 'text-error'}
                   />
                   <Chip label="Days Held" value={`${pnl.days_held}d`} />
@@ -1536,7 +1615,7 @@ function TradeCard({
                         <Chip label="Current Value" value={fmtMoney(pnl.current_value)} />
                         <Chip
                           label="Unrealized P&L"
-                          value={`${mtmPnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(mtmPnl))}`}
+                          value={fmtMoney(mtmPnl, { signed: true })}
                           color={mtmPnl >= 0 ? 'text-success' : 'text-error'}
                         />
                       </div>
@@ -1599,7 +1678,7 @@ function TradeCard({
                     <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
                       <Chip label="Cost Basis" value={fmtMoney(costBasis)} />
                       <Chip label="Current Value" value={fmtMoney(pnl.current_value)} />
-                      <Chip label="Unrealized P&L" value={`${mtmPnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(mtmPnl))}`} color={mtmPnl >= 0 ? 'text-success' : 'text-error'} />
+                      <Chip label="Unrealized P&L" value={fmtMoney(mtmPnl, { signed: true })} color={mtmPnl >= 0 ? 'text-success' : 'text-error'} />
                       <Chip label="Margin" value={pnl.margin_required > 0 ? fmtMoney(pnl.margin_required) : '—'} />
                       <Chip label="Ann. Return" value={annReturn != null ? fmtAnnualized(annReturn) : '—'} color={annReturn != null && annReturn >= 5 ? 'text-success' : 'text-warning'} />
                       <Chip label="Trade Date" value={trade.entry_date ? fmtDate(trade.entry_date) : '—'} />
@@ -1654,7 +1733,7 @@ function TradeCard({
                       <span>
                         Total:{' '}
                         <span className={pnl.unrealized_pnl >= 0 ? 'text-success font-medium' : 'text-error font-medium'}>
-                          {pnl.unrealized_pnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(pnl.unrealized_pnl))}
+                          {fmtMoney(pnl.unrealized_pnl, { signed: true })}
                         </span>
                       </span>
                     </div>
@@ -1729,7 +1808,7 @@ function TradeCard({
                       <span>
                         Total P&L:{' '}
                         <span className={pnl.unrealized_pnl >= 0 ? 'text-success font-medium' : 'text-error font-medium'}>
-                          {pnl.unrealized_pnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(pnl.unrealized_pnl))}
+                          {fmtMoney(pnl.unrealized_pnl, { signed: true })}
                         </span>
                       </span>
                     </div>
@@ -1765,7 +1844,7 @@ function TradeCard({
                       {pnl.underlying_price > 0 && <Chip label="Current Price" value={fmtMoney(pnl.underlying_price)} />}
                       {pnl.stock_pnl != null && (
                         <Chip label="Stock P&L"
-                          value={`${pnl.stock_pnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(pnl.stock_pnl))}`}
+                          value={fmtMoney(pnl.stock_pnl, { signed: true })}
                           color={pnl.stock_pnl >= 0 ? 'text-success' : 'text-error'} />
                       )}
                       <Chip label="Days Held" value={`${held}d`} />
@@ -1782,7 +1861,7 @@ function TradeCard({
                           <Chip label="Cost Basis" value={fmtMoney(ob.cost_basis)} />
                           <Chip label="Current Value" value={fmtMoney(ob.current_value)} />
                           <Chip label="Unrealized P&L"
-                            value={`${ob.options_pnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(ob.options_pnl))}`}
+                            value={fmtMoney(ob.options_pnl, { signed: true })}
                             color={ob.options_pnl >= 0 ? 'text-success' : 'text-error'} />
                           <Chip label="Days Held" value={`${ob.days_held}d`} />
                         </div>
@@ -1837,7 +1916,7 @@ function TradeCard({
                     <div className="text-[9px] uppercase text-warning/60 tracking-wider font-semibold">3 · Stock + Option Combined</div>
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                       <Chip label="Combined P&L"
-                        value={`${pnl.unrealized_pnl >= 0 ? '+' : ''}${fmtMoney(Math.abs(pnl.unrealized_pnl))}`}
+                        value={fmtMoney(pnl.unrealized_pnl, { signed: true })}
                         color={pnl.unrealized_pnl >= 0 ? 'text-success' : 'text-error'} />
                       {pnl.net_greeks?.delta != null && (
                         <Chip label="Portfolio Δ Delta"
@@ -1853,7 +1932,7 @@ function TradeCard({
                       )}
                       {pnl.analysis?.expected_value != null && (
                         <Chip label="Expected Value"
-                          value={`${pnl.analysis.expected_value >= 0 ? '+' : ''}${fmtMoney(Math.abs(pnl.analysis.expected_value))}`}
+                          value={fmtMoney(pnl.analysis.expected_value, { signed: true })}
                           color={pnl.analysis.expected_value >= 0 ? 'text-success' : 'text-error'} />
                       )}
                     </div>
@@ -1895,7 +1974,7 @@ function TradeCard({
               )}
 
             </div>
-          )}
+          ))(pricedPnl)}
 
 
           {/* Legs table — compact, with per-leg roll/close actions */}
@@ -2839,11 +2918,17 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
   const handleDelete = async (row: ClosedRow) => {
     const t = row.trade;
     const label = row.part === 'options' ? 'option legs' : row.part === 'stock' ? 'stock leg' : row.structureLabel;
-    if (!window.confirm(`Delete ${t.ticker} ${label} from your closed journal? This cannot be undone.`)) return;
+    // A row of a still-ACTIVE trade is only its banked chunk — the live shares / open options must survive.
+    const plan = closedRowDeletion(t.trade_status, row.part);
+    const live = plan.live;
+    const msg = live
+      ? `Remove the banked ${t.ticker} ${label} P&L from your closed journal? The live position (shares / open options) stays on Active. This cannot be undone.`
+      : `Delete ${t.ticker} ${label} from your closed journal? This cannot be undone.`;
+    if (!window.confirm(msg)) return;
     const key = `${t.id}-${row.part}`;
     setDeletingKey(key);
     try {
-      if (row.part === 'all') await deleteTrade(t.id);
+      if (plan.kind === 'delete_trade') await deleteTrade(t.id);
       else await deleteClosedPart(t.id, row.part);
       setDeletingKey(null);
       const month = t.close_month || (row.closedAt ? row.closedAt.slice(0, 7) : null);
@@ -3041,7 +3126,8 @@ function ClosedLedger({ trades, pnlMap, frozenMonths = [], currentMonth = null, 
           </button>
           <button
             className="btn btn-ghost btn-xs px-1 text-base-content/20 hover:text-error opacity-0 group-hover:opacity-100 transition-opacity"
-            title={r.part === 'all' ? 'Delete this closed trade from the journal'
+            title={r.part === 'all'
+              ? (r.trade.trade_status !== 'closed' ? 'Remove this banked P&L from the journal — the live position stays on Active' : 'Delete this closed trade from the journal')
               : `Delete just the ${r.part === 'options' ? 'option legs' : 'stock leg'} of this trade`}
             disabled={deletingKey === delKey}
             onClick={() => handleDelete(r)}
@@ -3510,8 +3596,8 @@ export default function MyTradesV2() {
 
   const totalCapital = trades.reduce((s, t) => s + deployedCapital(t, pnlMap[t.id]), 0);
   // Only sum P&L for trades still in view (pnlMap can hold stale/closed entries).
-  const totalPnl = trades.reduce((s, t) => s + (pnlMap[t.id]?.unrealized_pnl ?? 0), 0);
-  const hasPnl = trades.some(t => pnlMap[t.id]?.unrealized_pnl != null);
+  // Priced rows only — an unpriced position has no P&L (it must not read as a loss); count them instead.
+  const { totalPnl, pricedCount, noQuote: noQuoteCount, hasPnl } = pnlTotals(trades, pnlMap);
   // Closed tab: banked realized P&L (authoritative stored total), not live unrealized —
   // the current-month rows PLUS every frozen prior month's stored realized.
   const totalRealized = trades.reduce((s, t) => s + (closedRealized(t, showRollPartials) ?? 0), 0)
@@ -3588,7 +3674,7 @@ export default function MyTradesV2() {
               <>
                 <span className="opacity-30">·</span>
                 <span className={totalRealized >= 0 ? 'text-success' : 'text-error'}>
-                  {totalRealized >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalRealized))} realized
+                  {fmtMoney(totalRealized, { signed: true })} realized
                 </span>
               </>
             ) : (
@@ -3598,8 +3684,17 @@ export default function MyTradesV2() {
                 {hasPnl && totalPnl !== 0 && (
                   <>
                     <span className="opacity-30">·</span>
-                    <span className={totalPnl >= 0 ? 'text-success' : 'text-error'}>
-                      {totalPnl >= 0 ? '+' : ''}{fmtMoney(Math.abs(totalPnl))} unrealized
+                    <span className={totalPnl >= 0 ? 'text-success' : 'text-error'}
+                      title={noQuoteCount > 0 ? `Sum of the ${pricedCount} priced position${pricedCount !== 1 ? 's' : ''} — excludes ${noQuoteCount} with no live quote` : undefined}>
+                      {fmtMoney(totalPnl, { signed: true })} unrealized
+                    </span>
+                  </>
+                )}
+                {noQuoteCount > 0 && (
+                  <>
+                    <span className="opacity-30">·</span>
+                    <span className="text-warning" title="Couldn't be priced live — their P&L is unknown and left out of the unrealized total above. Expand a row for the reason.">
+                      {noQuoteCount} no quote
                     </span>
                   </>
                 )}

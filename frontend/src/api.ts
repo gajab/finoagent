@@ -1459,7 +1459,8 @@ export async function fetchClosedLedgerMonth(month: string): Promise<SavedStrate
 
 // Delete just the option legs OR the stock leg of a closed combo trade. Returns the updated
 // trade, or null if that emptied it and the whole (fully-closed) trade was removed.
-export async function deleteClosedPart(id: number, part: 'options' | 'stock'): Promise<SavedStrategyItem | null> {
+/** part 'all' = a still-ACTIVE trade's single-part journal row: drops only the banked chunk, never the live position. */
+export async function deleteClosedPart(id: number, part: 'options' | 'stock' | 'all'): Promise<SavedStrategyItem | null> {
   return apiFetch<SavedStrategyItem | null>(`/api/saved-strategies/${id}/delete-closed-part`, {
     method: 'POST',
     body: JSON.stringify({ part }),
@@ -1467,6 +1468,12 @@ export async function deleteClosedPart(id: number, part: 'options' | 'stock'): P
 }
 
 // Undo a close — restore a closed (or partially-closed) trade to Active with all its legs.
+/** Remove just the STOCK from an income trade (covered call / stock + options): its option income —
+ *  realized, partial and still-open — is kept (open legs stay Active; banked-only income moves to Closed). */
+export async function removeTradeStock(id: number): Promise<SavedStrategyItem> {
+  return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${id}/remove-stock`, { method: 'POST' });
+}
+
 export async function reopenTrade(id: number): Promise<SavedStrategyItem> {
   return apiFetch<SavedStrategyItem>(`/api/saved-strategies/${id}/reopen`, { method: 'POST' });
 }
@@ -1757,9 +1764,15 @@ export interface LivePnlResponse {
   quote_source: string;
   underlying_price: number;
   entry_cost: number;
-  current_value: number;
-  unrealized_pnl: number;
-  pnl_pct: number;
+  /** null when a leg couldn't be priced — an unpriced structure has NO mark, it is not worth $0. */
+  current_value: number | null;
+  /** null ⇔ `pricing_complete === false`. Totals must skip it and flag it "no quote", never count it as 0. */
+  unrealized_pnl: number | null;
+  pnl_pct: number | null;
+  /** false when ≥1 leg had no live quote. Absent on payloads persisted before this field existed. */
+  pricing_complete?: boolean;
+  unpriced_legs?: number[];            // legs_data indices with no quote
+  pricing_warning?: string | null;
   days_held: number;
   current_quotes: any[];
   greeks: any[];
