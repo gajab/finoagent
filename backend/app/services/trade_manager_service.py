@@ -33,6 +33,7 @@ from typing import Any, Optional
 import numpy as np
 
 from . import trader_lenses as TL
+from .lifecycle_service import SIGNAL_SCORE_CEILING
 
 logger = logging.getLogger(__name__)
 
@@ -730,6 +731,9 @@ def build_profile(strategy: dict, pnl: dict) -> dict:
         "legs": [{"right": o["right"], "side": "SHORT" if o["side"] < 0 else "LONG", "strike": o["strike"],
                   "qty": o["qty"], "exp": o["exp"]} for o in opts],
         "stock_shares": stock_sh, "covered": covered, "avg_cost": _num(params.get("avg_cost")),
+        # an option leg with no live quote → P&L and every mark-based read are unknown (live-pnl: pricing_complete False)
+        "quote_gap": ({"unpriced_legs": list(pnl.get("unpriced_legs") or []), "warning": pnl.get("pricing_warning")}
+                      if pnl.get("pricing_complete") is False else None),
         "spot": spot, "dte": dte, "direction": direction, "pos_sign": pos_sign, "dir_raw": round(dir_raw, 3),
         "kind": kind, "short_premium": short_prem, "long_premium": long_prem, "range_play": range_play,
         "long_vol": long_vol, "undefined_risk": bool(pnl.get("unbounded_loss")) and not covered,
@@ -1314,9 +1318,13 @@ def _quant_score(profile: dict, ev: Optional[dict] = None) -> dict:
     sc = q.get("score")
     if sc is None:
         # no quant-desk read yet → NOT scored: it drops out of the blend rather than contributing a made-up 50
+        gap = profile.get("quote_gap")
         return {"score": 50.0, "signal": q.get("signal"), "source": "fallback", "overrides": [], "detail": detail, "label": "Quant",
-                "notes": ["No quant-desk read for this position yet — open Quant Analysis (or refresh P&L) for the full factor breakdown. Until then this lens is left out of the score."]}
-    notes = [f"Quant desk (hold read): {str(q.get('signal') or '').replace('_', ' ')} {sc:.0f}/100"
+                "notes": ([f"{gap.get('warning') or 'An option leg has no live quote'} — the quant hold/close read is withheld until it prices, "
+                           "so this lens is left out of the score (never valued at $0)."] if gap else
+                          ["No quant-desk read for this position yet — open Quant Analysis (or refresh P&L) for the full factor breakdown. Until then this lens is left out of the score."])}
+    src_txt = "full desk score" if q.get("source") == "full_desk" else "light read — run Quant Analysis for the full desk score"
+    notes = [f"Quant desk (hold read · {src_txt}): {str(q.get('signal') or '').replace('_', ' ')} {sc:.0f}/100"
              + (f" · hold anchor {q['hold_base']:.0f} (neutral 50 + holder factors)" if q.get("hold_base") is not None else "")]
     notes += [f"{a_['label']} {a_['pts']:+d}: {a_['note']}" if isinstance(a_.get("pts"), (int, float)) and a_.get("note") else f"{a_['label']}: {a_.get('note') or ''}"
               for a_ in detail["desk"]["adjustments"][:5] if a_.get("label")]
@@ -1435,7 +1443,7 @@ def decide(profile: dict, ev: dict) -> dict:
     q_sig = qnt.get("signal")
     q_sev = SEV.get({"CLOSE": "EXIT", "STRONG_CLOSE": "STRONG_EXIT"}.get(q_sig, q_sig), None)
     if qnt["overrides"] and q_sev is not None and q_sev >= 2:
-        floor_score = {2: 44.0, 3: 27.0}[q_sev]
+        floor_score = float({2: SIGNAL_SCORE_CEILING["CLOSE"], 3: SIGNAL_SCORE_CEILING["STRONG_CLOSE"]}[q_sev])   # the shared band ceilings
         if capped > floor_score:
             capped = floor_score
             overrides.append(f"Quant desk hard stop — {'; '.join(qnt['overrides'][:2])}")
@@ -1456,13 +1464,19 @@ def decide(profile: dict, ev: dict) -> dict:
     cov = ev.get("sources_ok") or {}
     coverage = (sum(1 for v in cov.values() if v) / len(cov)) if cov else 0.0
     conviction = _clamp(100 - spread * 0.9, 0, 100) * (0.6 + 0.4 * coverage)
+    gap = profile.get("quote_gap")
+    if gap:
+        conviction = min(conviction, 40.0)       # an unpriced option leg → the position's own risk/reward is unknown: never "high"
     if not avail["quant"]:
         conviction *= 0.85                       # no quant-desk read for this position → less to anchor on
     if len(scored) <= 1:
         conviction *= 0.8
     conf = "high" if conviction >= 68 and coverage >= 0.7 else "medium" if conviction >= 45 else "low"
     conflicts = []
-    if not avail["quant"]:
+    if gap:
+        conflicts.append(f"{gap.get('warning') or 'An option leg has no live quote'} — this verdict rests on Technical / Fundamental / Event only "
+                         "(the position's own P&L and quant read are unknown), so treat it as provisional.")
+    elif not avail["quant"]:
         conflicts.append("No quant-desk read for this position yet — the score rests on Technical and Fundamental only (confidence reduced). Open Quant Analysis for the full read.")
     if avail["quant"] and abs(lens["quant"] - lens["technical"]) >= 25:
         hi, lo = (qnt["label"], "Technical") if lens["quant"] > lens["technical"] else ("Technical", qnt["label"])
@@ -1477,6 +1491,7 @@ def decide(profile: dict, ev: dict) -> dict:
     return {
         "signal": signal, "score": round(capped, 1), "raw_score": round(overall, 1), "blend": round(blend, 1), "event_adj": round(event_adj, 1),
         "confidence": conf, "conviction": round(conviction, 0), "weights": {**w, "event": 0.0}, "overrides": overrides, "conflicts": conflicts,
+        "quote_gap": gap,
         "lenses": lenses, "coverage": round(coverage, 2),
     }
 

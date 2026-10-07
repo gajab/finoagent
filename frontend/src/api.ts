@@ -1665,7 +1665,7 @@ export interface NetGreeks {
   vega: number;
 }
 
-export type LegActionKind = 'CLOSE' | 'HOLD' | 'ROLL' | 'LET_EXPIRE';
+export type LegActionKind = 'CLOSE' | 'HOLD' | 'ROLL' | 'LET_EXPIRE' | 'NO_QUOTE';   // NO_QUOTE: the leg has no mark → no call is made on it
 
 export interface LegAdvice {
   leg: number;               // index into legs_data
@@ -1676,6 +1676,7 @@ export interface LegAdvice {
   reason: string;
   p_itm_pct: number | null;  // risk-neutral prob this leg finishes ITM at its strike
   captured_pct: number | null;
+  no_quote?: boolean;        // true ⇒ action is NO_QUOTE (unmarked leg, never valued at $0)
   prob_source: 'rnd' | 'lognormal' | 'delta';
 }
 
@@ -1730,7 +1731,9 @@ export interface TradeAnalysis {
   hold_vs_close_reasons: string[];
   dte_remaining: number;
   recommendation?: TradeRecommendation;
-  exit_signal?: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
+  exit_signal?: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE' | null;   // null ⇔ verdict_withheld
+  /** An option leg has no live quote: exit signal, captured %, hold/close, headline and quant read are all withheld together. */
+  verdict_withheld?: boolean;
   exit_reasons?: string[];
   captured_pct?: number | null;
   quant_exit?: QuantExit | null;
@@ -2108,6 +2111,8 @@ export interface DeskScoreResult {
   spot?: number;
   lifecycle_adjustments?: { name: string; pts: number; note: string }[];
   lifecycle_score?: number;
+  raw_score?: number | null;             // points before a hard override capped the score into its signal's band
+  pnl_inputs_known?: boolean;            // false ⇒ captured % / unrealized were unknown (unquoted leg), not 0
   signal?: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   overrides?: string[];
   hold_base?: number;                    // neutral-50 baseline (holder factors move it)
@@ -2139,6 +2144,7 @@ export interface ManagementAnalysis {
   factors_net: number;
   overlay: { name: string; pts: number; note: string }[]; // slim time / gamma
   score: number;
+  raw_score?: number | null;      // pre-override points — differs from `score` only when an override capped it
   signal: 'STRONG_HOLD' | 'HOLD' | 'CLOSE' | 'STRONG_CLOSE';
   overrides: string[];
   advisories?: string[];          // covered / naked call structural advice

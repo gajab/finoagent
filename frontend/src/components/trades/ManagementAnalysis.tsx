@@ -165,7 +165,10 @@ export default function ManagementAnalysis({ ma, qp, perSide }: { ma: MA; qp?: a
       </div>
 
       {ma.overrides.length > 0 && (
-        <div className="text-[10px] text-warning/80">Override: {ma.overrides.join('; ')}</div>
+        <div className="text-[10px] text-warning/80">
+          Override: {ma.overrides.join('; ')}
+          {ma.raw_score != null && ma.raw_score !== ma.score && ` — the factors alone scored ${ma.raw_score}; the score is capped at ${ma.score} so it matches the ${ma.signal.replace(/_/g, ' ')} call`}
+        </div>
       )}
       </>)}
     </div>

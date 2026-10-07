@@ -3707,6 +3707,8 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
         "spot": desk.get("spot") or (desk.get("context") or {}).get("spot"),
         "signal": mgmt["signal"],
         "lifecycle_score": mgmt["score"],
+        "raw_score": mgmt.get("raw_score"),                       # points before a hard override capped the score into its signal's band
+        "pnl_inputs_known": pnl.get("pricing_complete") is not False,   # False → captured % / unrealized were unknown, not 0
         "overrides": mgmt["overrides"],
         "management_analysis": {
             "anchor": mgmt["anchor"],
@@ -3716,6 +3718,7 @@ def score_desk_management(row: dict, desk: dict, *, pnl_snapshot: dict, structur
             "factors_net": mgmt["factors_net"],
             "overlay": mgmt["overlay"],               # take-profit / time-gamma
             "score": mgmt["score"],
+            "raw_score": mgmt.get("raw_score"),
             "signal": mgmt["signal"],
             "overrides": mgmt["overrides"],
             "advisories": mgmt["advisories"],         # covered / naked call advice

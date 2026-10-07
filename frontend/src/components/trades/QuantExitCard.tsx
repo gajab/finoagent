@@ -14,6 +14,7 @@ import { Loader2, Cpu, AlertTriangle } from 'lucide-react';
 import { runDeskScore } from '../../api';
 import type { QuantExit, LivePnlResponse, SavedStrategyItem, DeskScoreResult } from '../../api';
 import ManagementAnalysis from './ManagementAnalysis';
+import { setDeskScore } from '../../lib/deskScoreStore';
 
 const SIGNAL: Record<string, { label: string; cls: string; tone: string }> = {
   STRONG_HOLD:    { label: 'STRONG HOLD',    cls: 'badge-success',               tone: 'success' },
@@ -53,7 +54,7 @@ export default function QuantExitCard({ q, trade, pnl, deskFocus }: {
     try {
       const r = await runDeskScore(trade.id, pnl, deskFocus, pnl.quote_source || 'yfinance');
       if (!r.matched) setErr(r.error || 'This trade is not among the current desk candidates.');
-      else setFull(r);
+      else { setFull(r); setDeskScore(trade.id, r); }   // the Trade Manager's Quant lens reads this same result
     } catch (e: any) { setErr(e?.message || 'Desk score failed'); }
     finally { setLoading(false); }
   };
@@ -186,7 +187,7 @@ export function QuantAnalysisLoader({ trade, pnl, deskFocus }: {
         const r = await runDeskScore(trade.id, pnl, deskFocus, pnl.quote_source || 'yfinance');
         if (!alive) return;
         if (!r.matched) setErr(r.error || 'This trade is not among the current desk candidates.');
-        else setFull(r);
+        else { setFull(r); setDeskScore(trade.id, r); }   // the Trade Manager's Quant lens reads this same result
       } catch (e: any) { if (alive) setErr(e?.message || 'Desk score failed'); }
       finally { if (alive) setLoading(false); }
     })();
