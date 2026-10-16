@@ -24,6 +24,7 @@ import ScoreCard from './ScoreCard';
 import SplitPane from './SplitPane';
 import PriceLadder from './PriceLadder';
 import { choosePicks, capitalOf, type Pick } from './betaPicks';
+import { premiumAfterFill, afterFillText, afterFillTitle } from '../lib/fills';
 
 // ── presets ──────────────────────────────────────────────────────────────────
 type PresetKey = 'safe' | 'balanced' | 'income';
@@ -365,6 +366,9 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                           <div className="mt-2 flex items-baseline gap-1.5"><span className="text-2xl font-semibold tabular-nums text-success">{keepPct(p.trade.prob_keep_pct)}</span><span className="text-xs text-base-content/50">keep chance</span></div>
                           <div className="mt-1.5 grid grid-cols-2 gap-x-3 text-xs">
                             <span className="text-base-content/50">Premium</span><span className="text-right tabular-nums">{money(p.trade.premium)}</span>
+                            {premiumAfterFill(p.trade) != null && (<>
+                              <span className="text-base-content/50 cursor-help" title={afterFillTitle(p.trade)}>After fill</span><span className="text-right tabular-nums">{money(premiumAfterFill(p.trade))}</span>
+                            </>)}
                             <span className="text-base-content/50">{cap.label}</span><span className="text-right tabular-nums" title={cap.sub}>{money(cap.value)}</span>
                             <span className="text-base-content/50">Return</span><span className="text-right tabular-nums">{p.trade.static_return_pct != null ? `${p.trade.static_return_pct.toFixed(1)}%` : '—'}</span>
                           </div>
@@ -386,6 +390,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                             {([
                               ['Keep chance', (t: DeskRankedTrade) => keepPct(t.prob_keep_pct)],
                               ['Premium', (t: DeskRankedTrade) => money(t.premium)],
+                              ['After fill', (t: DeskRankedTrade) => premiumAfterFill(t) != null ? money(premiumAfterFill(t)) : '—'],
                               ['Capital', (t: DeskRankedTrade) => { const c = capitalOf(t); return `${money(c.value)} ${c.label.toLowerCase()}`; }],
                               ['Break-even', (t: DeskRankedTrade) => `${money(t.breakeven, 2)}${t.cushion_pct != null ? ` (${t.cushion_pct.toFixed(1)}% cushion)` : ''}`],
                               ['Return', (t: DeskRankedTrade) => t.static_return_pct != null ? `${t.static_return_pct.toFixed(1)}% in ${t.dte}d` : '—'],
@@ -434,7 +439,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                               <td className="px-2 py-2"><PriceLadder t={t} spot={rev.spot} width={96} /></td>
                               <td className="px-2 py-2 text-right tabular-nums">{keepPct(t.prob_keep_pct)}{t.prob_method === 'BS_fallback' && <span className="text-warning" title="IV estimate — the option chain's implied-vol surface was inconsistent, so this is a flat-vol estimate."> ≈</span>}</td>
                               <td className="px-2 py-2 text-right tabular-nums leading-tight">{t.static_return_pct != null ? `${t.static_return_pct.toFixed(1)}%` : '—'}<div className="text-[11px] text-base-content/40">{annText(t.premium_annualized_pct)}</div></td>
-                              <td className="pr-3 py-2 text-right tabular-nums hidden xl:table-cell">{money(t.premium)}</td>
+                              <td className="pr-3 py-2 text-right tabular-nums hidden xl:table-cell leading-tight">{money(t.premium)}{afterFillText(t) && <div className="text-[11px] text-base-content/40 cursor-help" title={afterFillTitle(t)}>{afterFillText(t)}</div>}</td>
                             </tr>
                           );
                         })}
@@ -462,7 +467,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                       </div>
                       <div className="grid grid-cols-2 gap-2 mt-3">
                         {[
-                          ['Premium', money(selected.premium), `${money(selected.premium_per_share, 2)} per share`],
+                          ['Premium', money(selected.premium), `${money(selected.premium_per_share, 2)} per share${afterFillText(selected) ? ` · ${afterFillText(selected)}` : ''}`],
                           [capitalOf(selected).label, money(capitalOf(selected).value), capitalOf(selected).sub],
                           ['Break-even', money(selected.breakeven, 2), selected.cushion_pct != null ? `${selected.cushion_pct.toFixed(1)}% cushion` : undefined],
                           ['Return', selected.static_return_pct != null ? `${selected.static_return_pct.toFixed(1)}%` : '—', `in ${selected.dte}d ${annText(selected.premium_annualized_pct)}`],

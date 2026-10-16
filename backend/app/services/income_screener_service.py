@@ -360,6 +360,8 @@ def _compact(o: dict, pick: str) -> dict:
         "short_delta": o.get("short_delta"),
         "premium": o.get("premium"),
         "premium_per_share": o.get("premium_per_share"),
+        "premium_fill": o.get("premium_fill"),           # what you collect after the expected fill + commissions
+        "entry_cost": o.get("entry_cost"),
         "prob_keep_pct": o.get("prob_keep_pct"),
         "prob_touch_pct": o.get("prob_touch_pct"),
         "premium_annualized_pct": o.get("premium_annualized_pct"),
@@ -407,7 +409,7 @@ async def evaluate_ticker(ticker: str, p: dict, user=None, db=None) -> dict:
     from .quote_providers import get_provider
 
     ticker = _norm_ticker(ticker)
-    ck = _key(f"iscreen:eval:{ticker}:v1", p)
+    ck = _key(f"iscreen:eval:{ticker}:v3", p)   # v2: exact payoff law · v3: fills + carry-to-risk + market-implied law
     if db is not None:
         cached = await get_cached(db, ck)
         if cached is not None:

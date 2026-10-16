@@ -11,6 +11,7 @@ import { RatingsHelpButton } from './RatingsHelp';
 import DeskDebateModal from './DeskDebateModal';
 import { OpportunitySummary, LegsTable } from './DerivativeIncome';
 import CollapsibleSection from './trades/CollapsibleSection';
+import { afterFillText, afterFillTitle } from '../lib/fills';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
 import type { DeskReviewParams, DeskEvaluateParams } from '../api';
 import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan, BlindRead, PerSideLeg } from '../types';
@@ -1681,7 +1682,11 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                               </span>
                             )}
                           </td>
-                          <td className="text-success whitespace-nowrap">{money(t.premium)}</td>
+                          <td className="text-success whitespace-nowrap">{money(t.premium)}
+                            {afterFillText(t) && (
+                              <div className="text-[10px] text-base-content/45 cursor-help" title={afterFillTitle(t)}>{afterFillText(t)}</div>
+                            )}
+                          </td>
                           <td className="whitespace-nowrap">{winPct(t.prob_keep_pct)}
                             {t.prob_method === 'BS_fallback' && (
                               <span className="ml-0.5 text-[10px] text-warning cursor-help align-super font-semibold"

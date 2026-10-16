@@ -137,16 +137,27 @@ def payoff_distribution_metrics(prices, pnls, weights, capital: float,
 
     weights: probability mass per price bucket (len = len(prices) − 1).
     """
-    out = {"pop": None, "expected_value": None, "omega": None, "sortino": None,
-           "calmar": None, "expected_return_pct": None, "downside_dev_pct": None}
     prices = np.asarray(prices, dtype=float)
     pnls = np.asarray(pnls, dtype=float)
+    if len(prices) < 2:
+        return _metrics_from_pnl(np.zeros(0), np.zeros(0), capital, max_loss, dte_days, mar)
+    pnl_mid = (pnls[:-1] + pnls[1:]) / 2.0
+    return _metrics_from_pnl(pnl_mid, np.asarray(weights, dtype=float), capital, max_loss, dte_days, mar)
+
+
+def _metrics_from_pnl(pnl_mid: np.ndarray, weights: np.ndarray, capital: float,
+                      max_loss: Optional[float], dte_days: int, mar: float = 0.0) -> dict:
+    """PoP / EV / Omega / Sortino / Calmar from per-bucket P&L and probability mass — the ONE formula
+    behind both the scenario-grid path (`payoff_distribution_metrics`) and the exact bucket path
+    (`_payoff_distribution`), so the two can never define a ratio differently."""
+    out = {"pop": None, "expected_value": None, "omega": None, "sortino": None,
+           "calmar": None, "expected_return_pct": None, "downside_dev_pct": None}
+    pnl_mid = np.asarray(pnl_mid, dtype=float)
     w = np.asarray(weights, dtype=float)
     s = w.sum()
-    if s <= 0 or len(prices) < 2 or dte_days <= 0:
+    if s <= 0 or len(pnl_mid) < 1 or len(w) != len(pnl_mid) or dte_days <= 0:
         return out
     w = w / s
-    pnl_mid = (pnls[:-1] + pnls[1:]) / 2.0
 
     out["expected_value"] = round(float(np.sum(w * pnl_mid)), 2)
     out["pop"] = round(float(np.sum(w[pnl_mid > 0]) * 100), 1)
@@ -353,7 +364,13 @@ def horizon_payoff_curve(legs, stock_shares, spot, horizon_years, r=0.05,
 
 
 def _weighted_var_cvar(pnl_mid: np.ndarray, w: np.ndarray, alpha: float = 0.05) -> tuple:
-    """Weighted VaR/CVaR (positive-loss $) at the alpha tail of the terminal P&L."""
+    """Weighted VaR/CVaR (positive-loss $) at the alpha tail of the terminal P&L.
+
+    CVaR is the exact Expected Shortfall: the mass-weighted mean of the worst ``alpha`` of outcomes, with the
+    bucket that straddles the alpha boundary counted FRACTIONALLY (not dropped) — so it does not jump as a
+    bucket edge crosses alpha."""
+    pnl_mid = np.asarray(pnl_mid, dtype=float)
+    w = np.asarray(w, dtype=float)
     if len(pnl_mid) == 0 or w.sum() <= 0:
         return None, None
     order = np.argsort(pnl_mid)
@@ -362,10 +379,10 @@ def _weighted_var_cvar(pnl_mid: np.ndarray, w: np.ndarray, alpha: float = 0.05) 
     cw = np.cumsum(ww)
     idx = min(int(np.searchsorted(cw, alpha)), len(p) - 1)
     var = -float(p[idx])
-    mask = cw <= alpha
-    if not mask.any():
-        mask[0] = True
-    cvar = -float(np.sum(p[mask] * ww[mask]) / ww[mask].sum())
+    before = float(cw[idx - 1]) if idx > 0 else 0.0
+    take = min(max(alpha - before, 0.0), float(ww[idx]))          # the straddling bucket's share of the tail
+    tail_mass = before + take
+    cvar = -(float(np.sum(p[:idx] * ww[:idx])) + float(p[idx]) * take) / tail_mass if tail_mass > 0 else var
     return round(max(var, 0.0), 2), round(max(cvar, 0.0), 2)
 
 
@@ -396,10 +413,535 @@ def _kelly_fraction(rets: np.ndarray, w: np.ndarray) -> Optional[float]:
     return round(max(0.0, min(1.0, er / er2)), 3)
 
 
+# ── The trade's payoff DISTRIBUTION — one exact, skew-consistent law for PoP / EV / ratios / VaR / Kelly ──
+# Two defects this replaces (both verified against an exact reference market):
+#   1. A 2.5%-step scenario grid: the bucket holding the breakeven was all-or-nothing, so PoP was off by up to
+#      ~7 pts and EV by ~10% of the premium, and neighbouring strikes swapped rank on grid alignment.
+#   2. ONE flat vol (the average of the legs' IVs) for every leg: on a skewed smile that misprices every leg, so
+#      a FAIR put spread read EV −$31 / Omega 0.5 (spreads, condors, jade lizards pushed down; call spreads up).
+# The fix — cheap (a few hundred numpy points, no Python price loop) and exact where it matters:
+#   • buckets are EXACT lognormal masses (Φ differences) with each bucket valued at its exact conditional-mean
+#     price; every strike and every breakeven is a bucket edge, so the payoff is linear inside each bucket
+#     ⇒ EV is exact and PoP has no breakeven bucket to misclassify;
+#   • the PRIOR is the expiry's market-implied law (the scan's SVI → Breeden-Litzenberger density, carried as a
+#     compact grid) — ONE consistent law for every trade on the expiry — else a lognormal centred on ATM IV;
+#   • each leg is priced at its OWN vol (backed out of its mid) and the law is the minimum-relative-entropy tilt
+#     of the prior that reprices them all while keeping the forward (Avellaneda-style calibration) ⇒ always a
+#     valid density, and a fairly-priced trade of ANY structure has EV ≈ 0 at mid (carry only);
+#   • the P-measure widening is preserved: realized variance above the centre implied is ADDED by convolving the
+#     law with independent noise (body widens, the market's skewed wings keep their shape; a lone leg with no
+#     anchor ⇒ exactly the old max(IV, HV) lognormal).
+_DIST_NODES = 321           # log-spaced price nodes (plus every strike, ATM forward and breakeven)
+_DIST_SPAN_SD = 8.0         # grid half-width in total-σ around the forward (mass outside ≈ 1e-15)
+_CAL_MAX_ITER = 60
+_CAL_TOL = 1e-10            # max |E[payoff] − target| per constraint, in units of the forward
+_ATM_ANCHOR_RATIO = (0.4, 2.5)   # ATM IV accepted as the centre only within this ratio of the nearest leg's vol
+
+
+def _ncdf(x):
+    """Standard normal CDF, vectorized (scipy's ndtr ufunc — accurate deep in both tails)."""
+    from scipy.special import ndtr
+    return ndtr(x)
+
+
+def _leg_vol(lg) -> Optional[float]:
+    """A leg's quoted IV as a decimal (legs carry percent OR decimal, like horizon_payoff_curve)."""
+    iv = lg.get("iv")
+    try:
+        iv = float(iv)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(iv) or iv <= 0:
+        return None
+    return iv / 100.0 if iv > 3 else iv
+
+
+def _fwd_put(F: float, K: float, v: float) -> float:
+    """Undiscounted (forward) Black put value E[(K − S_T)^+]; v = σ·√T."""
+    if v <= 0:
+        return max(K - F, 0.0)
+    d1 = (math.log(F / K) + 0.5 * v * v) / v
+    d2 = d1 - v
+    n = lambda z: 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    return K * n(-d2) - F * n(-d1)
+
+
+def _vol_from_price(price: float, K: float, is_call: bool, F: float, T: float, r: float) -> Optional[float]:
+    """The Black vol that reproduces this leg's traded price (bisection on the forward put value — a call is
+    mapped through put-call parity). None when the price is outside the no-arbitrage band (stale/garbage)."""
+    if not (price and price > 0 and K > 0 and T > 0):
+        return None
+    fwd = price * math.exp(r * T)
+    put_fwd = fwd - (F - K) if is_call else fwd
+    if not (max(K - F, 0.0) + 1e-12 < put_fwd < K):
+        return None
+    sq = math.sqrt(T)
+    lo, hi = 1e-4, 5.0
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        if _fwd_put(F, K, mid * sq) > put_fwd:
+            hi = mid
+        else:
+            lo = mid
+    v = 0.5 * (lo + hi)
+    return v if 0.02 <= v <= 4.0 else None
+
+
+def _payoff_at(prices: np.ndarray, life_legs, stock_shares: float, spot: float, horizon_T: float,
+               r: float, iv_fallback: float, multi_exp: bool) -> np.ndarray:
+    """P&L ($) at an array of underlying prices AT THE HORIZON — vectorized, and the same math as
+    `terminal_payoff_curve` (single expiry: every leg pays intrinsic) / `horizon_payoff_curve` (multi-expiry:
+    a leg still alive at the horizon is Black-Scholes-marked at its own IV on its remaining life)."""
+    P = np.asarray(prices, dtype=float)
+    pnl = stock_shares * (P - spot)
+    for lg in life_legs:
+        K = float(lg.get("strike") or 0.0)
+        is_call = str(lg.get("right", "")).upper().startswith("C")
+        t_rem = (float(lg.get("dte_years") or 0.0) - horizon_T) if multi_exp else 0.0
+        if t_rem <= 1e-6:
+            val = np.maximum(P - K, 0.0) if is_call else np.maximum(K - P, 0.0)
+        else:
+            sig = _leg_vol(lg) or iv_fallback
+            if not sig or sig <= 0:
+                sig = iv_fallback
+            v = sig * math.sqrt(t_rem)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                d1 = (np.log(np.maximum(P, 1e-12) / K) + (r + 0.5 * sig * sig) * t_rem) / v
+            d2 = d1 - v
+            disc = K * math.exp(-r * t_rem)
+            val = (P * _ncdf(d1) - disc * _ncdf(d2)) if is_call else (disc * _ncdf(-d2) - P * _ncdf(-d1))
+        pnl = pnl + lg["sign"] * float(lg.get("qty") or 1) * 100.0 * (val - float(lg.get("price") or 0.0))
+    return pnl
+
+
+def _tilt_to_targets(m: np.ndarray, G: np.ndarray, c: np.ndarray) -> Optional[np.ndarray]:
+    """Minimum-relative-entropy reweighting of prior masses ``m`` so that E_w[G] = c (one column per
+    constraint). Convex dual, Newton with backtracking. Returns the new masses, or None if the targets are
+    infeasible (an arbitrageable / inconsistent set of quotes) or the solve does not converge."""
+    pos = m > 0
+    logm = np.full(len(m), -np.inf)
+    logm[pos] = np.log(m[pos])
+    theta = np.zeros(G.shape[1])
+
+    def _state(th):
+        a = logm + G @ th
+        amax = float(np.max(a[pos]))
+        e = np.where(pos, np.exp(a - amax), 0.0)
+        z = float(e.sum())
+        return e / z, amax + math.log(z) - float(th @ c)
+
+    w, phi = _state(theta)
+    for _ in range(_CAL_MAX_ITER):
+        eg = w @ G
+        grad = eg - c
+        if float(np.max(np.abs(grad))) < _CAL_TOL:
+            return w
+        gc = G - eg
+        H = (gc * w[:, None]).T @ gc
+        H[np.diag_indices_from(H)] += 1e-14 + 1e-10 * float(np.trace(H))
+        try:
+            step = np.linalg.solve(H, grad)
+        except np.linalg.LinAlgError:
+            return None
+        t = 1.0
+        while t > 1e-8:
+            w_n, phi_n = _state(theta - t * step)
+            if math.isfinite(phi_n) and phi_n <= phi - 1e-4 * t * float(grad @ step):
+                break
+            t *= 0.5
+        else:                                     # no descent left: accept only if already at precision
+            return w if float(np.max(np.abs(grad))) < _CAL_TOL * 1e3 else None
+        theta = theta - t * step
+        w, phi = w_n, phi_n
+    return w if float(np.max(np.abs(w @ G - c))) < _CAL_TOL * 1e3 else None
+
+
+def _tilt_soft(m: np.ndarray, G: np.ndarray, c: np.ndarray, tol: np.ndarray,
+               max_iter: int = 80) -> Optional[np.ndarray]:
+    """Minimum-relative-entropy reweighting of prior masses ``m`` that matches E_w[G] = c to within ``tol`` per
+    column (a quote's half-spread) — the bid/ask-aware, ALWAYS-feasible sibling of `_tilt_to_targets` (noisy or
+    mutually-inconsistent quotes can't make it fail). Dual: min_θ log Σ m·e^{Gθ} − θ·c + ½ Σ (tol·θ)²."""
+    pos = m > 0
+    logm = np.full(len(m), -np.inf)
+    logm[pos] = np.log(m[pos])
+    t2 = np.asarray(tol, dtype=float) ** 2
+    theta = np.zeros(G.shape[1])
+
+    def _state(th):
+        a = logm + G @ th
+        amax = float(np.max(a[pos]))
+        e = np.where(pos, np.exp(a - amax), 0.0)
+        z = float(e.sum())
+        return e / z, amax + math.log(z) - float(th @ c) + 0.5 * float(np.sum(t2 * th * th))
+
+    w, phi = _state(theta)
+    scale = np.maximum(np.sqrt(t2), 1e-9)
+
+    def _gap(gr):                                 # optimality gap in units of each quote's tolerance
+        return float(np.max(np.abs(gr) / scale))
+
+    for _ in range(max_iter):
+        eg = w @ G
+        grad = eg - c + t2 * theta
+        if _gap(grad) < 1e-3:
+            return w
+        gc = G - eg
+        H = (gc * w[:, None]).T @ gc
+        H[np.diag_indices_from(H)] += t2 + 1e-14
+        try:
+            step = np.linalg.solve(H, grad)
+        except np.linalg.LinAlgError:
+            return None
+        t = 1.0
+        while t > 1e-8:
+            w_n, phi_n = _state(theta - t * step)
+            if math.isfinite(phi_n) and phi_n <= phi - 1e-4 * t * float(grad @ step):
+                break
+            t *= 0.5
+        else:                                     # stalled: accept only if already at the optimum (precision)
+            return w if _gap(grad) < 1e-2 else None
+        theta = theta - t * step
+        w, phi = w_n, phi_n
+    return w if _gap(w @ G - c + t2 * theta) < 1e-2 else None     # never hand back a half-solved law
+
+
+def law_is_sane(K: np.ndarray, cdf: np.ndarray, forward: float, T: float, atm_iv: Optional[float]) -> bool:
+    """A market law is only trusted when it looks like one: mean ≈ the forward, and the log-return spread within a
+    broad band of the ATM vol (catches a law collapsed onto a garbage quote — JPM 2026-11 put all its mass at $185
+    off one stale wing quote). Shared by the scan (grid build) and the desk (grid use)."""
+    try:
+        w = np.diff(np.asarray(cdf, dtype=float))
+        K = np.asarray(K, dtype=float)
+        if len(w) < 10 or np.any(w < -1e-9) or abs(float(w.sum()) - 1.0) > 1e-3 or forward <= 0:
+            return False
+        m = 0.5 * (K[1:] + K[:-1])
+        mean = float(w @ m) / float(w.sum())
+        if abs(mean / forward - 1.0) > 0.01:
+            return False
+        lr = np.log(m / forward)
+        sd = math.sqrt(max(float(w @ (lr * lr)) - float(w @ lr) ** 2, 0.0))
+        if atm_iv and atm_iv > 0 and T > 0:
+            ref = atm_iv * math.sqrt(T)
+            return 0.4 * ref <= sd <= 2.5 * ref
+        return sd > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _usable_rnd_grid(g: Optional[dict], T: float, atm_iv: Optional[float] = None) -> Optional[tuple]:
+    """(K, cdf, pe) arrays from a scan's compact market-implied law when it is well-formed AND for this horizon
+    (the same expiry); else None → the lognormal prior is used."""
+    try:
+        if not g or abs(float(g.get("T") or 0.0) - T) > 2.0 / 365.0:
+            return None
+        K = np.asarray(g["K"], dtype=float)
+        cdf = np.asarray(g["cdf"], dtype=float)
+        pe = np.asarray(g["pe"], dtype=float)
+        if len(K) < 50 or len(cdf) != len(K) or len(pe) != len(K) or np.any(np.diff(K) <= 0):
+            return None
+        if not (abs(cdf[-1] - 1.0) < 1e-3 and cdf[0] < 1e-3 and np.all(np.diff(cdf) >= -1e-9)):
+            return None
+        if not law_is_sane(K, cdf, float(g.get("forward") or 0.0), T, atm_iv):
+            return None
+        return K, np.clip(cdf, 0.0, 1.0), np.maximum(pe, 0.0)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _buckets_from_cdf_pe(edges: np.ndarray, cdf_e: np.ndarray, pe_e: np.ndarray, mean_all: float):
+    """Bucket masses + conditional means on [0, e0], [e0, e1], …, [e_last, ∞) from the CDF and the partial
+    expectation E[S·1{S>e}] at the edges. Means are clipped into their bucket (guards round-off)."""
+    cdf = np.concatenate([[0.0], np.clip(cdf_e, 0.0, 1.0), [1.0]])
+    part_e = np.concatenate([[mean_all], pe_e, [0.0]])
+    mass = np.maximum(np.diff(cdf), 0.0)
+    part = np.maximum(part_e[:-1] - part_e[1:], 0.0)
+    b_lo = np.concatenate([[0.0], edges])
+    b_hi = np.concatenate([edges, [edges[-1] * 2.0]])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean = np.where(mass > 1e-300, part / np.where(mass > 0, mass, 1.0), 0.5 * (b_lo + b_hi))
+    mean = np.minimum(np.maximum(mean, b_lo), b_hi)
+    tot = float(mass.sum())
+    return (mass / tot if tot > 0 else mass), mean
+
+
+def _widen(w: np.ndarray, mu: np.ndarray, edges: np.ndarray, dv: float, chunk: int = 64):
+    """P-measure widening: convolve the law with independent lognormal noise of log-variance ``dv`` (mean 1, so
+    the forward is kept) and re-bucket on the SAME edges (strikes / breakevens stay edges). Adds variance to the
+    body while the market's skewed wings keep their shape. Chunked so memory stays O(chunk × buckets)."""
+    sd = math.sqrt(dv)
+    pos = (w > 0) & (mu > 0)
+    wj, mj = w[pos], mu[pos]
+    cdf_e = np.empty(len(edges))
+    pe_e = np.empty(len(edges))
+    lm = np.log(mj)
+    for i in range(0, len(edges), chunk):
+        le = np.log(edges[i:i + chunk])[:, None]
+        cdf_e[i:i + chunk] = _ncdf((le - lm + 0.5 * dv) / sd) @ wj
+        pe_e[i:i + chunk] = _ncdf((lm - le + 0.5 * dv) / sd) @ (wj * mj)
+    return _buckets_from_cdf_pe(edges, cdf_e, pe_e, float(wj @ mj))
+
+
+_NARROW_MIN_RATIO = 0.25    # never narrow the law below 25% of the market's variance (σ_P ≥ ½·σ_Q)
+
+
+def _narrow(w: np.ndarray, mu: np.ndarray, F: float, var_ratio: float) -> Optional[np.ndarray]:
+    """P-measure NARROWING (implied above the physical forecast — the seller's volatility risk premium): the
+    minimum-relative-entropy reweighting of the market law whose log-return variance is ``var_ratio`` × the
+    market's, keeping the forward. A Gaussian-shaped damping (tilt ∝ e^{θ·(x−x̄)²}, θ<0) — both tails thin
+    smoothly; the market's skew shape is otherwise kept. None if it can't be solved (caller keeps the law)."""
+    pos = (w > 0) & (mu > 0)
+    if pos.sum() < 10:
+        return None
+    x = np.where(mu > 0, np.log(np.where(mu > 0, mu, 1.0) / F), 0.0)
+    xbar = float(w @ x)
+    d2 = (x - xbar) ** 2
+    var_q = float(w @ d2)
+    if var_q <= 0:
+        return None
+    G = np.column_stack([mu / F, d2 / var_q])
+    c = np.array([1.0, max(var_ratio, _NARROW_MIN_RATIO)])
+    return _tilt_to_targets(w, G, c)
+
+
+def _payoff_distribution(life_legs, stock_shares: float, spot: float, dte_days: int, r: float,
+                         implied: Optional[float], realized: Optional[float],
+                         atm_iv: Optional[float] = None, iv_fallback: float = 0.30,
+                         rnd_grid: Optional[dict] = None, event_var: float = 0.0) -> Optional[dict]:
+    """The trade's terminal (or horizon) P&L distribution as exact buckets — see the block comment above.
+
+    Prior = the expiry's MARKET-IMPLIED law (`rnd_grid`, the scan's SVI → Breeden-Litzenberger density) when
+    available — one consistent law for every trade on the expiry — else a lognormal centred on ATM IV. It is then
+    minimally tilted to reprice each leg at its mid (and keep the forward) — the Q (market) law.
+
+    The P (physical) law re-sizes it to the PHYSICAL variance: ``realized`` (the desk's diffusion vol forecast)
+    over the horizon plus ``event_var`` (an earnings print inside the window, as a variance in log-return units —
+    priced at its implied size, so event premium is never mistaken for edge). Wider than the market → convolve
+    (`_widen`); narrower (the seller's VRP) → entropy-narrow (`_narrow`). Expectation metrics (PoP / EV / Omega /
+    Sortino / Kelly) use P; tail metrics use the WIDER of P and Q — a tail is never thinner than the market prices
+    it.
+
+    Returns {"w": masses, "pnl": $ per bucket, "price": conditional-mean price per bucket, "method",
+    "center_vol", "weight_vol", "n_constraints", "atm_anchor", "max_price_err"} or None (caller falls back)."""
+    if not life_legs or not spot or spot <= 0 or not dte_days or dte_days <= 0:
+        return None
+    dte_ys = [float(l.get("dte_years") or 0.0) for l in life_legs]
+    multi_exp = len({round(d, 6) for d in dte_ys}) > 1
+    T = (min(d for d in dte_ys if d > 0) if multi_exp and any(d > 0 for d in dte_ys) else dte_days / 365.0)
+    if T <= 0:
+        return None
+    g = _usable_rnd_grid(rnd_grid, T, atm_iv)
+    F = spot * math.exp(r * T)
+    r_px = r                                       # rate that turns a quoted price into a forward value
+    if g is not None:
+        gF, gr = float(rnd_grid.get("forward") or 0.0), rnd_grid.get("r")
+        if gF > 0 and abs(math.log(gF / F)) < 0.05:
+            F = gF                                 # the market's parity forward (carry net of dividends)
+            r_px = float(gr) if gr is not None else r
+
+    # 1) Each strike's OWN vol, backed out of its MID (the market's fair value — `price` may be the expected
+    #    fill, whose cost must surface as negative EV, not be absorbed into the vol), falling back to the quoted
+    #    IV. Only legs that EXPIRE at the horizon constrain the horizon law (a calendar's back leg is marked on its
+    #    own remaining life inside _payoff_at). Same-strike legs (a call & put) are averaged.
+    by_k: dict[float, list[float]] = {}
+    for lg in life_legs:
+        if multi_exp and float(lg.get("dte_years") or 0.0) - T > 1e-6:
+            continue
+        K = float(lg.get("strike") or 0.0)
+        if K <= 0:
+            continue
+        is_call = str(lg.get("right", "")).upper().startswith("C")
+        mark = lg.get("mid") if lg.get("mid") not in (None, 0, 0.0) else lg.get("price")
+        v = _vol_from_price(float(mark or 0.0), K, is_call, F, T, r_px) or _leg_vol(lg)
+        if v and 0.02 <= v <= 4.0:
+            by_k.setdefault(K, []).append(v)
+    nodes = sorted((K, sum(vs) / len(vs)) for K, vs in by_k.items())
+
+    # 2) Prior + CENTRE vol. The market law needs no anchor (it already carries the whole smile). The lognormal
+    #    prior is centred on ATM IV when sane (it carries the skew a lone OTM leg cannot) — skipped when a leg
+    #    already sits at the money — else on the leg nearest the forward.
+    nearest = min(nodes, key=lambda kv: abs(math.log(kv[0] / F)))[1] if nodes else None
+    atm_ok = bool(atm_iv and 0.03 <= atm_iv <= 3.0 and
+                  (nearest is None or _ATM_ANCHOR_RATIO[0] <= atm_iv / nearest <= _ATM_ANCHOR_RATIO[1]))
+    center = nearest or (implied if implied and implied > 0 else None) or (realized if realized and realized > 0 else None) or 0.30
+    use_atm = False
+    if atm_ok:
+        if g is not None:
+            center = atm_iv
+        elif all(abs(math.log(K / F)) > 0.25 * atm_iv * math.sqrt(T) for K, _ in nodes):
+            center, use_atm = atm_iv, True
+    # P-measure widening: realized ABOVE the centre implied (negative VRP) adds the variance gap.
+    dv = max(0.0, (realized * realized - center * center) * T) if (realized and realized > 0) else 0.0
+    sig_w = math.sqrt(center * center + dv / T)
+
+    # 3) Price grid: log-spaced over ±_DIST_SPAN_SD total-σ (sized off the WIDEST vol in play), always reaching
+    #    past every strike so the open tail buckets are linear; every strike + the ATM forward is an edge.
+    strikes = [float(l.get("strike") or 0.0) for l in life_legs if float(l.get("strike") or 0.0) > 0]
+    _var_p = max(dv, max(float(event_var or 0.0), 0.0) + max((realized or 0.0) ** 2 * T - center * center * T, 0.0))
+    s_max = math.sqrt(max([center] + [v for _, v in nodes]) ** 2 + _var_p / T) * math.sqrt(T)
+    lo = min(F * math.exp(-_DIST_SPAN_SD * s_max), 0.85 * min(strikes, default=spot))
+    hi = max(F * math.exp(_DIST_SPAN_SD * s_max), 1.15 * max(strikes, default=spot))
+    edges = np.unique(np.concatenate([np.exp(np.linspace(math.log(lo), math.log(hi), _DIST_NODES)),
+                                      np.array(strikes + [F], dtype=float)]))
+    # 4) Breakevens become edges too (sign change between neighbours → linear root; exact for a terminal
+    #    payoff, which is linear between consecutive edges once every strike is one).
+    pe_ = _payoff_at(edges, life_legs, stock_shares, spot, T, r, iv_fallback, multi_exp)
+    flip = np.nonzero(np.sign(pe_[:-1]) * np.sign(pe_[1:]) < 0)[0]
+    if len(flip):
+        roots = edges[flip] - pe_[flip] * (edges[flip + 1] - edges[flip]) / (pe_[flip + 1] - pe_[flip])
+        edges = np.unique(np.concatenate([edges, roots]))
+
+    # 5) Prior bucket masses + conditional-mean prices, incl. the two open tails [0, lo] and [hi, ∞).
+    le = np.log(edges / F)
+
+    def _phi_diff(a, b):                                          # Φ(b) − Φ(a), a ≤ b, cancellation-safe
+        return np.where(a > 0, _ncdf(-a) - _ncdf(-b), _ncdf(b) - _ncdf(a))
+
+    def _lognormal(sig):                                          # exact: P(S≤e)=Φ(z), E[S·1{S>e}]=F·Φ(v−z)
+        v = sig * math.sqrt(T)
+        z = np.concatenate([[-np.inf], (le + 0.5 * v * v) / v, [np.inf]])
+        d1 = v - z
+        mass = np.maximum(_phi_diff(z[:-1], z[1:]), 0.0)
+        part = F * np.maximum(_phi_diff(d1[1:], d1[:-1]), 0.0)
+        b_lo = np.concatenate([[0.0], edges])
+        b_hi = np.concatenate([edges, [edges[-1] * 2.0]])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean = np.where(mass > 1e-300, part / np.where(mass > 0, mass, 1.0), 0.5 * (b_lo + b_hi))
+        return mass / mass.sum(), np.minimum(np.maximum(mean, b_lo), b_hi)
+
+    if g is not None:
+        gK, gcdf, gpe = g
+        m, mu = _buckets_from_cdf_pe(edges, np.interp(edges, gK, gcdf, left=0.0, right=1.0),
+                                     np.interp(edges, gK, gpe, left=float(gpe[0]), right=0.0), float(gpe[0]))
+        prior = "rnd"
+    else:
+        m, mu = _lognormal(center)
+        prior = "lognormal"
+
+    # 6) Calibrate: reprice every node strike at its own mid-implied vol (+ the ATM anchor on a lognormal prior),
+    #    keep the forward — the minimum-relative-entropy tilt of the prior.
+    cons = [(K, vol) for K, vol in nodes]
+    if use_atm:
+        cons.append((F, center))
+    method, w = prior, m
+    max_err = 0.0
+    if cons:
+        def _solve(cset):
+            G = np.column_stack([mu / F] + [np.maximum(K - mu, 0.0) / F for K, _ in cset])
+            c = np.array([1.0] + [_fwd_put(F, K, vk * math.sqrt(T)) / F for K, vk in cset])
+            return _tilt_to_targets(m, G, c), G, c
+        w_c, G, c = _solve(cons)
+        if w_c is None and use_atm:                                # inconsistent with the anchor → legs only
+            cons, use_atm = cons[:-1], False
+            w_c, G, c = _solve(cons) if cons else (None, None, None)
+        if w_c is not None:
+            w, method = w_c, ("calibrated_rnd" if prior == "rnd" else "calibrated")
+            max_err = float(np.max(np.abs(w @ G - c))) * F
+        elif prior == "lognormal":
+            # Quotes no single density can reprice (stale / crossed legs): keep the exact bucket grid but use the
+            # previous flat law, max(implied, realized) — already physical, so no further widening.
+            sig_w = max([x for x in (implied, realized) if x and x > 0] or [center])
+            center = implied or sig_w
+            w, mu = _lognormal(sig_w)
+            method, dv = "lognormal_fallback", 0.0
+        # (an RND prior that can't be tilted stays the market's own law — method "rnd")
+    # 7) Physical (P) law: re-size the market law to the physical variance (diffusion forecast + event).
+    w_q, mu_q = w, mu
+    measure = "market"
+    if method != "lognormal_fallback":
+        v_q = center * center * T
+        v_p = ((realized * realized * T) if (realized and realized > 0) else v_q) + max(float(event_var or 0.0), 0.0)
+        if v_p > v_q * (1 + 1e-9):
+            w, mu = _widen(w, mu, edges, v_p - v_q)
+            measure = "physical_wider"
+        elif v_p < v_q * (1 - 1e-6):
+            w_n = _narrow(w, mu, F, v_p / v_q)
+            if w_n is not None:
+                w, measure = w_n, "physical_narrower"
+        sig_w = math.sqrt(max(v_p, 0.0) / T)
+    elif dv > 1e-12:                               # (fallback law is already flat at max(implied, realized))
+        w, mu = _widen(w, mu, edges, dv)
+    pnl = _payoff_at(mu, life_legs, stock_shares, spot, T, r, iv_fallback, multi_exp)
+    wider_p = measure != "physical_narrower"       # tails: the WIDER of the physical and market laws
+    pnl_risk = pnl if wider_p else _payoff_at(mu_q, life_legs, stock_shares, spot, T, r, iv_fallback, multi_exp)
+    return {"w": w, "pnl": pnl, "price": mu, "w_risk": w if wider_p else w_q, "pnl_risk": pnl_risk,
+            "measure": measure, "method": method, "center_vol": center, "weight_vol": sig_w,
+            "n_constraints": len(cons) if method.startswith("calibrated") else 0, "atm_anchor": bool(use_atm),
+            "max_price_err": max_err, "multi_exp": multi_exp, "horizon_T": T}
+
+
+# ── Income lens: CARRY-TO-RISK ─────────────────────────────────────────────────────────────────────────────
+# premium collected ÷ the 1% expected shortfall (CVaR99) it underwrites, × √(365/DTE). √ (Sharpe-style), not
+# linear: every cycle re-exposes you to the tail, so linear annualization would make a 7-DTE weekly look 6× a
+# monthly; √ leaves only the mild short-tenor preference the VRP evidence supports. Log-scaled between bounds.
+_CTR_LO = 0.03              # carry-to-risk (per year) that scores 0 on the Income lens — the live p5 …
+_CTR_HI = 0.40              # … and 1 — the live p95 (24 liquid names, 261 desk candidates, 2026-10-15),
+                            #     log-interpolated between
+_CTR_CAP = 10.0             # a trade with ~no 1% tail (CVaR99 ≈ 0) is capped, not infinite
+# Tail-lens denominator: "capital" = the trade's capital basis (Reg-T BPR / width / stock — financing-DEPENDENT);
+# "exposure" = |max loss| when bounded, else the short legs' notional (financing-neutral, but a spread's tail IS its
+# whole small exposure, so it punishes defined risk); "notional" = the underlying notional the shorts control
+# (spot × 100 × short contracts on the larger side — financing-neutral AND structure-fair).
+_TAIL_BASIS = "notional"     # chosen 2026-10-15 after the live 4-variant comparison (24 names / 261 candidates)
+
+
+def _carry_to_risk(life_legs, cvar99: Optional[float], dte_days: int) -> Optional[dict]:
+    """{"ctr", "per_cycle", "credit", "cvar99"} — or None for a debit structure / missing tail. Premium is the
+    net option credit at the price you transact (`price` = expected fill on a new trade): option legs only, so a
+    covered call's capped stock appreciation is never counted as income."""
+    if not life_legs or not dte_days or dte_days <= 0 or cvar99 is None:
+        return None
+    credit = sum(-float(l["sign"]) * float(l.get("qty") or 1) * 100.0 * float(l.get("price") or 0.0) for l in life_legs)
+    if credit <= 0:
+        return None
+    per_cycle = (credit / cvar99) if cvar99 > 1e-9 else _CTR_CAP
+    ctr = min(per_cycle * math.sqrt(365.0 / dte_days), _CTR_CAP)
+    return {"ctr": ctr, "per_cycle": per_cycle, "credit": credit, "cvar99": float(cvar99)}
+
+
+def _tail_exposure(life_legs, spot: float, max_loss: Optional[float]) -> Optional[float]:
+    """Financing-neutral size of what the trade can lose: |max loss| when bounded; otherwise the larger side's
+    short notional (puts: strike, calls: spot — ×100×qty). None when there is nothing short to size."""
+    if max_loss is not None and max_loss < 0:
+        return abs(float(max_loss))
+    put_n = sum(float(l.get("strike") or 0.0) * 100.0 * float(l.get("qty") or 1)
+                for l in (life_legs or []) if l.get("sign", 0) < 0 and str(l.get("right", "")).upper().startswith("P"))
+    call_n = sum(float(spot) * 100.0 * float(l.get("qty") or 1)
+                 for l in (life_legs or []) if l.get("sign", 0) < 0 and str(l.get("right", "")).upper().startswith("C"))
+    exp = max(put_n, call_n)
+    return exp if exp > 0 else None
+
+
+def _tail_notional(life_legs, spot: float) -> Optional[float]:
+    """The underlying notional the trade's shorts control: spot × 100 × short contracts on the larger side."""
+    sp = sum(float(l.get("qty") or 1) for l in (life_legs or [])
+             if l.get("sign", 0) < 0 and str(l.get("right", "")).upper().startswith("P"))
+    sc = sum(float(l.get("qty") or 1) for l in (life_legs or [])
+             if l.get("sign", 0) < 0 and str(l.get("right", "")).upper().startswith("C"))
+    n = float(spot) * 100.0 * max(sp, sc)
+    return n if n > 0 else None
+
+
+def _matches_curve(dist_args: tuple, scenarios: list[dict]) -> bool:
+    """True when the legs reproduce the caller's own payoff curve — the guard that lets the exact path take
+    over ONLY when the legs fully describe the trade (a caller that dropped a leg, or built a custom curve,
+    keeps its scenario path). Tolerance covers the curve's 2-decimal rounding of price and P&L."""
+    life_legs, stock_shares, spot, T, r, iv_fallback, multi_exp = dist_args
+    try:
+        P = np.array([float(s["price"]) for s in scenarios], dtype=float)
+        given = np.array([float(s.get("pnl", s.get("pnl_at_expiry"))) for s in scenarios], dtype=float)
+    except (KeyError, TypeError, ValueError):
+        return False
+    model = _payoff_at(P, life_legs, stock_shares, spot, T, r, iv_fallback, multi_exp)
+    slope = sum(float(l.get("qty") or 1) * 100.0 for l in life_legs) + abs(stock_shares)
+    tol = 0.006 * slope + 0.02 + 1e-3 * float(np.ptp(given) if len(given) else 0.0)
+    return bool(np.all(np.abs(model - given) <= tol))
+
+
 def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_loss,
                       max_profit, kelly, dte_days: int, sofr_pct: float = 5.0,
                       income_mode: bool = False, buffer_mode: bool = False,
-                      upside_cap_pct: Optional[float] = None) -> dict:
+                      upside_cap_pct: Optional[float] = None,
+                      carry: Optional[dict] = None, tail_capital: Optional[float] = None) -> dict:
     """Deterministic entry recommendation from the whole payoff distribution.
 
     ``income_mode`` RE-ANCHORS the blend for premium-income selling — the goal there is a SAFE trade that
@@ -423,7 +965,10 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
 
     omega, pop = pm.get("omega"), pm.get("pop")
     sortino, exp_ret = pm.get("sortino"), pm.get("expected_return_pct")
-    tail_frac = (cvar95 / capital) if (capital and capital > 0 and cvar95 is not None) else 0.5
+    _tcap = tail_capital if (tail_capital and tail_capital > 0) else capital    # Tail-lens denominator (see _TAIL_BASIS)
+    tail_frac = (cvar95 / _tcap) if (_tcap and _tcap > 0 and cvar95 is not None) else 0.5
+    ctr = (carry or {}).get("ctr")                     # carry-to-risk (income mode) — see _carry_to_risk
+    _tbase = ("underlying notional" if _TAIL_BASIS == "notional" else _TAIL_BASIS) if (tail_capital and tail_capital > 0) else "capital"
     hurdle = (sofr_pct / 100.0) * (dte_days / 365.0) * 100.0 if dte_days else 0.0
     prem_ann = ((max_profit / capital) * (365.0 / dte_days) * 100.0
                 if (max_profit and capital and capital > 0 and dte_days) else None)   # gross premium yield %/yr
@@ -436,8 +981,12 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
         s_pop = clamp(((pop or 0) - 70.0) / (92.0 - 70.0)) if pop is not None else 0.4         # keep-prob 70→92%
         s_sortino = clamp(((sortino or 0) + 0.2) / 1.2) if sortino is not None else 0.4
         s_tail = clamp(1.0 - tail_frac / 0.90)
-        s_carry = (clamp((prem_ann - sofr_pct) / (sofr_pct + 10.0) + 0.4) if prem_ann is not None
-                   else clamp(((exp_ret or 0) - hurdle) / (abs(hurdle) + 3.0) + 0.5))          # premium yield vs cash
+        # INCOME = carry-to-risk: premium collected per $ of 1%-tail underwritten, √-annualized, on a LOG scale
+        # (it spans ~10× across a ladder). Financing-neutral — identical on Reg-T, cash-secured or portfolio
+        # margin — and premium-only (a covered call's capped stock gain is not income). Debit structures
+        # (calendars / back ratios) collect no premium → their expected return vs the cash hurdle.
+        s_carry = (clamp(math.log(max(ctr, 1e-9) / _CTR_LO) / math.log(_CTR_HI / _CTR_LO)) if ctr is not None
+                   else clamp(((exp_ret or 0) - hurdle) / (abs(hurdle) + 3.0) + 0.5))
         wts = {"edge": 0.12, "pop": 0.34, "sortino": 0.10, "tail": 0.14, "carry": 0.30}
     elif buffer_mode:
         # DEFENSIVE-PARTICIPATION anchoring — a dual-direction buffer / protective hedge is bought for
@@ -477,8 +1026,11 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
         reasons.append(f"Sortino {sortino:.2f}")
     if capital and cvar95 is not None:
         label = "downside protection — CVaR" if buffer_mode else "CVaR95"
-        reasons.append(f"{label} {tail_frac*100:.0f}% of capital (expected shortfall, not deep tail)")
-    if income_mode and prem_ann is not None:
+        reasons.append(f"{label} {tail_frac*100:.0f}% of {_tbase} (expected shortfall, not deep tail)")
+    if income_mode and ctr is not None:
+        reasons.append(f"carry-to-risk {ctr * 100:.0f}%/yr (${carry['credit']:.0f} premium per "
+                       f"${carry['cvar99']:.0f} of 1% tail)")
+    elif income_mode and prem_ann is not None:
         reasons.append(f"premium yield {prem_ann:.1f}%/yr vs {sofr_pct:.1f}% cash (the income alpha)")
     elif buffer_mode and upside_cap_pct is not None:
         reasons.append(f"upside participation to a {upside_cap_pct:.1f}% cap")
@@ -506,8 +1058,11 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
     # ENTRY base quality is as auditable as the management base — NOT a black box. The note leads with THIS
     # trade's measured metric (the UI shows it inline); the generic meaning follows the em-dash (on hover).
     # Σ(contribution) == score by construction, so the lenses reconcile to the base.
-    _carry_note = (f"premium yield {prem_ann:.1f}%/yr vs {sofr_pct:.1f}% cash — the income alpha over the cash hurdle"
-                   if (income_mode and prem_ann is not None)
+    _carry_note = (f"carry-to-risk {ctr * 100:.0f}%/yr — ${carry['credit']:.0f} premium per ${carry['cvar99']:.0f} "
+                   f"of 1%-tail ({carry['per_cycle'] * 100:.1f}% per cycle) — income per $ of tail you underwrite"
+                   if (income_mode and ctr is not None)
+                   else f"exp. return {exp_ret:+.1f}% vs {hurdle:.1f}% hurdle — a debit structure collects no premium"
+                   if (income_mode and exp_ret is not None)
                    else f"expected participation {exp_ret:+.1f}% — protected return, judged vs 0 not the cash hurdle"
                    if (buffer_mode and exp_ret is not None)
                    else f"exp. return {exp_ret:+.1f}% vs {hurdle:.1f}% hurdle — carry over the risk-free rate"
@@ -521,7 +1076,7 @@ def algorithmic_quant(pm: dict, cvar95: Optional[float], capital: float, max_los
          (f"Omega {omega:.2f} — probability-weighted gains ÷ losses (≥1 = you keep more than you risk)" if omega is not None
           else "Omega — probability-weighted gains vs losses (≥1 = edge)")),
         ("Tail",     s_tail,    wts["tail"],
-         (f"CVaR95 {abs(tail_frac)*100:.0f}% of capital — the contained expected shortfall, not the deep worst case"
+         (f"CVaR95 {abs(tail_frac)*100:.0f}% of {_tbase} — the contained expected shortfall, not the deep worst case"
           if (capital and cvar95 is not None) else "expected shortfall (CVaR) vs capital — how contained the left tail is")),
         ("Risk-adj", s_sortino, wts["sortino"],
          (f"Sortino {sortino:.2f} — reward per unit of downside deviation" if sortino is not None
@@ -1061,14 +1616,22 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
 
 def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_profit,
                              avg_iv, dte_days, stock_shares=0.0, r=0.05, sofr_pct=5.0,
-                             realized_vol=None, strategy_type="", upside_cap_pct=None) -> dict:
+                             realized_vol=None, strategy_type="", upside_cap_pct=None,
+                             atm_iv=None, rnd_grid=None, event_var=0.0) -> dict:
     """Full desk read for a PROPOSED trade: Trader Greeks + PM ratios + position
-    VaR/CVaR + the algorithmic Quant recommendation. `avg_iv` (implied) is decimal (0 = unknown).
+    VaR/CVaR + the algorithmic Quant recommendation. `avg_iv` (implied) is decimal (0 = unknown);
+    `atm_iv` (decimal, optional) is the expiry's ATM vol (the centre); `rnd_grid` (optional) is the scan's compact
+    market-implied law for this expiry — when given it is the prior every trade on the expiry shares.
 
-    Q-vs-P: the payoff distribution is weighted by the WIDER of implied (Q, risk-neutral) and
-    realized (P, physical) vol. When implied is crushed below realized (negative VRP), this stops
-    PoP/tail/EV — and therefore the whole base-quality score — from reading falsely safe. `avg_iv`
-    is still what we DISPLAY (the trade's true implied); only the probability WEIGHTS use the wider σ.
+    Distribution: when the legs fully describe the trade (they reproduce the caller's `scenarios`), every
+    probability-weighted number comes from `_payoff_distribution` — exact buckets, each leg priced at its own
+    vol (skew-consistent), so PoP / EV / Omega / Sortino / VaR / CVaR / Kelly all share ONE law. Otherwise
+    (no legs, or a custom curve) the caller's scenario grid is weighted by a flat lognormal as before.
+
+    Q-vs-P: the payoff distribution is widened when realized (P, physical) vol exceeds implied (Q,
+    risk-neutral). When implied is crushed below realized (negative VRP), this stops PoP/tail/EV — and
+    therefore the whole base-quality score — from reading falsely safe. `avg_iv` is still what we DISPLAY
+    (the trade's true implied); only the probability WEIGHTS use the wider σ.
     """
     trader = higher_order_greeks(life_legs, spot, r, stock_shares) if life_legs else {}
 
@@ -1079,7 +1642,27 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
     pm = {"pop": None, "expected_value": None, "omega": None, "sortino": None,
           "calmar": None, "expected_return_pct": None, "downside_dev_pct": None}
     var95 = cvar95 = var99 = cvar99 = kelly = None
-    if scenarios and len(scenarios) >= 3 and dte_days and dte_days > 0:
+    dist = None
+    if life_legs and dte_days and dte_days > 0:
+        iv_fb = realized or 0.30                      # = the desk's horizon-curve iv_fallback (hv or 0.30)
+        try:
+            dist = _payoff_distribution(life_legs, stock_shares, spot, dte_days, r, implied, realized,
+                                        atm_iv=atm_iv, iv_fallback=iv_fb, rnd_grid=rnd_grid, event_var=event_var)
+            if (dist is not None and scenarios and len(scenarios) >= 3 and not _matches_curve(
+                    (life_legs, stock_shares, spot, dist["horizon_T"], r, iv_fb, dist["multi_exp"]), scenarios)):
+                dist = None                           # the legs don't reproduce the caller's curve → its grid
+        except Exception:  # noqa: BLE001 — the exact path must never sink a desk read; fall back to the grid
+            dist = None
+    if dist is not None:
+        w_iv = dist["weight_vol"]
+        wn, pnl_b = dist["w"], dist["pnl"]                     # PHYSICAL law → expectation (the VRP in dollars)
+        wr, pnl_r = dist["w_risk"], dist["pnl_risk"]           # wider of physical / market → tails
+        pm = _metrics_from_pnl(pnl_b, wn, capital, max_loss, dte_days)
+        var95, cvar95 = _weighted_var_cvar(pnl_r, wr, 0.05)
+        var99, cvar99 = _weighted_var_cvar(pnl_r, wr, 0.01)
+        if capital and capital > 0:
+            kelly = _kelly_fraction(pnl_b / capital, wn)
+    elif scenarios and len(scenarios) >= 3 and dte_days and dte_days > 0:
         prices = np.array([s["price"] for s in scenarios], dtype=float)
         pnls = np.array([s["pnl"] for s in scenarios], dtype=float)
         w = _lognormal_weights(prices, spot, w_iv, dte_days, r)
@@ -1112,9 +1695,14 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
     _st = (strategy_type or "").lower()
     _buffer = ("buffer" in _st or "dual_direction" in _st or "hedge" in _st)
     _income = ("income" in _st) or (not _st)   # blank = the income-desk default (back-compat)
+    _inc_mode = _income and not _buffer
+    carry = _carry_to_risk(life_legs, cvar99, dte_days) if (_inc_mode and dist is not None) else None
+    tail_cap = ((_tail_exposure(life_legs, spot, max_loss) if _TAIL_BASIS == "exposure"
+                 else _tail_notional(life_legs, spot) if _TAIL_BASIS == "notional" else None) if _inc_mode else None)
     quant = algorithmic_quant(pm, tail_cvar, capital, max_loss, max_profit, kelly, dte_days, sofr_pct,
-                              income_mode=(_income and not _buffer), buffer_mode=_buffer,
-                              upside_cap_pct=(upside_cap_pct if _buffer else None))
+                              income_mode=_inc_mode, buffer_mode=_buffer,
+                              upside_cap_pct=(upside_cap_pct if _buffer else None),
+                              carry=carry, tail_capital=tail_cap)
     vrp_ratio = (implied / realized) if (implied and realized) else None   # < 1 = negative VRP
     return {
         "trader": {**trader, "avg_iv_pct": round(avg_iv * 100, 1) if (avg_iv and avg_iv > 0) else None},
@@ -1133,4 +1721,15 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
             "iv_hv_ratio": round(vrp_ratio, 2) if vrp_ratio else None,
             "physical_wider": bool(realized and implied and realized > implied),
         },
+        # The Income lens's input — premium per $ of 1%-tail (None for debit structures / no exact law).
+        "carry": ({"carry_to_risk_pct": round(carry["ctr"] * 100, 1), "per_cycle_pct": round(carry["per_cycle"] * 100, 2),
+                   "credit": round(carry["credit"], 2), "cvar_99": round(carry["cvar99"], 2)} if carry else None),
+        "tail_basis": _TAIL_BASIS if tail_cap else "capital",
+        # Which law produced the numbers above — auditable, so a fallback is never silent.
+        "distribution": ({"method": dist["method"], "measure": dist["measure"], "n_constraints": dist["n_constraints"],
+                          "atm_anchor": dist["atm_anchor"], "buckets": int(len(dist["w"])),
+                          "center_vol_pct": round(dist["center_vol"] * 100, 1),
+                          "weight_vol_pct": round(dist["weight_vol"] * 100, 1),
+                          "max_price_err": round(dist["max_price_err"], 4)}
+                         if dist is not None else {"method": "scenario_grid"}),
     }

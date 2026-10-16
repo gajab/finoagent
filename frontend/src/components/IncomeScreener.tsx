@@ -4,6 +4,7 @@ import {
   AlertTriangle, Info, SlidersHorizontal, ChevronDown, ChevronUp, ExternalLink, X, Calendar,
 } from 'lucide-react';
 import { screenIncomeUniverse, fetchIncomeVolMetrics, evaluateIncomeTicker } from '../api';
+import { afterFillText, afterFillTitle } from '../lib/fills';
 import type {
   IncomeScreenParams, IncomeScreenRow, IncomeVolRow, IncomeEvalParams, IncomeEvalResult, IncomeEvalTrade,
 } from '../types';
@@ -120,7 +121,9 @@ function TradeRow({ t, onOpen }: { t: IncomeEvalTrade; onOpen: () => void }) {
         {t.timing_hold && <div className="text-[9px] text-warning mt-0.5" title="Good trade, but momentum is against a reachable strike — wait">WAIT</div>}
       </td>
       <td className="text-right font-mono text-xs">{t.desk_score ?? '—'}</td>
-      <td className="text-right font-mono text-xs">{money0(t.premium)}<div className="text-[10px] text-base-content/45">{f2(t.premium_per_share)}/sh</div></td>
+      <td className="text-right font-mono text-xs">{money0(t.premium)}<div className="text-[10px] text-base-content/45">{f2(t.premium_per_share)}/sh</div>
+        {afterFillText(t) && <div className="text-[10px] text-base-content/45 cursor-help" title={afterFillTitle(t)}>{afterFillText(t)}</div>}
+      </td>
       <td className="text-right font-mono text-xs text-success">{f1pct(t.prob_keep_pct)}</td>
       <td className="text-right font-mono text-xs">{f1pct(t.prob_touch_pct)}</td>
       <td className="text-right font-mono text-xs">{f1pct(t.premium_annualized_pct)}</td>

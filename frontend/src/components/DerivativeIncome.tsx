@@ -7,6 +7,7 @@ import {
   BarChart3, Layers, Feather, ClipboardCheck, Plus, Trash2, List, Filter, RefreshCw, Crown, GitFork, ScanSearch
 } from 'lucide-react';
 import { IncomeScreener } from './IncomeScreener';
+import { afterFillText, afterFillTitle } from '../lib/fills';
 import { useAuth } from '../contexts/AuthContext';
 import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations, fetchDerivativeIncomeWatchlist, addDerivativeIncomeWatchlist, deleteDerivativeIncomeWatchlist } from '../api';
 import type { DerivativeIncomeWatchlistItem } from '../api';
@@ -402,7 +403,12 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
         <MetricTile label="Premium income" tone="text-success"
           value={money(opp.contracts ? opp.total_premium : opp.premium, 0)}
-          sub={opp.contracts ? `${opp.contracts}× $${opp.premium.toFixed(0)}` : `$${opp.premium_per_share.toFixed(2)}/sh`} />
+          sub={<>
+            {opp.contracts ? `${opp.contracts}× $${opp.premium.toFixed(0)}` : `$${opp.premium_per_share.toFixed(2)}/sh`}
+            {afterFillText(opp, opp.contracts || 1) && (
+              <div className="cursor-help" title={afterFillTitle(opp, opp.contracts || 1)}>{afterFillText(opp, opp.contracts || 1)}</div>
+            )}
+          </>} />
         <MetricTile label="Return / period" value={pct(opp.static_return_pct)} sub={`~${annPct(opp.premium_annualized_pct)} ann.`} />
         <MetricTile label="vs SOFR" tone={opp.beats_sofr ? 'text-success' : 'text-base-content/70'}
           value={opp.beats_sofr ? `+${annPct(opp.sofr_excess_pct)}` : 'below'} sub="excess yield" />

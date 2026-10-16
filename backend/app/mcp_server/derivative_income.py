@@ -272,7 +272,7 @@ def _shape_scan(res: dict, top_n: int, verbose: bool, include_raw: bool) -> dict
         "data_source_note": res.get("data_source_note"),
     }
     if include_raw:
-        payload["raw"] = res
+        payload["raw"] = {k: v for k, v in res.items() if k != "_rnd_grids"}   # internal desk law — not tool output
     return payload
 
 

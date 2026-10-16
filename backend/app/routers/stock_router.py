@@ -2955,7 +2955,7 @@ async def compute_desk_review(
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])
-        return result
+        return {k: v for k, v in result.items() if k != "_rnd_grids"}   # internal desk law — not for the client
     except HTTPException:
         raise
     except Exception as exc:

@@ -3959,6 +3959,8 @@ export interface DerivativeIncomeLeg {
   oi: number;
   vol: number;
   prob_reach_pct?: number | null;
+  fill?: number | null;           // expected OPENING fill per share (mid ∓ k·half-spread, incl. commission)
+  entry_cost_ps?: number | null;  // |fill − mid| per share — the cost of opening this leg
   delta: number | null;
   gamma: number | null;
   theta: number | null;
@@ -3996,6 +3998,9 @@ export interface DerivativeIncomeOpportunity {
   prob_method: 'RND' | 'BS' | 'BS_fallback' | string;   // BS_fallback = the RND was degenerate (inconsistent chain IV) → flat-vol estimate
   premium: number;
   premium_per_share: number;
+  entry_cost?: number | null;                 // $ to open at the expected fill (all legs × contracts, incl. commissions)
+  premium_fill?: number | null;               // premium actually collected after that cost (mid stays the headline)
+  premium_annualized_fill_pct?: number | null;
   collateral: number;
   capital_basis?: 'reg_t_margin' | 'covered_stock' | string;   // short put = Reg-T naked margin (BPR)
   notional_capital?: number | null;                            // full cash-secured notional (the dollar RISK)
@@ -4651,6 +4656,8 @@ export interface IncomeEvalTrade {
   short_delta?: number | null;
   premium?: number | null;
   premium_per_share?: number | null;
+  premium_fill?: number | null;
+  entry_cost?: number | null;
   prob_keep_pct?: number | null;
   prob_touch_pct?: number | null;
   premium_annualized_pct?: number | null;

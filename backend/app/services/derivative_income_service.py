@@ -378,7 +378,8 @@ def _context_sync(ticker: str) -> dict:
     """Realized vol (20/30d, annualized), 52-week high/low and the next earnings
     date, from ONE 1-year history pull. Best-effort: returns ``None`` defaults if
     yfinance is unavailable for the name."""
-    out: dict = {"hv10": None, "hv20": None, "hv30": None, "next_earnings": None,
+    out: dict = {"hv10": None, "hv20": None, "hv30": None, "hv21": None, "hv63": None, "index_like": False,
+                 "next_earnings": None,
                  "week52_high": None, "week52_low": None, "hv_series": None, "har_rv30": None,
                  "prev_close": None, "last_close": None,
                  # earnings timing + the ex-event diffusion HV (post-crush VRP baseline)
@@ -409,6 +410,12 @@ def _context_sync(ticker: str) -> dict:
                 out["hv20"] = round(float(log_ret.tail(20).std() * math.sqrt(252)), 4)
             if len(log_ret) >= 30:
                 out["hv30"] = round(float(log_ret.tail(30).std() * math.sqrt(252)), 4)
+            # 21d / 63d realized vol — their ratio is the volatility-compression state the desk's physical-vol
+            # forecast keys off (calibrated: forward vol runs ~1.2× trailing in a compressed calm near highs).
+            if len(log_ret) >= 21:
+                out["hv21"] = round(float(log_ret.tail(21).std() * math.sqrt(252)), 4)
+            if len(log_ret) >= 63:
+                out["hv63"] = round(float(log_ret.tail(63).std() * math.sqrt(252)), 4)
             # Rolling 30-day annualized realized-vol series → drives vol rank/percentile.
             roll = (log_ret.rolling(30).std() * math.sqrt(252)).dropna()
             if len(roll) >= 20:
@@ -419,6 +426,7 @@ def _context_sync(ticker: str) -> dict:
         # timestamp so a same-day print (usually AMC) is treated as UPCOMING, not already-past, and we track
         # the LAST past print + the ex-event diffusion HV for the post-crush VRP baseline.
         # Skipped entirely for funds/indices: they never report.
+        out["index_like"] = bool(str(ticker).startswith("^") or not _reports_earnings(stock))   # ETF / index / fund
         if _reports_earnings(stock):
             earn_ts: list = []
             # (a) modern earnings_dates frame — richest (several past + future prints WITH times), but
@@ -632,6 +640,60 @@ TICK_TOLERANCE = 0.05      # always allow one 5-cent tick (cheap-option granular
 MIN_LIQUIDITY = 10         # OI + volume floor per leg (truly dead strikes)
 
 
+# Expected FILL — what a working limit order realistically gets, not the mid. You give up a fraction k of the
+# HALF-spread: ≈0.25 on a tight, deep book (you fill at or near mid), rising to 0.75 on a wide or thin one (the
+# mid is a mirage there — the box-scanner lesson), plus a per-contract commission. Timed executions pay well
+# under half the quoted spread (Muravyev & Pearson, RFS 2020), so k stays below 1 even on wide quotes. These are
+# ASSUMPTIONS (tunable), surfaced on every leg/opp so the cost is never hidden.
+FILL_K_MIN = 0.25           # tight (≤ FILL_K_TIGHT_PCT of mid) and deep book
+FILL_K_MAX = 0.75           # cap: past FILL_K_WIDE_PCT the fraction stops growing
+FILL_K_TIGHT_PCT = 0.03
+FILL_K_WIDE_PCT = 0.30
+FILL_THIN_DEPTH = 100       # OI + volume below this → extra give-up (nobody to cross with at mid)
+FILL_K_THIN = 0.15
+COMMISSION_PER_CONTRACT = 0.65   # $ per contract per leg (typical retail broker; per-share = /100)
+
+
+def _expected_fill(q: OptionQuote, action: str) -> tuple[float, float]:
+    """(fill_per_share, cost_per_share) for opening this leg. SELL fills below mid, BUY above, never past the
+    bid/ask; the commission is folded in per share so every downstream P&L includes it automatically."""
+    mid = float(q.mid or 0.0)
+    comm = COMMISSION_PER_CONTRACT / CONTRACT_MULTIPLIER
+    bid, ask = float(q.bid or 0.0), float(q.ask or 0.0)
+    if mid <= 0:
+        return mid, comm
+    half = max(ask - bid, 0.0) / 2.0 if (bid > 0 and ask > 0) else 0.0
+    sp = (2.0 * half) / mid
+    k = FILL_K_MIN + (FILL_K_MAX - FILL_K_MIN) * min(max((sp - FILL_K_TIGHT_PCT) / (FILL_K_WIDE_PCT - FILL_K_TIGHT_PCT), 0.0), 1.0)
+    if (q.oi or 0) + (q.volume or 0) < FILL_THIN_DEPTH:
+        k = min(k + FILL_K_THIN, FILL_K_MAX)
+    give = k * half
+    if str(action).upper().startswith("S"):
+        fill = max(mid - give, bid if bid > 0 else 0.0) - comm
+    else:
+        fill = min(mid + give, ask if ask > 0 else mid + give) + comm
+    return fill, abs(fill - mid)
+
+
+def _attach_fill_economics(opp: dict) -> dict:
+    """Opp-level ENTRY cost at the expected fill (all legs × contracts, commissions included) and the premium /
+    yield you actually collect — alongside the mid figures, which stay as the display headline. Debit trades
+    show the extra debit as the cost. Idempotent; safe on any opp whose legs came from `_leg`."""
+    legs = opp.get("legs") or []
+    contracts = int(opp.get("contracts") or 1)
+    cost = sum(float(l.get("entry_cost_ps") or 0.0) for l in legs) * CONTRACT_MULTIPLIER * contracts
+    opp["entry_cost"] = round(cost, 2)
+    prem = opp.get("premium")
+    if prem is not None:
+        opp["premium_fill"] = round(float(prem) - cost, 2)
+        cap, dte = opp.get("collateral"), int(opp.get("dte") or 0)
+        if cap and dte and float(prem) - cost > 0:
+            opp["premium_annualized_fill_pct"] = round(annualized_return_pct(float(prem) - cost, float(cap), dte), 2)
+        else:
+            opp["premium_annualized_fill_pct"] = None
+    return opp
+
+
 def _spread_pct(q: OptionQuote) -> Optional[float]:
     if q.mid and q.mid > 0 and q.ask > 0 and q.bid > 0:
         return round((q.ask - q.bid) / q.mid * 100, 1)
@@ -665,12 +727,15 @@ def _leg(q: OptionQuote, action: str, exp: str, spot: float, dte: int,
     iv = q.iv if q.iv else atm_iv
     g = _bs_greeks(spot, q.strike, dte, iv or 0.0, q.right)
     reach = _prob_reach(rnd, q.strike, spot, dte, iv)
+    fill, cost_ps = _expected_fill(q, action)
     return {
         "action": action,
         "type": "CALL" if q.right == "C" else "PUT",
         "strike": round(q.strike, 2),
         "expiration": exp,
         "bid": round(q.bid, 2), "ask": round(q.ask, 2), "mid": round(q.mid, 2),
+        "fill": round(fill, 4),                     # expected opening fill per share (incl. commission)
+        "entry_cost_ps": round(cost_ps, 4),         # |fill − mid| per share — the cost of opening this leg
         "bid_ask_spread_pct": _spread_pct(q),      # execution slippage — costly to exit if wide
         "iv": round(iv * 100, 1) if iv else None,
         "oi": q.oi, "vol": q.volume,
@@ -1634,7 +1699,7 @@ def _scan_calendars(chains: list, spot: float, r: float, min_income: float,
             out.append(o)
     # keep the single best ATM calendar (call/put are ~equivalent at ATM; pick the higher keep-prob)
     out.sort(key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0), reverse=True)
-    return out[:1]
+    return [_attach_fill_economics(o) for o in out[:1]]
 
 
 # ---------------------------------------------------------------------------
@@ -1924,10 +1989,12 @@ def _price_user_leg(leg: dict, cd: dict, spot: float, r: float) -> tuple[dict, f
     price = bs_price(spot, strike, max(dte, 1) / 365.0, r, iv, otype)
     g = _bs_greeks(spot, strike, dte, iv, right)
     reach = _prob_reach(rnd, strike, spot, dte, iv)
+    comm = COMMISSION_PER_CONTRACT / CONTRACT_MULTIPLIER          # no quote to cross → commission only
     d = {
         "action": action, "type": "CALL" if right == "C" else "PUT",
         "strike": round(strike, 2), "expiration": exp,
         "bid": round(price, 2), "ask": round(price, 2), "mid": round(price, 2),
+        "fill": round(price - comm if action == "SELL" else price + comm, 4), "entry_cost_ps": round(comm, 4),
         "bid_ask_spread_pct": None, "iv": round(iv * 100, 1),
         "oi": 0, "vol": 0,
         "prob_reach_pct": round(reach * 100, 1) if reach is not None else None,
@@ -2117,7 +2184,7 @@ def _build_evaluate_opp(legs: list[dict], stock: Optional[dict], chains_by_exp: 
     strikes_all = near_cd.get("strikes") or sorted(set(near_cd["calls"]) | set(near_cd["puts"]))
     quant = _quant_block(rnd, near_cd["calls"], near_cd["puts"], strikes_all, spot, near_dte, atm_iv)
     opp["confidence"] = _confidence(opp, quant)
-    return opp
+    return _attach_fill_economics(opp)
 
 
 _EARN_GAP_MIN_FRAC = 0.4   # a print in the window ALWAYS carries a gap → the isolated event is ≥ 40% of the
@@ -2156,6 +2223,126 @@ def _earnings_implied_move_pct(calls: dict, puts: dict, spot: float, dte: int,
     m_event = math.sqrt(max(m_total ** 2 - m_diff ** 2, 0.0))
     m_event = max(m_event, _EARN_GAP_MIN_FRAC * m_total)        # floor — a print always carries a gap
     return min(m_event, 0.60)                                   # sanity clamp against a mispriced/illiquid straddle
+
+
+_RND_GRID_N = 401          # samples in the compact market-implied law handed to the desk (≈8 KB / expiry)
+_RND_GRID_SIGMAS = 6.0     # the grid must reach ±6 total-σ so a high-IV name's tails aren't truncated
+_RND_GRID_MAX_W = 2.5      # … within a sane log-width ceiling
+
+
+_RND_MAX_QUOTES = 80        # cap on the mids the expiry law is calibrated to (bounds the Newton system)
+
+
+def _arb_clean(q: list[tuple[float, float, float]], F: float) -> list[tuple[float, float, float]]:
+    """Drop quotes that break static no-arbitrage on the forward put-equivalent curve P(K): slope in [0, 1]
+    (it is the CDF) and non-decreasing (convex). A stale/garbage quote (JPM 2026-11: the 190 put marked $1.08 while
+    the 210 put was $0.07) would otherwise drag the whole law onto itself. Of a violating pair, the one FARTHER from
+    the forward is dropped (wing quotes go stale first). Tolerances = the quotes' half-spreads."""
+    q = sorted(q)
+    for _ in range(len(q)):
+        bad = None
+        for i in range(len(q) - 1):
+            (k0, v0, t0), (k1, v1, t1) = q[i], q[i + 1]
+            sl = (v1 - v0) / (k1 - k0)
+            tol = (t0 + t1) / (k1 - k0)
+            if sl < -tol or sl > 1.0 + tol:
+                bad = (i, i + 1)
+                break
+            if i + 2 < len(q):
+                k2, v2, t2 = q[i + 2]
+                sl2 = (v2 - v1) / (k2 - k1)
+                if sl2 < sl - (tol + (t1 + t2) / (k2 - k1)):
+                    bad = (i, i + 2)
+                    break
+        if bad is None:
+            return q
+        a, b = bad
+        drop = a if abs(math.log(q[a][0] / F)) >= abs(math.log(q[b][0] / F)) else b
+        q.pop(drop)
+    return q
+
+
+def _mid_quotes(calls: dict, puts: dict, F: float, T: float, r: float) -> list[tuple[float, float, float]]:
+    """(strike, forward put-equivalent value, tolerance) for every clean OTM quote — puts below the forward,
+    calls above (mapped through parity) — with the tolerance = the half-spread (+ a 1¢ floor). Two-sided,
+    non-mirage quotes only, inside a 0.5–2× forward band; evenly thinned to ≤ _RND_MAX_QUOTES."""
+    g = math.exp(r * T)
+    out = []
+    for k in sorted(set(calls) | set(puts)):
+        if not (0.5 * F <= k <= 2.0 * F):
+            continue
+        is_call = k >= F
+        q = calls.get(k) if is_call else puts.get(k)
+        if q is None or not (q.bid and q.bid > 0 and q.ask and q.ask > 0 and q.mid and q.mid > 0):
+            continue
+        if (q.ask - q.bid) > 0.5 * q.mid:                 # a mirage mid would bend the law
+            continue
+        fwd = float(q.mid) * g
+        put_eq = fwd - (F - k) if is_call else fwd
+        if not (max(k - F, 0.0) < put_eq < k):
+            continue
+        out.append((float(k), put_eq, 0.5 * (float(q.ask) - float(q.bid)) * g + 0.01))
+    out = _arb_clean(out, F)
+    if len(out) > _RND_MAX_QUOTES:
+        idx = np.unique(np.linspace(0, len(out) - 1, _RND_MAX_QUOTES).round().astype(int))
+        out = [out[i] for i in idx]
+    return out
+
+
+def _rnd_grid(rnd, atm_iv: Optional[float], calls: Optional[dict] = None, puts: Optional[dict] = None,
+              spot: Optional[float] = None, dte: Optional[int] = None) -> Optional[dict]:
+    """A compact, cacheable copy of the expiry's MARKET-implied law for the desk's payoff distribution: the CDF
+    and the partial expectation E[S·1{S>K}] on log-spaced strikes.
+
+    Shape prior = the scan's SVI → Breeden-Litzenberger density, re-sampled WIDE (≥ ±6σ — the scan's ±60% grid
+    would cut a high-IV name's tails, exactly where CVaR99 lives). Level = calibrated to the chain's MIDS: the
+    scan's smile is fitted to the provider's `impliedVolatility` field, which on yfinance sits far from the mids
+    (SPY 2026-11: the SVI law priced near-money puts 15–25% BELOW their 1¢-wide mids, and a mid-IV SVI refit still
+    missed by ~$1). So the prior is tilted (minimum relative entropy, bid/ask-aware) to reprice every clean OTM mid
+    within its half-spread and keep the parity forward. None when there is no smile (desk → lognormal prior)."""
+    if rnd is None or getattr(rnd, "smile", None) is None:
+        return None
+    try:
+        from .quant_service import risk_neutral_density
+        from .lifecycle_service import _tilt_soft, law_is_sane
+        smile = rnd.smile
+        T = float(smile.T)
+        r = float(getattr(smile, "r", DEFAULT_RISK_FREE) or DEFAULT_RISK_FREE)
+        sig = atm_iv if (atm_iv and atm_iv > 0) else 0.30
+        width = min(max(0.6, _RND_GRID_SIGMAS * sig * math.sqrt(max(T, 1e-6))), _RND_GRID_MAX_W)
+        law = risk_neutral_density(smile, n=1601, width=width)
+        K = np.asarray(law.K, dtype=float)
+        F = float(law.forward)
+        pdf = np.maximum(np.asarray(law.pdf, dtype=float), 0.0)
+        # buckets between grid nodes: mass + conditional-mean price (trapezoid on the fine grid)
+        dK = np.diff(K)
+        mass = 0.5 * (pdf[1:] + pdf[:-1]) * dK
+        part = 0.5 * (pdf[1:] * K[1:] + pdf[:-1] * K[:-1]) * dK
+        tot = float(mass.sum())
+        if not (tot > 0 and np.isfinite(tot)):
+            return None
+        mass, part = mass / tot, part / tot
+        mu = np.where(mass > 0, part / np.where(mass > 0, mass, 1.0), 0.5 * (K[1:] + K[:-1]))
+        basis, n_q = "provider_iv", 0
+        quotes = _mid_quotes(calls, puts, F, T, r) if (calls is not None and puts is not None) else []
+        if len(quotes) >= 4:
+            G = np.column_stack([mu / F] + [np.maximum(k - mu, 0.0) / F for k, _, _ in quotes])
+            c = np.array([1.0] + [v / F for _, v, _ in quotes])
+            tol = np.array([1e-6] + [t / F for _, _, t in quotes])
+            w = _tilt_soft(mass, G, c, tol)
+            if w is not None and law_is_sane(K, np.concatenate([[0.0], np.cumsum(w)]), F, T, atm_iv):
+                mass, basis, n_q = w, "mid_calibrated", len(quotes)
+        cdf = np.concatenate([[0.0], np.cumsum(mass)])
+        if not law_is_sane(K, cdf, F, T, atm_iv):
+            return None                                   # even the provider smile is broken → desk lognormal
+        pe = float(mass @ mu) - np.concatenate([[0.0], np.cumsum(mass * mu)])     # E[S·1{S>K}]
+        idx = np.unique(np.linspace(0, len(K) - 1, _RND_GRID_N).round().astype(int))
+        return {"K": [round(float(x), 4) for x in K[idx]], "cdf": [round(float(x), 9) for x in cdf[idx]],
+                "pe": [round(float(x), 6) for x in np.maximum(pe[idx], 0.0)], "forward": round(F, 4),
+                "r": r, "T": T, "width": round(width, 3), "basis": basis, "n_quotes": n_q}
+    except Exception as exc:  # noqa: BLE001 — the desk falls back to its lognormal prior
+        logger.debug("rnd grid failed: %s", exc)
+        return None
 
 
 def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: date,
@@ -2300,6 +2487,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     # Per-opportunity confidence (fill + trust), from the expiry's quant diagnostics.
     for o in opps:
         o["confidence"] = _confidence(o, quant)
+        _attach_fill_economics(o)              # entry cost at the expected fill + the premium/yield actually collected
 
     # Gamma-pin magnet: the strike carrying the most open interest at this expiry.
     oi_by_strike: dict[float, int] = {}
@@ -2327,6 +2515,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
         "macro_events": macro,
         "quant": quant,
         "n_opportunities": len(opps),
+        "_rnd_grid": _rnd_grid(rnd, atm_iv, calls, puts, spot, dte),   # → result["_rnd_grids"] (internal)
     }
     return opps, summary
 
@@ -2478,11 +2667,13 @@ async def run_derivative_income(
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
                  f"{'own' if owns_underlying else 'naked'}:"
-                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v6")   # owns → covered call · else naked-call BPR;
+                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v8")   # owns → covered call · else naked-call BPR;
                  # v4: not-owned short calls now build as structure=naked_call (correct payoff/grade), untradeable-leg
                  #     filter, + context.change_pct/prev_close — all change the cached shape.
                  # v5: opp.earnings_gap_pct (isolated event move) attached when earnings is before expiry.
                  # v6: earnings gap made ROBUST (multi-strike straddle + HV cap + floor) — no longer collapses to None.
+                 # v7: legs carry the expected fill (+ commission); opps carry entry_cost / premium_fill.
+                 # v8: context.hv21_pct / hv63_pct / index_like (physical-vol forecast + term-structure sign).
                  #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:
@@ -2522,6 +2713,7 @@ async def run_derivative_income(
 
     opportunities: list[dict] = []
     expiry_summaries: list[dict] = []
+    rnd_grids: dict = {}          # exp → compact market-implied law (desk payoff distribution); internal-only
     chains_cache: list = []       # (dte, exp, calls, puts) — kept so the CALENDAR builder can pair two expiries
     for exp, dte in chosen:
         try:
@@ -2541,6 +2733,7 @@ async def run_derivative_income(
             focus=focus, owns_underlying=owns_underlying, focus_only=focus_only, ta_levels=ta_levels,
         )
         opportunities.extend(opps)
+        rnd_grids[exp] = summary.pop("_rnd_grid", None)    # internal (desk distribution); kept off the summaries
         expiry_summaries.append(summary)
         try:
             _cc, _pp = _split_chain(chain)
@@ -2632,6 +2825,9 @@ async def run_derivative_income(
         "sofr_source": sofr_label,
         "hv30_pct": round(ctx["hv30"] * 100, 1) if ctx.get("hv30") else None,
         "hv20_pct": round(ctx["hv20"] * 100, 1) if ctx.get("hv20") else None,
+        "hv21_pct": round(ctx["hv21"] * 100, 1) if ctx.get("hv21") else None,
+        "hv63_pct": round(ctx["hv63"] * 100, 1) if ctx.get("hv63") else None,
+        "index_like": bool(ctx.get("index_like")),          # ETF / index / fund (no earnings) — term-structure sign
         "next_earnings": ctx.get("next_earnings"),
         "next_earnings_amc": ctx.get("next_earnings_amc"),   # 'amc' (after close, still ahead today) | 'bmo' | None
         "days_since_earnings": ctx.get("days_since_earnings"),
@@ -2659,6 +2855,7 @@ async def run_derivative_income(
         "expiry_mode": "target" if target_dte else "monthly_le_45d",
         "target_dte": target_dte,
         "expiry_summaries": expiry_summaries,
+        "_rnd_grids": rnd_grids,          # INTERNAL — stripped from the public /derivative-income response
         "opportunities": opportunities,
         "best_by_structure": list(best_by_structure.values()),
         "n_opportunities": len(opportunities),
@@ -2732,7 +2929,7 @@ async def run_portfolio_derivative_income(
     page = holdings[offset: offset + limit]
 
     cache_key = (f"derivinc:pf:{user.id}:{offset}:{limit}:{target_dte or 'monthly'}:"
-                 f"{min_prob:.2f}:{int(min_income)}:{quote_source}:v2")   # v2: naked_call grading + row change_pct
+                 f"{min_prob:.2f}:{int(min_income)}:{quote_source}:v3")   # v2: naked_call grading + row change_pct · v3: fill economics
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return cached
