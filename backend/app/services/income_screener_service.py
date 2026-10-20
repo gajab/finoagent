@@ -362,6 +362,7 @@ def _compact(o: dict, pick: str) -> dict:
         "premium_per_share": o.get("premium_per_share"),
         "premium_fill": o.get("premium_fill"),           # what you collect after the expected fill + commissions
         "entry_cost": o.get("entry_cost"),
+        "limit_only": bool(o.get("limit_only")),          # wide market — work a limit order
         "prob_keep_pct": o.get("prob_keep_pct"),
         "prob_touch_pct": o.get("prob_touch_pct"),
         "premium_annualized_pct": o.get("premium_annualized_pct"),
@@ -409,7 +410,7 @@ async def evaluate_ticker(ticker: str, p: dict, user=None, db=None) -> dict:
     from .quote_providers import get_provider
 
     ticker = _norm_ticker(ticker)
-    ck = _key(f"iscreen:eval:{ticker}:v5", p)   # v2: exact payoff law · v3: fills + carry-to-risk + market-implied law · v4: earnings split
+    ck = _key(f"iscreen:eval:{ticker}:v6", p)   # v2: exact payoff law · v3: fills + carry-to-risk + market-implied law · v4: earnings split · v6: limit-only legs
     if db is not None:
         cached = await get_cached(db, ck)
         if cached is not None:

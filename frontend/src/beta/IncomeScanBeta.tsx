@@ -24,7 +24,8 @@ import ScoreCard from './ScoreCard';
 import SplitPane from './SplitPane';
 import PriceLadder from './PriceLadder';
 import { choosePicks, capitalOf, type Pick } from './betaPicks';
-import { premiumAfterFill, afterFillText, afterFillTitle } from '../lib/fills';
+import { premiumAfterFill, afterFillText, afterFillTitle, LIMIT_ONLY_NOTE } from '../lib/fills';
+import NoTradeReasons from '../components/NoTradeReasons';
 
 // ── presets ──────────────────────────────────────────────────────────────────
 type PresetKey = 'safe' | 'balanced' | 'income';
@@ -343,7 +344,8 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
           {rev.data_source_note && <div className="rounded-lg border border-warning/30 bg-warning/[0.07] px-3 py-2 text-xs text-warning flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5 shrink-0" /> {rev.data_source_note}</div>}
 
           {ranked.length === 0 ? (
-            <div className="alert alert-warning text-sm"><AlertTriangle className="w-4 h-4" /><span>{rev.note || 'No candidate trades cleared these filters. Try a lower keep chance, a longer expiry, or a more volatile underlying.'}</span></div>
+            <NoTradeReasons note={rev.note} reasons={rev.note_reasons}
+              fallback="No candidate trades cleared these filters. Try a lower keep chance, a longer expiry, or a more volatile underlying." />
           ) : (
             <>
               {/* picks */}
@@ -362,7 +364,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                             <GradeChip t={p.trade} />
                           </div>
                           <div className="mt-2 text-sm font-semibold leading-tight">{p.trade.label}</div>
-                          <div className="text-xs text-base-content/50">{strikeText(p.trade)} · {p.trade.dte}d</div>
+                          <div className="text-xs text-base-content/50">{strikeText(p.trade)} · {p.trade.dte}d{p.trade.limit_only ? <span className="text-warning cursor-help" title={LIMIT_ONLY_NOTE}> · limit order only</span> : null}</div>
                           <div className="mt-2 flex items-baseline gap-1.5"><span className="text-2xl font-semibold tabular-nums text-success">{keepPct(p.trade.prob_keep_pct)}</span><span className="text-xs text-base-content/50">keep chance</span></div>
                           <div className="mt-1.5 grid grid-cols-2 gap-x-3 text-xs">
                             <span className="text-base-content/50">Premium</span><span className="text-right tabular-nums">{money(p.trade.premium)}</span>
@@ -434,7 +436,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                               <td className="py-2"><GradeChip t={t} /></td>
                               <td className="px-2 py-2 overflow-hidden">
                                 <div className="font-medium truncate">{t.label}{(t.nearby_count ?? 0) > 0 && <span className="ml-1 text-[11px] text-base-content/40" title={`Best of ${(t.nearby_count ?? 0) + 1} adjacent strikes`}>+{t.nearby_count}</span>}</div>
-                                <div className="text-xs text-base-content/50 truncate">{strikeText(t)} · {t.dte}d{crossesEarnings(t, nextEarnings) ? <span className="text-warning"> · earnings</span> : null}{isWaiting(t) ? <span className="text-warning"> · wait</span> : null}</div>
+                                <div className="text-xs text-base-content/50 truncate">{strikeText(t)} · {t.dte}d{crossesEarnings(t, nextEarnings) ? <span className="text-warning"> · earnings</span> : null}{isWaiting(t) ? <span className="text-warning"> · wait</span> : null}{t.limit_only ? <span className="text-warning cursor-help" title={LIMIT_ONLY_NOTE}> · limit order</span> : null}</div>
                               </td>
                               <td className="px-2 py-2"><PriceLadder t={t} spot={rev.spot} width={96} /></td>
                               <td className="px-2 py-2 text-right tabular-nums">{keepPct(t.prob_keep_pct)}{t.prob_method === 'BS_fallback' && <span className="text-warning" title="IV estimate — the option chain's implied-vol surface was inconsistent, so this is a flat-vol estimate."> ≈</span>}</td>
@@ -467,7 +469,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                       </div>
                       <div className="grid grid-cols-2 gap-2 mt-3">
                         {[
-                          ['Premium', money(selected.premium), `${money(selected.premium_per_share, 2)} per share${afterFillText(selected) ? ` · ${afterFillText(selected)}` : ''}`],
+                          ['Premium', money(selected.premium), `${money(selected.premium_per_share, 2)} per share${afterFillText(selected) ? ` · ${afterFillText(selected)}` : ''}${selected.limit_only ? ' · limit order only' : ''}`],
                           [capitalOf(selected).label, money(capitalOf(selected).value), capitalOf(selected).sub],
                           ['Break-even', money(selected.breakeven, 2), selected.cushion_pct != null ? `${selected.cushion_pct.toFixed(1)}% cushion` : undefined],
                           ['Return', selected.static_return_pct != null ? `${selected.static_return_pct.toFixed(1)}%` : '—', `in ${selected.dte}d ${annText(selected.premium_annualized_pct)}`],

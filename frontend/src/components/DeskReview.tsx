@@ -12,6 +12,8 @@ import DeskDebateModal from './DeskDebateModal';
 import { OpportunitySummary, LegsTable } from './DerivativeIncome';
 import CollapsibleSection from './trades/CollapsibleSection';
 import { afterFillText, afterFillTitle } from '../lib/fills';
+import LimitOnlyBadge from './LimitOnlyBadge';
+import NoTradeReasons from './NoTradeReasons';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
 import type { DeskReviewParams, DeskEvaluateParams } from '../api';
 import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan, BlindRead, PerSideLeg } from '../types';
@@ -1686,6 +1688,7 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
                             {afterFillText(t) && (
                               <div className="text-[10px] text-base-content/45 cursor-help" title={afterFillTitle(t)}>{afterFillText(t)}</div>
                             )}
+                            <LimitOnlyBadge o={t} />
                           </td>
                           <td className="whitespace-nowrap">{winPct(t.prob_keep_pct)}
                             {t.prob_method === 'BS_fallback' && (
@@ -1765,10 +1768,8 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
       })()}
 
       {rev && rev.ranked.length === 0 && (
-        <div className="alert alert-warning text-xs">
-          <AlertTriangle className="w-4 h-4" />
-          <span>{rev.note || 'No candidate trades to review under these filters.'}</span>
-        </div>
+        <NoTradeReasons note={rev.note} reasons={rev.note_reasons} className="text-xs"
+          fallback="No candidate trades to review under these filters." />
       )}
     </div>
   );

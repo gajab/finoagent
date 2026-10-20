@@ -3,7 +3,7 @@
 // thin one) plus a $0.65/contract commission (derivative_income_service._expected_fill). The mid premium stays the
 // headline; this is what you realistically collect, and it is what the desk score is computed on.
 
-type Fillable = { premium_fill?: number | null; entry_cost?: number | null } | null | undefined;
+type Fillable = { premium_fill?: number | null; entry_cost?: number | null; limit_only?: boolean } | null | undefined;
 
 export const FILL_NOTE =
   'Expected fill: each leg at mid minus 25–75% of its half-spread (wider or thinner books give up more) ' +
@@ -23,8 +23,14 @@ export function afterFillText(o: Fillable, contracts = 1): string | null {
   return `≈ ${sign}$${Math.round(Math.abs(net)).toLocaleString()} after fill`;
 }
 
+export const LIMIT_ONLY_NOTE =
+  'Limit order only: the bid-ask spread is past the normal tolerance, but the market is real (two-sided, a live ' +
+  'book, and even the bid alone clears your premium floor). Work a limit between the bid and the mid, never a ' +
+  'market order. Scored at the expected fill and ranked below fillable trades.';
+
 /** Tooltip: the opening cost in dollars + how it is estimated. */
 export function afterFillTitle(o: Fillable, contracts = 1): string {
   const cost = (o?.entry_cost ?? 0) * (contracts || 1);
-  return `Opening cost ≈ $${cost < 10 ? cost.toFixed(2) : Math.round(cost).toLocaleString()} (spread + commissions). ${FILL_NOTE}`;
+  return `Opening cost ≈ $${cost < 10 ? cost.toFixed(2) : Math.round(cost).toLocaleString()} (spread + commissions). ${FILL_NOTE}`
+    + (o?.limit_only ? ` ${LIMIT_ONLY_NOTE}` : '');
 }

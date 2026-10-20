@@ -3070,6 +3070,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
     # so the top-ranked trade has already cleared every mechanical filter the LLM desk applies.
     ranked.sort(key=lambda r: (
         not r["grade_blocking"],            # structural veto → very bottom
+        not r.get("limit_only"),            # wide market (limit order only) → below every fillable trade
         not r.get("grade_timing_hold"),     # then WAIT (timing) → below clean, above vetoed
         r["desk_score"],
         (r["desk_metrics"].get("pm") or {}).get("sortino") or 0,
@@ -3144,6 +3145,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         "earnings_aware": bool(earnings_aware),
         "earnings_in_window": any(s.get("earnings_before_expiry") for s in (scan.get("expiry_summaries") or [])),
         "note": scan.get("note"),
+        "note_reasons": scan.get("note_reasons"),           # every reason an empty scan found no trade
         "data_source_note": scan.get("data_source_note"),   # IBKR→yfinance fallback flag, if any
     }
 

@@ -243,6 +243,7 @@ def _shape_desk(res: dict, top_n: int, verbose: bool, include_raw: bool) -> dict
         "events": res.get("events"),
         "flag_events": res.get("flag_events"),
         "note": res.get("note"),
+        "note_reasons": res.get("note_reasons"),
         "data_source_note": res.get("data_source_note"),
     }
     if include_raw:
@@ -269,6 +270,7 @@ def _shape_scan(res: dict, top_n: int, verbose: bool, include_raw: bool) -> dict
         "n_trades_total": res.get("n_opportunities", len(opps)),
         "events": res.get("events"),
         "note": res.get("note"),
+        "note_reasons": res.get("note_reasons"),
         "data_source_note": res.get("data_source_note"),
     }
     if include_raw:

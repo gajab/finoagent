@@ -4001,6 +4001,7 @@ export interface DerivativeIncomeOpportunity {
   entry_cost?: number | null;                 // $ to open at the expected fill (all legs × contracts, incl. commissions)
   premium_fill?: number | null;               // premium actually collected after that cost (mid stays the headline)
   premium_annualized_fill_pct?: number | null;
+  limit_only?: boolean;                       // wide but real market — work a limit order; ranked below fillable trades
   collateral: number;
   capital_basis?: 'reg_t_margin' | 'covered_stock' | string;   // short put = Reg-T naked margin (BPR)
   notional_capital?: number | null;                            // full cash-secured notional (the dollar RISK)
@@ -4130,6 +4131,7 @@ export interface DerivativeIncomeResult {
   best_by_structure: DerivativeIncomeOpportunity[];
   n_opportunities: number;
   note?: string;
+  note_reasons?: string[] | null;             // empty scan: every reason no trade cleared the filters
   error?: string;
 }
 
@@ -4338,6 +4340,7 @@ export interface DeskReviewResult {
   /** An expiry in the scan straddles a print, so the earnings-aware toggle actually bit. */
   earnings_in_window?: boolean;
   note?: string;
+  note_reasons?: string[] | null;
   error?: string;
   // Chrome passthrough (single-ticker one-call render): the same context / expiries / event flags
   // the /derivative-income scan returns, so the header + volatility + events render from this payload.
@@ -4658,6 +4661,7 @@ export interface IncomeEvalTrade {
   premium_per_share?: number | null;
   premium_fill?: number | null;
   entry_cost?: number | null;
+  limit_only?: boolean;
   prob_keep_pct?: number | null;
   prob_touch_pct?: number | null;
   premium_annualized_pct?: number | null;

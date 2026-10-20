@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { screenIncomeUniverse, fetchIncomeVolMetrics, evaluateIncomeTicker } from '../api';
 import { afterFillText, afterFillTitle } from '../lib/fills';
+import LimitOnlyBadge from './LimitOnlyBadge';
 import type {
   IncomeScreenParams, IncomeScreenRow, IncomeVolRow, IncomeEvalParams, IncomeEvalResult, IncomeEvalTrade,
 } from '../types';
@@ -123,6 +124,7 @@ function TradeRow({ t, onOpen }: { t: IncomeEvalTrade; onOpen: () => void }) {
       <td className="text-right font-mono text-xs">{t.desk_score ?? '—'}</td>
       <td className="text-right font-mono text-xs">{money0(t.premium)}<div className="text-[10px] text-base-content/45">{f2(t.premium_per_share)}/sh</div>
         {afterFillText(t) && <div className="text-[10px] text-base-content/45 cursor-help" title={afterFillTitle(t)}>{afterFillText(t)}</div>}
+        <LimitOnlyBadge o={t} />
       </td>
       <td className="text-right font-mono text-xs text-success">{f1pct(t.prob_keep_pct)}</td>
       <td className="text-right font-mono text-xs">{f1pct(t.prob_touch_pct)}</td>

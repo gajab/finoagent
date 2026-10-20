@@ -8,6 +8,8 @@ import {
 } from 'lucide-react';
 import { IncomeScreener } from './IncomeScreener';
 import { afterFillText, afterFillTitle } from '../lib/fills';
+import LimitOnlyBadge from './LimitOnlyBadge';
+import NoTradeReasons from './NoTradeReasons';
 import { useAuth } from '../contexts/AuthContext';
 import { runDerivativeIncome, runDerivativeIncomePortfolio, runDeskReview, evaluateDeskTrade, fetchTechnicalForTimeframe, fetchOptionExpirations, fetchDerivativeIncomeWatchlist, addDerivativeIncomeWatchlist, deleteDerivativeIncomeWatchlist } from '../api';
 import type { DerivativeIncomeWatchlistItem } from '../api';
@@ -408,6 +410,7 @@ export function OpportunitySummary({ opp }: { opp: DerivativeIncomeOpportunity }
             {afterFillText(opp, opp.contracts || 1) && (
               <div className="cursor-help" title={afterFillTitle(opp, opp.contracts || 1)}>{afterFillText(opp, opp.contracts || 1)}</div>
             )}
+            <LimitOnlyBadge o={opp} className="mt-0.5" />
           </>} />
         <MetricTile label="Return / period" value={pct(opp.static_return_pct)} sub={`~${annPct(opp.premium_annualized_pct)} ann.`} />
         <MetricTile label="vs SOFR" tone={opp.beats_sofr ? 'text-success' : 'text-base-content/70'}
@@ -607,6 +610,7 @@ function SingleTickerResult({ result, desk, shares, costBasis, hideCommonEvents,
   const expirySummaries = desk?.expiry_summaries ?? result?.expiry_summaries ?? [];
   const events: DerivativeIncomeFlag[] = desk?.flag_events ?? result?.events ?? [];
   const note = desk?.note ?? result?.note;
+  const noteReasons = desk?.note_reasons ?? result?.note_reasons;
   const oppEmpty = desk ? desk.ranked.length === 0 : (result?.opportunities.length ?? 0) === 0;
 
   const primaryQuant = expirySummaries[0]?.quant;
@@ -633,10 +637,8 @@ function SingleTickerResult({ result, desk, shares, costBasis, hideCommonEvents,
       {/* Empty-state note — only the portfolio-expand path (no desk); the single-ticker DeskReview
           shows its own "no candidate trades" banner. */}
       {!desk && oppEmpty && (
-        <div className="alert alert-warning text-sm">
-          <AlertTriangle className="w-4 h-4 shrink-0" />
-          <span>{note || 'No executable opportunities cleared your filters. Try a lower probability, a longer target DTE, or a more volatile underlying.'}</span>
-        </div>
+        <NoTradeReasons note={note} reasons={noteReasons}
+          fallback="No executable opportunities cleared your filters. Try a lower probability, a longer target DTE, or a more volatile underlying." />
       )}
 
     </div>

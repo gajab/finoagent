@@ -79,6 +79,103 @@ TTL_EMPTY = 60                  # an EMPTY result is held only ~1 min (see scan_
 TTL_PORTFOLIO = 300
 
 
+def _market_open_now(now: Optional[datetime] = None) -> bool:
+    """US listed-options regular session (Mon–Fri 9:30–16:00 ET; exchange holidays not modelled)."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    t = (now or datetime.now(et)).astimezone(et)
+    return t.weekday() < 5 and (9, 30) <= (t.hour, t.minute) < (16, 0)
+
+
+def _no_trade_reasons(diag: dict, scanned: list[tuple[str, int]], failed: list[str], structures: list[str],
+                      min_prob: float, min_income: float, owns_underlying: bool, next_earnings: Optional[str],
+                      today: date, expiry_mode: str, market_open: bool) -> list[str]:
+    """EVERY reason the scan came back empty, most actionable first: what was scanned, each structure's binding
+    gate with counts and the strike closest to qualifying, then the context (earnings, market hours) and what to
+    try. Built from the per-strike rejections `_single_leg_income` records in ``diag``."""
+    p, m = round(min_prob * 100), f"${min_income:.0f}"
+    out: list[str] = []
+    if scanned:
+        how = {"exact": "the expiry you picked",
+               "target": "the expiries nearest your target DTE",
+               "auto": "auto mode scans the nearest monthly ≤ 45 DTE — pick a specific date to scan another"}
+        out.append(f"Scanned {', '.join(f'{e} ({d}d)' for e, d in scanned)} — {how.get(expiry_mode, how['auto'])}.")
+    if failed:
+        out.append(f"Option chain unavailable for {', '.join(failed)} (provider error) — retry in a minute.")
+
+    sides = [("put", "P", "Cash-secured puts")] if "cash_secured_put" in structures else []
+    if "covered_call" in structures:
+        sides.append(("call", "C", "Covered calls" if owns_underlying else "Naked calls"))
+
+    def quote(e: dict, rt: str) -> str:
+        sp = f", {e['spread_pct']:.0f}% of mid" if e.get("spread_pct") is not None else ""
+        return f"{e['strike']:g}{rt} bid ${e['bid']:.2f} / ask ${e['ask']:.2f}{sp}"
+
+    blocked = {"prob": False, "premium": False, "liquidity": False}
+    for side, rt, name in sides:
+        d = diag.get(side) or {}
+        seen = (d.get("_seen") or {}).get("n", 0)
+        if not seen:
+            out.append(f"{name}: no out-of-the-money strikes are quoted for this expiry.")
+            continue
+        parts = []
+        liq = {c: d[c] for c in ("wide", "no_market", "thin") if c in d}
+        n_liq = sum(v["n"] for v in liq.values())
+        if n_liq:
+            blocked["liquidity"] = True
+            bits = []
+            if "wide" in liq:
+                bits.append(f"{liq['wide']['n']} too wide even for a limit order (spread > "
+                            f"{LIMIT_ONLY_MAX_SPREAD * 100:.0f}% of mid, or the bid alone pays < {m})")
+            if "no_market" in liq:
+                bits.append(f"{liq['no_market']['n']} with no bid")
+            if "thin" in liq:
+                bits.append(f"{liq['thin']['n']} with a dead book (OI + volume < {MIN_LIQUIDITY})")
+            # the example: the nearest-to-tradable failure (a real but too-wide market before a dead or one-sided book)
+            code = next(c for c in ("wide", "thin", "no_market") if c in liq)
+            why = {"wide": "too wide", "thin": "dead book", "no_market": "no bid"}[code]
+            best = liq[code]["ex"]
+            parts.append(f"{n_liq} clear {p}% keep and {m} but can't be filled — {'; '.join(bits)}"
+                         + (f" (closest: {quote(best, rt)} — {why})" if best else ""))
+        if "prob" in d:
+            blocked["prob"] = True
+            e = d["prob"]["ex"]
+            parts.append(f"{d['prob']['n']} keep < {p}% (best: {e['strike']:g}{rt} keeps {e['keep_pct']}% "
+                         f"for ${e['premium']:.0f} at mid)")
+        if "premium" in d:
+            blocked["premium"] = True
+            e = d["premium"]["ex"]
+            parts.append(f"{d['premium']['n']} keep ≥ {p}% but pay < {m} (best: {e['strike']:g}{rt} pays "
+                         f"${e['premium']:.0f} at mid)")
+        if "delta" in d:
+            parts.append(f"{d['delta']['n']} otherwise-qualifying strike(s) sit outside the tradable delta band "
+                         f"(|Δ| {MIN_ABS_DELTA:.3f}–{MAX_ABS_DELTA:.2f})")
+        out.append(f"{name} — {seen} strikes checked: " + ("; ".join(parts) if parts else "none qualified") + ".")
+
+    multi = [s for s in structures if s not in ("covered_call", "cash_secured_put")]
+    if multi:
+        out.append(f"Multi-leg ({', '.join(s.replace('_', ' ') for s in multi)}): none built — every leg must be "
+                   f"fillable within the IV-scaled spread tolerance and the net credit must clear {m} at {p}% keep.")
+    if next_earnings and scanned and today.isoformat() <= next_earnings <= max(e for e, _ in scanned):
+        out.append(f"Earnings {next_earnings} fall inside the window — market makers widen quotes into a print "
+                   f"(spreads usually tighten after it) and the event raises assignment odds.")
+    if not market_open:
+        out.append("The US options market is closed — off-hours provider quotes and IVs are stale or blank (bids "
+                   "often read $0); re-run during market hours (9:30–16:00 ET).")
+    tips = []
+    if blocked["prob"]:
+        tips.append(f"a lower keep chance (e.g. {max(p - 5, 50)}%)")
+    if blocked["premium"]:
+        tips.append("a lower premium floor")
+    if blocked["liquidity"]:
+        tips.append("a more liquid expiry or underlying")
+    if expiry_mode == "auto":
+        tips.append("a specific later expiry")
+    if tips:
+        out.append("Try " + ", ".join(tips) + ".")
+    return out
+
+
 def scan_cache_ttl(has_results: bool, ttl: int = TTL_ANALYSIS) -> int:
     """TTL for a cached scan / evaluation. A result WITH trades keeps the normal TTL; an EMPTY one is held only
     briefly — a single bad provider response (yfinance intermittently returns a degraded chain) must not pin
@@ -647,6 +744,11 @@ MAX_SPREAD_CAP = 0.40      # hard ceiling — past this the mid is a mirage even
 DEEP_BOOK = 100            # OI+vol above which a wide quote can still be worked at mid
 TICK_TOLERANCE = 0.05      # always allow one 5-cent tick (cheap-option granularity)
 MIN_LIQUIDITY = 10         # OI + volume floor per leg (truly dead strikes)
+# LIMIT-ORDER ONLY — a real but WIDE single-leg market (two-sided, a live book, spread ≤ this × mid, and even the BID
+# clears the premium floor) is no longer hidden: it is offered flagged `limit_only`, scored at the expected fill
+# (which already gives up 75% of the half-spread on a wide quote) and ranked below fillable trades. MCO 2026-10: every
+# put failed the IV-scaled gate (410P 1.00/2.90, 97% of mid) and the scan showed nothing at all.
+LIMIT_ONLY_MAX_SPREAD = 1.50
 
 
 # Expected FILL — what a working limit order realistically gets, not the mid. You give up a fraction k of the
@@ -709,17 +811,14 @@ def _spread_pct(q: OptionQuote) -> Optional[float]:
     return None
 
 
-def _executable(q: OptionQuote) -> tuple[bool, str]:
-    """Can this option realistically be traded near mid? Returns ``(ok, reason)``.
-
-    Filters the non-fillable quotes (no bid, blown-out spread, empty book) that made
-    many recommendations un-actionable.
-    """
+def _exec_status(q: OptionQuote) -> tuple[str, str]:
+    """Can this option realistically be traded near mid? ``(code, reason)`` with code ``ok`` | ``no_market``
+    (no bid/ask) | ``thin`` (dead book) | ``wide`` (spread past the IV-scaled tolerance)."""
     if q.bid <= 0 or q.ask <= 0 or q.mid <= 0:
-        return False, "no two-sided market (missing bid/ask)"
+        return "no_market", "no two-sided market (missing bid/ask)"
     depth = q.oi + q.volume
     if depth < MIN_LIQUIDITY:
-        return False, f"thin book (OI {q.oi} + vol {q.volume} < {MIN_LIQUIDITY})"
+        return "thin", f"thin book (OI {q.oi} + vol {q.volume} < {MIN_LIQUIDITY})"
     iv = q.iv if (q.iv and q.iv > 0) else 0.30
     allowed_pct = min(BASE_SPREAD_PCT + IV_SPREAD_COEF * iv, MAX_SPREAD_CAP)
     if depth >= DEEP_BOOK:                      # deep books can be worked even when quoted wide
@@ -727,8 +826,43 @@ def _executable(q: OptionQuote) -> tuple[bool, str]:
     allowed = max(TICK_TOLERANCE, allowed_pct * q.mid)
     spread = q.ask - q.bid
     if spread > allowed:
-        return False, f"bid-ask {spread / q.mid * 100:.0f}% > {allowed_pct * 100:.0f}% IV-scaled tolerance"
-    return True, ""
+        return "wide", f"bid-ask {spread / q.mid * 100:.0f}% > {allowed_pct * 100:.0f}% IV-scaled tolerance"
+    return "ok", ""
+
+
+def _executable(q: OptionQuote) -> tuple[bool, str]:
+    """Can this option realistically be traded near mid? Returns ``(ok, reason)``.
+
+    Filters the non-fillable quotes (no bid, blown-out spread, empty book) that made
+    many recommendations un-actionable.
+    """
+    code, why = _exec_status(q)
+    return code == "ok", why
+
+
+def _limit_only_ok(q: OptionQuote, min_income: float) -> bool:
+    """A WIDE but real market worth a limit order: two-sided, a live book, spread ≤ LIMIT_ONLY_MAX_SPREAD × mid,
+    and even the bid alone clears the premium floor (so the trade still qualifies if it only fills at the bid)."""
+    return (q.bid > 0 and q.ask > 0 and q.mid > 0 and (q.oi + q.volume) >= MIN_LIQUIDITY
+            and (q.ask - q.bid) / q.mid <= LIMIT_ONLY_MAX_SPREAD and q.bid * CONTRACT_MULTIPLIER >= min_income)
+
+
+def _diag_add(diag: Optional[dict], reason: str, q: OptionQuote, p_keep: Optional[float], premium: float,
+              liquid: bool = True) -> None:
+    """Record one rejected strike under ``reason`` (per side) and keep the example CLOSEST to qualifying: the
+    highest keep-probability for ``prob``, the highest premium otherwise — a TRADABLE quote first (``liquid``), so a
+    stale dead-book mid never becomes the example."""
+    if diag is None:
+        return
+    d = diag.setdefault("call" if q.right == "C" else "put", {}).setdefault(reason, {"n": 0, "ex": None})
+    d["n"] += 1
+    ex = {"strike": round(q.strike, 2), "bid": round(q.bid, 2), "ask": round(q.ask, 2),
+          "spread_pct": _spread_pct(q), "keep_pct": round(p_keep * 100, 1) if p_keep is not None else None,
+          "premium": round(premium, 2), "liquid": liquid}
+    rank = (lambda e: (e["liquid"], e["keep_pct"] or 0.0)) if reason == "prob" else \
+        (lambda e: (e["liquid"], e["premium"] or 0.0))
+    if d["ex"] is None or rank(ex) > rank(d["ex"]):
+        d["ex"] = ex
 
 
 def _leg(q: OptionQuote, action: str, exp: str, spot: float, dte: int,
@@ -955,25 +1089,43 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
                        atm_iv: Optional[float], iv_hv_ratio: Optional[float],
                        richness: str, european: bool, earnings_before: Optional[str],
                        macro: list[str], min_prob: float, min_income: float,
-                       ticker: str, allow_illiquid: bool = False, covered: bool = True) -> Optional[dict]:
+                       ticker: str, allow_illiquid: bool = False, covered: bool = True,
+                       diag: Optional[dict] = None) -> Optional[dict]:
     """Short call (right C) or short put (right P) on a single strike. ``covered`` (calls only) = the user
     HOLDS the shares → the call is stock-secured (covered call); otherwise it is a NAKED call sized by
     Reg-T margin. Short puts are always Reg-T naked margin (never cash-secured).
 
     ``allow_illiquid`` bypasses the executability / min-income gates — used for the
     FOCUS path (scoring a trade the user ALREADY holds), where the strike can be
-    illiquid/wide but we must still score the position rather than drop it."""
+    illiquid/wide but we must still score the position rather than drop it.
+
+    A WIDE but real market is kept as ``limit_only`` (see LIMIT_ONLY_MAX_SPREAD). ``diag`` collects why each
+    rejected strike failed — liquidity only when the strike would otherwise qualify, else the economic gate."""
     right = q.right
-    if not allow_illiquid and not _executable(q)[0]:     # drop un-fillable quotes (scan only)
-        return None
+    if diag is not None:
+        diag.setdefault("call" if right == "C" else "put", {}).setdefault("_seen", {"n": 0, "ex": None})["n"] += 1
     if not q.mid or q.mid <= 0:                           # no price → can't score either way
+        _diag_add(diag, "no_market", q, None, 0.0)
         return None
     premium = q.mid * CONTRACT_MULTIPLIER
-    if not allow_illiquid and premium < min_income:
-        return None
     iv = q.iv if q.iv else atm_iv
     p_keep, method = _prob_keep(rnd, q.strike, right, spot, dte, r, iv)
-    if p_keep is None or p_keep < min_prob:
+    prob_ok = p_keep is not None and p_keep >= min_prob
+    prem_ok = allow_illiquid or premium >= min_income
+    limit_only = False
+    if not allow_illiquid:
+        code, _why = _exec_status(q)
+        if code == "wide" and prob_ok and prem_ok and _limit_only_ok(q, min_income):
+            limit_only = True                             # a real market, just wide → offer it as a limit order
+        elif code != "ok":
+            _diag_add(diag, code if (prob_ok and prem_ok) else ("prob" if not prob_ok else "premium"),
+                      q, p_keep, premium, liquid=(code == "wide" and _limit_only_ok(q, 0.0)))
+            return None
+    if not prob_ok:
+        _diag_add(diag, "prob", q, p_keep, premium)
+        return None
+    if not prem_ok:
+        _diag_add(diag, "premium", q, p_keep, premium)
         return None
 
     # Capital blocked (the YIELD denominator) + the true bounded RISK, by how the short is secured:
@@ -1018,6 +1170,12 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
     expected_pnl = round(premium - exp_intr * CONTRACT_MULTIPLIER, 2) if exp_intr is not None else None
 
     flags = _opp_flags(richness, atm_iv, iv_hv_ratio)
+    if limit_only:
+        _fill_ps = _expected_fill(q, "SELL")[0]
+        flags.insert(0, {"level": "warn", "text":
+            f"Wide market — LIMIT ORDER ONLY: bid ${q.bid:.2f} / ask ${q.ask:.2f} ({_spread_pct(q):.0f}% of mid). "
+            f"Work a limit between the bid and the mid (never a market order); the desk scores it at the expected "
+            f"fill ≈ ${_fill_ps:.2f}, not the ${q.mid:.2f} mid, and ranks it below fillable trades."})
     if cap_basis == "reg_t_margin":
         _risk = (f"the full ${notional_val:,.0f} notional is the assignment risk" if right == "P"
                  else "the upside risk is UNLIMITED (naked call — no stock behind it)")
@@ -1059,6 +1217,7 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
         "iv_hv_ratio": iv_hv_ratio,
         "premium_richness": richness,
         "liquidity": {"oi": q.oi, "volume": q.volume, "spread_pct": _spread_pct(q)},
+        "limit_only": limit_only,               # wide but real market — work a limit order (ranked below fillable)
         "exercise_style": "European (cash-settled)" if european else "American",
         "flags": flags,
         "legs": [_leg(q, "SELL", exp, spot, dte, atm_iv, rnd)],
@@ -2391,11 +2550,12 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
                  european: bool, next_earnings: Optional[str], min_prob: float,
                  min_income: float, ticker: str, focus: Optional[dict] = None,
                  owns_underlying: bool = False, focus_only: bool = False,
-                 ta_levels: Optional[dict] = None) -> tuple[list[dict], dict]:
+                 ta_levels: Optional[dict] = None, diag: Optional[dict] = None) -> tuple[list[dict], dict]:
     """All qualifying opportunities for one expiration + an expiry summary. ``owns_underlying`` = the user
     holds the shares → short calls are COVERED; otherwise they are NAKED (Reg-T margin). ``ta_levels`` =
     {"levels": [S/R, value area, dealer gamma walls/flip], "atr_pct": daily ATR%} that biases multi-leg
-    SHORT strikes an ATR-sized buffer beyond a wall (TA-aware selection); None on the plain scan path."""
+    SHORT strikes an ATR-sized buffer beyond a wall (TA-aware selection); None on the plain scan path. ``diag``
+    collects why single-leg strikes were rejected (the empty-scan explanation, `_no_trade_reasons`)."""
     calls, puts = _split_chain(chain)
     strikes_all = sorted(set(calls) | set(puts))
     rnd = _build_rnd(calls, puts, strikes_all, spot, dte)
@@ -2436,10 +2596,11 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
         cc = []
         for k in call_strikes:
             o = _single_leg_income(_struct, _cc_label, calls[k],
-                                   sofr_pct=sofr_pct, covered=owns_underlying, **common)
+                                   sofr_pct=sofr_pct, covered=owns_underlying, diag=diag, **common)
             if not o:
                 continue
             if not (MIN_ABS_DELTA <= abs(o.get("short_delta") or 0.0) <= MAX_ABS_DELTA):
+                _diag_add(diag, "delta", calls[k], (o.get("prob_keep_pct") or 0) / 100.0, o.get("premium") or 0.0)
                 continue                           # outside the tradable delta band — skip (liquidity + memory)
             if not owns_underlying:
                 o["unbounded_loss"] = True     # naked call — upside risk is unbounded (matches the evaluate build)
@@ -2451,10 +2612,16 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
 
     # ---- Cash-secured puts (OTM puts) ----
     if "cash_secured_put" in structures:
-        cp = [o for k in put_strikes
-              if (o := _single_leg_income("cash_secured_put", "Cash-Secured Put", puts[k],
-                                          sofr_pct=sofr_pct, **common))
-              and MIN_ABS_DELTA <= abs(o.get("short_delta") or 0.0) <= MAX_ABS_DELTA]
+        cp = []
+        for k in put_strikes:
+            o = _single_leg_income("cash_secured_put", "Cash-Secured Put", puts[k],
+                                   sofr_pct=sofr_pct, diag=diag, **common)
+            if not o:
+                continue
+            if not (MIN_ABS_DELTA <= abs(o.get("short_delta") or 0.0) <= MAX_ABS_DELTA):
+                _diag_add(diag, "delta", puts[k], (o.get("prob_keep_pct") or 0) / 100.0, o.get("premium") or 0.0)
+                continue
+            cp.append(o)
         # Prioritize SAFER strikes (higher keep-prob) — the full ladder above min_prob; yield breaks ties.
         opps += sorted(cp, key=lambda o: (o.get("prob_keep_pct") or 0, o.get("premium_annualized_pct") or 0),
                        reverse=True)[:PER_STRUCTURE_CAP]
@@ -2709,7 +2876,7 @@ async def run_derivative_income(
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
                  f"{'own' if owns_underlying else 'naked'}:"
-                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v10")   # owns → covered call · else naked-call BPR;
+                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v11")   # owns → covered call · else naked-call BPR;
                  # v4: not-owned short calls now build as structure=naked_call (correct payoff/grade), untradeable-leg
                  #     filter, + context.change_pct/prev_close — all change the cached shape.
                  # v5: opp.earnings_gap_pct (isolated event move) attached when earnings is before expiry.
@@ -2718,6 +2885,7 @@ async def run_derivative_income(
                  # v8: context.hv21_pct / hv63_pct / index_like (physical-vol forecast + term-structure sign).
                  # v9: earnings_gap_pct computed in consistent σ units (straddle = √(2/π)·σ).
                  # v10: summaries carry straddle_iv_pct (the term-structure event split's estimator).
+                 # v11: wide-market single legs kept as limit_only; empty scans carry note_reasons.
                  #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:
@@ -2759,12 +2927,17 @@ async def run_derivative_income(
     expiry_summaries: list[dict] = []
     rnd_grids: dict = {}          # exp → compact market-implied law (desk payoff distribution); internal-only
     chains_cache: list = []       # (dte, exp, calls, puts) — kept so the CALENDAR builder can pair two expiries
+    diag: dict = {}               # why single-leg strikes were rejected → the empty-scan reasons
+    scanned: list[tuple[str, int]] = []
+    failed: list[str] = []
     for exp, dte in chosen:
         try:
             chain = await provider.get_option_chain(ticker, exp)
         except Exception as exc:  # noqa: BLE001
             logger.debug("chain fetch failed %s %s: %s", ticker, exp, exc)
+            failed.append(exp)
             continue
+        scanned.append((exp, dte))
         # Decisive triage log: how much of the chain actually carries implied vol. If this shows
         # "N quotes, 0 with IV", the smile can't fit → ATM IV / IV rank / skew all blank (the vol
         # panel goes empty) even though realized-vol metrics (from price history) stay populated.
@@ -2774,7 +2947,7 @@ async def run_derivative_income(
         opps, summary = _scan_expiry(
             chain, spot, dte, exp, today, sofr_frac, sofr_pct, hv, structures,
             european, ctx.get("next_earnings"), min_prob, min_income, ticker,
-            focus=focus, owns_underlying=owns_underlying, focus_only=focus_only, ta_levels=ta_levels,
+            focus=focus, owns_underlying=owns_underlying, focus_only=focus_only, ta_levels=ta_levels, diag=diag,
         )
         opportunities.extend(opps)
         rnd_grids[exp] = summary.pop("_rnd_grid", None)    # internal (desk distribution); kept off the summaries
@@ -2905,9 +3078,12 @@ async def run_derivative_income(
         "n_opportunities": len(opportunities),
     }
     if not opportunities:
-        result["note"] = (f"No structure cleared {round(min_prob * 100)}% no-assignment "
-                          f"AND ${min_income:.0f} premium in the scanned expiries. "
-                          f"Try a longer target DTE, a lower probability, or a more volatile underlying.")
+        result["note"] = f"No trade cleared {round(min_prob * 100)}% keep-probability AND ${min_income:.0f} premium."
+        _mode = ("exact" if (target_expiration and any(e == target_expiration for e, _ in chosen))
+                 else "target" if target_dte else "auto")
+        result["note_reasons"] = _no_trade_reasons(diag, scanned, failed, structures, min_prob, min_income,
+                                                   owns_underlying, ctx.get("next_earnings"), today, _mode,
+                                                   _market_open_now())
     if db is not None and focus is None:   # never cache a focus-injected (per-trade) build
         await set_cached(db, cache_key, result, ttl_seconds=scan_cache_ttl(bool(opportunities)))
     return result
