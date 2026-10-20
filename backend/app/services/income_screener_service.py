@@ -468,5 +468,6 @@ async def evaluate_ticker(ticker: str, p: dict, user=None, db=None) -> dict:
         base["skipped"] = (f"No {'/'.join(sorted(grades))}-grade trades" if ranked
                            else "No executable trades met the probability / premium filters")
     if db is not None:
-        await set_cached(db, ck, base, ttl_seconds=EVAL_TTL)
+        from .derivative_income_service import scan_cache_ttl
+        await set_cached(db, ck, base, ttl_seconds=scan_cache_ttl(bool(base["trades"]), EVAL_TTL))
     return base

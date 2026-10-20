@@ -75,7 +75,16 @@ PER_STRUCTURE_CAP = 15           # CC/CSP strikes kept per expiry — effectivel
 MIN_ABS_DELTA = 0.015           # hard floor — below this the strike is illiquid junk, never a candidate
 MAX_ABS_DELTA = 0.16            # near cap = ~84% win floor: drop near-money strikes; min_prob tightens further
 TTL_ANALYSIS = 900              # 15 min — matches _TTL_PRICE
+TTL_EMPTY = 60                  # an EMPTY result is held only ~1 min (see scan_cache_ttl)
 TTL_PORTFOLIO = 300
+
+
+def scan_cache_ttl(has_results: bool, ttl: int = TTL_ANALYSIS) -> int:
+    """TTL for a cached scan / evaluation. A result WITH trades keeps the normal TTL; an EMPTY one is held only
+    briefly — a single bad provider response (yfinance intermittently returns a degraded chain) must not pin
+    "no structure cleared" on that cache key for 15 minutes. Seen live: CB auto-expiry scan returned 0 trades at
+    10:17:37 and stayed empty on every retry, while the explicit-date key (fresh) found 3 trades 82 s later."""
+    return ttl if has_results else min(ttl, TTL_EMPTY)
 EVENTS_HORIZON_DAYS = 90         # always surface events for the next 90 days …
                                 # … even though the option scan defaults to ≤45 DTE
 
@@ -2865,7 +2874,7 @@ async def run_derivative_income(
                           f"AND ${min_income:.0f} premium in the scanned expiries. "
                           f"Try a longer target DTE, a lower probability, or a more volatile underlying.")
     if db is not None and focus is None:   # never cache a focus-injected (per-trade) build
-        await set_cached(db, cache_key, result, ttl_seconds=TTL_ANALYSIS)
+        await set_cached(db, cache_key, result, ttl_seconds=scan_cache_ttl(bool(opportunities)))
     return result
 
 
