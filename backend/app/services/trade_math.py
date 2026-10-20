@@ -362,7 +362,8 @@ def walk_ledger(transactions: list[dict]) -> PositionSnapshot:
 
 # Action vocabulary. LET_EXPIRE is a distinct, gentler cousin of CLOSE:
 # "it's basically worthless, no need to pay commission to buy it back".
-LegAction = Literal["CLOSE", "HOLD", "ROLL", "LET_EXPIRE"]
+# NO_QUOTE is not advice at all: the leg has no live mark, so no close/roll call is made on it.
+LegAction = Literal["CLOSE", "HOLD", "ROLL", "LET_EXPIRE", "NO_QUOTE"]
 
 
 def _norm_cdf(x: float) -> float:
@@ -438,8 +439,19 @@ def classify_leg_action(
     """
     is_put = str(right).upper().startswith("P")
     rt = "put" if is_put else "call"
-    captured = _captured_pct(sign, entry_prem, current_mid)
     p = p_itm if p_itm is not None else None
+    if current_mid is None:
+        # No live mark → we cannot say how much of the credit is captured, so NO close / roll / hold call is made.
+        # (Falling through used to read "theta is working for you, hold" off a leg with no data at all.)
+        return {
+            "action": "NO_QUOTE",
+            "reason": (f"No live quote for this {'short' if sign < 0 else 'long'} {rt} — it can't be marked, so no "
+                       "close/roll call is made (it is never priced at $0)."),
+            "p_itm_pct": round(p * 100, 1) if p is not None else None,
+            "captured_pct": None,
+            "no_quote": True,
+        }
+    captured = _captured_pct(sign, entry_prem, current_mid)
     p_txt = f"{p * 100:.0f}%" if p is not None else "n/a"
     mid_txt = f"${current_mid:.2f}" if current_mid is not None else "n/a"
 
@@ -631,7 +643,7 @@ def structure_breakevens(legs: list[dict], entry_cost: float,
 
 
 # Rank of urgency so the overall verdict can pick the most pressing leg action.
-_ACTION_URGENCY = {"ROLL": 3, "CLOSE": 2, "LET_EXPIRE": 1, "HOLD": 0}
+_ACTION_URGENCY = {"ROLL": 3, "CLOSE": 2, "LET_EXPIRE": 1, "HOLD": 0, "NO_QUOTE": 0}
 
 
 def _structure_standing(
@@ -837,4 +849,80 @@ def exit_recommendation(
         "signal": signal,
         "reasons": reasons,
         "captured_pct": round(captured * 100, 1) if captured is not None else None,
+    }
+
+
+
+# ── The stock behind an option overlay — ONE reading for Defend / roll search / book tail risk ──────
+
+def stock_position(params: Optional[dict], legs: Optional[list], entry_prices: Optional[list] = None,
+                   strategy_type: Optional[str] = None) -> dict:
+    """The share position a saved trade holds behind its option legs → {"shares": signed (+long/−short), "basis": per-share
+    cost or None, "source": "parameters" | "legs" | None}.
+
+    A combo / covered-call trade stores its shares in `parameters` (`shares` + `avg_cost`) and keeps ONLY the option legs
+    in `legs_data`, with `entry_prices = [stock row, *option rows]`. A trade built from a stock LEG inside `legs_data` is
+    the fallback. `parameters` wins and the two are never added together (that would double-count the shares). Reading
+    only the legs saw ZERO shares on the first shape and modelled every covered call as a naked short."""
+    p = params if isinstance(params, dict) else {}
+    legs = [l for l in (legs or []) if isinstance(l, dict)]
+    eps = [e for e in (entry_prices or [])]
+    stype = str(strategy_type or "").lower()
+
+    def _f(x) -> float:
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return 0.0
+
+    psh = _f(p.get("shares"))
+    if psh:
+        shares = -abs(psh) if (stype.startswith("stock") and "short" in stype) else psh
+        basis = _f(p.get("avg_cost")) or None
+        if basis is None and len(eps) == len(legs) + 1 and isinstance(eps[0], dict):    # the combo convention: stock row at [0]
+            basis = _f(eps[0].get("price")) or None
+        return {"shares": shares, "basis": basis, "source": "parameters"}
+
+    tot, cost = 0.0, 0.0
+    for i, l in enumerate(legs):
+        typ = str(l.get("type", "")).lower()
+        if not any(k in typ for k in ("stock", "share", "equity")):
+            continue
+        q = abs(_f(l.get("shares") or l.get("qty")))
+        if not q:
+            continue
+        sgn = -1.0 if any(k in str(l.get("action", "")).upper() for k in ("SELL", "SHORT")) else 1.0
+        tot += sgn * q
+        ep = eps[i].get("price") if (i < len(eps) and isinstance(eps[i], dict)) else None
+        px = _f(ep) or _f(l.get("price")) or _f(l.get("premium")) or _f(l.get("mid"))
+        if px and sgn > 0:
+            cost += q * px
+    if tot:
+        longq = sum(abs(_f(l.get("shares") or l.get("qty"))) for l in legs
+                    if any(k in str(l.get("type", "")).lower() for k in ("stock", "share", "equity"))
+                    and not any(k in str(l.get("action", "")).upper() for k in ("SELL", "SHORT")))
+        return {"shares": tot, "basis": (cost / longq) if (cost and longq) else None, "source": "legs"}
+    return {"shares": 0.0, "basis": None, "source": None}
+
+
+# ── No quote → no verdict ───────────────────────────────────────────────────────────────────────────
+
+def withheld_verdict(warning: str) -> dict:
+    """The `analysis` fields to OVERWRITE when an option leg has no live quote (`leg_mark_to_market` → incomplete).
+
+    The P&L is already reported as unknown (None). Every VERDICT that rests on the option mark — % of max profit captured,
+    the exit signal, hold/close, the one-line headline, the quant hold read — must be withheld in the same breath, in ONE
+    voice. Running them on a neutral $0 mark left a badge, a headline and a quant score on the card that were
+    computed from a leg we couldn't price (one said "Hold the structure", another STRONG CLOSE). `exit_signal` and
+    `quant_exit` go to None (not a made-up HOLD) so no consumer can mistake the gap for advice."""
+    return {
+        "hold_vs_close": "NO_QUOTE", "hold_vs_close_reasons": [warning],
+        "recommendation": {
+            "action": "NO_QUOTE", "headline": warning,
+            "outcome": "P&L is unknown until the unquoted leg prices — nothing here is valued at $0.",
+            "leg_notes": [], "reasons": [warning],
+        },
+        "exit_signal": None, "exit_reasons": [warning],
+        "captured_pct": None, "quant_exit": None,
+        "verdict_withheld": True,
     }

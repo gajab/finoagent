@@ -8,11 +8,12 @@
  *   AI assist   — facts-only evidence JSON → LLM, on the explicit click only
  * Shares and options get different content: no expiry / theta / strikes for shares, no scale-out ladder for options.
  */
-import { useEffect, useState, useCallback, type ReactNode } from 'react';
+import { useEffect, useState, useCallback, useSyncExternalStore, type ReactNode } from 'react';
 import {
   Loader2, AlertTriangle, RefreshCw, Sparkles, Target, Eye, Layers, FileJson, Check, X, Minus, Copy, ShieldAlert, Flag,
 } from 'lucide-react';
 import { fetchTradeManager, runTradeManagerAI } from '../../api';
+import { getDeskScore, subscribeDeskScore } from '../../lib/deskScoreStore';
 import type {
   LivePnlResponse, SavedStrategyItem, TradeManagerResult, TradeManagerAI, ManagerExitItem,
   ManagerSignal, ManagerTraderLens, ManagerWatchLevel, ManagerSinceEntry,
@@ -612,13 +613,16 @@ export default function TradeManagerPanel({ trade, pnl }: { trade: SavedStrategy
   const [aiErr, setAiErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // The deep Quant Analysis score, once the user has run it, IS this panel's Quant lens (the server prefers it over the
+  // light read) — so both panels show the SAME number. It arriving re-reads the verdict; until then the lens is labelled "light read".
+  const desk = useSyncExternalStore((fn) => subscribeDeskScore(trade.id, fn), () => getDeskScore(trade.id));
   const load = useCallback(async () => {
     setLoading(true); setErr(null);
-    try { setRes(await fetchTradeManager(trade.id, pnl)); }
+    try { setRes(await fetchTradeManager(trade.id, pnl, desk ?? undefined)); }
     catch (e: any) { setErr(e?.message || 'Trade manager failed'); }
     finally { setLoading(false); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [trade.id]);
+  }, [trade.id, desk]);
   useEffect(() => { load(); }, [load]);
 
   const askAI = async () => {
