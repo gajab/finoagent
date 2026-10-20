@@ -1743,9 +1743,13 @@ def rank_defenses(menu: dict) -> dict:
         # …and its RECOVERY axis the same way: every other row is scored on P(all-in P&L ≥ 0) vs holding, and closing a
         # loss means that probability is 0 — you can never get back to profit. It was handed a flat 55 (above the 50
         # baseline!) for foreclosing the recovery that Hold (54%) and every roll (58–70%) were being credited with.
-        close_pop = 100.0 if float(unreal or 0.0) >= 0 else 0.0
+        # A plain close is CERTAIN (100 if it locks in a gain, 0 if a loss). A close that KEEPS the shares is not — the
+        # share position still moves after the buy-back — so it is scored on its OWN P(all-in P&L ≥ 0), like every row.
+        own_pop = close_row.get("pop_pct") if close_row.get("keeps_shares") else None
+        close_pop = float(own_pop) if own_pop is not None else (100.0 if float(unreal or 0.0) >= 0 else 0.0)
         hold_pop_v = hold_row.get("pop_pct")
-        recov_c = _clip(50.0 + 2.0 * (close_pop - float(hold_pop_v))) if hold_pop_v is not None else (100.0 if close_pop else 35.0)
+        recov_c = (_clip(50.0 + 2.0 * (close_pop - float(hold_pop_v))) if hold_pop_v is not None
+                   else (_clip(close_pop) if own_pop is not None else (100.0 if close_pop else 35.0)))
         close_row["desk_score"] = round(0.35 * edge_c + 0.30 * risk_c + 0.20 * recov_c + 0.15 * fit_c)
         close_row["score_breakdown"] = {"edge": round(edge_c), "risk": round(risk_c), "recovery": round(recov_c), "market_fit": round(fit_c)}
 

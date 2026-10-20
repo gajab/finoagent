@@ -194,6 +194,20 @@ def test_close_is_buy_back_keeping_the_shares_and_is_priced_like_hold(provider):
     assert close["ev"] < 1000                                                 # …and nowhere near the phantom +$5,964
 
 
+def test_a_close_that_keeps_the_shares_is_scored_on_its_own_recovery_odds(provider):
+    # Buying the call back leaves the shares exposed, so the close is NOT certain: its recovery axis is its own
+    # P(all-in P&L ≥ 0) against Hold's — not the 100% a flat close gets for locking in a gain (which handed it the
+    # maximum recovery score on a position whose shares can still lose ~$6k).
+    m = _menu(_strategy())
+    close = next(a for a in m["alternatives"] if a["category"] == "exit")
+    hold = next(a for a in m["alternatives"] if a["category"] == "hold")
+    assert close["pop_pct"] is not None and 0 < close["pop_pct"] < 100
+    expect = max(0.0, min(100.0, 50.0 + 2.0 * (close["pop_pct"] - hold["pop_pct"])))
+    assert close["score_breakdown"]["recovery"] == round(expect)
+    certain = max(0.0, min(100.0, 50.0 + 2.0 * (100.0 - hold["pop_pct"])))      # the old read
+    assert close["score_breakdown"]["recovery"] < certain
+
+
 def test_every_alternative_carries_the_shares(provider):
     m = _menu(_strategy())
     hold = next(a for a in m["alternatives"] if a["category"] == "hold")
