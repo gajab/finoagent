@@ -233,7 +233,11 @@ export default function BetaStrategies({ ticker, setups, spot, drawnKey, onDraw 
     if (!n) return null;
     if (st?.loading) return 'running…';
     if (st?.err) return 'unavailable';
-    if (st?.data) { const p = n.toPanel(st.data); return `${p.badge} · ${p.subBadge}`; }
+    if (st?.data) {
+      const p = n.toPanel(st.data);
+      // momentum strategies carry a second (crash-risk) axis — never show the trend grade alone
+      return p.fragility ? `${p.badge} · Fragility ${p.fragility.flags}/4 · ${p.subBadge}` : `${p.badge} · ${p.subBadge}`;
+    }
     return null;
   };
 

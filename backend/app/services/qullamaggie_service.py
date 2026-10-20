@@ -35,6 +35,7 @@ import numpy as np
 from .microstructure_service import _r, _now_str, _safe_history
 from .trade_setup_service import _entry_style, _equity_plan, _sizing, _rr, _next_earnings
 from .day_trade_service import _opening_range, _to_date
+from .fragility_service import compute_fragility, apply_risk_overlay, two_axis_line
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +601,14 @@ def compute_qullamaggie_setups(stock) -> dict | None:
         s = _parabolic_short_setup(m, spot, atr, orange, m["_o"], m["_h"], m["_l"], m["_c"])
         if s:
             setups.append(s)
+
+        # second axis (fragility) + gap-adjusted sizing — before ranking so fragile breakouts sink below safer entries.
+        # The screen's score stays TREND quality; the summary always shows both axes.
+        frag = compute_fragility(daily)
+        for s in setups:
+            apply_risk_overlay(s, frag)
+        qual["trend_grade"], qual["trend_score"], qual["fragility"] = qual["grade"], qual["score"], frag
+        qual["summary"] = f"{two_axis_line(qual['grade'], qual['score'], frag)} {qual['summary']}"
 
         setups.sort(key=lambda s: -(s.get("score") or 0))
         for i, s in enumerate(setups):

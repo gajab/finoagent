@@ -338,6 +338,32 @@ export interface EquityPlan {
   risk_per_share: number | null; reward_per_share_t1: number | null; risk_reward: number | null;
   suggested_shares: number | null; risk_budget: number | null; sizing_basis?: string;
   dollar_risk: number | null; dollar_reward_t1: number | null; note: string;
+  /** Momentum Swing / Qullamäggie only: expected loss when stopped incl. measured gap slippage, + how the size was derived */
+  expected_loss_if_stopped?: number | null;
+  size_adjustment?: SizeAdjustment;
+}
+
+// ===== Trend-vs-Fragility overlay (Momentum Swing + Qullamäggie): a CRASH-RISK axis, not a direction call =====
+export interface FragilityComponent {
+  key: string; label: string; value: number | null; value_fmt: string;
+  cutoff: number; cutoff_fmt: string; hit: boolean; detail: string;
+}
+export interface ExitPolicy { mode: 'fast' | 'standard' | string; level: number | null; rule: string; evidence: string }
+export interface Fragility {
+  flags: number; max_flags: number; level: 'calm' | 'normal' | 'fragile' | 'extreme' | string;
+  crash_odds_pct: number; base_crash_pct: number; size_cap: number; size_cap_label: string;
+  components: FragilityComponent[]; calibrated_state: boolean; atr14: number | null; ema20: number | null;
+  exit_policy: ExitPolicy; headline: string; action: string; basis: string;
+}
+export interface SizeAdjustment {
+  base_shares: number; stop_atr_multiple: number | null; gap_overshoot: number | null; gap_adjusted_shares: number;
+  fragility_cap: number; fragility_cap_label: string; final_shares: number;
+  binding: 'fragility' | 'gap' | 'none' | string; explain: string[];
+}
+export interface RiskOverlay {
+  fragility_flags: number; fragility_level: string | null; crash_odds_pct: number | null; base_crash_pct: number;
+  size_cap: number; size_cap_label: string; stop_atr_multiple: number | null; gap_overshoot: number | null;
+  exit_policy: ExitPolicy; reduced_fresh_entry: boolean;
 }
 export interface OptionLeg { action: string; right: string; strike: number; price: number | null }
 export interface OptionsPlan {
@@ -385,6 +411,8 @@ export interface TradeSetup {
   options_plan?: OptionsPlan | null;
   options_alternatives?: OptionsAlt[];
   what_to_watch?: string[];
+  /** Momentum Swing / Qullamäggie: fragility cap, gap-adjusted sizing and the state-dependent exit rule */
+  risk_overlay?: RiskOverlay;
   edge?: {
     equity?: EquityOdds;
     /** expiry PoP + the structure's model P&L under the same market-implied odds (≈ $0 when fairly priced — NOT an edge) */
@@ -434,6 +462,8 @@ export interface QullamaggieBase { high: number; low: number; days: number; dept
 export interface QullamaggieQualification {
   is_candidate: boolean; grade: 'A' | 'B' | 'C' | '—' | string; score: number;
   checks: QullamaggieCheck[]; summary: string; passes: number;
+  /** grade/score = TREND quality; fragility = the crash-risk second axis */
+  trend_grade?: string; trend_score?: number; fragility?: Fragility | null;
 }
 export interface QullamaggieData {
   price: number | null; as_of: string; adr_pct: number | null; atr: number | null;
@@ -458,6 +488,8 @@ export interface MomentumQualification {
   is_candidate: boolean; grade: 'A' | 'B' | 'C' | '—' | string; score: number;
   checks: MomentumCheck[]; summary: string; passes: number;
   entry_mode: string | null; gates: { uptrend: boolean; leadership: boolean };
+  /** grade/score = TREND quality; fragility = the crash-risk second axis */
+  trend_grade?: string; trend_score?: number; fragility?: Fragility | null;
 }
 export interface MomentumData {
   price: number | null; as_of: string; atr: number | null; adr_pct: number | null;
@@ -4598,8 +4630,13 @@ export interface IncomeScreenParams {
   week52_pos_max?: number | null;
   sectors?: string[];
   exclude_earnings_within_days?: number | null;
+  /** Earnings play: only names reporting in this window (trading sessions); overrides the exclusion above. */
+  earnings_window?: IncomeEarningsWindow | null;
   max_results?: number;
 }
+
+export type IncomeEarningsWindow = 'today' | 'tomorrow' | 'within_2' | 'within_3' | 'within_4' | 'within_5';
+export type EarningsSlot = 'bmo' | 'amc';
 
 export interface IncomeScreenRow {
   ticker: string;
@@ -4613,6 +4650,9 @@ export interface IncomeScreenRow {
   avg_volume?: number | null;
   next_earnings?: string | null;
   days_to_earnings?: number | null;
+  earnings_timing?: EarningsSlot | null;   // calendar slot (earnings-window screens only)
+  earnings_reaction?: string | null;       // session whose open prices the print (where the crush lands)
+  earnings_estimate?: boolean | null;      // Yahoo flags the date as an estimate
 }
 
 export interface IncomeScreenResult {
@@ -4620,6 +4660,7 @@ export interface IncomeScreenResult {
   rows: IncomeScreenRow[];
   as_of?: string;
   universe_note?: string;
+  earnings_window?: { window: IncomeEarningsWindow; from: string | null; to: string | null; n_reporting: number } | null;
 }
 
 export interface IncomeVolRow {
@@ -4633,6 +4674,11 @@ export interface IncomeVolRow {
   today_pct?: number | null;
   week52_high?: number | null;
   week52_low?: number | null;
+  // Event expiry (first listed expiry after the print) — present when an earnings hint was sent
+  event_expiry?: string | null;
+  event_dte?: number | null;
+  event_iv?: number | null;        // ATM IV on the event expiry (%)
+  event_move_pct?: number | null;  // isolated implied earnings move (%), same definition the desk grades with
 }
 
 export interface IncomeEvalParams {
@@ -4640,11 +4686,13 @@ export interface IncomeEvalParams {
   min_income: number;
   min_dte: number;
   max_dte: number;
-  earnings: 'include' | 'exclude';
+  /** play = sell the print: trade the first expiry after the report (min DTE ignored, gap-aware grading forced). */
+  earnings: 'include' | 'exclude' | 'play';
   earnings_aware?: boolean;
   grades?: string[];
   quote_source?: string;
   next_earnings?: string | null;
+  earnings_timing?: EarningsSlot | null;
 }
 
 export interface IncomeEvalTrade {
@@ -4674,6 +4722,7 @@ export interface IncomeEvalTrade {
   implied_vol_pct?: number | null;
   iv_hv_ratio?: number | null;
   earnings_gap_pct?: number | null;
+  move_multiple?: number | null;   // |short strike − spot| in multiples of the implied earnings move
   desk_score?: number | null;
   algo_grade?: string | null;
   approval_odds?: string | null;
@@ -4688,6 +4737,9 @@ export interface IncomeEvalResult {
   expiration?: string | null;
   dte?: number | null;
   next_earnings?: string | null;
+  earnings_timing?: EarningsSlot | null;
+  earnings_mode?: IncomeEvalParams['earnings'];
+  event_move_pct?: number | null;
   n_candidates?: number;
   n_qualified?: number;
   trades: IncomeEvalTrade[];
@@ -5342,7 +5394,7 @@ export interface BondGapStrategy {
 }
 export interface BondGapPlan {
   as_of: string; account_type: string; min_credit: string; budget: number | null; inflation_pct: number; inflation_long_pct?: number;
-  inflation_source?: string; has_goals: boolean; retired_tax?: BondRetiredTax | null;
+  inflation_source?: string; has_goals: boolean; retired_tax?: BondRetiredTax | null; after_tax?: boolean;
   scenarios: { key: BondGapScenarioKey; label: string; short: number; long: number; rate_shift: number; story: string }[];
   current: { outcomes: Record<BondGapScenarioKey, BondGapOutcome>; cost_to_fund: { total: number } };
   gaps: { year: number; shortfall: number; need: number; real_share: number }[];
@@ -5350,7 +5402,7 @@ export interface BondGapPlan {
   breakeven_pct?: number | null;
   placement?: { year: number; note: string; rows: { account: string; label: string;
     nominal: { label: string; spendable_per_dollar: number; after_tax_pct: number | null } | null;
-    tips: { spendable_per_dollar: number; after_tax_pct: number | null } | null }[] };
+    tips: { spendable_per_dollar: number; after_tax_pct: number | null } | null }[] } | null;
   resilience: { before: BondResilience; after?: BondResilience };
   notes: string[];
 }
@@ -5359,12 +5411,16 @@ export interface BondGapPlan {
 export interface BondRebalanceParams {
   new_money?: number; new_money_account?: string; max_turnover_pct?: number; robustness?: 'expected' | 'both' | 'high' | 'all';
   min_credit?: 'govt' | 'AA' | 'A' | 'BBB'; keep_ids?: number[]; tips_max_pct?: number; type_max_pct?: number; intl_pct?: number;
-  bond_turnover_pct?: number;
+  bond_turnover_pct?: number; after_tax?: boolean;
 }
 export interface BondRebalanceSell {
   holding_id: number; label: string; kind: BondKind; ticker: string | null; cusip: string | null; account_type: string;
   fraction_pct: number; amount: number; proceeds: number; gain: number; tax_now: number; trading_cost: number;
+  /** pre-tax view only: the tax a real sale would cost, which that view leaves out */
+  tax_ignored?: number;
   total_yield_pct: number | null; after_tax_yield_pct: number | null; duration: number | null; maturity: string | null;
+  /** the yield on the view's basis: after tax (in-account inside an IRA/Roth), or the quoted yield pre-tax */
+  yield_pct?: number | null;
   is_fund: boolean; reason?: string;
 }
 export interface BondRebalanceBuy extends Omit<BondGapLine, 'why' | 'basis' | 'alternatives' | 'leg'> {
@@ -5378,10 +5434,10 @@ export interface BondFundAlternative {
 export interface BondRebalance {
   verdict: 'rebalance' | 'hold' | 'no_goals' | 'unavailable'; as_of: string; robustness: 'expected' | 'both' | 'high' | 'all';
   new_money: number; new_money_account: string; max_turnover_pct: number; min_credit: string; book_value: number; has_goals: boolean;
-  inflation_source?: string; worlds_optimized: string[];
+  inflation_source?: string; worlds_optimized: string[]; after_tax?: boolean;
   scenarios: BondGapPlan['scenarios'];
   sells: BondRebalanceSell[]; buys: BondRebalanceBuy[]; cash_left?: { account_type: string; amount: number }[]; why: string[];
-  totals?: { sold: number; bought: number; turnover_pct: number; tax_now: number; trading_cost: number; positions_sold: number; lines_bought: number };
+  totals?: { sold: number; bought: number; turnover_pct: number; tax_now: number; tax_ignored?: number; trading_cost: number; positions_sold: number; lines_bought: number };
   by_account?: { account_type: string; value: number; sold: number; bought: number; new_money: number }[];
   outcomes?: { before: Record<BondGapScenarioKey, BondGapOutcome>; after: Record<BondGapScenarioKey, BondGapOutcome> };
   book?: { before: Record<string, number | null>; after: Record<string, number | null> };
@@ -5396,4 +5452,260 @@ export interface BondRebalance {
   limits?: { tips_max_pct: number; type_max_pct: number; intl_pct: number; bond_turnover_pct: number; intl_target: number;
              intl_funds: { ticker: string; name: string; what: string; share: number; yield_pct: number; duration: number | null; expense_ratio_pct: number | null }[] };
   notes: string[];
+}
+
+
+// ===== Concentration ladder =====
+export interface LadderLotInput { shares: number; cost_basis: number }
+export interface LadderPositionInput { ticker: string; lots: LadderLotInput[] }
+export interface LadderRequest {
+  positions: LadderPositionInput[];
+  tax: { st_rate_pct: number; lt_rate_pct: number };
+  mode: 'budget' | 'deferral';
+  annual_gain_budget: number | null;
+  horizon_years: number; num_rungs: number; floor_pct: number; coverage_pct: number;
+  straddle_defers_put_loss: boolean;
+  execution: 'listed' | 'flex'; flex_spread_vol_pts: number;
+  stance: 'protect' | 'balanced' | 'income'; max_loss_pct: number; call_prob_pct: number;
+}
+export interface LadderLeg { strike: number; bid: number; ask: number; mid: number; iv: number | null; oi: number; volume: number; spread_pct: number | null; pct_of_spot: number }
+export interface LadderScenario { move_pct: number; price: number; called: boolean; tax_this_year: number; after_tax_value: number; unhedged_after_tax: number; vs_unhedged: number }
+export interface LadderMenuRow {
+  id: string; name: string; kp: number | null; kp2: number | null; kc: number; net_credit_per_share: number;
+  tax_funding_pct: number; protection_pct: number; upside_capture_pct: number; p_called_pct: number; stress_loss_pct: number;
+  constructive_risk: 'low' | 'elevated' | 'high'; score: number; eligible: boolean; recommended: boolean;
+}
+export interface LadderOverlayOption {
+  target_delta: number; delta: number; strike: number; cap_pct: number; bid: number; expiry: string; dte: number; iv_pct: number;
+  p_assign_cycle_pct: number; p_assign_12m_pct: number; annual_yield_pct_if_never_assigned: number; shares: number;
+  premium_per_year: number; after_tax_premium_per_year: number; tax_if_assigned: number; funds_pct_of_assignment_tax: number | null;
+}
+export interface LadderOverlay { outside_ladder: boolean; shares: number; options: LadderOverlayOption[]; note: string }
+export interface LadderRung {
+  expiry: string; dte: number; tax_year: number; shares: number; contracts: number; avg_basis: number;
+  lots: { basis: number; shares: number }[]; put: LadderLeg | null; put2: LadderLeg | null; call: LadderLeg;
+  structure: { id: string; name: string }; menu: LadderMenuRow[]; tax_funding_pct: number | null; protection_pct: number | null;
+  stress_loss_pct: number; stress_pct: number; tax_note: string;
+  net_credit_per_share: number; net_credit_total: number; zero_cost: boolean;
+  floor_pct: number | null; cap_pct: number; band_pct: number | null;
+  constructive_sale: { risk: 'low' | 'elevated' | 'high'; note: string };
+  density: string; p_called_pct: number; p_floor_breach_pct: number; max_loss_vs_spot_pct: number | null;
+  worst_case_gain: number; worst_case_tax: number; expected_gain: number; expected_tax: number;
+  put_tax_character: string; scenarios: LadderScenario[]; flags: string[];
+  venue: 'Listed' | 'FLEX/OTC';
+  rfq: null | { underlying: string; contracts: number; shares: number; expiry: string; style: string; settlement: string; structure: string;
+    reference_spot: number; buy_put: { strike: number; indicative_ask: number } | null; sell_put: { strike: number; indicative_bid: number } | null;
+    sell_call: { strike: number; indicative_bid: number }; indicative_net_per_share: number; ask_for: string };
+}
+export interface LadderTimingFactor { name: string; weight: number; score: number; points: number; note: string }
+export interface LadderTiming {
+  verdict: 'PUT_ON_NOW' | 'STAGGER' | 'WAIT' | 'JUST_SELL' | 'NOT_APPLICABLE';
+  score: number | null; headline: string; factors: LadderTimingFactor[]; triggers: string[];
+}
+export interface LadderPosition {
+  ticker: string; spot?: number; error?: string;
+  summary?: { shares: number; gain_shares: number; covered_shares: number; avg_basis_gain_lots: number; market_value: number;
+    unrealized_gain: number; gain_pct: number; tax_if_sold_today: number; underwater_shares: number; underwater_loss: number };
+  timing?: LadderTiming; ladder?: LadderRung[]; notes?: string[]; overlay?: LadderOverlay | null;
+  context?: { atm_iv_pct: number | null; hv30_pct: number | null; iv_hv_ratio: number | null; skew_pts: number | null;
+    next_earnings: string | null; rsi14: number | null; vs_200d_pct: number | null; off_high_pct: number | null };
+}
+export interface LadderYear {
+  year: number; rungs: number; tickers: string[]; worst_case_gain: number; worst_case_tax: number;
+  expected_gain: number; expected_tax: number; budget: number | null; headroom: number | null; within_budget: boolean | null;
+}
+export interface LadderResponse {
+  success: boolean; as_of: string; mode: string; horizon_years: number;
+  positions: LadderPosition[]; by_year: LadderYear[];
+  deferral: { tax_if_sold_today: number; pv_value_of_deferral: number; basis: string };
+  roll_plan: { ticker: string; review_on: string; expiry: string; action: string }[];
+  assumptions: Record<string, any>; disclaimer: string; warnings: string[];
+  income: { net_premium_total: number; tax_if_all_called: number; funding_pct: number; after_tax_net_premium: number; note: string };
+  execution: 'listed' | 'flex'; execution_guide: { venue: string; who: string; notes: string }[];
+}
+
+// ---------------------------------------------------------------------------
+// Selloff Monitor — /api/market/selloff-monitor (deterministic, no LLM)
+// ---------------------------------------------------------------------------
+export type SelloffTone = 'stress' | 'watch' | 'calm';
+export interface SelloffFanPoint {
+  h: number; date?: string; p10: number; p25: number; p50: number; p75: number; p90: number; sigma_pct?: number;
+}
+export interface SelloffHorizonStats {
+  n: number; p_up: number; p_up_ci: [number, number]; median_pct: number; mean_pct: number;
+  p10_pct: number; p90_pct: number; baseline_p_up: number; baseline_median_pct: number;
+  edge_pts: number; significant: boolean;
+  p_up_ci_episode?: [number, number] | null; z?: number; p_holm?: number; strength?: 'strong' | 'suggestive' | 'none';
+  wilson_significant?: boolean; p_up_shrunk?: number;
+}
+export interface SelloffSkillScore { n: number; bss_raw: number | null; lo: number | null; hi: number | null; bss_shrunk: number | null; hit_rate_up?: number }
+export interface SelloffCalibration {
+  available: boolean; reason?: string; k?: number; horizon?: number; m?: number | null; m_is_inf?: boolean;
+  tuned_on?: string; evaluated_on?: string; n_origins?: number; n_test_all?: number; n_test_stress?: number;
+  skill?: Record<string, { all: SelloffSkillScore; stress: SelloffSkillScore; badge: 'skill' | 'no_skill' | 'worse' | 'insufficient' }>;
+  coverage?: Record<string, Record<'all' | 'stress', { n: number; analog_p10_p90: number | null; vix_cone_p10_p90: number | null; vix_cone_1sd: number | null }>>;
+  fan_factor?: Record<string, Record<'all' | 'stress', { factor: number; n_tune: number; test_coverage_raw: number | null; test_coverage_calibrated: number | null; n_test: number } | null>>;
+  method?: string;
+}
+export interface SelloffAnalogMatch {
+  date: string; distance: number; ret3_pct: number; move3_sigma: number; dist_200d: number;
+  drawdown_52w: number; vix: number; fwd5_pct: number; fwd20_pct: number; worst20_pct: number;
+}
+export interface SelloffAnalogPath {
+  p_new_low_5d: number; p_new_low_5d_ci: [number, number]; baseline_p_new_low_5d: number | null;
+  p_reclaim_pre_move_20d: number; p_reclaim_pre_move_20d_ci: [number, number]; baseline_p_reclaim_pre_move_20d: number | null;
+  worst_close_20d_median_pct: number; worst_close_20d_p10_pct: number;
+  baseline_worst_close_20d_median_pct: number | null; baseline_worst_close_20d_p10_pct: number | null;
+  baseline_note: string;
+  first_passage: { barrier_pct: number; up_first: number; down_first: number; neither: number;
+    baseline_up_first: number; baseline_down_first: number };
+}
+export interface SelloffAnalogs {
+  available: boolean; reason?: string; n?: number; k_target?: number; horizon?: number; since?: string; through?: string;
+  median_distance?: number; fan_pct?: SelloffFanPoint[]; fan_pct_raw?: SelloffFanPoint[]; fan_calibrated?: boolean;
+  fan_factor?: { h1: number; h5: number; h20: number; regime: 'stress' | 'all' } | null;
+  filter_baseline?: Record<string, { n: number; p_up: number | null }>;
+  era?: Record<'pre_2000' | 'from_2000', { n: number; p_up_h5: number | null; p_up_h20: number | null }>;
+  episodes?: { n: number; gap_sessions: number; decades: Record<string, number>; largest: number };
+  quality?: { kth_distance: number; percentile: number | null };
+  calibration?: SelloffCalibration | null;
+  stats?: Record<string, SelloffHorizonStats>; path?: SelloffAnalogPath; matches?: SelloffAnalogMatch[]; method?: string;
+}
+export interface SelloffConePoint {
+  expiration: string; days: number; straddle: number; sigma_total_pct: number; sigma_annual_pct: number;
+  price_source: 'mid' | 'last';
+}
+export interface SelloffStressCell {
+  date: string; value: number | null; change: number | null; z: number | null; stress: number | null; obs_date?: string | null;
+}
+export interface SelloffStressRow {
+  symbol: string; label: string; kind: 'pct' | 'pts' | 'bp' | 'ratio'; stress_sign: number;
+  cells: SelloffStressCell[]; now: SelloffStressCell | null;
+  window: { change: number | null; z: number | null; stress: number | null };
+  note?: string; as_of?: string;
+}
+export interface SelloffDiagnosis {
+  label: string; tone: SelloffTone; summary: string; rules: string;
+  points: { lens: string; value: string; tone: SelloffTone }[];
+}
+export interface SelloffTell {
+  id: string; side: 'continuation' | 'recovery'; label: string; status: 'met' | 'not_met' | 'watch';
+  detail: string; basis: string; level?: number | null; distance_pct?: number | null; value?: number | null; threshold?: number | null;
+  unit?: string; evidence?: { grade: string; note: string; ref?: string };
+}
+export type EvidenceGrade = 'strong' | 'moderate' | 'weak' | 'folklore';
+export interface SelloffEvidenceItem {
+  id: string; grade: EvidenceGrade; signal: string; finding: string; on_page: string; sources: { label: string; url: string }[];
+}
+export interface SelloffEvidence {
+  bottom_line: string;
+  own_test: { badge: 'skill' | 'no_skill' | 'worse' | 'insufficient'; bss: number; lo: number | null; hi: number | null; n: number;
+    evaluated_on: string; analog_fan_coverage: number | null; vix_cone_coverage: number | null } | null;
+  grades: Record<EvidenceGrade, string>;
+  items: SelloffEvidenceItem[];
+  report: { title: string; available: boolean; sources_note: string };
+}
+export interface SelloffContextNote { id: string; label: string; detail: string; flip?: number | null; flip_distance_pct?: number | null; evidence?: { grade: string; note: string } }
+export interface SelloffLevel { id: string; label: string; price: number; kind: 'recovery' | 'continuation' | 'trend' | 'dealer' }
+export interface SelloffFutures { trading: boolean; ref?: number; last?: number; change_pct?: number; as_of?: string }
+export interface SelloffMonitorData {
+  available: boolean; reason?: string; as_of: string; last_session: string; window_sessions: number;
+  state: {
+    index_close: number; index_date: string; spy_close: number; spy_date: string;
+    ret1_pct: number | null; ret3_pct: number | null; ret5_pct: number | null;
+    move1_sigma: number | null; move3_sigma: number | null; sigma_daily_pct: number | null;
+    drawdown_52w: number | null; dist_200d: number | null; dist_50d: number | null;
+    vix: number | null; vix_ratio: number | null; hy_oas: number | null; hy_oas_as_of: string | null; hy_oas_window_bp: number | null;
+    dealer: { sign: 'long' | 'short' | null; net_gex_millions: number | null; flip: number | null; put_support: number | null;
+      call_resistance: number | null; hvl: number | null; as_of: string | null } | null;
+    recent: { date: string; ret_pct: number | null; sigma: number | null }[];
+    momentum_panic_state?: { on: boolean; ret_24m_pct: number | null; var126_pct_rank: number | null; note: string };
+  };
+  stress: {
+    sessions: string[]; window_sessions: number; z_lookback: number;
+    groups: { group: string; rows: SelloffStressRow[] }[]; diagnosis: SelloffDiagnosis;
+    credit_model?: { beta_bp_per_pct: number | null; expected_bp: number | null; actual_bp: number | null; excess_bp: number | null;
+      excess_z: number | null; days: number; as_of: string; stale: boolean } | null;
+    fts?: { kappa: number; rho_1y: number | null; q_threshold: number | null; days: string[] } | null;
+  };
+  analogs: SelloffAnalogs;
+  options_cone: { available: boolean; reason?: string; points?: SelloffConePoint[]; fan_pct?: SelloffFanPoint[]; method?: string };
+  chart: {
+    history: { date: string; close: number }[]; anchor: { date: string; close: number }; forward_dates: string[];
+    history_fan: SelloffFanPoint[] | null; options_fan: SelloffFanPoint[] | null; levels: SelloffLevel[];
+    spy_implied_open: number | null;
+  };
+  overnight: { available: boolean; spy_implied?: number; es?: SelloffFutures; nq?: SelloffFutures };
+  tells: SelloffTell[];
+  context_notes?: SelloffContextNote[];
+  evidence?: SelloffEvidence;
+  events: { date: string; label: string; note: string }[];
+  read: string[];
+}
+
+// Selloff Monitor Phase 2 — /api/market/selloff-monitor/internals (breadth + anatomy)
+export interface BreadthPoint {
+  date: string; pct20: number | null; pct50: number | null; pct200: number | null; nh: number; nl: number;
+  adv: number; dec: number; up_vol_pct: number | null; zweig: number | null;
+}
+export interface BreadthData {
+  available: boolean; reason?: string; n_stocks?: number;
+  last?: BreadthPoint & { pct20_before: number | null; pct50_before: number | null; pct200_before: number | null };
+  window?: { sessions: number; n: number; pct_down: number | null; median_pct: number | null; mean_pct: number | null; nh_sum: number; nl_sum: number };
+  series?: BreadthPoint[]; ninety_pct_days?: { date: string; kind: 'up' | 'down'; up_vol_pct: number }[];
+  zweig_thrust_on?: string | null; state?: 'washout' | 'overbought' | 'neutral';
+  thresholds?: { washout_20d: number; overbought_20d: number; zweig_low: number; zweig_high: number; note: string };
+}
+export interface AnatomySector {
+  symbol: string; name: string; gics: string; ret_pct: number | null; z: number | null; vs_spy_pts: number | null;
+  members: number; pct_down: number | null; median_member_pct: number | null;
+}
+export interface AnatomyFactor {
+  id: string; label: string; long: string[]; short: string[]; negative_means: string; spread_pts: number | null; z: number | null;
+}
+export interface AnatomyHolding { symbol: string; name: string; weight_pct: number; ret_pct: number; contribution_pts: number }
+export interface AnatomyMover { symbol: string; name: string; sector: string | null; ret_pct: number }
+export interface AnatomyLabel { id: string; label: string; why: string }
+export interface AnatomyData {
+  available: boolean; reason?: string; window_sessions?: number;
+  spy?: { ret_pct: number | null; z: number | null };
+  sectors?: AnatomySector[]; factors?: AnatomyFactor[];
+  concentration?: { holdings: AnatomyHolding[]; weight_pct: number; contribution_pts: number; index_ret_pct: number; rest_pts: number; note: string } | null;
+  movers?: { losers: AnatomyMover[]; gainers: AnatomyMover[] };
+  classification?: { primary: AnatomyLabel; also: AnatomyLabel[]; context: { sectors_down: number; pct_stocks_down: number | null }; rules: string;
+    evidence?: { grade: string; note: string } };
+}
+export interface SelloffInternalsData {
+  available: boolean; reason?: string; as_of?: string; last_session?: string | null;
+  breadth: BreadthData; anatomy: AnatomyData; tells: SelloffTell[]; read: string[];
+}
+
+// Selloff Monitor Phase 3 — /api/market/selloff-monitor/book (the user's open trades under the tape)
+export interface BookDist {
+  n: number; p10: number; p50: number; p90: number; mean: number; p_loss: number;
+  worst: number; worst_date: string; best: number; best_date: string;
+}
+export interface BookHorizon {
+  h: number; days: number;
+  history: BookDist & { points: { date: string; mkt_pct: number; vix_ratio: number; pnl: number }[] };
+  history_with_stock?: BookDist;
+  options: { q: 'p10' | 'p50' | 'p90'; mkt_pct: number; iv_scale: number; pnl: number }[];
+  vol_rule: { a: number; b: number; n: number; r2: number | null } | null;
+}
+export interface BookTradeRow {
+  trade_id: number | null; name: string | null; ticker: string; purpose: string; beta: number; spot: number; capital: number | null;
+  nearest_short: { strike: number; right: 'P' | 'C'; exp?: string; distance_pct: number; z: number | null; itm: boolean } | null;
+  pnl_bad?: number; breached_bad?: string[]; pnl_good?: number; breached_good?: string[];
+}
+export interface SelloffBookData {
+  available: boolean; stored?: boolean; reason?: string; as_of?: string; monitor_session?: string; quote_source?: string;
+  indicative?: boolean; focus_h?: number; horizons?: BookHorizon[];
+  levels?: { id: string; label: string; h: number; mkt_pct: number; pnl: number }[];
+  curve?: { h: number; days: number; points: { mkt_pct: number; pnl: number }[] };
+  bad_case_mkt_pct?: number | null; good_case_mkt_pct?: number | null;
+  trades?: BookTradeRow[]; by_purpose_bad?: Record<string, number>;
+  exposures?: { beta_delta_spy: number | null; dollar_delta_per_1pct: number; gamma_per_1pct_sq: number; theta_per_day: number;
+    vega_per_pt: number; capital: number; short_legs: number };
+  has_covered_stock?: boolean; assumptions?: string[]; read?: string[];
+  coverage?: { requested: number; analysed: number; skipped: { trade_id: number | null; ticker: string | null; reason: string }[] };
 }

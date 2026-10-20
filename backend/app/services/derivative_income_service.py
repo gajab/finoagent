@@ -1153,7 +1153,8 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
 
     if right == "C":
         cushion_pct = (q.strike - spot) / spot * 100
-        breakeven = round(spot - q.mid, 2)                 # position breakeven (downside)
+        # Covered: stock + short call → loses below spot − premium. Naked: no stock → loses above strike + premium.
+        breakeven = round(spot - q.mid, 2) if covered else round(q.strike + q.mid, 2)
         if_assigned = ((q.strike - spot) + q.mid) / spot * 100   # capped gain + premium
         total_ann = premium_ann
         # covered = premium alpha on the held stock; naked = AROM excess over the SOFR benchmark

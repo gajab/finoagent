@@ -8,6 +8,7 @@ import assert from 'assert';
 import BetaTechnical from '../../../src/beta/ta/BetaTechnical';
 import { tradeOdds } from '../../../src/beta/ta/firstPassage';
 import * as F from '../preview/fixtures';
+import momentumFragile from '../preview/momentumFragile.json';   // REAL engine on a synthetic 4/4-fragile series (gen_momentum_fragile_fixture.py)
 
 const g: any = globalThis;
 let passed = 0;
@@ -32,7 +33,7 @@ function installFetch(net: Net) {
     if (url.includes('/candles')) return reply(F.candles(new URL(url, 'http://x').searchParams.get('interval') || '1d'));
     if (url.includes('/trade-setups')) return reply(net.setups(url));
     if (url.includes('/trader-strategies')) return reply(net.traders ? net.traders(url) : F.traderStrategies);
-    if (url.includes('/momentum-setup')) return reply({ ticker: 'NVDA', momentum_setup: MOMENTUM });
+    if (url.includes('/momentum-setup')) return reply(g.__momentum || { ticker: 'NVDA', momentum_setup: MOMENTUM });
     if (url.includes('/day-trade-setups')) return reply(F.dayTradeSetups);
     if (url.includes('/dealer-positioning')) { const d: any = clone(F.dealer); if (url.includes('/AAA/')) d.dealer_positioning.gamma_levels.call_resistance.strike = 9999; return reply(d); }
     if (url.includes('/market-structure')) return reply(F.marketStructure);
@@ -312,7 +313,7 @@ async function main() {
     // named screens are lazy and show their state on the tile
     assert.equal(count(net.log, '/momentum-setup'), 0);
     await click(m.container, /./, '[data-tile="momentum"]'); await settle(250);
-    assert.equal(count(net.log, '/momentum-setup'), 1); has(m.text(), 'Momentum Swing', 'Stage-2 uptrend'); has(tile('momentum').textContent || '', 'Grade B');
+    assert.equal(count(net.log, '/momentum-setup'), 1); has(m.text(), 'Momentum Swing', 'Stage-2 uptrend'); has(tile('momentum').textContent || '', 'Trend B');
     await click(m.container, /./, '[data-tile="swing"]'); await click(m.container, /./, '[data-tile="momentum"]'); await settle(100);
     assert.equal(count(net.log, '/momentum-setup'), 1); ok('a named screen runs when its tile is picked, once, and its grade shows on the tile afterwards');
     await m.unmount();
@@ -344,6 +345,32 @@ async function main() {
     await click(m.container, /^Strategies/); await m.rerender('BBB'); await settle(900);
     const t = m.text(); lacks(t, '15 bullish'); has(t, `${(F.traderStrategies.trader_strategies as any).consensus.bull} bullish`);
     ok('switching ticker while the rule-sets run never shows the previous ticker\'s consensus'); await m.unmount();
+  }
+
+  // ── second axis: a 4/4-fragile momentum read never shows a lone grade ──
+  {
+    reset(); g.__momentum = momentumFragile; const net = newNet(); installFetch(net); const m = await mount(); await settle(300);
+    await click(m.container, /^Strategies/); await settle(300);
+    await click(m.container, /./, '[data-tile="momentum"]'); await settle(300);
+    const q: any = (momentumFragile as any).momentum_setup.qualification;
+    assert.equal(q.fragility.flags, 4, 'fixture is 4/4 fragile');
+    const tileText = (m.container.querySelector('[data-tile="momentum"]') as HTMLElement).textContent || '';
+    has(tileText, `Trend ${q.grade}`, 'Fragility 4/4');
+    const t = m.text();
+    has(t, `Trend ${q.grade} (${q.score}/100) · Fragility 4/4 extreme`, '24.8% crash', 'Fragility — the second axis (crash risk, not direction)');
+    for (const c of q.fragility.components) has(t, c.label, c.value_fmt);          // every input visible, collapsed
+    const vol = q.fragility.components.find((c: any) => c.key === 'vol');
+    await click(m.container, /Realized volatility \(20d, annualized\)/); await settle(40);
+    has(m.text(), `fragile if ≥ ${vol.cutoff_fmt}`, 'Std-dev of the last 20 daily returns');  // …and explained when opened
+    has(t, 'Action:', 'Size capped at ⅓', 'Exit:', 'first daily CLOSE below the 20-day EMA');
+    ok('tile + panel show Trend AND Fragility, every fragility input with its value and cutoff, the size cap and the exit rule');
+    const setups: any[] = (momentumFragile as any).momentum_setup.setups;
+    assert(setups.length >= 2 && setups.every(s => s.direction === 'long'), 'fixture has live long setups');
+    assert.equal((t.match(/Fragile 4\/4 · ⅓ size · 20-EMA exit/g) || []).length, setups.length, 'every long setup carries the fragile pill');
+    has(t, 'Gap-adjusted:', 'Fragility 4/4 cap ⅓', 'Expected loss if stopped, incl. typical gap slippage');
+    for (const s of setups) has(t, `${s.equity_plan.suggested_shares}`);
+    ok('each setup card shows the fragile pill and how its size was derived (base → gap-adjusted → ⅓ cap) and the expected loss if stopped');
+    g.__momentum = undefined; await m.unmount();
   }
 
   // ── leaving ──

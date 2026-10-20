@@ -11,6 +11,7 @@ Caching strategy
   an AI briefing hit the /overview/narrative or /sectors/narrative endpoints.
 """
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -37,6 +38,8 @@ from ..services.pick_shovel_service import (
     refine_recommendations,
 )
 from ..services.liquidity_service import get_liquidity_dashboard, _llm_liquidity_narrative
+from ..services.selloff_monitor_service import get_selloff_monitor
+from ..services.market_internals_service import fetch_constituents, get_market_internals
 from ..services.business_cycle_service import get_business_cycle
 from ..services.cycle_sector_ta_service import get_cycle_sectors_ta
 from ..services.cache_service import get_cached, set_cached
@@ -564,6 +567,184 @@ async def liquidity_narrative(
     except Exception as exc:
         logger.exception("Liquidity narrative failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Narrative failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Selloff Monitor — continuation vs recovery (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+# Bump the version whenever the payload shape changes (old-shape blobs render nothing).
+_SELLOFF_CACHE_KEY = "market:selloff:v3"   # v3: + evidence panel, calibration, context notes (v2: analogs.outcomes)
+_SPY_DEALER_CACHE_KEY = "dealergex:SPY:v1"   # SAME entry the per-ticker dealer panel uses
+_SELLOFF_LOCK = asyncio.Lock()               # cold cache: one build, the rest wait and reuse it
+
+
+async def _monitor_payload(db: AsyncSession, refresh: bool = False) -> dict:
+    """The Selloff Monitor payload — cached, built at most once at a time. Shared by the monitor endpoint
+    and the book view, so the book is replayed on EXACTLY the scenarios the page shows."""
+    if not refresh:
+        cached = await get_cached(db, _SELLOFF_CACHE_KEY)
+        if cached:
+            return cached
+    async with _SELLOFF_LOCK:
+        if not refresh:
+            cached = await get_cached(db, _SELLOFF_CACHE_KEY)
+            if cached:
+                return cached
+        dealer = await get_cached(db, _SPY_DEALER_CACHE_KEY)
+        if dealer is None:
+            try:
+                import yfinance as yf
+                from ..services.dealer_positioning_service import compute_dealer_positioning
+                dealer = await asyncio.to_thread(lambda: compute_dealer_positioning(yf.Ticker("SPY")))
+                if dealer:
+                    await set_cached(db, _SPY_DEALER_CACHE_KEY, dealer, ttl_seconds=_TTL_PRICE)
+            except Exception as exc:  # dealer levels are optional context
+                logger.warning("Selloff monitor: SPY dealer positioning failed: %s", exc)
+                dealer = None
+        result = await get_selloff_monitor(dealer)
+        if result.get("available"):
+            await set_cached(db, _SELLOFF_CACHE_KEY, result, ttl_seconds=_TTL_PRICE)
+        return result
+
+
+@router.get("/selloff-monitor")
+async def selloff_monitor(
+    refresh: bool = Query(False, description="Recompute instead of serving the 15-min cache"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """State strip, cross-asset stress grid, history-vs-options fan and next-session tells.
+    Cached 15 min. DB ops stay sequential (one AsyncSession); network + compute run in threads."""
+    try:
+        return await _monitor_payload(db, refresh)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Selloff monitor failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Selloff monitor failed: {exc}") from exc
+
+
+@router.get("/selloff-monitor/evidence/report")
+async def selloff_evidence_report(user: User = Depends(get_current_user)):
+    """The literature review behind the page's evidence grades (markdown, shipped with the app)."""
+    from ..services.selloff_evidence import REPORT_TITLE, report_markdown
+    md = report_markdown()
+    if not md:
+        raise HTTPException(status_code=404, detail="The research report is not available on this server.")
+    return {"title": REPORT_TITLE, "markdown": md, "words": len(md.split())}
+
+
+# Phase 3 — the user's own book under this tape. Needs live option quotes for every open trade (like
+# Manage Book's Refresh), so it only runs on an explicit request; page load returns the stored snapshot.
+_SELLOFF_BOOK_TTL = 900
+_VALID_QUOTE_SOURCES = {"yfinance", "ibkr"}
+
+
+def _selloff_book_key(user_id: int) -> str:
+    return f"market:selloff:book:v1:{user_id}"
+
+
+@router.get("/selloff-monitor/book")
+async def selloff_book(
+    quote_source: str = Query("yfinance"),
+    refresh: bool = Query(False, description="Reprice the open trades from live quotes (else the stored snapshot)"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every open option trade replayed through the monitor's scenarios (historical analog outcomes with
+    their actual VIX path, the options-implied range, the tell levels): book P&L distribution, exposures,
+    per-trade bad/good case and breached short strikes."""
+    key = _selloff_book_key(user.id)
+    if not refresh:
+        stored = await get_cached(db, key)
+        return {**stored, "stored": True} if stored else {"available": False, "stored": False}
+    if quote_source not in _VALID_QUOTE_SOURCES:
+        raise HTTPException(status_code=400, detail="quote_source must be yfinance or ibkr")
+    from sqlalchemy import select
+    from ..models import SavedStrategy
+    from .saved_strategy_router import _book_purpose
+    from ..services.selloff_book_service import compute_book_under_tape
+
+    monitor = await _monitor_payload(db)
+    if not monitor.get("available"):
+        raise HTTPException(status_code=503, detail="The selloff monitor has no market read right now.")
+    rows = list((await db.execute(select(SavedStrategy).where(
+        SavedStrategy.user_id == user.id, SavedStrategy.trade_status == "active"))).scalars().all())
+    if not rows:
+        return {"available": False, "stored": False, "reason": "No open trades in My Trades to run through the scenarios."}
+    purpose_of = {s.id: _book_purpose(s) for s in rows}
+    try:
+        res = await compute_book_under_tape(rows, purpose_of, quote_source, user, db, monitor)
+    except Exception as exc:
+        logger.exception("Selloff book failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Book scenarios failed: {exc}") from exc
+    if res.get("available"):
+        await set_cached(db, key, res, ttl_seconds=_SELLOFF_BOOK_TTL)
+    return {**res, "stored": False}
+
+
+# Phase 2 — market internals (breadth + anatomy). Scans ~500 stocks (~20 s, ≈+40 MB peak), so it is a
+# separate lazily-loaded endpoint: one scan at a time, cached, and refresh can't re-scan more often
+# than every 5 minutes.
+_INTERNALS_CACHE_KEY = "market:selloff:internals:v1"
+_CONSTITUENTS_CACHE_KEY = "market:sp500:constituents:v1"
+_TTL_CONSTITUENTS = 7 * 86400
+_INTERNALS_MIN_REFRESH_S = 300
+_INTERNALS_LOCK = asyncio.Lock()
+
+
+def _internals_ttl(now_et=None) -> int:
+    """30 min while US equities trade (breadth moves intraday), 6 h otherwise (closing basis)."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from ..services.selloff_monitor_service import is_session
+
+    now_et = now_et or _dt.datetime.now(ZoneInfo("America/New_York"))
+    open_now = is_session(now_et.date()) and _dt.time(9, 30) <= now_et.time() <= _dt.time(16, 30)
+    return 1800 if open_now else 21600
+
+
+def _fresh_enough(payload: dict | None, max_age_s: int) -> bool:
+    import datetime as _dt
+    try:
+        built = _dt.datetime.strptime(payload["as_of"], "%Y-%m-%d %H:%M")
+    except Exception:
+        return False
+    return (_dt.datetime.now() - built).total_seconds() < max_age_s
+
+
+@router.get("/selloff-monitor/internals")
+async def selloff_internals(
+    refresh: bool = Query(False, description="Re-scan (ignored if the cached scan is under 5 minutes old)"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Breadth (S&P 500 participation, highs/lows, up-volume, Zweig) + anatomy (sectors, factor
+    spreads, mega-cap concentration, movers, selloff type) + extra tells/read lines."""
+    cached = await get_cached(db, _INTERNALS_CACHE_KEY)
+    if cached and (not refresh or _fresh_enough(cached, _INTERNALS_MIN_REFRESH_S)):
+        return cached
+    async with _INTERNALS_LOCK:
+        cached = await get_cached(db, _INTERNALS_CACHE_KEY)
+        if cached and (not refresh or _fresh_enough(cached, _INTERNALS_MIN_REFRESH_S)):
+            return cached
+        constituents = await get_cached(db, _CONSTITUENTS_CACHE_KEY)
+        if not constituents:
+            try:
+                constituents = await fetch_constituents()
+            except Exception as exc:
+                logger.warning("S&P 500 constituents fetch failed: %s", exc)
+                raise HTTPException(status_code=503, detail="S&P 500 member list unavailable right now.") from exc
+            await set_cached(db, _CONSTITUENTS_CACHE_KEY, constituents, ttl_seconds=_TTL_CONSTITUENTS)
+        try:
+            result = await get_market_internals(constituents)
+        except Exception as exc:
+            logger.exception("Market internals failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Market internals failed: {exc}") from exc
+        if result.get("available"):
+            await set_cached(db, _INTERNALS_CACHE_KEY, result, ttl_seconds=_internals_ttl())
+        return result
 
 
 # ---------------------------------------------------------------------------

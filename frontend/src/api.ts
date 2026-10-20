@@ -1,4 +1,4 @@
-import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, DeskReviewResult, DeskAgentsResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight } from './types';
+import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, DeskReviewResult, DeskAgentsResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight, LadderRequest, LadderResponse } from './types';
 import type { BondMarket, BondCatalogue, BondLookup, BondProfile, BondHoldingInput, BondPortfolio, BondCashFlow, BondLadderParams, BondLadderResult, TipsLadderResult, BondSimulation, BondLadderSaved, BondPlan, BondCalcResult, BondYieldMenu, BondStatus, BondPreview, BondFilters, BondWithdrawalMode, BondBuyParams, BondBuyPlan, BondGapParams, BondGapPlan, BondRebalanceParams, BondRebalance } from './types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
@@ -899,7 +899,7 @@ export async function screenIncomeUniverse(params: import('./types').IncomeScree
   return apiFetch('/api/stock/strategies/income-screener/screen', { method: 'POST', body: JSON.stringify(params) });
 }
 
-export async function fetchIncomeVolMetrics(items: { ticker: string; price?: number | null }[]): Promise<import('./types').IncomeVolRow[]> {
+export async function fetchIncomeVolMetrics(items: { ticker: string; price?: number | null; next_earnings?: string | null; earnings_timing?: string | null }[]): Promise<import('./types').IncomeVolRow[]> {
   return apiFetch('/api/stock/strategies/income-screener/vol-metrics', { method: 'POST', body: JSON.stringify({ items }) });
 }
 
@@ -1238,6 +1238,13 @@ export async function computeConcentration(params: {
   return apiFetch<any>(`/api/stock/${encodeURIComponent(params.ticker)}/strategies/concentration`, {
     method: 'POST',
     body: JSON.stringify(params),
+  });
+}
+
+export async function computeConcentrationLadder(req: LadderRequest): Promise<LadderResponse> {
+  return apiFetch<LadderResponse>('/api/stock/concentration-ladder', {
+    method: 'POST',
+    body: JSON.stringify(req),
   });
 }
 
@@ -1954,6 +1961,8 @@ export interface BookTailRiskResult {
   hedge_plan?: HedgePlan | null;
   // Hedges built on the nearest ETFs to the book's holdings (put on the ETF, funded by a sold call / lower put).
   etf_hedges?: EtfHedges | null;
+  // Money deployed the way My Trades shows it (stock held for stock-backed trades, else the app's Reg-T margin) — Income options trades only.
+  deployed_reg_t?: number;
   // What the engine actually analysed vs left out (a tagged trade can yield no position: stock-only, closed options, no price).
   coverage?: { requested: number; analysed: number; skipped: { trade_id: number | null; ticker: string | null; reason: string }[] };
   // Where each leg's IV came from: the chain (cross-checked against its price), re-solved from the price (junk/missing chain IV —
@@ -1976,6 +1985,7 @@ export interface BookTailRiskResult {
           recommended: RemediationLeg; alt?: RemediationLeg | null;
           short?: { strike: number; right: string; qty: number } | null;   // targeted short leg — always closeable
           stress?: { market_move_pct: number; beta: number; name_move_pct: number; vol_shock_pts: number };   // the move behind `tail_before`
+          protected?: boolean;   // this side is already a defined-risk spread (a long caps the short) — nothing to buy, only close
         }[];
       };
     }[];
@@ -2016,7 +2026,11 @@ export interface RepairAlternative {
   ev?: number | null;                                    // E[P&L] under the lognormal law
   d_pop?: number | null; d_max_loss?: number | null; d_ev?: number | null;   // vs the Hold baseline
   turns_profitable: boolean;
-  legs?: { action: string; right: string; strike: number; qty: number; dte_days: number | null; expiry?: string | null }[];
+  legs?: { action: string; right: string; strike: number; qty: number; dte_days: number | null; expiry?: string | null; price?: number }[];
+  // WHAT TO DO, spelled out against the position you hold today: what to close, what to open, what stays — with prices and cash —
+  // and what the whole thing (old trade + this move) adds up to. `legs` above is only the resulting position.
+  steps?: MoveSteps;
+  all_in?: MoveAllIn;
   // institutional RANKING — one composite the desk actually decides on, folding in E[P&L]-per-$-
   // of-capital, defined-risk size vs full assignment, Δrecovery, and fit with P(touch)/trend/
   // pattern/IV structure. Present on every alt INCLUDING hold/close, so either can legitimately win.
@@ -2030,8 +2044,20 @@ export interface RepairAlternative {
   // the search's own read — RND probability, which structural levels the new strike clears, earnings.
   roll_meta?: RollMeta | null;
 }
+export interface MoveStep { action: 'BUY' | 'SELL' | string; right: 'P' | 'C' | 'STK' | string; strike: number | null; qty: number; expiry?: string | null; price: number; cash?: number | null }
+export interface MoveSteps {
+  close: MoveStep[]; open: MoveStep[]; keep: MoveStep[]; stock: MoveStep | null; notes: string[];
+  close_cash: number; open_cash: number; net_cash: number; reconciled: boolean;
+}
+// The all-in picture: the position you ALREADY hold plus this move. collected_at_open = what the original position paid you;
+// locked_in = the P&L that closing part/all of it crystallizes (negative = a loss); best/worst/at_spot/breakevens are for the WHOLE thing.
+export interface MoveAllIn {
+  collected_at_open: number; locked_in: number; net_cash_today: number;
+  best_case: number | null; worst_case: number | null; at_spot: number | null; breakevens: number[];
+}
 export interface RollMeta {
   expiry: string; dte: number; strike: number; credit_total: number;
+  wing?: { short: number; long: number | null; width: number; old_short: number; old_long: number | null };      // present when a SPREAD is rolled as one package
   p_otm: number | null; p_otm_source: 'RND' | 'BS' | null; spans_earnings: boolean;
   structure: Record<string, boolean | number>;      // per-level 'clears …' flags + cleared_count + levels_available
   scores: { composite?: number; probability?: number; structure?: number; credit?: number; cushion?: number; cushion_sigma?: number; time_factor?: number };
@@ -2072,6 +2098,11 @@ export interface DefendContext {
   earnings?: { before_expiry: boolean; date: string | null; days: number | null; note: string };
   vol_note?: string;
 }
+export interface MoveTiming {
+  verdict: 'now' | 'before_print' | 'vol_rich' | 'vol_cheap' | 'neutral' | 'hold';
+  title: string; points: string[]; act_by: string | null;
+  vol: { iv_pct: number | null; hv_pct: number | null; vrp_pct: number | null; implied_move_pct: number | null; earnings_days: number | null } | null;
+}
 export interface RepairMenuResult {
   error?: string; ticker?: string; tested?: boolean; cushion_pct?: number; covered?: boolean;
   short_right?: 'P' | 'C'; short_strike?: number; spot?: number; dte_days?: number; contracts?: number;
@@ -2082,8 +2113,20 @@ export interface RepairMenuResult {
   hold?: { pop_pct: number | null; expected_pnl: number | null; max_loss: number | null;
            greeks?: { delta: number; gamma: number; theta: number; vega: number }; breakevens?: number[] };
   // The single named desk pick — computed (not LLM), may legitimately be Hold or Close.
+  // WHEN to act — read off the earnings print (and the move the term structure prices for it), IV vs realized vol, the term
+  // structure and what waiting costs. `act_by` = the last sensible day before the print.
+  timing?: MoveTiming | null;
+  // The print as the market prices it: where it falls relative to this expiry, and the implied ±1σ move (null when it can't be isolated).
+  event?: { date: string; days: number; position: 'inside' | 'after'; implied_move_pct: number | null; far_expiry: string | null } | null;
+  // The tested WING when the position is a clean vertical (a credit spread, or one side of an iron condor) — rolled as ONE package.
+  wing?: { right: 'P' | 'C'; qty: number; short_strike: number; long_strike: number; width: number; short_entry: number; long_entry: number; net_entry: number; kept_legs: number } | null;
+  // The position as it stands today (every alternative's steps are diffed against it).
+  held?: { legs: { right: string; strike: number; sign: number; qty: number; dte_days: number; expiry?: string | null; entry: number; mark: number }[];
+           stock: { shares: number; basis: number } | null; collected: number } | null;
   desk_recommendation?: {
     name: string; category: string; group?: string; desk_score: number;
+    // 'income' = the pick overrides a higher-scoring Hold/Close because it is a free improvement on what you hold (see reasons[0]).
+    policy?: 'income' | null; policy_over?: { over: string; over_score: number; gap: number } | null;
     score_breakdown: { edge: number; risk: number; recovery: number; market_fit: number };
     reasons: string[];
     // 'fix' = the best way to KEEP the trade alive when the pick is a benchmark (Close / stressed Hold);
@@ -2716,6 +2759,23 @@ export async function fetchLiquidityDashboard(): Promise<import('./types').Macro
 
 export async function fetchLiquidityNarrative(): Promise<{ narrative: string | null }> {
   return apiFetch<{ narrative: string | null }>('/api/market/liquidity/narrative', { method: 'POST' });
+}
+
+export async function fetchSelloffMonitor(refresh = false): Promise<import('./types').SelloffMonitorData> {
+  return apiFetch<import('./types').SelloffMonitorData>(`/api/market/selloff-monitor${refresh ? '?refresh=true' : ''}`);
+}
+
+export async function fetchSelloffInternals(refresh = false): Promise<import('./types').SelloffInternalsData> {
+  return apiFetch<import('./types').SelloffInternalsData>(`/api/market/selloff-monitor/internals${refresh ? '?refresh=true' : ''}`);
+}
+
+export async function fetchSelloffEvidenceReport(): Promise<{ title: string; markdown: string; words: number }> {
+  return apiFetch<{ title: string; markdown: string; words: number }>('/api/market/selloff-monitor/evidence/report');
+}
+
+export async function fetchSelloffBook(quoteSource: string, refresh = false): Promise<import('./types').SelloffBookData> {
+  const q = new URLSearchParams({ quote_source: quoteSource, refresh: refresh ? 'true' : 'false' });
+  return apiFetch<import('./types').SelloffBookData>(`/api/market/selloff-monitor/book?${q.toString()}`);
 }
 
 export async function fetchBusinessCycle(): Promise<import('./types').BusinessCycleResponse> {

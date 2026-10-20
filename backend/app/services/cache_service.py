@@ -63,19 +63,22 @@ async def set_cached(
     expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
     payload = json.dumps(data, default=str)
     try:
-        existing = (
-            await db.execute(
-                select(DataCache).where(DataCache.cache_key == key)
-            )
-        ).scalar_one_or_none()
-        if existing:
-            await db.execute(
-                update(DataCache)
-                .where(DataCache.cache_key == key)
-                .values(payload=payload, expires_at=expires)
-            )
+        # Atomic upsert: concurrent writers of the same key must not race
+        # between a SELECT and an INSERT (UniqueViolation on cache_key).
+        dialect = db.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _insert
         else:
-            db.add(DataCache(cache_key=key, payload=payload, expires_at=expires))
+            from sqlalchemy.dialects.sqlite import insert as _insert
+        stmt = _insert(DataCache).values(
+            cache_key=key, payload=payload, expires_at=expires
+        )
+        await db.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["cache_key"],
+                set_={"payload": payload, "expires_at": expires},
+            )
+        )
         await db.commit()
     except Exception as exc:
         logger.warning("Cache write failed for key %r: %s", key, exc)

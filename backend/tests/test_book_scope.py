@@ -64,7 +64,7 @@ class TestIncomeBook:
 
 def test_stored_snapshots_from_earlier_scopes_are_not_reused():
     # v1 covered every active trade, v2 also counted untagged trades, v3 predates covered-share netting and live-quote fixes
-    assert _book_tr_key(7) == "book_tail_risk:v4:7"
+    assert _book_tr_key(7) == "book_tail_risk:v5:7"
 
 
 # ── the endpoints really hand ONLY Income trades to the engine ─────────────────

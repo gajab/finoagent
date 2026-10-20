@@ -20,6 +20,7 @@ export interface FixVariant {
   rec: RemediationLeg;                 // the recommended action (cap or close) with its real legs and numbers
   alt: RemediationLeg | null;          // the alternative, if any
   tailBefore: number;                  // position P&L at the stress move BEFORE the fix
+  protected: boolean;                  // already a defined-risk spread: the fix is to CLOSE it, never to buy another wing
   stress: Target['stress'] | null;     // the move behind it (market ±%, β, name move, vol shift) — so "risk now" is explainable
   checks: CheckRef[];                  // the guardrails this exact fix addresses
 }
@@ -73,7 +74,7 @@ export function groupFixesByTrade(sc: ScoreCard | null | undefined): GroupedFixe
       const vkey = `${t.recommended.action}|${t.recommended.legs}|${r0(t.tail_before)}|${r0(t.recommended.tail_after)}|${r0(t.recommended.cost)}`;
       let v = tf.variants.find(x => x.key === vkey);
       if (!v) {
-        v = { key: vkey, rec: t.recommended, alt: t.alt ?? null, tailBefore: t.tail_before, stress: t.stress ?? null, checks: [] };
+        v = { key: vkey, rec: t.recommended, alt: t.alt ?? null, tailBefore: t.tail_before, stress: t.stress ?? null, protected: !!t.protected, checks: [] };
         tf.variants.push(v);
       }
       addUnique(v.checks, ref(c));

@@ -22,6 +22,7 @@ import {
 import { fetchDefendMenu, fetchDefendCommittee, fetchDefendRefine } from '../api';
 import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor } from '../api';
 import { money, rank, CAT, PayoffCurve, legStr } from '../components/trades/RepairMenu';
+import { MoveStepsBlock, TimingBlock, stepsLine } from '../components/trades/MoveSteps';
 import { Accordion, Callout, Chip, Meter, ScoreRing, SubHead, Tile, TONE, type Tone } from './BetaKit';
 
 const num = (v: number | null | undefined, d = 0) => (v == null || !isFinite(v) ? '—' : v.toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d }));
@@ -106,12 +107,18 @@ function Recommendation({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a
   return (
     <div className="rounded-2xl border border-secondary/40 bg-secondary/[0.06] p-4 space-y-3">
       <div className="flex items-center gap-3">
-        <ScoreRing value={rec.desk_score} tone="accent" label="Desk score" />
+        <div title={rec.policy === 'income' && rec.policy_over ? `${rec.policy_over.over} scores ${rec.policy_over.over_score} on the composite; this is the income-policy pick` : undefined}>
+          <ScoreRing value={rec.desk_score} tone="accent" label="Desk score" />
+        </div>
         <div className="min-w-0 flex-1">
-          <div className="text-[11px] text-secondary/80 font-semibold flex items-center gap-1.5"><Target className="w-3.5 h-3.5" /> Desk recommendation</div>
+          <div className="text-[11px] text-secondary/80 font-semibold flex items-center gap-1.5 flex-wrap"><Target className="w-3.5 h-3.5" /> Desk recommendation
+            {rec.policy === 'income' && <Chip tone="info" title={`The composite score puts "${rec.policy_over?.over}" ${rec.policy_over?.gap ?? ''} points ahead, but it has no term for the premium you keep collecting — on an income trade a free improvement on what you hold is preferred`}>Income policy</Chip>}
+          </div>
           <div className="text-base font-semibold leading-snug mt-0.5">→ {rec.name}</div>
         </div>
       </div>
+      {winner && <MoveStepsBlock a={winner} spot={d.spot ?? 0} />}
+      <TimingBlock t={d.timing} />
       {winner && <PayoffBlock a={winner} spot={d.spot ?? 0} />}
       {b && (
         <div className="grid sm:grid-cols-2 gap-x-6 gap-y-1.5">
@@ -179,7 +186,12 @@ function MoveRow({ a, no, best, spot, onEvaluate }: { a: RepairAlternative; no?:
               <Chip tone={CAT_TONE[a.category] || 'neutral'}>{CAT[a.category]?.label || a.category}</Chip>
               {best && <Chip tone="good"><Star className="w-3 h-3" /> Desk pick</Chip>}
             </div>
-            {a.legs && a.legs.length > 0 && <div className="text-xs font-mono text-base-content/55 truncate mt-0.5" title={a.mechanics}>{a.legs.map(legStr).join('   ')}</div>}
+            {(() => {
+              const line = stepsLine(a);
+              return line
+                ? <div className="text-xs font-mono text-base-content/60 truncate mt-0.5" title={a.mechanics} data-testid="move-steps-line">{line}</div>
+                : (a.legs && a.legs.length > 0 && <div className="text-xs font-mono text-base-content/55 truncate mt-0.5" title={a.mechanics}>{a.legs.map(legStr).join('   ')}</div>);
+            })()}
           </div>
           <div className="text-right shrink-0">
             {a.desk_score != null && <div className="text-lg font-semibold tabular-nums text-secondary leading-none" title="Desk score — edge per $ of capital, risk shape, Δrecovery & market fit">{a.desk_score}</div>}
@@ -187,9 +199,9 @@ function MoveRow({ a, no, best, spot, onEvaluate }: { a: RepairAlternative; no?:
           </div>
         </div>
         <div className="grid grid-cols-3 sm:grid-cols-6 gap-x-3 gap-y-2 mt-3">
-          <Stat label="Net cash" value={money(a.net_cash)} />
-          <Stat label="Max loss" value={a.max_loss == null ? 'undefined' : money(a.max_loss)} tone="text-error" />
-          <Stat label="Max gain" value={money(a.max_gain)} tone="text-success" />
+          <Stat label="Net cash today" value={money(a.net_cash)} />
+          <Stat label="Worst case (all-in)" value={a.max_loss == null ? 'undefined' : money(a.max_loss)} tone="text-error" />
+          <Stat label="Best case (all-in)" value={money(a.max_gain)} tone="text-success" />
           <Stat label="E[P&L]" value={a.ev != null ? money(a.ev) : '—'} tone={a.ev != null ? (a.ev >= 0 ? 'text-success' : 'text-error') : undefined} />
           <Stat label="Theta / day" value={money(a.theta_day)} tone={a.theta_day >= 0 ? 'text-success' : 'text-error'} />
           <Stat label="Δ recovery" value={a.d_pop != null && !bench ? `${a.d_pop >= 0 ? '+' : ''}${a.d_pop}%` : '—'} tone={a.d_pop != null && !bench ? (a.d_pop >= 0 ? 'text-success' : 'text-error') : undefined} />
@@ -199,6 +211,7 @@ function MoveRow({ a, no, best, spot, onEvaluate }: { a: RepairAlternative; no?:
       <PayoffBlock a={a} spot={spot} className="px-3 pb-3" />
       {open && (
         <div className="px-3 pb-3 pt-3 space-y-3 border-t border-white/[0.06]">
+          <MoveStepsBlock a={a} spot={spot} />
           <div className="flex flex-wrap items-center gap-2">
             {a.category !== 'exit' && (a.defined_risk
               ? <Chip tone="good"><ShieldCheck className="w-3 h-3" /> defined risk</Chip>
@@ -227,11 +240,14 @@ function Moves({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a: RepairA
   const TOP = 4;
   const alts = d.alternatives || [];
   const priced = alts.filter(a => a.category !== 'exit' && a.category !== 'hold');
-  const fixes = priced.filter(a => a.group !== 'replace').sort((x, y) => rank(y) - rank(x));
-  const redeploys = priced.filter(a => a.group === 'replace').sort((x, y) => rank(y) - rank(x));
+  const pickName = d.desk_recommendation?.name;
+  // The pick leads the list even when an income-policy override put it below a higher raw score (otherwise "Desk pick" would sit at #4).
+  const byRank = (x: RepairAlternative, y: RepairAlternative) => (Number(y.name === pickName) - Number(x.name === pickName)) || (rank(y) - rank(x));
+  const fixes = priced.filter(a => a.group !== 'replace').sort(byRank);
+  const redeploys = priced.filter(a => a.group === 'replace').sort(byRank);
   const hold = alts.find(a => a.category === 'hold');
   const close = alts.find(a => a.category === 'exit');
-  const bestName = d.desk_recommendation?.name || fixes[0]?.name;
+  const bestName = pickName || fixes[0]?.name;
   const shown = showAll ? fixes : fixes.slice(0, TOP);
   const hidden = fixes.length - shown.length;
   const rollCount = fixes.filter(a => a.roll_meta).length;

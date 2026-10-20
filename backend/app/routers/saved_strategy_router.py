@@ -1899,10 +1899,11 @@ _BOOK_TR_TTL = 90 * 86400   # persist the last "Manage Book" result ~90 days (un
 
 
 def _book_tr_key(user_id: int) -> str:
-    # v4: scoped to trades EXPLICITLY tagged Income (v1 covered every active trade; v2 also counted untagged),
-    # covered shares netted in the scenarios (+ the optional downside variant), fixes priced from live quotes,
-    # and the concentration view.
-    return f"book_tail_risk:v4:{user_id}"
+    # v5: defined-risk aware (capital = spread width for protected shorts; fixes never re-buy a held wing; Reg-T deployed).
+    # Bumped because two containers on different code can share this cache — an OLDER build refreshing under the same key
+    # overwrote a newer snapshot with stale numbers (ASML iron condor told to buy its own wing). v4 and older stay untouched.
+    # (v4: Income-tagged only, covered shares netted, live-quote fixes, concentration view; v3/v2/v1 earlier scopes.)
+    return f"book_tail_risk:v5:{user_id}"
 
 
 def _book_purpose(s) -> str:
@@ -2912,7 +2913,7 @@ async def get_repair_menu(
     import datetime as dt
     from ..services.quote_providers import get_provider
     from ..services.hedging_service import _split_chain
-    from ..services.trade_repair_service import repair_alternatives, rank_defenses, drop_plain_rolls
+    from ..services.trade_repair_service import repair_alternatives, rank_defenses, drop_plain_rolls, implied_event_move
 
     result = await db.execute(select(SavedStrategy).where(
         SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
@@ -3094,17 +3095,35 @@ async def get_repair_menu(
     except Exception:  # noqa: BLE001
         pass
 
+    # ── THE PRINT, AS THE MARKET PRICES IT — the earnings date plus the move the term structure implies for it
+    #    (back-month vs front-month IV when the print sits between the two expiries). The ranking scales its earnings
+    #    deduction by how exposed each short strike is to that move, and the timing read quotes it. ──
+    try:
+        _earn = (menu.get("context") or {}).get("earnings") or {}
+        _ed, _days = str(_earn.get("date") or "")[:10], _earn.get("days")
+        if _ed and isinstance(_days, (int, float)) and _days >= 0:
+            _iv = menu.get("iv_structure") or {}
+            _near_iv = (float(_iv["near_iv_pct"]) / 100.0) if _iv.get("near_iv_pct") else None
+            _far_iv = (float(_iv["far_iv_pct"]) / 100.0) if _iv.get("far_iv_pct") else None
+            menu["event"] = {"date": _ed, "days": int(_days), "position": ("inside" if _days <= n_dte else "after"),
+                             "implied_move_pct": implied_event_move(_near_iv, _far_iv, n_dte, (f_dte if far_book else None), _days),
+                             "far_expiry": (f_exp if far_book else None)}
+    except Exception:  # noqa: BLE001 — the print is context; the menu stands without it
+        pass
+
     # ── LIVE ROLL SEARCH — phase 2 of ONE recommendation (see /defend/refine). Applies to a LONE short
-    #    (CSP / short call / covered call) that is NOT healthy: that's when a credit roll is a real
-    #    candidate. The frontend runs phase 2 automatically and only shows the recommendation once the
-    #    search's candidates are merged into this same ranked menu. A healthy trade skips it (Hold is the
-    #    answer) and drops the fixed-horizon fallback rolls so no stray +45d roll is offered for it.
+    #    (CSP / short call / covered call) OR a clean vertical WING (put/call credit spread, one side of an iron
+    #    condor — priced as one package: close the old spread, open a new one of the same width) that is NOT
+    #    healthy: that's when a credit/even roll is a real candidate. The frontend runs phase 2 automatically and
+    #    only shows the recommendation once the search's candidates are merged into this same ranked menu. A healthy
+    #    trade skips it (Hold is the answer) and drops the fixed-horizon fallback rolls so no stray +45d roll is offered.
     lone = menu.get("structure") in ("cash_secured_put", "short_call", "covered_call")
-    if lone and (menu.get("recoverability") or {}).get("posture") != "healthy":
+    searchable = lone or bool(menu.get("wing"))
+    if searchable and (menu.get("recoverability") or {}).get("posture") != "healthy":
         menu["roll_search"] = "pending"
     else:
         menu["roll_search"] = "skipped"
-        if lone:
+        if searchable:
             drop_plain_rolls(menu)
 
     # ── DESK RANKING — collapse the whole menu (+ the market read above) into ONE composite score
@@ -3484,6 +3503,11 @@ async def run_defend_committee(
     dr = d.get("desk_recommendation") or {}
     dr_txt = (f"{dr.get('name')} (score {dr.get('desk_score')}/100) — " + "; ".join(dr.get("reasons") or [])
               if dr else "n/a")
+    tm = d.get("timing") or {}
+    timing_txt = (f"[{tm.get('verdict')}] {tm.get('title')} — " + "; ".join(tm.get("points") or [])) if tm.get("title") else "n/a"
+    ev = d.get("event") or {}
+    event_txt = (f"earnings {ev.get('date')} in {ev.get('days')}d ({'INSIDE this trade' if ev.get('position') == 'inside' else 'AFTER this expiry'})"
+                 + (f", market-implied ±{ev.get('implied_move_pct')}% move" if ev.get("implied_move_pct") else "")) if ev else "none known"
     ctx = (
         f"TESTED TRADE — {d.get('ticker')} {d.get('structure')} · tested {d.get('short_right')} ${d.get('short_strike')} "
         f"· spot ${d.get('spot')} · {d.get('dte_days')}d · cushion {d.get('cushion_pct')}% · mark-to-close {d.get('unrealized_pnl')}\n\n"
@@ -3500,6 +3524,8 @@ async def run_defend_committee(
         f"CLOSE now: realizes {close.get('net_cash')}, desk_score {close.get('desk_score')}\n"
         f"COST OF WAITING: {cw_txt}\n"
         f"CONTEXT: {ctx_extra}\n"
+        f"WHEN TO ACT (already computed): {timing_txt}\n"
+        f"EARNINGS: {event_txt}\n"
         f"DETERMINISTIC DESK PICK (already computed, composite of risk-adjusted edge/risk-shape/recovery/market-fit — "
         f"NOT an LLM guess): {dr_txt}\n"
         f"PRICED REPAIRS (ranked by desk_score):\n{repairs_txt}\n"
@@ -3530,7 +3556,11 @@ async def run_defend_committee(
         "• RISK — assignment P(ITM), early-exercise, capital at stake, max loss DEFINED vs OPEN (and if open, which "
         "repair caps it and by how much), whether the trader can take assignment. Flag an open tail as a concern, "
         "never as a reassurance.\n"
-        "• PM — weigh it and pick ONE path: hold, a NAMED repair, take-assignment-and-wheel, or close. You are given "
+        "• PM — weigh it and pick ONE path: hold, a NAMED repair, take-assignment-and-wheel, or close. "
+        "This is an INCOME desk: when the pick carries an 'Income policy' reason, a free improvement on the position (no new money, "
+        "defined risk) is preferred to booking the loss — do NOT recommend Close just because it scores higher on the composite; "
+        "and honour the WHEN TO ACT read (a roll through earnings must say whether the short sits inside the implied move). "
+        "You are given "
         "a DETERMINISTIC DESK PICK (a computed composite score — edge-per-$-of-capital, defined-risk size vs full "
         "assignment, Δrecovery, and fit with P(touch)/trend/VRP/pattern/IV structure — NOT a model guess). Default "
         "to agreeing with it. You may override it only for a reason the score can't see (e.g. the trader's own risk "
@@ -3604,7 +3634,7 @@ async def refine_defend_with_rolls(
     recommendation back until this returns. Applies to a LONE short; anything else is returned as-is."""
     from ..services.quote_providers import get_provider
     from ..services.roll_optimizer_service import optimize_roll
-    from ..services.trade_repair_service import build_roll_alternatives, drop_plain_rolls, rank_defenses
+    from ..services.trade_repair_service import build_roll_alternatives, drop_plain_rolls, rank_defenses, identify_wing
 
     result = await db.execute(select(SavedStrategy).where(
         SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
@@ -3618,23 +3648,32 @@ async def refine_defend_with_rolls(
 
     legs, _near_exp, covered_shares, stock_basis = _parse_defend_position(strategy)
     shorts = [l for l in legs if l["sign"] < 0]
-    if len(legs) != 1 or len(shorts) != 1:          # spreads / condors: rolling ONE leg would break the structure
-        d["roll_search"] = "skipped"
-        return _to_native(d)
-
     spot = float(d.get("spot") or 0.0)
     current_dte = int(d.get("dte_days") or 0)
+    # What is being rolled: a LONE short, or a clean vertical WING (one package — close the old spread, open a new one of
+    # the same width). A strangle / ratio / custom structure has no single unit to roll, so it is left as-is.
+    wing = identify_wing(legs, spot) if (spot > 0 and len(legs) > 1) else None
+    lone = len(legs) == 1 and len(shorts) == 1
+    if not lone and not wing:
+        d["roll_search"] = "skipped"
+        return _to_native(d)
     if spot <= 0 or current_dte <= 0:
         return {"error": "The defend payload is missing spot / DTE — rerun the analysis."}
 
-    tested = shorts[0]
-    covered = tested["right"] == "C" and covered_shares >= 100 * tested["qty"]
+    if wing:
+        tested = {"right": wing["right"], "strike": wing["short_strike"], "qty": wing["qty"], "entry": wing["net_entry"],
+                  "long_strike": wing["long_strike"], "dte_days": current_dte,
+                  "expiry": next((l.get("expiry") for l in (d.get("held") or {}).get("legs") or [] if l.get("expiry")), None)}
+    else:
+        tested = shorts[0]
+    covered = (not wing) and tested["right"] == "C" and covered_shares >= 100 * tested["qty"]
     provider = get_provider(quote_source, user=user, db=db)
     try:
         out = await optimize_roll(
             ticker=strategy.ticker, provider=provider, spot=spot, tested_right=tested["right"],
             tested_strike=tested["strike"], tested_qty=tested["qty"], tested_entry=tested["entry"],
-            current_dte=current_dte, covered=covered)
+            current_dte=current_dte, covered=covered,
+            wing_long_strike=(wing["long_strike"] if wing else None))
     except Exception as exc:  # noqa: BLE001 — the phase-1 ranking still stands; report why the search didn't run
         out = {"error": f"The live roll search failed: {exc}"}
     if out.get("error"):
@@ -3645,14 +3684,17 @@ async def refine_defend_with_rolls(
     cands = out.get("candidates") or []
     stock = {"shares": covered_shares, "basis": stock_basis if stock_basis else spot} if covered_shares > 0 else None
     iv_default = float((d.get("recoverability") or {}).get("iv_pct") or 40.0) / 100.0
+    kept = [{**k, "dte_days": current_dte, "iv": iv_default} for k in (wing["kept"] if wing else [])]   # the untouched side of a condor
     built = build_roll_alternatives(
         candidates=cands, tested=tested, tested_mark=float((out.get("tested") or {}).get("mark") or 0.0),
-        hold=d.get("hold"), spot=spot, r=0.045, stock=stock, iv_default=iv_default)
+        hold=d.get("hold"), spot=spot, r=0.045, stock=stock, iv_default=iv_default, held=d.get("held"), kept=kept)
     drop_plain_rolls(d)                                                      # the search is now the ONLY source of rolls
     d["alternatives"] = [a for a in d["alternatives"] if not a.get("roll_meta")] + built   # idempotent on a re-run
     d["roll_structure"] = out.get("structure")
     d["roll_note"] = (out.get("note") if cands else
-                      "No net-credit roll clears the quality bar right now — rolling would cost money or leave a coin-flip strike.")
+                      ("No roll of this spread at even cost or better clears the quality bar right now — closing the old spread and "
+                       "reopening further out would cost money, or leave a coin-flip short strike." if wing else
+                       "No net-credit roll clears the quality bar right now — rolling would cost money or leave a coin-flip strike."))
     d["roll_search"] = "done"
     rank_defenses(d)
     return _to_native(d)

@@ -9,6 +9,7 @@ import {
     LineElement, BarElement, Title, Tooltip, Legend
 } from 'chart.js';
 import { Chart } from 'react-chartjs-2';
+import { ConcentrationLadder } from './ConcentrationLadder';
 
 ChartJS.register(
     CategoryScale, LinearScale, PointElement, LineElement, BarElement, Title, Tooltip, Legend
@@ -51,6 +52,7 @@ interface ConcentrationResult {
 }
 
 export function ConcentrationManager() {
+    const [view, setView] = useState<'ladder' | 'single'>('ladder');
     const [ticker, setTicker] = useState('AAPL');
     const [shares, setShares] = useState<number>(1000);
     const [costBasis, setCostBasis] = useState<number>(150);
@@ -123,8 +125,24 @@ export function ConcentrationManager() {
         }
     };
 
+    if (view === 'ladder') {
+        return (
+            <div className="space-y-4">
+                <div className="tabs tabs-boxed w-fit">
+                    <button className="tab tab-active">Tax-aware ladder</button>
+                    <button className="tab" onClick={() => setView('single')}>Single collar</button>
+                </div>
+                <ConcentrationLadder />
+            </div>
+        );
+    }
+
     return (
         <div className="space-y-6">
+            <div className="tabs tabs-boxed w-fit">
+                <button className="tab" onClick={() => setView('ladder')}>Tax-aware ladder</button>
+                <button className="tab tab-active">Single collar</button>
+            </div>
             <div className="border-l-4 border-info bg-info/10 p-4 rounded-r-xl">
                 <h3 className="font-bold flex items-center gap-2 text-info">
                     <Target className="w-5 h-5" />

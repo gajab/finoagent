@@ -59,7 +59,7 @@ export function ResilienceCard({ before: rb, after: ra }: { before: BondResilien
 
 // Purchases sized to the plan's shortfall years, in three flavours (nominal / TIPS / half-half), each re-run
 // through the planner in four inflation worlds. Deterministic; the recommended one has the smallest worst case.
-export default function BondGapPlan({ onChanged, onGotoPlanner }: { onChanged: () => void; onGotoPlanner: () => void }) {
+export default function BondGapPlan({ afterTax = true, onChanged, onGotoPlanner }: { afterTax?: boolean; onChanged: () => void; onGotoPlanner: () => void }) {
   const [budget, setBudget] = useState('');
   const [account, setAccount] = useState('taxable');
   const [credit, setCredit] = useState<NonNullable<BondGapParams['min_credit']>>('AA');
@@ -83,6 +83,7 @@ export default function BondGapPlan({ onChanged, onGotoPlanner }: { onChanged: (
       const d = await fetchBondGapPlan({
         budget: numOrNull(budget), account_type: account, min_credit: credit,
         low_inflation: numOrNull(low) ?? -1, high_inflation: numOrNull(high) ?? 5, debase_inflation: numOrNull(deb) ?? 6,
+        after_tax: afterTax,
       });
       if (id === req.current) { setData(d); setPick(d.recommended); setAdded({}); }
     } catch (e) {
@@ -90,8 +91,12 @@ export default function BondGapPlan({ onChanged, onGotoPlanner }: { onChanged: (
     } finally {
       if (id === req.current) setLoading(false);
     }
-  }, [budget, account, credit, low, high, deb]);
+  }, [budget, account, credit, low, high, deb, afterTax]);
   useEffect(() => { if (!started.current) { started.current = true; run(); } }, [run]);
+  // switching After tax ⇄ Pre-tax is a change of view, not of inputs → re-run straight away (like the Planner)
+  const shownTax = useRef(afterTax);
+  useEffect(() => { if (shownTax.current !== afterTax) { shownTax.current = afterTax; run(); } }, [afterTax, run]);
+  const taxed = data?.after_tax ?? afterTax;
 
   const strat = data?.strategies.find(s => s.key === pick) ?? data?.strategies[0];
   const scen = useMemo(() => SC_ORDER.map(k => data?.scenarios.find(s => s.key === k)).filter(Boolean) as GapPlan['scenarios'], [data]);
@@ -137,16 +142,17 @@ export default function BondGapPlan({ onChanged, onGotoPlanner }: { onChanged: (
   return (
     <div className="space-y-4">
       <Card icon={<Target className="h-4 w-4 text-primary" />} title="Fund my plan — and stress-test it"
-        subtitle="Buys sized to the exact years your plan is short (after your bonds, fund sales, Social Security and taxes), then every option is re-run through your whole plan in four inflation worlds."
+        subtitle={`Buys sized to the exact years your plan is short (after your bonds, fund sales, Social Security${afterTax ? ' and taxes' : ' — before tax'}), then every option is re-run through your whole plan in four inflation worlds.`}
         right={<button className="btn btn-primary btn-sm" onClick={run} disabled={loading}>{loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} {data ? 'Re-run' : 'Run'}</button>}>
         <div className="grid gap-3 md:grid-cols-3">
           <Field label="Money available" hint="Blank = whatever closes every gap. With a limit, the nearest gap years are funded first">
             <input className={inputCls} inputMode="decimal" value={budget} placeholder={data?.strategies.length ? `enough: ~${usd(Math.max(...data.strategies.map(s => s.cost)), { compact: true })}` : 'enough to close every gap'} onChange={e => setBudget(e.target.value)} />
           </Field>
-          <Field label="Buy in account" hint="Sets each bond's tax: yearly in a taxable account (at your pre-/post-retirement rates), at withdrawal in an IRA, never in a Roth">
+          <Field label="Buy in account" hint={afterTax ? "Sets each bond's tax: yearly in a taxable account (at your pre-/post-retirement rates), at withdrawal in an IRA, never in a Roth"
+            : 'Pre-tax view: the account changes no yields — only when its money can be spent'}>
             <select className={selectCls} value={account} onChange={e => setAccount(e.target.value)}>{ACCOUNTS.map(x => <option key={x.value} value={x.value}>{x.label}</option>)}</select>
           </Field>
-          <Field label="Credit limit for the nominal bonds" hint="The plan picks whichever of Treasury, CD, agency, muni or corporate leaves the most after tax within this limit">
+          <Field label="Credit limit for the nominal bonds" hint={`The plan picks whichever of Treasury, CD, agency, muni or corporate leaves the most ${afterTax ? 'after tax' : 'before tax'} within this limit`}>
             <select className={selectCls} value={credit} onChange={e => setCredit(e.target.value as typeof credit)}>{CREDIT_OPTS.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}</select>
           </Field>
         </div>
@@ -235,7 +241,7 @@ export default function BondGapPlan({ onChanged, onGotoPlanner }: { onChanged: (
                   <div className="max-h-[440px] overflow-auto">
                     <table className="w-full text-xs">
                       <thead className="sticky top-0 bg-base-100 text-[10px] uppercase tracking-wide text-base-content/45">
-                        <tr>{['For', 'Buy', 'Amount', 'Yield → after tax', 'Exactly what', 'Why'].map(h => <th key={h} className="px-2 py-1.5 text-left font-medium">{h}</th>)}</tr>
+                        <tr>{['For', 'Buy', 'Amount', taxed ? 'Yield → after tax' : 'Yield (pre-tax)', 'Exactly what', 'Why'].map(h => <th key={h} className="px-2 py-1.5 text-left font-medium">{h}</th>)}</tr>
                       </thead>
                       <tbody>
                         {strat.lines.map(l => (
@@ -243,7 +249,7 @@ export default function BondGapPlan({ onChanged, onGotoPlanner }: { onChanged: (
                             <td className="px-2 py-1.5 font-semibold tabular-nums">{l.year}</td>
                             <td className="px-2 py-1.5"><span className="flex items-center gap-1.5"><KindBadge kind={l.kind} /><span className="font-medium">{l.label}</span></span></td>
                             <td className="px-2 py-1.5 font-semibold tabular-nums">{usd(l.amount)}<div className="text-[10px] font-normal text-base-content/45">→ {usd(l.spendable, { compact: true })} to spend</div></td>
-                            <td className="px-2 py-1.5 tabular-nums">{pct(l.pre_tax_pct)} → <span className="text-emerald-400">{pct(l.after_tax_pct)}</span>
+                            <td className="px-2 py-1.5 tabular-nums">{taxed ? <>{pct(l.pre_tax_pct)} → <span className="text-emerald-400">{pct(l.after_tax_pct)}</span></> : pct(l.pre_tax_pct)}
                               {l.real_yield_pct != null && <div className="text-[10px] text-base-content/45">real {pct(l.real_yield_pct)}</div>}</td>
                             <td className="max-w-[220px] px-2 py-1.5 text-[11px] leading-snug">
                               {l.security ? <><span className="font-mono text-primary">{l.security.cusip}</span> · {l.security.coupon_pct}% due {fmtDate(l.security.maturity)}

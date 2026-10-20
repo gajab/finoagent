@@ -82,7 +82,8 @@ def _bs_vec(S, K: float, T: float, r: float, sigma, right: str):
 # ── crash scenarios — FULL repricing (Taylor is invalid for large moves) ─────
 
 def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r: float,
-                     include_stock: bool = False) -> float:
+                     include_stock: bool = False, *, days: float = 0.0,
+                     iv_scale: Optional[float] = None) -> float:
     """Book P&L if the market instantly moves `move` (each name × its beta) and vol
     jumps `vol_shock_pts`, by fully repricing every OPTION leg with Black-Scholes.
 
@@ -92,16 +93,22 @@ def reprice_scenario(positions: list[dict], move: float, vol_shock_pts: float, r
     loss is counted only when the position carries `down_stock` (the user's "include stock losses"
     choice); otherwise the downside is the OPTION OVERLAY only, the shares being a separate core
     holding. Naked / spread shorts have no `cov_shares` and are unaffected.
-    (include_stock=True revalues EVERY share both ways — an economic-exposure view.)"""
+    (include_stock=True revalues EVERY share both ways — an economic-exposure view.)
+
+    HORIZON (``days`` > 0, used by the Selloff Monitor's book view): the move lands ``days`` calendar days
+    from now, so every leg is repriced at T − days (the book banks that decay) and a leg expiring inside the
+    horizon settles at intrinsic (bs_price returns intrinsic at T ≤ 0). ``iv_scale`` replaces the additive
+    ``vol_shock_pts`` with a proportional rule (iv1 = iv0 × iv_scale, e.g. the VIX ratio measured over a
+    historical path). Defaults (days=0, iv_scale=None) are the instantaneous crash table, unchanged."""
     total = 0.0
     for p in positions:
         s_crash = p["spot"] * (1 + move * p.get("beta", 1.0))
         for lg in p["legs"]:
             ot = "call" if lg["right"] == "C" else "put"
             iv0 = lg["iv"]
-            iv1 = max(0.02, iv0 + vol_shock_pts / 100.0)
+            iv1 = max(0.02, iv0 * iv_scale) if iv_scale is not None else max(0.02, iv0 + vol_shock_pts / 100.0)
             v0 = bs_price(p["spot"], lg["strike"], lg["dte_years"], r, iv0, ot)
-            v1 = bs_price(s_crash, lg["strike"], lg["dte_years"], r, iv1, ot)
+            v1 = bs_price(s_crash, lg["strike"], max(0.0, lg["dte_years"] - days / 365.0), r, iv1, ot)
             total += lg["sign"] * lg["qty"] * _MULT * (v1 - v0)
         if include_stock and p.get("shares"):
             total += p["shares"] * (s_crash - p["spot"])   # signed: long>0 loses on the way down
@@ -365,6 +372,49 @@ def _pay_price(q: Optional[dict]) -> tuple[Optional[float], str]:
     return None, "model"
 
 
+def _reg_t_deployed(pos: dict, sparams: dict, spot: float) -> Optional[float]:
+    """Money DEPLOYED the way My Trades shows it: the stock held for a stock-backed trade (shares × average cost), else the
+    broker Reg-T margin from the app's single margin source (`calc_reg_t_margin`: spreads = width, naked = max(20%·U − OTM,
+    10%·base)). Distinct from `capital` (the cash-secured / spread-width basis the % limits are measured against)."""
+    try:
+        shares = float(sparams.get("shares") or 0)
+        avg = float(sparams.get("avg_cost") or 0)
+        if shares > 0 and avg > 0:
+            return round(shares * avg, 0)
+        from ..routers.saved_strategy_router import calc_reg_t_margin      # lazy: the router imports this module
+        legs = [{"right": lg["right"], "action": "SELL" if lg["sign"] < 0 else "BUY", "strike": lg["strike"], "qty": lg["qty"]} for lg in pos["legs"]]
+        return round(float(calc_reg_t_margin(legs, float(spot or 0.0), str(sparams.get("margin_mode") or "reg_t"))), 0)
+    except Exception as exc:  # noqa: BLE001 — a margin miss must never fail the desk
+        logger.debug("reg-t deployed failed: %s", exc)
+        return None
+
+
+def _committed_capital(legs: list[dict]) -> float:
+    """Capital a position ties up, per side (puts / calls).
+
+    A NAKED short is cash-secured at strike × 100 × contracts. A short protected by a long on the same side is a SPREAD:
+    the most it can cost is the strike WIDTH × 100 × contracts, not the short strike's full notional — an iron condor
+    with $10 / $5 wings ties up ~$1,500, not $23,500. Each short is paired with the nearest long strike (contract for
+    contract); whatever is left unpaired is naked."""
+    total = 0.0
+    for right in ("P", "C"):
+        shorts = [[float(l["strike"]), float(l["qty"])] for l in legs if l["sign"] < 0 and l["right"] == right]
+        longs = [[float(l["strike"]), float(l["qty"])] for l in legs if l["sign"] > 0 and l["right"] == right]
+        for sk, sq in shorts:
+            remaining = sq
+            for lg in sorted(longs, key=lambda x: abs(x[0] - sk)):
+                if remaining <= 0:
+                    break
+                if lg[1] <= 0:
+                    continue
+                q = min(remaining, lg[1])
+                total += abs(sk - lg[0]) * _MULT * q
+                remaining -= q
+                lg[1] -= q
+            total += remaining * sk * _MULT
+    return total
+
+
 async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache) -> Optional[dict]:
     from .hedging_service import _split_chain
     legs = json.loads(strategy.legs_data or "[]")
@@ -435,7 +485,7 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
         return None
     g = higher_order_greeks(life_legs, spot, r=r, stock_shares=0.0)   # OPTION LAYER ONLY
     avg_iv = sum(x["iv"] for x in life_legs) / len(life_legs)
-    capital = sum(sk * _MULT * q for sk, q in short_strikes) or abs(g["net_delta"]) * spot
+    capital = _committed_capital(life_legs) or abs(g["net_delta"]) * spot
     # structure + stock presence → so a short CALL can be flagged COVERED (excluded from the
     # naked-assignment total) vs naked. Any non-option long-share leg also counts as cover.
     structure = getattr(strategy, "strategy_type", None) or getattr(strategy, "structure", None)
@@ -469,6 +519,7 @@ async def _position_greeks(strategy, provider, r, today, spot_cache, chain_cache
            "strikes_by_exp": strikes_by_exp, "quotes_by_exp": quotes_by_exp, "structure": structure,
            "has_stock": bool(has_stock), "covered": covered_flag, **g}
     pos["cov_shares"] = _covered_shares(pos)    # shares behind the short calls — scenarios net their P&L
+    pos["reg_t"] = _reg_t_deployed(pos, _sparams, spot)
     pos["iv_audit"], pos["indicative"] = iv_audit, indicative
     return pos
 
@@ -1126,6 +1177,7 @@ def _concentration_view(positions: list[dict], r: float, book_capital: float, fa
                                            "gamma": 0.0, "beta": p.get("beta", 1.0), "down": 0.0, "up": 0.0})
         n["trades"] += 1
         n["capital"] += p.get("capital") or 0.0
+        n["reg_t"] = n.get("reg_t", 0.0) + (p.get("reg_t") or 0.0)
         n["theta"] += p.get("net_theta") or 0.0
         n["gamma"] += abs(p.get("net_gamma") or 0.0)
         n["down"] += _position_side_metrics(p, "down", r)["tail"]
@@ -1150,7 +1202,7 @@ def _concentration_view(positions: list[dict], r: float, book_capital: float, fa
         cap_pct = n["capital"] / tot_cap * 100 if tot_cap > 0 else 0.0
         rows.append({
             "ticker": n["ticker"], "trades": n["trades"], "beta": round(n["beta"], 2),
-            "capital": round(n["capital"], 0), "capital_pct": round(cap_pct, 1),
+            "capital": round(n["capital"], 0), "capital_pct": round(cap_pct, 1), "reg_t": round(n.get("reg_t", 0.0), 0),
             "theta": round(n["theta"], 1), "theta_pct": round(max(0.0, n["theta"]) / tot_theta * 100, 1) if tot_theta > 0 else 0.0,
             "down_pnl": round(n["down"], 0), "up_pnl": round(n["up"], 0),
             "tail_loss": round(lo, 0), "tail_pct": round(tail_pct, 1),
@@ -1397,6 +1449,9 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
     shorts = [lg for lg in p["legs"] if lg["sign"] < 0 and lg["right"] == right]
     if not shorts:
         return None
+    short_q = sum(lg["qty"] for lg in shorts)
+    long_q = sum(lg["qty"] for lg in p["legs"] if lg["sign"] > 0 and lg["right"] == right)
+    protected = long_q >= short_q                  # a long on this side already caps every short contract (a spread / condor wing)
     tgt = min(shorts, key=lambda lg: lg["strike"]) if side == "up" else max(shorts, key=lambda lg: lg["strike"])
     spot, K, qty, iv, dte = p["spot"], tgt["strike"], tgt["qty"], tgt["iv"], tgt["dte_years"]
     tail_before = reprice_scenario([p], move, vshock, r)
@@ -1407,9 +1462,12 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
               "name_move_pct": round(move * beta * 100, 1), "vol_shock_pts": round(vshock, 1)}
 
     opts = []
-    # CAP — buy a real wing beyond the short → defined-risk spread.
-    wing = _pick_wing((p.get("strikes_by_exp") or {}).get(tgt.get("exp"), {}).get(right, []), K, +1 if side == "up" else -1)
+    # CAP — buy a real wing beyond the short → defined-risk spread. NEVER when this side is already protected (the wing exists).
+    # A partly-protected short (more short than long contracts) is capped only for the uncovered remainder.
+    wing = None if protected else _pick_wing((p.get("strikes_by_exp") or {}).get(tgt.get("exp"), {}).get(right, []), K, +1 if side == "up" else -1)
+    wing_qty = max(1.0, float(short_q - long_q)) if not protected else qty
     if wing:
+        qty_cap, qty = wing_qty, tgt["qty"]
         # Cost = what the wing REALLY costs: its live ask captured when the book was refreshed (mid if no
         # ask). Only if the chain had no quote for that strike do we fall back to a model price — and say so.
         wq = quotes.get(float(wing))
@@ -1417,29 +1475,53 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
         wing_iv = _sane_iv(wq, spot, float(wing), dte, r, right, iv)[0]   # the wing's own IV (skew), sanity-checked
         if px is None:
             px = bs_price(spot, wing, dte, r, wing_iv, ot)
-        wing_cost = px * _MULT * qty
-        p_cap = {**p, "legs": p["legs"] + [{"strike": wing, "right": right, "sign": 1, "qty": qty, "iv": wing_iv, "dte_years": dte}]}
+        wing_cost = px * _MULT * qty_cap
+        p_cap = {**p, "legs": p["legs"] + [{"strike": wing, "right": right, "sign": 1, "qty": qty_cap, "iv": wing_iv, "dte_years": dte}]}
         tail_after = reprice_scenario([p_cap], move, vshock, r)
         opts.append({"action": "cap", "cost": round(wing_cost, 0), "tail_after": round(tail_after, 0),
                      "premium_kept": round(prem_leg - wing_cost, 0),
                      "unit_price": round(px, 2), "pricing": how,
-                     "legs": f"BUY {qty:g}× {tgt.get('exp','')} {wing:g}{right} (vs your short {K:g}{right})",
+                     "legs": f"BUY {qty_cap:g}× {tgt.get('exp','')} {wing:g}{right} (vs your short {K:g}{right})",
                      "detail": f"turns the naked {K:g}{right} into a {K:g}/{wing:g} spread",
                      # structured legs so the UI can hand the REPAIRED spread to Evaluate for exact pricing.
                      "prefill": {"ticker": p["ticker"], "legs": [
-                         {"action": "SELL", "type": ot.upper(), "strike": K, "expiration": tgt.get("exp"), "qty": int(qty)},
-                         {"action": "BUY", "type": ot.upper(), "strike": wing, "expiration": tgt.get("exp"), "qty": int(qty)},
+                         {"action": "SELL", "type": ot.upper(), "strike": K, "expiration": tgt.get("exp"), "qty": int(qty_cap)},
+                         {"action": "BUY", "type": ot.upper(), "strike": wing, "expiration": tgt.get("exp"), "qty": int(qty_cap)},
                      ]}})
-    # CLOSE — buy the short back.
-    p_close = {**p, "legs": [lg for lg in p["legs"] if lg is not tgt]}
-    cpx, chow = _pay_price({"ask": tgt.get("ask"), "mid": tgt.get("mid")})     # buy-to-close at the live ask
-    if cpx is None:
-        cpx = bs_price(spot, K, dte, r, iv, ot)
-    opts.append({"action": "close", "cost": round(cpx * _MULT * qty, 0),
-                 "tail_after": round(reprice_scenario([p_close], move, vshock, r), 0),
-                 "premium_kept": 0.0, "unit_price": round(cpx, 2), "pricing": chow,
-                 "legs": f"BUY-to-close {qty:g}× {tgt.get('exp','')} {K:g}{right}",
-                 "detail": "exit the leg entirely"})
+    # CLOSE — a NAKED short: buy it back. A PROTECTED side: close the whole spread (buy the short, sell the long wing),
+    # because closing only the short would leave an orphan long option.
+    if protected:
+        side_legs = [lg for lg in p["legs"] if lg["right"] == right]
+        p_close = {**p, "legs": [lg for lg in p["legs"] if lg["right"] != right]}
+        cost_sh = 0.0
+        how_parts = set()
+        for lg in side_legs:
+            if lg["sign"] < 0:
+                px_, how_ = _pay_price({"ask": lg.get("ask"), "mid": lg.get("mid")})
+                if px_ is None:
+                    px_, how_ = bs_price(spot, lg["strike"], lg["dte_years"], r, lg["iv"], ot), "model"
+                cost_sh += px_ * _MULT * lg["qty"]
+            else:                                           # selling the long wing: you get the BID (nothing if there is none)
+                bid_ = lg.get("bid") or 0.0
+                how_ = "live bid" if bid_ > 0 else "no bid (wing worth ~0)"
+                cost_sh -= bid_ * _MULT * lg["qty"]
+            how_parts.add(how_)
+        longs_txt = " / ".join(f"{lg['strike']:g}{right}" for lg in side_legs if lg["sign"] > 0)
+        opts.append({"action": "close", "cost": round(max(cost_sh, 0.0), 0),
+                     "tail_after": round(reprice_scenario([p_close], move, vshock, r), 0),
+                     "premium_kept": 0.0, "pricing": " + ".join(sorted(how_parts)),
+                     "legs": f"CLOSE the {K:g}/{longs_txt} {'call' if right == 'C' else 'put'} spread ({qty:g}×) — buy back the short, sell the long wing",
+                     "detail": f"already defined-risk: the long {longs_txt} caps the {K:g}{right}, so there is nothing to buy — closing exits the exposure"})
+    else:
+        p_close = {**p, "legs": [lg for lg in p["legs"] if lg is not tgt]}
+        cpx, chow = _pay_price({"ask": tgt.get("ask"), "mid": tgt.get("mid")})     # buy-to-close at the live ask
+        if cpx is None:
+            cpx = bs_price(spot, K, dte, r, iv, ot)
+        opts.append({"action": "close", "cost": round(cpx * _MULT * qty, 0),
+                     "tail_after": round(reprice_scenario([p_close], move, vshock, r), 0),
+                     "premium_kept": 0.0, "unit_price": round(cpx, 2), "pricing": chow,
+                     "legs": f"BUY-to-close {qty:g}× {tgt.get('exp','')} {K:g}{right}",
+                     "detail": "exit the leg entirely"})
     # rank by LOSS REDUCED per $ spent (tail_after is less negative than tail_before → improvement
     # is tail_after − tail_before, a positive number); break ties by premium kept.
     def _eff(o):
@@ -1447,7 +1529,7 @@ def _remediate_position(p: dict, side: str, r: float) -> Optional[dict]:
         return (improvement / max(o["cost"], 1.0), o["premium_kept"])
     opts.sort(key=_eff, reverse=True)
     best = opts[0]
-    return {"tail_before": round(tail_before, 0), "stress": stress, "recommended": best,
+    return {"tail_before": round(tail_before, 0), "stress": stress, "protected": protected, "recommended": best,
             "alt": next((o for o in opts if o["action"] != best["action"]), None),
             # the targeted short leg — so the UI can ALWAYS render a "Close {K}{right}" action, even
             # when no cap wing is available (e.g. an already-defined-risk spread → close is the only fix).
@@ -1458,13 +1540,24 @@ def _offender_targets(positions: list[dict], side: str, r: float, *, tickers=Non
     """Rank the positions creating the most `side` risk vs the premium they still pay, worst first,
     and attach each one's concrete remediation. Optionally restrict to `tickers` (a concentrated set)."""
     pool = [p for p in positions if (tickers is None or p["ticker"] in tickers)]
+    book_cap = sum(p.get("capital") or 0.0 for p in positions) or 1.0
+    rt = "C" if side == "up" else "P"
     scored = []
     for p in pool:
         m = _position_side_metrics(p, side, r)
         if m["tail"] >= -1:            # only positions that actually LOSE on this side
             continue
+        sq = sum(l["qty"] for l in p["legs"] if l["sign"] < 0 and l["right"] == rt)
+        lq = sum(l["qty"] for l in p["legs"] if l["sign"] > 0 and l["right"] == rt)
+        if sq > 0 and lq >= sq and abs(m["tail"]) < 0.01 * book_cap:
+            continue                   # a defined-risk spread whose WORST case is < 1% of the book is not worth a fix suggestion
         scored.append((p, m))
-    scored.sort(key=lambda pm: pm[1]["tail"])   # most negative first
+    def _is_protected(p):                          # every short contract on this side has a long behind it
+        rt = "C" if side == "up" else "P"
+        sq = sum(l["qty"] for l in p["legs"] if l["sign"] < 0 and l["right"] == rt)
+        lq = sum(l["qty"] for l in p["legs"] if l["sign"] > 0 and l["right"] == rt)
+        return sq > 0 and lq >= sq
+    scored.sort(key=lambda pm: (_is_protected(pm[0]), pm[1]["tail"]))   # naked first, then most negative
     out = []
     for p, m in scored[:top]:
         rem = _remediate_position(p, side, r)
@@ -1962,9 +2055,10 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
             "beta_delta_notional": round(bw_delta_notional, 0), "beta_delta_spy": beta_delta_spy,
             "book_capital": round(book_capital, 0), "annual_income": round(annual_income, 0),
             # What the "% of capital" denominator IS — surfaced so the user can see it, not guess.
-            "capital_basis": ("Σ committed capital across positions = short-put strikes × 100 (the cash "
-                              "each CSP secures) + short-call/other strike notional. It is the capital PUT TO "
-                              "WORK, the % of cap denominator — NOT your whole account net-liq."),
+            "capital_basis": ("Σ committed capital across positions: a NAKED short = strike × 100 × contracts (the cash it "
+                              "secures); a short protected by a long on the same side (a spread / condor wing) = the strike "
+                              "WIDTH × 100 × contracts. It is the capital PUT TO WORK, the % of cap denominator — NOT your "
+                              "whole account net-liq."),
             # θ/Net-Liq — daily decay income as a % of capital at work (how hard the book earns);
             # carry_yield = that annualized. tastytrade rule-of-thumb: ~0.1%/day (~25%/yr) is healthy.
             "theta_net_liq_pct": round(net_theta / book_capital * 100, 3) if book_capital else None,
@@ -2008,6 +2102,7 @@ async def compute_book_tail_risk(strategies: list, quote_source: str, user, db,
 
     result = await _run(positions)
     result["coverage"], result["data_quality"] = coverage, quality
+    result["deployed_reg_t"] = round(sum(p.get("reg_t") or 0.0 for p in positions), 0)
     has_cov = any(p.get("cov_shares") for p in positions)
     result["has_covered_stock"] = has_cov
     if has_cov:

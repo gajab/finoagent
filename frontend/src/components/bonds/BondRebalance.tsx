@@ -43,7 +43,7 @@ function World({ b, a }: { b: BondGapOutcome; a: BondGapOutcome }) {
 
 // Balance the whole book: every holding, in every account, is kept / sold / swapped (plus any new money) so the
 // plan is funded at the best after-tax outcome with limited turnover. One LP; the planner judges the result.
-export default function BondRebalance({ data, onChanged }: { data: BondPortfolio; onChanged: () => void }) {
+export default function BondRebalance({ data, afterTax = true, onChanged }: { data: BondPortfolio; afterTax?: boolean; onChanged: () => void }) {
   const [newMoney, setNewMoney] = useState('');
   const [newAcct, setNewAcct] = useState('taxable');
   const [turnover, setTurnover] = useState('25');
@@ -67,15 +67,18 @@ export default function BondRebalance({ data, onChanged }: { data: BondPortfolio
     try {
       const r = await fetchBondRebalance({ new_money: money(newMoney), new_money_account: newAcct, max_turnover_pct: Number(turnover),
         robustness: robust, min_credit: credit, keep_ids: keepIds, tips_max_pct: Number(tipsMax), bond_turnover_pct: Number(bondsMode),
-        intl_pct: Number(intl) });
+        intl_pct: Number(intl), after_tax: afterTax });
       if (id === req.current) { setRes(r); setAdded({}); }
     } catch (e) {
       if (id === req.current) setErr(e instanceof Error ? e.message : 'Could not rebalance');
     } finally {
       if (id === req.current) setLoading(false);
     }
-  }, [newMoney, newAcct, turnover, robust, credit, keep, tipsMax, bondsMode, intl]);
+  }, [newMoney, newAcct, turnover, robust, credit, keep, tipsMax, bondsMode, intl, afterTax]);
   useEffect(() => { if (!started.current) { started.current = true; run(); } }, [run]);
+  // switching After tax ⇄ Pre-tax is a change of view, not of inputs → re-run straight away (like the Planner)
+  const shownTax = useRef(afterTax);
+  useEffect(() => { if (shownTax.current !== afterTax) { shownTax.current = afterTax; run(); } }, [afterTax, run]);
 
   const toggleKeep = (id: number) => { const next = keep.includes(id) ? keep.filter(x => x !== id) : [...keep, id]; setKeep(next); run(next); };
   const accounts = useMemo(() => Array.from(new Set([...(res?.sells ?? []).map(s => s.account_type), ...(res?.buys ?? []).map(b => b.account_type)])), [res]);
@@ -96,10 +99,12 @@ export default function BondRebalance({ data, onChanged }: { data: BondPortfolio
 
   const t = res?.totals;
   const hold = res?.verdict === 'hold';
+  const taxed = res?.after_tax ?? afterTax;
   return (
     <div className="space-y-4">
       <Card icon={<Scale className="h-4 w-4 text-primary" />} title="Balance the whole book"
-        subtitle="Looks at every holding in every account (plus any money you add) and asks: keep it, or is there something that funds your plan better after tax? It changes only what pays for its own tax and trading cost."
+        subtitle={afterTax ? 'Looks at every holding in every account (plus any money you add) and asks: keep it, or is there something that funds your plan better after tax? It changes only what pays for its own tax and trading cost.'
+          : 'Looks at every holding in every account (plus any money you add) and asks: keep it, or is there something that funds your plan better before tax? Taxes are left out; it changes only what pays for its trading cost.'}
         right={<button className="btn btn-primary btn-sm" onClick={() => run()} disabled={loading}>{loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} {res ? 'Re-run' : 'Run'}</button>}>
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           <Field label="New money to add (optional)" hint="Invested in the account you pick; everything else stays in its own account">
@@ -145,7 +150,7 @@ export default function BondRebalance({ data, onChanged }: { data: BondPortfolio
           <div className={`rounded-2xl border px-4 py-3 ${hold ? 'border-white/[0.08] bg-base-100/60' : 'border-emerald-500/25 bg-emerald-500/[0.06]'}`}>
             <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
               <span className={`text-sm font-bold ${hold ? '' : 'text-emerald-300'}`}>{hold ? 'Hold — nothing worth changing' : `Rebalance: sell ${t?.positions_sold} position${t?.positions_sold === 1 ? '' : 's'}, buy ${t?.lines_bought} line${t?.lines_bought === 1 ? '' : 's'}`}</span>
-              {!hold && t && <span className="text-xs text-base-content/60">{usd(t.sold, { compact: true })} sold ({pct(t.turnover_pct, 1)} of the book){res.new_money > 0 ? ` + ${usd(res.new_money, { compact: true })} new` : ''} · tax now {usd(t.tax_now)} · trading cost ≈ {usd(t.trading_cost)}</span>}
+              {!hold && t && <span className="text-xs text-base-content/60">{usd(t.sold, { compact: true })} sold ({pct(t.turnover_pct, 1)} of the book){res.new_money > 0 ? ` + ${usd(res.new_money, { compact: true })} new` : ''} · {taxed ? <>tax now {usd(t.tax_now)}</> : <span title="Pre-tax view: the optimizer ignores it, but a real sale would still owe it">tax left out{Math.abs(t.tax_ignored ?? 0) >= 1 ? ` (a real sale owes ≈ ${usd(t.tax_ignored ?? 0)})` : ''}</span>} · trading cost ≈ {usd(t.trading_cost)}</span>}
             </div>
             <ul className="mt-2 list-disc space-y-1 pl-4 text-[11.5px] leading-relaxed text-base-content/75">{res.why.map((w, i) => <li key={i}>{w}</li>)}</ul>
           </div>
@@ -161,13 +166,13 @@ export default function BondRebalance({ data, onChanged }: { data: BondPortfolio
             </div>
             {res.book && (
               <div className="grid grid-cols-2 gap-2 px-4 py-3 md:grid-cols-5">
-                <Delta label="After-tax yield" before={res.book.before.after_tax_yield_pct} after={res.book.after.after_tax_yield_pct} fmt={v => pct(v)} better="up" />
-                <Delta label="Total yield" before={res.book.before.total_yield_pct} after={res.book.after.total_yield_pct} fmt={v => pct(v)} better="up" />
+                {taxed && <Delta label="After-tax yield" before={res.book.before.after_tax_yield_pct} after={res.book.after.after_tax_yield_pct} fmt={v => pct(v)} better="up" />}
+                <Delta label={taxed ? 'Total yield' : 'Total yield (pre-tax)'} before={res.book.before.total_yield_pct} after={res.book.after.total_yield_pct} fmt={v => pct(v)} better="up" />
                 <Delta label="Duration" before={res.book.before.eff_duration} after={res.book.after.eff_duration} fmt={v => (v == null ? '—' : `${v.toFixed(2)}y`)}
                   hint="Longer isn't riskier here when each bond matures in the year you spend it — but its price moves more if you sold early" />
                 <Delta label="Positions" before={res.book.before.positions} after={res.book.after.positions} fmt={v => (v == null ? '—' : String(v))} />
                 <Delta label="Left at the end" before={res.end_wealth?.before} after={res.end_wealth?.after} fmt={v => usd(v, { compact: true })} better="up"
-                  hint="After-tax money remaining after the last goal year, at expected inflation" />
+                  hint={`${taxed ? 'After-tax' : 'Pre-tax'} money remaining after the last goal year, at expected inflation`} />
               </div>
             )}
           </Card>
@@ -193,10 +198,11 @@ export default function BondRebalance({ data, onChanged }: { data: BondPortfolio
                                 <div className="mt-0.5 text-[10.5px] leading-snug text-base-content/55">{s.reason}</div>
                               </td>
                               <td className="px-2 py-1.5 text-right tabular-nums"><div className="font-semibold">{usd(s.amount)}</div>
-                                <div className="text-[10px] text-base-content/45">yields {pct(s.after_tax_yield_pct)}</div></td>
+                                <div className="text-[10px] text-base-content/45">yields {pct(s.yield_pct ?? s.after_tax_yield_pct)}</div></td>
                               <td className="px-2 py-1.5 text-right tabular-nums text-[10.5px]">
                                 {Math.abs(s.gain) >= 1 && <div className={pnlClass(s.gain)}>{usd(s.gain, { sign: true })}</div>}
                                 {Math.abs(s.tax_now) >= 1 && <div className="text-base-content/45">tax {usd(s.tax_now, { sign: true })}</div>}
+                                {!taxed && Math.abs(s.tax_ignored ?? 0) >= 1 && <div className="text-base-content/35" title="Left out of the pre-tax view — a real sale would still owe it">tax {usd(s.tax_ignored ?? 0, { sign: true })} not counted</div>}
                               </td>
                               <td className="px-2 py-1.5 text-right">
                                 <button className="btn btn-ghost btn-xs" title="Keep this holding — re-run without selling it" disabled={loading} onClick={() => toggleKeep(s.holding_id)}><Unlock className="h-3 w-3" /> keep</button>
@@ -265,7 +271,7 @@ export default function BondRebalance({ data, onChanged }: { data: BondPortfolio
                     </tbody>
                   </table>
                 </div>
-                <div className="px-4 py-2"><Note>Yields are after tax in a taxable account and as earned inside a retirement account. A fund's "yield" is its estimated yield to maturity net of fees (or its distributions); funds with credit, leverage or currency risk can yield more than the alternative for that reason.</Note></div>
+                <div className="px-4 py-2"><Note>{taxed ? 'Yields are after tax in a taxable account and as earned inside a retirement account.' : 'Pre-tax view: every yield is the quoted yield, before any tax.'} A fund's "yield" is its estimated yield to maturity net of fees (or its distributions); funds with credit, leverage or currency risk can yield more than the alternative for that reason.</Note></div>
               </Card>
             )}
             {res.allocation && (

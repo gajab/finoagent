@@ -11,6 +11,7 @@ import BondRebalance from './BondRebalance';
 export default function BondBuyPlanner({ data, onChanged, onGotoPlanner }: { data: BondPortfolio; onChanged: () => void; onGotoPlanner: () => void }) {
   const hasGoals = (data.profile.goals ?? []).length > 0;
   const [mode, setMode] = useState<'plan' | 'balance'>(hasGoals ? 'plan' : 'balance');
+  const [afterTax, setAfterTax] = useState(true);            // same switch as the Planner; shared by both modes
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
@@ -20,8 +21,13 @@ export default function BondBuyPlanner({ data, onChanged, onGotoPlanner }: { dat
           {mode === 'plan' ? 'New purchases only: which years are short, what to buy for each, and what inflation does to it.'
             : 'Everything you hold, account by account: what to keep, what to swap, and where new money goes.'}
         </span>
+        <span className="ml-auto" title={afterTax ? 'Income tax, tax on sales and IRA withdrawal tax are counted — what you actually keep'
+          : 'Taxes left out: every yield and gap is before tax (as in the Planner\'s Pre-tax view)'}>
+          <Seg value={afterTax ? 'at' : 'pre'} onChange={v => setAfterTax(v === 'at')} options={[{ value: 'at', label: 'After tax' }, { value: 'pre', label: 'Pre-tax' }]} />
+        </span>
       </div>
-      {mode === 'plan' ? <BondGapPlan onChanged={onChanged} onGotoPlanner={onGotoPlanner} /> : <BondRebalance data={data} onChanged={onChanged} />}
+      {mode === 'plan' ? <BondGapPlan afterTax={afterTax} onChanged={onChanged} onGotoPlanner={onGotoPlanner} />
+        : <BondRebalance data={data} afterTax={afterTax} onChanged={onChanged} />}
     </div>
   );
 }

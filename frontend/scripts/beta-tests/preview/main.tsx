@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router-dom';
 import '../../../src/index.css';
 import BetaTechnical from '../../../src/beta/ta/BetaTechnical';
 import * as F from './fixtures';
+import momentumFragile from './momentumFragile.json';   // REAL engine on a synthetic 4/4-fragile series
 
 const params = new URLSearchParams(location.search);
 const noIv = params.has('noiv'), fail = params.get('fail');
@@ -26,6 +27,7 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       { signal: 'market_structure', reads: 'bullish', detail: 'market structure is bullish' }, { signal: 'daily_trend', reads: 'bearish', detail: 'daily trend is down' }, { signal: 'rsi', reads: 'bullish', detail: 'RSI 58' }, { signal: 'macd', reads: 'bearish', detail: 'MACD below signal' }] }; b.trade_setups.setups = []; }
     return json(b);
   }
+  if (url.includes('/momentum-setup')) return json(momentumFragile);
   if (url.includes('/day-trade-setups')) return json(F.dayTradeSetups);
   if (url.includes('/microstructure')) return json(F.microstructure);
   if (url.includes('/market-structure')) return json(F.marketStructure);

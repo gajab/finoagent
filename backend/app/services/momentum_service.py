@@ -41,6 +41,7 @@ from .qullamaggie_service import _ema, _adr_pct, _pct_move, _find_base, _detect_
 from .regime_edge_service import _rsi, _atr
 from .regime_service import _hurst, _efficiency_ratio, _classify
 from .institutional_ta_service import compute_institutional_ta
+from .fragility_service import compute_fragility, apply_risk_overlay, two_axis_line
 from .day_trade_service import _opening_range, _to_date
 
 
@@ -799,6 +800,10 @@ def compute_momentum_setup(stock, deep: bool = True) -> dict | None:
         ep_s = _ep(f, inst, ctx, spot, atr, orange)
         if ep_s:
             setups.append(ep_s)
+        # second axis (fragility) + gap-adjusted sizing; applied BEFORE ranking so fragile breakouts sink below pullbacks
+        frag = compute_fragility(daily)
+        for s in setups:
+            apply_risk_overlay(s, frag)
         setups.sort(key=lambda s: -(s.get("score") or 0))
         for i, s in enumerate(setups):
             s["rank"] = i + 1
@@ -822,7 +827,10 @@ def compute_momentum_setup(stock, deep: bool = True) -> dict | None:
             misses = [c["label"] for c in sc["checks"] if c["status"] == "fail"]
             summary = f"Partial momentum profile ({score}/100) — weak on: {', '.join(misses[:4])}." if misses else f"Partial momentum profile ({score}/100) — not enough confluence to qualify."
 
+        # two axes, never a lone trend grade: the score above is TREND quality; fragility is the crash-risk axis
+        summary = f"{two_axis_line(grade, score, frag)} {summary}"
         qualification = {"is_candidate": is_candidate, "grade": grade, "score": score,
+                         "trend_grade": grade, "trend_score": score, "fragility": frag,
                          "checks": sc["checks"], "summary": summary,
                          "passes": sum(1 for c in sc["checks"] if c["status"] == "pass"),
                          "entry_mode": entry_mode, "gates": {"uptrend": gate_trend, "leadership": gate_lead}}

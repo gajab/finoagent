@@ -193,10 +193,15 @@ const bookTailRisk = () => {
   const AMD = () => bt('AMD', 21, 'options', -49872, remed('BUY 1x 770C (vs your short 700C)', -6760, 11, 232, 'cap', pf('AMD', 770, 'CALL')), 242, { strike: 700, right: 'C', qty: 1 }, remed('SELL 1x 700C (close)', -1000, 900, 0, 'close'));
   const SMH = () => bt('SMH', 22, 'options_spread', -33212, remed('BUY 1x 825C (vs your short 750C)', -7081, 233, 601, 'cap', pf('SMH', 825, 'CALL')), 834, { strike: 750, right: 'C', qty: 1 });
   const APP = () => bt('APP', 11, 'cash_secured_put', -6829, remed('BUY 1x 205P (vs your short 230P)', -2272, 16, 112, 'cap', pf('APP', 205, 'PUT')), 126, { strike: 230, right: 'P', qty: 1 });
+  const AAOI = () => ({ ticker: 'AAOI', name: 'AAOI', trade_id: 180, structure: 'options_spread', risk: 936, premium_left: 90, why: 'w', tail_before: -936, protected: true,
+    stress: { market_move_pct: -20, beta: 3, name_move_pct: -60, vol_shock_pts: 15 },
+    recommended: { action: 'close', legs: 'CLOSE the 80/70P put spread (1×) — buy back the short, sell the long wing', cost: 100, tail_after: 0, premium_kept: 0, pricing: 'live ask + no bid (wing worth ~0)', detail: 'already defined-risk' },
+    alt: null, short: { strike: 80, right: 'P', qty: 1 } });
   const fix = (headline, targets, extra = {}) => ({ headline, effect: 'cuts the stress loss', cost: 'each target priced below', targets, ...extra });
   const chk = (key, label, status, value_str, limit_str, f, note) => ({ key, label, status, value_str, limit_str, note, fix: f });
   return {
     scope: { purpose: 'income', included: 14, excluded: { hedge: 2, untagged: 2, trade: 1 }, excluded_total: 5 },
+    deployed_reg_t: 41000,
     coverage: { requested: 14, analysed: 12, skipped: [{ trade_id: 50, ticker: 'TOST', reason: 'no open option legs (stock / futures only, or the options are closed)' }, { trade_id: 64, ticker: 'EQT', reason: 'no open option legs (stock / futures only, or the options are closed)' }] },
     data_quality: { legs: 22, chain: 1, solved: 21, fallback: 0, indicative: true },
     etf_hedges: (() => {
@@ -293,7 +298,7 @@ const bookTailRisk = () => {
         chk('var', 'VaR 95% (1-mo)', 'pass', '11.5%', '≤ 15%', undefined),
         chk('sym', 'Up/down tail symmetry', 'breach', 'up-tail 2.4× down', '≤ 1.5×', fix('Cap the call side where the squeeze loses', [AMD(), SMH()])),
         chk('cluster', 'Correlated-cluster conc.', 'breach', '61% in one cluster', '≤ 40%', fix('Cap the cluster', [AMD(), SMH()])),
-        chk('sector', 'Sector concentration', 'warn', 'Semis 52%', '≤ 45%', fix('Reduce Semis', [AMD()])),
+        chk('sector', 'Sector concentration', 'warn', 'Semis 52%', '≤ 45%', fix('Reduce Semis', [AMD(), AAOI()])),
         chk('tail', 'Tail loss at −20%', 'pass', '−$9.5k', '≤ $15k', undefined),
       ],
     },

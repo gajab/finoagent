@@ -94,7 +94,10 @@ class TestStructuralRepairs:
         r = self._condor()
         assert r["structure"] == "iron_condor" and r["short_right"] == "P"   # put side is tested
         names = " ".join(a["name"] for a in r["alternatives"])
-        assert "whole structure out" in names and "tested put wing" in names and "keep the call side" in names
+        assert "whole structure out" in names and "keep the call side" in names
+        # the tested-wing roll is offered ONLY as a credit/even roll (no new money): here it would cost a debit, so the
+        # menu must not carry it — and anything named "Roll…" that IS present must be net ≥ 0
+        assert all(a["net_cash"] >= 0 for a in r["alternatives"] if a["name"].startswith("Roll"))
         # NO single-leg overlays (jade / wheel) on a multi-leg structure
         assert not any("Jade" in a["name"] or a["category"] == "assignment" for a in r["alternatives"])
 
@@ -495,9 +498,11 @@ class TestEarnings:
         if d["category"] == "exit":
             assert any("removes the exposure to earnings" in x for x in d["reasons"])
 
-    def test_the_pick_tells_you_the_print_lands_after_this_expiry(self):
-        d = _ranked()["desk_recommendation"]
-        assert any("land AFTER this expiry" in x for x in d["reasons"])
+    def test_the_timing_read_tells_you_the_print_lands_after_this_expiry(self):
+        # (this used to be a generic sentence in the pick's reasons; WHEN to act now has its own structured read)
+        t = _ranked()["timing"]
+        assert t["verdict"] == "before_print" and t["act_by"]
+        assert any("land AFTER this expiry" in x for x in t["points"])
 
     def test_a_healthy_trade_gets_no_earnings_lecture(self):
         d = _ranked(posture="healthy", p_touch=8, far_spans=False)["desk_recommendation"]

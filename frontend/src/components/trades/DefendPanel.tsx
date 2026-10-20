@@ -30,6 +30,7 @@ import {
 import { fetchDefendMenu, fetchDefendCommittee, fetchDefendRefine } from '../../api';
 import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor } from '../../api';
 import { Card, money, rank, ScoreBar } from './RepairMenu';
+import { MoveStepsBlock, TimingBlock } from './MoveSteps';
 
 const num = (v: number | null | undefined, d = 0) =>
   v == null || !isFinite(v) ? '—' : v.toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -272,7 +273,9 @@ function DeskRecommendation({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate
         <span className="text-[10px] uppercase tracking-wider text-secondary/80 font-semibold">Desk recommendation</span>
         <span className="ml-auto text-lg font-bold text-secondary leading-none">{rec.desk_score}<span className="text-[9px] text-base-content/40">/100</span></span>
       </div>
-      <div className="text-sm font-semibold text-base-content/90">→ {rec.name}</div>
+      <div className="text-sm font-semibold text-base-content/90">→ {rec.name}{rec.policy === 'income' && <span className="badge badge-xs badge-info ml-1.5 align-middle" title={`The composite puts "${rec.policy_over?.over}" ${rec.policy_over?.gap ?? ''} points ahead, but it has no term for the premium you keep collecting`}>income policy</span>}</div>
+      {winner && <MoveStepsBlock a={winner} spot={d.spot ?? 0} />}
+      <TimingBlock t={d.timing} />
       {b && (
         <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 max-w-sm">
           <ScoreBar label="edge/$risk" v={b.edge} />
@@ -333,8 +336,10 @@ function ActionMenu({ d, onEvaluate }: { d: RepairMenuResult; onEvaluate: (a: Re
   const alts = d.alternatives || [];
   const priced = alts.filter(a => a.category !== 'exit' && a.category !== 'hold');
   // A "replace" closes the current trade and opens a new one — kept apart so the focus stays on fixing.
-  const fixes = priced.filter(a => a.group !== 'replace').sort((x, y) => rank(y) - rank(x));
-  const redeploys = priced.filter(a => a.group === 'replace').sort((x, y) => rank(y) - rank(x));
+  const pick = d.desk_recommendation?.name;
+  const byRank = (x: RepairAlternative, y: RepairAlternative) => (Number(y.name === pick) - Number(x.name === pick)) || (rank(y) - rank(x));
+  const fixes = priced.filter(a => a.group !== 'replace').sort(byRank);
+  const redeploys = priced.filter(a => a.group === 'replace').sort(byRank);
   const hold = alts.find(a => a.category === 'hold');
   const close = alts.find(a => a.category === 'exit');
   // The desk's actual pick (computed server-side — can legitimately BE Hold or Close, not just a

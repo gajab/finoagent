@@ -39,6 +39,17 @@ if "sqlite" not in settings.DATABASE_URL:
     engine_kwargs["pool_size"] = 5
     engine_kwargs["max_overflow"] = 10
     engine_kwargs["pool_timeout"] = 30
+    if "asyncpg" in settings.DATABASE_URL:
+        # Fail fast (instead of hanging) when the network can't reach the DB,
+        # and keep connections alive through NATs / flaky Wi-Fi.
+        engine_kwargs["connect_args"] = {
+            "timeout": 15,
+            "server_settings": {
+                "tcp_keepalives_idle": "30",
+                "tcp_keepalives_interval": "10",
+                "tcp_keepalives_count": "3",
+            },
+        }
 
 engine = create_async_engine(settings.DATABASE_URL, **engine_kwargs)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

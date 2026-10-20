@@ -4,7 +4,7 @@ import {
   Activity, TrendingUp, TrendingDown, Loader2, AlertCircle, RefreshCw,
   BarChart3, Globe, Waves, Sparkles, Gauge, Flame, Snowflake,
   ChevronDown, ChevronRight, MessageSquare, Send, Bot,
-  Sigma, Shield, Target, Zap, Scale, Droplets, CalendarRange, Compass, Landmark,
+  Sigma, Shield, ShieldAlert, Target, Zap, Scale, Droplets, CalendarRange, Compass, Landmark,
 } from 'lucide-react';
 import {
   Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement,
@@ -15,6 +15,7 @@ import { fetchMarketOverview, fetchMarketNarrative, fetchSectorDashboard, fetchS
 import SectorCalendarHeatmap from '../components/SectorCalendarHeatmap';
 import StyleCalendarHeatmap, { clearStyleCalendarCache } from '../components/StyleCalendarHeatmap';
 import LiquidityPanel from '../components/LiquidityPanel';
+import SelloffMonitor from '../components/SelloffMonitor';
 import { CollapsibleSidebar } from '../components/CollapsibleSidebar';
 import EconomicCycles from '../components/EconomicCycles';
 import DebtRadarPage from './DebtRadarPage';
@@ -803,7 +804,7 @@ function SectorQuantPanel({
 // Left-nav sections
 // ---------------------------------------------------------------------------
 
-type SectionId = 'indices' | 'sectors' | 'performance' | 'liquidity' | 'macro' | 'cycles' | 'debt';
+type SectionId = 'indices' | 'selloff' | 'sectors' | 'performance' | 'liquidity' | 'macro' | 'cycles' | 'debt';
 
 const SECTIONS: { id: SectionId; label: string; icon: React.ReactNode; description: string }[] = [
   {
@@ -811,6 +812,12 @@ const SECTIONS: { id: SectionId; label: string; icon: React.ReactNode; descripti
     label: 'Major Indices',
     icon: <BarChart3 className="w-5 h-5" />,
     description: 'Global equity benchmarks, rates, FX, commodities & crypto with sparklines and multi-timeframe returns.',
+  },
+  {
+    id: 'selloff',
+    label: 'Selloff Monitor',
+    icon: <ShieldAlert className="w-5 h-5" />,
+    description: 'Continuation or recovery? Cross-asset stress, historical base rates vs. options-implied ranges, and the levels to watch at the next open.',
   },
   {
     id: 'sectors',
@@ -905,7 +912,7 @@ export default function MarketPage() {
 
   useEffect(() => {
     const section = searchParams.get('section') as SectionId;
-    if (section && ['indices', 'sectors', 'performance', 'liquidity', 'macro', 'cycles', 'debt'].includes(section)) {
+    if (section && ['indices', 'selloff', 'sectors', 'performance', 'liquidity', 'macro', 'cycles', 'debt'].includes(section)) {
       setActiveSection(section);
     } else if (!section) {
       setActiveSection('indices');
@@ -1066,7 +1073,7 @@ export default function MarketPage() {
               <span className="text-[9px] font-bold uppercase tracking-widest text-base-content/30">Markets</span>
             </div>
             <div className="space-y-0.5">
-              {(['indices', 'sectors', 'performance'] as SectionId[]).map(id => {
+              {(['indices', 'selloff', 'sectors', 'performance'] as SectionId[]).map(id => {
                 const s = SECTIONS.find(sec => sec.id === id)!;
                 return <NavItem key={id} s={s} active={activeSection === id} onClick={() => selectSection(id)} />;
               })}
@@ -1370,6 +1377,13 @@ export default function MarketPage() {
                 <StyleCalendarHeatmap key={`style-${performanceRefreshKey}`} />
               </section>
             </div>
+          )}
+
+          {/* ============ SELLOFF MONITOR ============ */}
+          {activeSection === 'selloff' && (
+            <section className="bg-gray-900/60 rounded-2xl border border-white/10 p-6 shadow-lg">
+              <SelloffMonitor />
+            </section>
           )}
 
           {/* ============ LIQUIDITY & FUNDING ============ */}

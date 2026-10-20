@@ -69,6 +69,12 @@ def _sale_tax_rate(row: dict, rates: bm.TaxRates, today: date) -> float:
     return max(-0.3, min(0.5, pnl / mv * rate))
 
 
+def _view_yield(row: dict, after_tax: bool) -> float | None:
+    """A holding's yield on the basis the comparison uses: after tax in a taxable account, the yield earned in the
+    account inside an IRA/Roth (equal to its after-tax figure), and the quoted total yield when taxes are left out."""
+    return (row.get("tax") or {}).get("after_tax_yield_pct") if after_tax else row.get("total_yield_pct")
+
+
 async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
     try:
         import numpy as np
@@ -119,7 +125,7 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
                 **ps.inflation_fields(base_path, infl_src), "has_goals": bool((profile or {}).get("goals")),
                 "scenarios": [{k: (round(v * 100, 3) if k in ("short", "long", "rate_shift", "fx_drift") else v) for k, v in scs[key].items()}
                               for key in ("low", "base", "high", "debase")],
-                "worlds_optimized": [scs[k]["label"] for k in use]}
+                "worlds_optimized": [scs[k]["label"] for k in use], "after_tax": bool(after_tax)}
     if not out_base["has_goals"] or not any(b["need"].get(y, 0) > 0 for y in years):
         return {**out_base, "verdict": "no_goals", "sells": [], "buys": [], "why": [],
                 "notes": ["Add your goals in the Planner — the rebalancer builds the book that funds them."]}
@@ -390,13 +396,16 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
         if u <= 0:
             continue
         amt = r["market_value"] * u
-        rate = _sale_tax_rate(r, rates_now, today) if after_tax else 0.0
+        real_rate = _sale_tax_rate(r, rates_now, today)
+        rate = real_rate if after_tax else 0.0
         proceeds[r["account_type"]] += amt * p_h[r["id"]]
         sells.append({"holding_id": r["id"], "label": r["label"], "kind": r["kind"], "ticker": r.get("ticker"), "cusip": r.get("cusip"),
                       "account_type": r["account_type"], "fraction_pct": round(u * 100, 1), "amount": round(amt, 2),
                       "proceeds": round(amt * p_h[r["id"]], 2), "gain": round((r.get("unrealized_pnl") or 0.0) * u, 2),
-                      "tax_now": round(amt * rate, 2), "trading_cost": round(amt * TXN_COST.get(r["kind"], 0.005), 2),
+                      "tax_now": round(amt * rate, 2), "tax_ignored": 0.0 if after_tax else round(amt * real_rate, 2),
+                      "trading_cost": round(amt * TXN_COST.get(r["kind"], 0.005), 2),
                       "total_yield_pct": r.get("total_yield_pct"), "after_tax_yield_pct": (r.get("tax") or {}).get("after_tax_yield_pct"),
+                      "yield_pct": _view_yield(r, after_tax),
                       "duration": r.get("eff_duration"), "maturity": r.get("maturity"), "is_fund": False})
         h = by_id[r["id"]]
         if u >= 1.0:
@@ -412,13 +421,16 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
         if v <= 0:
             continue
         u = v / V
-        rate = _sale_tax_rate(r, rates_now, today) if after_tax else 0.0
+        real_rate = _sale_tax_rate(r, rates_now, today)
+        rate = real_rate if after_tax else 0.0
         proceeds[r["account_type"]] += v * p_f[fid]
         sells.append({"holding_id": fid, "label": r["label"], "kind": r["kind"], "ticker": r.get("ticker"), "cusip": None,
                       "account_type": r["account_type"], "fraction_pct": round(u * 100, 1), "amount": round(v, 2),
                       "proceeds": round(v * p_f[fid], 2), "gain": round((r.get("unrealized_pnl") or 0.0) * u, 2),
-                      "tax_now": round(v * rate, 2), "trading_cost": round(v * TXN_COST.get(r["kind"], 0.0005), 2),
+                      "tax_now": round(v * rate, 2), "tax_ignored": 0.0 if after_tax else round(v * real_rate, 2),
+                      "trading_cost": round(v * TXN_COST.get(r["kind"], 0.0005), 2),
                       "total_yield_pct": r.get("total_yield_pct"), "after_tax_yield_pct": (r.get("tax") or {}).get("after_tax_yield_pct"),
+                      "yield_pct": _view_yield(r, after_tax),
                       "duration": r.get("eff_duration"), "maturity": None, "is_fund": True,
                       "accumulates": (r.get("fund") or {}).get("payout") == "accumulates"})
         h = by_id[fid]
@@ -450,7 +462,7 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
                 buys.append({"account_type": a, "year": c["y"], "leg": "intl", "kind": "etf", "label": info["name"], "rating": None,
                              "ticker": c["ticker"], "amount": round(amt, 2), "face": round(qty, 3), "pre_tax_pct": info["yield_pct"],
                              "real_yield_pct": None,
-                             "after_tax_pct": ps._pct(c["c"]["pre_tax_yield"] if a in lad.SHELTERED else c["c"]["after_tax_yield"]),
+                             "after_tax_pct": ps._pct(c["c"]["pre_tax_yield"] if (a in lad.SHELTERED or not after_tax) else c["c"]["after_tax_yield"]),
                              "spendable": round(amt * c["c"]["growth"], 2), "security": None, "etf": c["ticker"], "what": info["what"],
                              "non_usd": True})
                 continue
@@ -465,8 +477,9 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
                          "amount": round(made[1]["cost"], 2), "face": made[1]["face"], "pre_tax_pct": ps._pct(cc["pre_tax_yield"]),
                          "real_yield_pct": ps._pct(cc["real_yield"]) if cc.get("real_yield") is not None else None,
                          # inside an IRA/Roth the yield compounds untaxed (a traditional IRA's tax comes at withdrawal, on
-                         # whatever it holds) → compare like with like: the yield earned IN the account
-                         "after_tax_pct": ps._pct(cc["pre_tax_yield"] if a in lad.SHELTERED else cc["after_tax_yield"]),
+                         # whatever it holds) → compare like with like: the yield earned IN the account. Pre-tax view: the
+                         # quoted yield everywhere (same basis as what's sold)
+                         "after_tax_pct": ps._pct(cc["pre_tax_yield"] if (a in lad.SHELTERED or not after_tax) else cc["after_tax_yield"]),
                          "spendable": round(made[1]["cost"] * cc["growth"], 2),
                          "security": made[1]["security"], "etf": fam.get(c["y"])})
     merged: dict[tuple, dict] = {}
@@ -515,15 +528,16 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
         a, D = r["account_type"], max(1.0, min(10.0, r.get("eff_duration") or 1.0))
         nom, _ = gap.best_nominal(D, today.year + int(round(D)), a, profile, sched, mi, base_path, today, min_credit=min_credit, after_tax=after_tax)
         inside = a in lad.SHELTERED
-        y_f = r.get("total_yield_pct") if inside else (r.get("tax") or {}).get("after_tax_yield_pct")
-        y_alt = ps._pct(nom["pre_tax_yield"] if inside else nom["after_tax_yield"]) if nom else None
+        pre = inside or not after_tax
+        y_f = _view_yield(r, after_tax)
+        y_alt = ps._pct(nom["pre_tax_yield"] if pre else nom["after_tax_yield"]) if nom else None
         fund_alts.append({
             "holding_id": fid, "label": r["label"], "ticker": r.get("ticker"), "account_type": a, "value": round(r["market_value"], 2),
             "yield_pct": y_f, "alt_label": nom["label"] if nom else None, "alt_years": round(D, 1), "alt_yield_pct": y_alt,
             "gap_pct": round(y_alt - y_f, 3) if (y_alt is not None and y_f is not None) else None,
             "duration": r.get("eff_duration"), "expense_ratio_pct": (r.get("fund") or {}).get("expense_ratio_pct"),
             "sold_pct": next((s_["fraction_pct"] for s_ in sells if s_["holding_id"] == fid), 0.0), "kept": fid in keep_ids,
-            "basis": "inside the account" if inside else "after tax"})
+            "basis": "inside the account" if inside else ("after tax" if after_tax else "before tax")})
     fund_alts.sort(key=lambda x: -(x["gap_pct"] if x["gap_pct"] is not None else -99))
     alt_by = {x["holding_id"]: x for x in fund_alts}
     for s_ in sells:
@@ -542,8 +556,8 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
             s_["reason"] = f"matures {mat_y}, before this account can be tapped ({released}) — the cash would just wait in T-bills"
         elif tips_b > 0.5 and s_["kind"] != "tips":
             s_["reason"] = "fixed dollars → inflation-linked: the spending it pays for rises with CPI"
-        elif (s_["after_tax_yield_pct"] or 0) + 0.05 < y_b:
-            s_["reason"] = f"earns {s_['after_tax_yield_pct']:.2f}% vs {y_b:.2f}% in what replaces it"
+        elif (s_["yield_pct"] or 0) + 0.05 < y_b:
+            s_["reason"] = f"earns {s_['yield_pct']:.2f}% vs {y_b:.2f}% in what replaces it"
         else:
             s_["reason"] = "moved to the years your plan is short"
     sold_total = sum(s_["amount"] for s_ in sells)
@@ -577,12 +591,12 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
             tips_share = sum(l["amount"] for l in bb if l["kind"] == "tips") / amt_b
             kinds_b = sorted({l["label"] for l in bb})
             label = "taxable account" if a == "taxable" else f"{a.upper()}"
-            basis = "a year after tax" if a not in lad.SHELTERED else "a year inside the account"
+            basis = "a year inside the account" if a in lad.SHELTERED else ("a year after tax" if after_tax else "a year before tax")
             span = f"{bb[0]['years'][0]}–{bb[-1]['years'][-1]}" if bb[0]["years"][0] != bb[-1]["years"][-1] else str(bb[0]["years"][0])
             msg = f"In your {label}: buy {gap._money(amt_b)} of bonds for {span} earning {y_b:.2f}% {basis}"
             if ss:
                 amt_s = sum(s_["amount"] for s_ in ss)
-                y_s = sum(s_["amount"] * (s_["after_tax_yield_pct"] or 0) for s_ in ss) / amt_s
+                y_s = sum(s_["amount"] * (s_["yield_pct"] or 0) for s_ in ss) / amt_s
                 funds_sold = [s_ for s_ in ss if s_["is_fund"]]
                 msg += f", paid for by selling {gap._money(amt_s)} earning {y_s:.2f}%"
                 if funds_sold:
@@ -604,15 +618,17 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
                 why.append(f"{scs[k]['label']}: unfunded spending {'falls' if d > 0 else 'rises'} by {gap._money(abs(d))} "
                            f"({before[k]['funded_ratio_pct']}% → {after[k]['funded_ratio_pct']}% funded).")
     else:
-        why.append("Your book already does what the plan needs about as well as any swap would after tax, trading costs and your "
-                   "turnover limit — nothing is worth changing" + (" beyond investing the new money." if new_money > 0 else "."))
+        why.append("Your book already does what the plan needs about as well as any swap would"
+                   + (" after tax, trading costs and your " if after_tax else " (before tax), after trading costs and your ")
+                   + "turnover limit — nothing is worth changing" + (" beyond investing the new money." if new_money > 0 else "."))
         if not (new_money > 0):
             sells, buys, cash_left, after, sum_a, rows_a = [], [], [], before, sum_b, rows_b
     return {
         **out_base, "verdict": verdict, "sells": sells, "buys": buys, "cash_left": cash_left, "why": why,
         "totals": {"sold": round(sum(s_["amount"] for s_ in sells), 2), "bought": round(sum(l["amount"] for l in buys), 2),
                    "turnover_pct": round(100 * sum(s_["amount"] for s_ in sells) / M0, 1) if M0 else 0.0,
-                   "tax_now": round(sum(s_["tax_now"] for s_ in sells), 2), "trading_cost": round(sum(s_["trading_cost"] for s_ in sells), 2),
+                   "tax_now": round(sum(s_["tax_now"] for s_ in sells), 2), "tax_ignored": round(sum(s_["tax_ignored"] for s_ in sells), 2),
+                   "trading_cost": round(sum(s_["trading_cost"] for s_ in sells), 2),
                    "positions_sold": len(sells), "lines_bought": len(buys)},
         "by_account": [{"account_type": a, "value": round(sum(r["market_value"] for r in live if r["account_type"] == a), 2),
                         "sold": round(sum(s_["amount"] for s_ in sells if s_["account_type"] == a), 2),
@@ -633,6 +649,9 @@ async def rebalance(holdings: list[dict], profile: dict, params: dict) -> dict:
                    "intl_target": round(intl_target, 2), "intl_funds": list(intl_info.values())},
         "keep_ids": sorted(keep_ids), "kept": [{"holding_id": i, "label": rows[i]["label"]} for i in sorted(keep_ids) if i in rows],
         "notes": [
+            *([] if after_tax else [
+                "Pre-tax view: income tax, tax on sales and IRA withdrawal tax are all left out — the book is judged on what it pays "
+                "before tax, so tax-exempt munis never win and gains cost nothing to realize. Switch to After tax for what you'd keep."]),
             *(["Non-dollar bond funds (unhedged): their dollar value moves with exchange rates — modelled as gaining what the dollar loses "
                "beyond your expected inflation, and losing if the dollar strengthens. Their yields are the funds' trailing distributions."]
               if intl_target >= 1000 else []),

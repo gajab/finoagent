@@ -348,7 +348,7 @@ async def gap_plan(body: GapPlanIn, user: User = Depends(get_current_user), db: 
     # ~20 full plan runs → cache per (book, profile, inputs, day): any edit to a holding, goal or setting misses
     sig = hashlib.md5(json.dumps([holdings, profile, body.model_dump(), mkt.us_today().isoformat()],
                                  sort_keys=True, default=str).encode()).hexdigest()
-    key = f"bonds:gap:v2:{user.id}:{sig}"
+    key = f"bonds:gap:v3:{user.id}:{sig}"
     hit = await get_cached(db, key)
     if hit is not None:
         return hit
@@ -399,7 +399,7 @@ async def rebalance(body: RebalanceIn, user: User = Depends(get_current_user), d
     profile = await _load_profile(db, user.id)
     sig = hashlib.md5(json.dumps([holdings, profile, body.model_dump(), mkt.us_today().isoformat()],
                                  sort_keys=True, default=str).encode()).hexdigest()
-    key = f"bonds:rebal:v2:{user.id}:{sig}"
+    key = f"bonds:rebal:v3:{user.id}:{sig}"
     hit = await get_cached(db, key)
     if hit is not None:
         return hit

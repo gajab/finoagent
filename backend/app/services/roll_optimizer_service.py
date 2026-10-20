@@ -92,16 +92,27 @@ def select_roll_expiries(inwin: list, *, earn_days: Optional[int] = None, max_ex
 
 async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str, tested_strike: float,
                         tested_qty: int, tested_entry: float, current_dte: int, covered: bool = False,
-                        r: float = 0.045, max_expiries: int = 5, max_horizon: int = 130) -> dict:
+                        r: float = 0.045, max_expiries: int = 5, max_horizon: int = 130,
+                        wing_long_strike: Optional[float] = None) -> dict:
     """Search the (strike, expiry) grid of CREDIT rolls and rank them on the confluence of RND
     probability, market structure (support/resistance · gamma flip/wall · volume POC), credit and
-    cushion. Returns {tested, structure, weights, candidates:[…]}. Best-effort; guarded throughout."""
+    cushion. Returns {tested, structure, weights, candidates:[…]}. Best-effort; guarded throughout.
+
+    `wing_long_strike` turns it into a SPREAD roll: the tested position is a vertical (the short at
+    `tested_strike` + the protective long at `wing_long_strike`, `tested_entry` = the spread's net credit per share).
+    The package is priced as one — buy back the whole old spread, sell a new spread of the SAME WIDTH at a later
+    expiry — and a candidate must still be a net credit or EVEN (no new money). Defined risk is preserved, so the
+    only questions are strike, date and what the print does to it."""
     from .hedging_service import _split_chain, _build_rnd
     from .stock_service import find_support_resistance
     from . import dealer_positioning_service as dps
 
     is_put = tested_right == "P"
     today = dt.date.today()
+    wing = wing_long_strike is not None
+    width = abs(float(tested_strike) - float(wing_long_strike)) if wing else 0.0
+    if wing and width <= 0:
+        return {"error": "The spread has no width to roll."}
 
     try:
         exps_raw = list(await provider.get_option_expirations(ticker))
@@ -182,16 +193,24 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
     if cur_exp is not None:
         try:
             c0, p0 = _split_chain(await provider.get_option_chain(ticker, cur_exp))
-            q0 = (p0 if is_put else c0).get(float(tested_strike))
+            book0 = p0 if is_put else c0
+            q0 = book0.get(float(tested_strike))
             m0 = getattr(q0, "mid", None) if q0 else None
-            tested_mark = float(m0) if m0 else None
+            if wing:                                                # the cost to buy back the WHOLE old spread
+                ql0 = book0.get(float(wing_long_strike))
+                ml0 = getattr(ql0, "mid", None) if ql0 else None
+                tested_mark = (float(m0) - float(ml0)) if (m0 and ml0 is not None) else None
+            else:
+                tested_mark = float(m0) if m0 else None
         except Exception:  # noqa: BLE001
             tested_mark = None
     if not tested_mark or tested_mark <= 0:
-        intr = max(0.0, tested_strike - spot) if is_put else max(0.0, spot - tested_strike)
-        tested_mark = intr + 0.05                                   # intrinsic + a token time value
+        def _intr(k):
+            return max(0.0, k - spot) if is_put else max(0.0, spot - k)
+        intr = (_intr(float(tested_strike)) - _intr(float(wing_long_strike))) if wing else _intr(float(tested_strike))
+        tested_mark = max(intr, 0.0) + 0.05                         # intrinsic + a token time value
 
-    base_capital = 100.0 * float(tested_strike) * tested_qty
+    base_capital = (width * 100.0 * tested_qty) if wing else (100.0 * float(tested_strike) * tested_qty)
     # probability (RND, time-aware) leads; structure is time-DECAYED and cushion is measured in σ over
     # the horizon, so a longer expiry (more days to drift across a level) scores lower — and credit is
     # de-weighted so a far-dated roll can't win on premium it only earns by taking on more time/risk.
@@ -229,6 +248,20 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
             credit_new = float(getattr(q, "mid", None) or 0.0)
             if credit_new <= 0:
                 continue
+            Kl = ql = None
+            if wing:
+                # the protective long at the SAME width, on a LISTED strike (a width we can't reproduce isn't a roll)
+                tgt = K - width if is_put else K + width
+                near = min(book.keys(), key=lambda k: abs(k - tgt))
+                if abs(near - tgt) > max(0.01, 0.01 * width) or abs(near - K) < 1e-9:
+                    continue
+                Kl, ql = float(near), book.get(near)
+                l_mid = float(getattr(ql, "mid", None) or 0.0)
+                if l_mid <= 0:
+                    continue
+                credit_new = credit_new - l_mid                      # the NEW spread's net credit
+                if credit_new <= 0:
+                    continue
             roll_net = round((credit_new - tested_mark) * 100.0 * tested_qty, 0)
             if roll_net < 0:                                        # ── CREDIT ONLY: no net new money ──
                 continue
@@ -245,7 +278,7 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
 
             total_credit = tested_entry + roll_net / (100.0 * tested_qty)
             new_be = round(K - total_credit if is_put else K + total_credit, 2)
-            new_cap = round(100.0 * K * tested_qty, 0)
+            new_cap = round((width * 100.0 * tested_qty) if wing else (100.0 * K * tested_qty), 0)
 
             # confluence against the RECENT structure — the strike must sit BEYOND the levels the stock
             # struggles to cross (safe direction: below for a put, above for a call).
@@ -267,7 +300,10 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
             structure_score = structure_raw * time_factor
 
             pop_score = p_otm * 100.0
-            credit_score = max(0.0, min(100.0, roll_net / (0.01 * base_capital) * 100.0)) if base_capital > 0 else 0.0
+            if wing:                                                # a credit worth 10% of the width is full marks
+                credit_score = max(0.0, min(100.0, roll_net / (0.10 * base_capital) * 100.0)) if base_capital > 0 else 0.0
+            else:
+                credit_score = max(0.0, min(100.0, roll_net / (0.01 * base_capital) * 100.0)) if base_capital > 0 else 0.0
             # Cushion in σ OVER THIS EXPIRY'S HORIZON — the SAME $ distance is FEWER σ (weaker) the more
             # days to expiry (σ grows with √T), so a far-dated roll must sit further out to score. This is
             # exactly the "more days → more chance to drift across the strike/level" the trader feels.
@@ -284,13 +320,21 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
             if spans_earn:
                 composite = round(composite - 6.0, 1)              # rolling PAST earnings adds binary risk
 
-            why = (f"Roll to the ${K:.0f} {'put' if is_put else 'call'} exp {exp_iso} for a "
-                   f"{'+' if roll_net >= 0 else '−'}${abs(roll_net):,.0f} credit — "
+            _word = "put" if is_put else "call"
+            _credit_txt = ("at EVEN cost" if abs(roll_net) < 0.5 else
+                           f"for a {'+' if roll_net >= 0 else '−'}${abs(roll_net):,.0f} credit")
+            if wing:
+                why = (f"Roll the ${float(tested_strike):.0f}/${float(wing_long_strike):.0f} {_word} spread to ${K:.0f}/${Kl:.0f} exp {exp_iso} "
+                       f"{_credit_txt} — ")
+            else:
+                why = (f"Roll to the ${K:.0f} {_word} exp {exp_iso} for a "
+                       f"{'+' if roll_net >= 0 else '−'}${abs(roll_net):,.0f} credit — ")
+            why = (why +
                    f"{round(p_otm * 100)}% {src}-OTM ({cushion_sigma:.1f}σ over {dte}d)"
                    + (f", clears {', '.join(cleared)}" if cleared else ", but clears no structural level")
                    + (" — but that's far out, so structure counts less" if time_factor < 0.7 else "")
                    + f"; new breakeven ${new_be}"
-                   + (f", frees capital to ${new_cap:,.0f}" if is_put and new_cap < base_capital else "")
+                   + (f", frees capital to ${new_cap:,.0f}" if (is_put and not wing and new_cap < base_capital) else "")
                    + (f"; ⚠ spans earnings {next_earn.isoformat()} (binary risk)" if spans_earn
                       else " — stays before earnings" if next_earn else "")
                    + ".")
@@ -299,8 +343,12 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
                 "expiry": exp_iso, "dte": dte, "strike": round(K, 2), "right": tested_right,
                 # the NEW short's own price + skew IV — the merge into the desk's ranked menu re-prices this
                 # leg's payoff/greeks/PoP/E[P&L] with the shared engine (build_roll_alternatives)
-                "new_price": round(credit_new, 4),
+                # (for a spread: `new_price` = the NEW SHORT's own mid, the wing's price/strike/IV ride alongside)
+                "new_price": round(float(getattr(q, "mid", None) or 0.0), 4),
                 "iv": (round(float(getattr(q, "iv", None)), 4) if getattr(q, "iv", None) else None),
+                **({"long_strike": round(Kl, 2), "long_price": round(float(getattr(ql, "mid", None) or 0.0), 4),
+                    "long_iv": (round(float(getattr(ql, "iv", None)), 4) if getattr(ql, "iv", None) else None),
+                    "width": round(width, 2)} if wing else {}),
                 "roll_net_cash": roll_net, "credit_per_share": round(credit_new - tested_mark, 2),
                 "new_credit_total": round(total_credit, 2), "new_breakeven": new_be, "new_capital": new_cap,
                 "p_otm": round(p_otm * 100, 1), "p_otm_source": src, "spans_earnings": spans_earn,
@@ -309,12 +357,15 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
                            "structure": round(structure_score, 1), "credit": round(credit_score, 1),
                            "cushion": round(cushion_score, 1),
                            "cushion_sigma": round(cushion_sigma, 2), "time_factor": round(time_factor, 2)},
-                "legs": [
+                "legs": ([
                     {"action": "BUY", "right": tested_right, "strike": round(float(tested_strike), 2),
                      "qty": tested_qty, "dte_days": current_dte, "expiry": (str(cur_exp)[:10] if cur_exp else None)},
-                    {"action": "SELL", "right": tested_right, "strike": round(K, 2),
-                     "qty": tested_qty, "dte_days": dte, "expiry": exp_iso},
-                ],
+                ] + ([{"action": "SELL", "right": tested_right, "strike": round(float(wing_long_strike), 2),
+                       "qty": tested_qty, "dte_days": current_dte, "expiry": (str(cur_exp)[:10] if cur_exp else None)}] if wing else [])
+                  + [{"action": "SELL", "right": tested_right, "strike": round(K, 2),
+                      "qty": tested_qty, "dte_days": dte, "expiry": exp_iso}]
+                  + ([{"action": "BUY", "right": tested_right, "strike": round(Kl, 2),
+                       "qty": tested_qty, "dte_days": dte, "expiry": exp_iso}] if wing else [])),
                 "why": why,
             })
 
@@ -322,7 +373,8 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
     return {
         "tested": {"right": tested_right, "strike": round(float(tested_strike), 2), "qty": tested_qty,
                    "entry": round(tested_entry, 2), "mark": round(tested_mark, 4), "dte": current_dte,
-                   "covered": bool(covered)},
+                   "covered": bool(covered),
+                   **({"long_strike": round(float(wing_long_strike), 2), "width": round(width, 2)} if wing else {})},
         "spot": round(spot, 2),
         "structure": {"support": support, "resistance": resistance, "poc": poc,
                       "gamma_flip": flip, "gamma_wall": wall, "gamma_regime": struct.get("gamma_regime"),
@@ -332,7 +384,10 @@ async def optimize_roll(*, ticker: str, provider, spot: float, tested_right: str
         "weights": weights,
         "considered": len(results),
         "candidates": results[:6],
-        "note": ("Covered call — the roll keeps your shares; 'capital' is the called-away notional, not new cash. Every roll is a NET CREDIT."
+        "note": (f"Defined-risk {'put' if is_put else 'call'} spread — every roll keeps the same ${width:.0f} width and is a NET CREDIT or EVEN "
+                 "(no new money): the loss on the old spread is carried forward, not crystallized, and the new credit lowers the break-even."
+                 if wing else
+                 "Covered call — the roll keeps your shares; 'capital' is the called-away notional, not new cash. Every roll is a NET CREDIT."
                  if covered else
                  "Naked short call — every roll is a NET CREDIT (no new money), but a roll only RE-TIMES the same unbounded upside; "
                  "it does not cap it."

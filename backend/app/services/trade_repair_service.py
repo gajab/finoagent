@@ -283,11 +283,117 @@ def _build(*, name, category, mechanics, legs, realized, stock, establish_cash, 
         "upside_risk_free": bool(_pnl_at(spot * 1.60, legs, realized, stock, r, horizon) >= -1),
         "pop_pct": pop, "ev": ev,
         "turns_profitable": bool(max_gain > 0),
+        # `price` = the leg's per-share entry price (for a NEW leg: today's chain mid — what you'd actually trade at).
         "legs": [{"action": "SELL" if lg["sign"] < 0 else "BUY", "right": lg["right"],
-                  "strike": round(lg["strike"], 2), "qty": lg["qty"], "dte_days": lg["dte_days"]} for lg in legs]
+                  "strike": round(lg["strike"], 2), "qty": lg["qty"], "dte_days": lg["dte_days"],
+                  "price": round(float(lg["entry"]), 2)} for lg in legs]
                 + ([{"action": "BUY" if stock_shares > 0 else "SELL", "right": "STK",
-                     "strike": round(stock["basis"], 2), "qty": abs(int(stock_shares)), "dte_days": None}] if stock else []),
+                     "strike": round(stock["basis"], 2), "qty": abs(int(stock_shares)), "dte_days": None,
+                     "price": round(stock["basis"], 2)}] if stock else []),
     }
+
+
+def attach_steps(alt: dict, held: dict, spot: float) -> None:
+    """Spell out, for ONE alternative, exactly WHAT TO DO and what it all adds up to — INCLUDING the position you
+    already hold. The card used to list only the NEW legs ("−1 P$75 Dec18 +1 P$65 Dec18"), so you could not tell what
+    to close, nor what the move did to the trade you are already in.
+
+    Diffs the alternative's legs against `held` (the position as it stands today):
+      close  — held legs the alternative drops, at TODAY's mark   (BUY to close a short, SELL to close a long)
+      open   — legs the alternative adds, at today's chain mid
+      keep   — held legs it leaves untouched
+    and the ALL-IN picture (`all_in`): what the original position collected, what closing locks in, the net cash
+    today, and the best / worst case and break-evens of the WHOLE thing (old trade + this move) — the numbers the
+    card's Max gain / Max loss already are, now named and bridged.
+
+    `held` = {"legs": [{right, strike, sign, qty, dte_days, expiry, entry, mark}], "stock": …, "collected": $}.
+    Sets `alt["steps"]` and `alt["all_in"]` in place. Pure — no pricing."""
+    cat = alt.get("category")
+    alt_opts = [l for l in (alt.get("legs") or []) if l.get("right") in ("P", "C")]
+
+    def key(right, strike, sign, dte):
+        return (right, round(float(strike), 4), int(sign), int(dte) if dte is not None else -1)
+
+    avail: dict = {}
+    meta: dict = {}
+    for lg in held.get("legs") or []:
+        k = key(lg["right"], lg["strike"], lg["sign"], lg.get("dte_days"))
+        avail[k] = avail.get(k, 0) + int(lg["qty"])
+        meta[k] = lg
+
+    keep, opens = [], []
+    for l in alt_opts:
+        sign = -1 if l.get("action") == "SELL" else 1
+        k = key(l["right"], l["strike"], sign, l.get("dte_days"))
+        q = int(l["qty"])
+        have = avail.get(k, 0)
+        kq = min(have, q)
+        if kq:
+            keep.append({"action": l["action"], "right": l["right"], "strike": l["strike"], "qty": kq,
+                         "expiry": (meta[k].get("expiry") or l.get("expiry")), "price": round(float(meta[k]["entry"]), 2)})
+            avail[k] = have - kq
+        if q - kq:
+            opens.append({"action": l["action"], "right": l["right"], "strike": l["strike"], "qty": q - kq,
+                          "expiry": l.get("expiry"), "price": round(float(l.get("price") or 0.0), 2)})
+
+    closes, closed_pnl = [], 0.0
+    for k, left in avail.items():
+        if left <= 0:
+            continue
+        lg = meta[k]
+        mark = float(lg.get("mark") or 0.0)
+        closes.append({"action": "BUY" if lg["sign"] < 0 else "SELL", "right": lg["right"], "strike": lg["strike"],
+                       "qty": left, "expiry": lg.get("expiry"), "price": round(mark, 2)})
+        closed_pnl += lg["sign"] * left * _MULT * (mark - float(lg["entry"]))      # short: (entry − mark); long: (mark − entry)
+
+    def cash(step):                                         # SELL brings cash in, BUY takes it out
+        return (1 if step["action"] == "SELL" else -1) * step["price"] * step["qty"] * _MULT
+
+    for s in closes + opens:
+        s["cash"] = round(cash(s), 0)
+
+    # shares: only when the alternative itself carries a stock leg (an option-only alternative leaves them untouched)
+    stk = next((l for l in (alt.get("legs") or []) if l.get("right") == "STK"), None)
+    stock_step, stock_cash = None, None
+    if stk:
+        alt_sh = int(stk["qty"]) * (1 if stk["action"] == "BUY" else -1)
+        held_sh = int((held.get("stock") or {}).get("shares") or 0)
+        delta = alt_sh - held_sh
+        if delta:
+            stock_step = {"action": "BUY" if delta > 0 else "SELL", "right": "STK", "qty": abs(delta), "price": round(spot, 2),
+                          "strike": None, "expiry": None}
+            stock_cash = -delta * spot
+
+    opt_cash = sum(s["cash"] for s in closes + opens)
+    net = float(alt.get("net_cash") or 0.0)
+    # Prices are shown to the cent, so each contract-leg can drift ≤ $0.50 from the unrounded engine cash — scale the
+    # reconciliation tolerance with the number of contracts instead of widening it for everything.
+    tol = 1.5 + 0.5 * sum(int(s["qty"]) for s in closes + opens)
+    if stock_step is not None:
+        if abs(opt_cash + stock_cash - net) <= tol:
+            stock_step["cash"] = round(stock_cash, 0)                       # shares paid for in cash
+        else:
+            stock_step["cash"] = None                                       # futures / margin hedge — no cash outlay modeled
+    reconciled = abs(opt_cash + (stock_step["cash"] if (stock_step and stock_step.get("cash") is not None) else 0.0) - net) <= tol
+
+    notes = []
+    if cat == "assignment":
+        # the wheel is "let the put be assigned", not "buy it back": the engine's cash is just the new call's credit
+        closes = []
+        opens = [o for o in opens if o["right"] == "C"]
+        if stk:
+            notes.append(f"Let the short put be ASSIGNED — you buy {int(stk['qty'])} sh at ${float(stk['strike']):.2f} effective, then sell the call.")
+        stock_step = None
+        reconciled = True
+        closed_pnl = 0.0
+
+    scn0 = next((s["pnl"] for s in (alt.get("scenarios") or []) if s.get("move_pct") == 0), None)
+    alt["steps"] = {"close": closes, "open": opens, "keep": keep, "stock": stock_step, "notes": notes,
+                    "close_cash": round(sum(s["cash"] for s in closes), 0), "open_cash": round(sum(s["cash"] for s in opens), 0),
+                    "net_cash": round(net, 0), "reconciled": bool(reconciled)}
+    alt["all_in"] = {"collected_at_open": round(float(held.get("collected") or 0.0), 0), "locked_in": round(closed_pnl, 0),
+                     "net_cash_today": round(net, 0), "best_case": alt.get("max_gain"), "worst_case": alt.get("max_loss"),
+                     "at_spot": scn0, "breakevens": alt.get("breakevens") or []}
 
 
 def _vs_hold(a: dict, hold_pop, hold_ev, hold_ml) -> None:
@@ -296,6 +402,36 @@ def _vs_hold(a: dict, hold_pop, hold_ev, hold_ml) -> None:
     a["d_pop"] = round(a["pop_pct"] - hold_pop) if (a.get("pop_pct") is not None and hold_pop is not None) else None
     a["d_max_loss"] = round(a["max_loss"] - hold_ml) if (a.get("max_loss") is not None and hold_ml is not None) else None
     a["d_ev"] = round(a["ev"] - hold_ev) if (a.get("ev") is not None and hold_ev is not None) else None
+
+
+def identify_wing(hold: list[dict], spot: float) -> Optional[dict]:
+    """The TESTED WING of a short-premium position, when it is a clean vertical: the tested short (the short furthest
+    into / nearest through the money) plus exactly ONE same-right long of equal size on the protective side (a put
+    credit spread, a call credit spread, or one side of an iron condor). That is the unit a trader ROLLS — close the
+    old spread, open a new one at a later expiry — so the live roll search can price it as one package. Anything else
+    (a lone short, a strangle, a debit/ratio structure) returns None.
+
+    `hold` = option legs [{right, sign, strike, qty, entry, …}]. `kept` = the legs OUTSIDE the wing (the other side
+    of a condor), which a wing roll leaves untouched."""
+    shorts = [lg for lg in hold if lg["sign"] < 0]
+    if not shorts:
+        return None
+    tested = max(shorts, key=lambda lg: (lg["strike"] - spot) if lg["right"] == "P" else (spot - lg["strike"]))
+    longs = [lg for lg in hold if lg["sign"] > 0 and lg["right"] == tested["right"]]
+    if len(longs) != 1:
+        return None
+    lng = longs[0]
+    if int(lng["qty"]) != int(tested["qty"]):
+        return None
+    protective = lng["strike"] < tested["strike"] if tested["right"] == "P" else lng["strike"] > tested["strike"]
+    if not protective:
+        return None
+    return {"right": tested["right"], "qty": int(tested["qty"]),
+            "short_strike": float(tested["strike"]), "long_strike": float(lng["strike"]),
+            "width": abs(float(tested["strike"]) - float(lng["strike"])),
+            "short_entry": float(tested["entry"]), "long_entry": float(lng["entry"]),
+            "net_entry": float(tested["entry"]) - float(lng["entry"]),
+            "kept": [dict(lg) for lg in hold if lg is not tested and lg is not lng]}
 
 
 def _close_realized(legs: list[dict], now_val: Callable[[dict], float]) -> float:
@@ -521,6 +657,7 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
     unreal = _close_realized(hold, now_val)
     shorts = [lg for lg in hold if lg["sign"] < 0]
     longs = [lg for lg in hold if lg["sign"] > 0]
+    wing_info = identify_wing(hold, spot)             # a clean vertical wing → the live roll search can price it as ONE package
 
     # the TESTED short = the short furthest into (or nearest through) the money.
     def tested_depth(lg):
@@ -1032,11 +1169,11 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
                 establish_cash=_close_cash(wing, now_val), spot=spot, r=r, iv_ref=iv0,
                 rationale="Takes the risk off the tested side for a defined cost while the safe wing keeps decaying — a clean partial exit."))
 
-    # The defense principle for a lone short: NO net new money — a roll must be a CREDIT. The live roll search only
-    # ever proposes credits, so the eager spread-rolls ("Roll up to a call spread", "Roll down + protection", …)
-    # obey the same rule; a debit roll offered beside a search that says "credit-only" is a contradiction.
-    if lone_short:
-        alts = [a for a in alts if not (a["name"].startswith("Roll") and a["net_cash"] < 0)]
+    # The defense principle: NO net new money — a roll must be a CREDIT (or at worst even). The live roll search only
+    # ever proposes those, so every eager roll ("Roll up to a call spread", "Roll the tested wing away & out", …) obeys
+    # the same rule; a debit roll offered beside a search that says "credit-only" is a contradiction. (Applies to
+    # spreads and condors too — it used to cover only a lone short, so a spread could be "defended" by paying.)
+    alts = [a for a in alts if not (a["name"].startswith("Roll") and a["net_cash"] < 0)]
 
     # ── HOLD-AS-IS baseline — the "do nothing" row every repair is judged against.
     hold_row = _build(
@@ -1056,7 +1193,8 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
         # The fixed-horizon (+roll_days) rolls are only a FALLBACK: for a lone short, the live roll search
         # (roll_optimizer_service → build_roll_alternatives) finds the real strike/expiry and REPLACES them,
         # so they carry a marker the merge uses to drop them (one source of truth for rolls).
-        if lone_short and a["category"] == "roll":
+        if a["category"] == "roll" and (lone_short or (wing_info and (
+                a["name"].startswith("Roll the tested") or (a["name"].startswith("Roll the whole") and not wing_info["kept"])))):
             a["plain_roll"] = True
     alts.append(hold_row)                            # pinned alongside Close as the two benchmarks
 
@@ -1076,6 +1214,15 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
             if lg.get("right") in ("P", "C"):
                 lg["expiry"] = _expiry_for(lg.get("dte_days"))
 
+    # The position AS IT STANDS — every alternative is spelled out against it (what to close / open / keep, and the
+    # all-in result including what you already hold). `mark` = today's value of each held leg (the close price).
+    held = {"legs": [{"right": lg["right"], "strike": lg["strike"], "sign": lg["sign"], "qty": lg["qty"], "dte_days": D,
+                      "expiry": _expiry_for(D), "entry": round(lg["entry"], 4), "mark": round(now_val(lg), 4)} for lg in hold],
+            "stock": ({"shares": stock["shares"], "basis": stock["basis"]} if stock else None),
+            "collected": round(sum(-lg["sign"] * lg["qty"] * _MULT * lg["entry"] for lg in hold), 0)}
+    for a in alts:
+        attach_steps(a, held, spot)
+
     _covered = bool(stock and (stock.get("shares") or 0) >= 100 * n and right == "C")
     return {
         "tested": bool(cushion_pct < 5.0), "cushion_pct": round(cushion_pct, 1),
@@ -1092,6 +1239,9 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
         "hold": {"pop_pct": hold_pop, "expected_pnl": hold_ev, "max_loss": hold_ml,
                  "greeks": hold_row.get("greeks"), "breakevens": hold_row.get("breakevens")},
         "alternatives": alts,
+        "held": held,
+        "wing": ({k: v for k, v in wing_info.items() if k != "kept"} | {"kept_legs": len(wing_info["kept"])}
+                 if wing_info else None),
     }
 
 
@@ -1138,6 +1288,9 @@ def _classify(hold) -> str:
 
 
 # ── shared risk math — the router's risk read and everything here use the SAME functions ──────────
+INCOME_VIABLE_SLACK = 12    # an income-viable fix is preferred unless it scores more than this many points below the top benchmark
+NEAREST_SUFFICIENT = 6      # among income-viable fixes within this many points of the best, take the SHORTEST extension
+NONVIABLE_MARGIN = 6        # a fix that costs money / worsens the odds must beat CLOSING by this many points (it removes the tail outright)
 _TOUCH_R_ANCHOR = 0.045     # risk-neutral rate the raw momentum is shrunk back toward
 _TOUCH_SHRINK = 0.35        # share of the (capped) momentum deviation that survives into the drift
 _TOUCH_CAP = 1.0            # ±100%/yr ceiling on the raw extrapolated momentum
@@ -1185,6 +1338,26 @@ def barrier_touch_prob(S, K, iv, dte, mu, right) -> Optional[float]:
     return max(0.0, min(0.999, float(p)))
 
 
+def implied_event_move(near_iv: Optional[float], far_iv: Optional[float], near_dte: Optional[float],
+                       far_dte: Optional[float], earn_days: Optional[float]) -> Optional[float]:
+    """The market-implied ONE-σ earnings move, in percent, read off the term structure.
+
+    When the print falls after the near expiry but on/before the far one, the far month's total variance holds the
+    event on top of ordinary diffusion. Taking the near (pre-event) IV as the base rate for the whole stretch,
+    event variance = σ_far²·T_far − σ_near²·T_far = (σ_far² − σ_near²)·T_far, and the implied move is its square root.
+    Indicative, not a quote — it needs the print to sit between the two expiries and a back month dearer than the
+    front (otherwise the event cannot be isolated and this returns None). Capped at 60% so a bad chain can't print
+    nonsense."""
+    if None in (near_iv, far_iv, near_dte, far_dte, earn_days):
+        return None
+    if not (float(near_dte) < float(earn_days) <= float(far_dte)):
+        return None
+    var = (float(far_iv) ** 2 - float(near_iv) ** 2) * float(far_dte) / 365.0
+    if var <= 0:
+        return None
+    return round(min(60.0, math.sqrt(var) * 100.0), 1)
+
+
 def _pct_gap(px: float, level: float) -> str:
     d = (level - px) / px * 100.0
     return f"{abs(d):.1f}% {'above' if d >= 0 else 'below'}"
@@ -1221,26 +1394,48 @@ def level_note(px: float, sup: float, res: float) -> str:
 
 
 def build_roll_alternatives(*, candidates: list[dict], tested: dict, tested_mark: float, hold: Optional[dict],
-                            spot: float, r: float, stock: Optional[dict], iv_default: float) -> list[dict]:
+                            spot: float, r: float, stock: Optional[dict], iv_default: float,
+                            held: Optional[dict] = None, kept: Optional[list] = None) -> list[dict]:
     """Turn the roll optimizer's CREDIT-ONLY candidates into FULL alternatives — payoff, greeks, PoP,
     E[P&L], max loss, Δ-vs-hold — built by the SAME `_build` engine as every other repair, so a roll is
     scored on exactly the same footing as a cap, a collar or a close. This is what makes the desk's
     recommendation and the roll search ONE ranked menu instead of two opinions.
 
-    `tested` = {right, strike, qty, entry}; `tested_mark` = the buy-back price the search used; `hold` =
-    the baseline {pop_pct, expected_pnl, max_loss}."""
+    `tested` = {right, strike, qty, entry[, long_strike, dte_days, expiry]}; `tested_mark` = the buy-back price the
+    search used (for a spread: the WHOLE old spread's debit); `hold` = the baseline {pop_pct, expected_pnl, max_loss}.
+
+    A SPREAD roll (`tested["long_strike"]` present — candidates then carry `long_strike`/`long_price`/`long_iv`)
+    closes the old spread and opens a new one of the same width; `tested["entry"]` is then the spread's NET credit per
+    share, so the realized loss of closing it is carried into every scenario. `kept` = the legs OUTSIDE the wing (the
+    untouched side of an iron condor) as held-leg dicts {right, sign, strike, qty, dte_days, iv, entry}.
+    `held` (from `repair_alternatives`) lets each row explain itself: what to close / open and the all-in result."""
     right = tested["right"]
     n = int(tested.get("qty") or 1)
     K0 = float(tested["strike"])
+    Kl0 = float(tested["long_strike"]) if tested.get("long_strike") is not None else None
+    wing = Kl0 is not None
     entry0 = abs(float(tested.get("entry") or 0.0))
+    cur_dte, cur_exp = tested.get("dte_days"), tested.get("expiry")
     word = "put" if right == "P" else "call"
-    realized = -1 * n * _MULT * (float(tested_mark) - entry0)      # buying the tested short back, vs its original credit
+    realized = n * _MULT * (entry0 - float(tested_mark))             # buying the old short (spread) back, vs its original credit
+    kept = [dict(k) for k in (kept or [])]
     out: list[dict] = []
     for c in candidates:
         K, dte = float(c["strike"]), int(c["dte"])
         new_px = float(c.get("new_price") or (float(tested_mark) + float(c.get("credit_per_share") or 0.0)))
         iv = float(c.get("iv") or 0.0) or float(iv_default)
-        leg = {"strike": K, "right": right, "sign": -1, "qty": n, "dte_days": dte, "iv": iv, "entry": new_px}
+        short_leg = {"strike": K, "right": right, "sign": -1, "qty": n, "dte_days": dte, "iv": iv, "entry": new_px}
+        new_legs = [short_leg]
+        Kl = None
+        if wing and c.get("long_strike") is not None:
+            Kl = float(c["long_strike"])
+            new_legs.append({"strike": Kl, "right": right, "sign": 1, "qty": n, "dte_days": dte,
+                             "iv": float(c.get("long_iv") or 0.0) or iv, "entry": float(c.get("long_price") or 0.0)})
+        if kept and cur_dte is not None and dte > int(cur_dte):
+            # the kept side expires first, so the horizon is THEIR expiry — what's left of the new wing is worth the
+            # forward vol for that stretch (same rule as every calendar / diagonal in this engine)
+            for lg in new_legs:
+                lg["iv_fwd"] = _fwd_iv(lg["iv"], float(iv_default), dte, int(cur_dte))
         roll_net = float(c["roll_net_cash"])
         try:
             d = dt.date.fromisoformat(str(c["expiry"])[:10])
@@ -1248,26 +1443,37 @@ def build_roll_alternatives(*, candidates: list[dict], tested: dict, tested_mark
         except (ValueError, TypeError):
             exp_lbl = str(c.get("expiry"))
         same = abs(K - K0) < 1e-6
+        credit_lbl = "even cost" if abs(roll_net) < 0.5 else f"{'+' if roll_net >= 0 else '−'}${abs(roll_net):,.0f} credit"
+        if wing and Kl is not None:
+            name = f"Roll the ${K0:.0f}/{Kl0:.0f} {word} spread → ${K:.0f}/{Kl:.0f} · {exp_lbl} ({dte}d) — {credit_lbl}"
+            mechanics = (f"Buy back the ${K0:.0f}/{Kl0:.0f} {word} spread (~${float(tested_mark):.2f} debit) and sell the "
+                         f"${K:.0f}/{Kl:.0f} {word} spread expiring {c.get('expiry')} (~${float(c.get('credit_per_share') or 0.0) + float(tested_mark):.2f} credit) — "
+                         f"{'EVEN cost' if abs(roll_net) < 0.5 else 'a NET CREDIT of $' + format(roll_net, ',.0f')}, the same ${abs(K - Kl):.0f} width, "
+                         "defined risk; no new money.")
+        else:
+            name = f"Roll to the ${K:.0f} {word} · {exp_lbl} ({dte}d) — {credit_lbl}"
+            mechanics = (f"Buy back the ${K0:.0f} {word} (~${float(tested_mark):.2f}) and sell the "
+                         f"{'SAME ' if same else ''}${K:.0f} {word} expiring {c.get('expiry')} (~${new_px:.2f}) — a NET CREDIT of "
+                         f"${roll_net:,.0f}; no new money.")
         row = _build(
-            name=f"Roll to the ${K:.0f} {word} · {exp_lbl} ({dte}d) — {'+' if roll_net >= 0 else '−'}${abs(roll_net):,.0f} credit",
-            category="roll", group="adjust",
-            mechanics=(f"Buy back the ${K0:.0f} {word} (~${float(tested_mark):.2f}) and sell the "
-                       f"{'SAME ' if same else ''}${K:.0f} {word} expiring {c.get('expiry')} (~${new_px:.2f}) — a NET CREDIT of "
-                       f"${roll_net:,.0f}; no new money."),
-            legs=[leg], realized=realized, stock=stock, establish_cash=roll_net, spot=spot, r=r, iv_ref=iv,
+            name=name, category="roll", group="adjust", mechanics=mechanics,
+            legs=new_legs + kept, realized=realized, stock=stock, establish_cash=roll_net, spot=spot, r=r, iv_ref=iv,
             rationale=c.get("why") or "")
         for lg in row["legs"]:
             if lg.get("right") in ("P", "C"):
-                lg["expiry"] = c.get("expiry")
+                lg["expiry"] = cur_exp if (cur_dte is not None and lg.get("dte_days") == int(cur_dte)) else c.get("expiry")
         row["roll_meta"] = {
             "expiry": c.get("expiry"), "dte": dte, "strike": K, "credit_total": roll_net,
             "p_otm": c.get("p_otm"), "p_otm_source": c.get("p_otm_source"),
             "spans_earnings": bool(c.get("spans_earnings")), "structure": c.get("structure") or {},
             "scores": c.get("scores") or {}, "new_breakeven": c.get("new_breakeven"),
             "new_capital": c.get("new_capital"),
+            **({"wing": {"short": K, "long": Kl, "width": abs(K - Kl), "old_short": K0, "old_long": Kl0}} if (wing and Kl is not None) else {}),
         }
         if hold:
             _vs_hold(row, hold.get("pop_pct"), hold.get("expected_pnl"), hold.get("max_loss"))
+        if held:
+            attach_steps(row, held, spot)
         out.append(row)
     return out
 
@@ -1334,6 +1540,8 @@ def rank_defenses(menu: dict) -> dict:
     earn_when = ((f"{earn_date} ({int(earn_days)}d out)" if earn_date else f"in {int(earn_days)}d")
                  if earn_days is not None else None)
     cur_dte = menu.get("dte_days")
+    spot_px = float(menu.get("spot") or 0.0)
+    em = (menu.get("event") or {}).get("implied_move_pct")       # market-implied ±1σ earnings move, % (None if not isolable)
     adverse_up = (right == "C")                          # the move that HURTS this tested short
     trending_adverse = bool(trend is not None and ((trend > 8 and adverse_up) or (trend < -8 and not adverse_up)))
     stressed = bool((p_touch or 0) >= 55 or trending_adverse or (vrp is not None and vrp <= -20) or posture == "tested")
@@ -1376,6 +1584,18 @@ def rank_defenses(menu: dict) -> dict:
             def _capped(s):
                 return any(x.get("action") == "BUY" and x.get("right") == s.get("right") and x["dte_days"] >= s["dte_days"] for x in opt)
             if all(_capped(s) for s in shorts):
+                # How exposed is the wing? That depends on where the short sits relative to what the PRINT alone can do:
+                # P(event move takes it out) = 1 − Φ(distance ÷ implied move). A short at the money is a coin-flip on the
+                # gap; one well outside the implied move barely cares. 6 pts is the floor (a gap can still hit the max).
+                s0 = min(shorts, key=lambda x: abs(spot_px - float(x["strike"]))) if spot_px > 0 else shorts[0]
+                if em and spot_px > 0:
+                    dist = abs(spot_px - float(s0["strike"])) / spot_px * 100.0
+                    p_ev = 1.0 - _norm_cdf(dist / float(em))
+                    side = "below" if s0.get("right") == "P" else "above"
+                    return 6.0 + min(10.0, 20.0 * p_ev), (
+                        f"a short leg spans earnings {earn_when} — the ${float(s0['strike']):.0f} short sits {dist:.1f}% {side} spot "
+                        f"vs a ±{float(em):.0f}% market-implied earnings move (≈{p_ev * 100:.0f}% odds the print alone takes it out); "
+                        "the wing caps the loss, but a gap can still hit the max")
                 return 6.0, f"a short leg spans earnings {earn_when} — its wing caps the loss, but a gap can still hit the max"
             has_stock = any(l.get("right") == "STK" for l in (a.get("legs") or []))
             naked_call = (not has_stock) and any(s.get("right") == "C" and not _capped(s) for s in shorts)
@@ -1485,15 +1705,92 @@ def rank_defenses(menu: dict) -> dict:
         unreal = close_row.get("ev")
         d_ev_close = (float(unreal) - hold_ev) if unreal is not None else 0.0
         edge_c = _clip(50.0 + (d_ev_close / cap_ref) * 400.0)
-        fit_c = 65.0 if stressed else 25.0
-        recov_c = 55.0 if (unreal or 0.0) >= hold_ev else 35.0
-        close_row["desk_score"] = round(0.35 * edge_c + 0.30 * 100.0 + 0.20 * recov_c + 0.15 * fit_c)
-        close_row["score_breakdown"] = {"edge": round(edge_c), "risk": 100, "recovery": round(recov_c), "market_fit": round(fit_c)}
+        # Closing is judged by the SAME rule as every other defined-risk row: its "max loss" is the loss it LOCKS IN.
+        # It used to get a free 100 on the risk axis (zero forward risk) while a rolled spread — whose worst case is
+        # bounded and also priced — was charged for it, so Close structurally beat every fix by ~10 points.
+        locked = abs(min(float(unreal or 0.0), 0.0))
+        risk_c = _clip(100.0 - 100.0 * min(locked / cap_ref, 1.0))
+        # Stress argues for closing only when there is a tail worth escaping. A defined-risk position's downside is
+        # already bounded (and priced in); closing it forfeits the remaining premium and the recovery.
+        fit_c = (65.0 if hold_ml is None else 45.0) if stressed else 25.0
+        # …and its RECOVERY axis the same way: every other row is scored on P(all-in P&L ≥ 0) vs holding, and closing a
+        # loss means that probability is 0 — you can never get back to profit. It was handed a flat 55 (above the 50
+        # baseline!) for foreclosing the recovery that Hold (54%) and every roll (58–70%) were being credited with.
+        close_pop = 100.0 if float(unreal or 0.0) >= 0 else 0.0
+        hold_pop_v = hold_row.get("pop_pct")
+        recov_c = _clip(50.0 + 2.0 * (close_pop - float(hold_pop_v))) if hold_pop_v is not None else (100.0 if close_pop else 35.0)
+        close_row["desk_score"] = round(0.35 * edge_c + 0.30 * risk_c + 0.20 * recov_c + 0.15 * fit_c)
+        close_row["score_breakdown"] = {"edge": round(edge_c), "risk": round(risk_c), "recovery": round(recov_c), "market_fit": round(fit_c)}
 
     ranked = sorted([a for a in alts if a.get("desk_score") is not None], key=lambda a: a["desk_score"], reverse=True)
     if not ranked:
         return menu
     winner = ranked[0]
+    # INCOME POLICY — this is a premium-selling desk, and "close it and book the loss" is the lazy answer on a defined-risk
+    # income trade. A fix is INCOME-VIABLE when it (1) needs no new money (even or credit), (2) keeps the risk defined (or
+    # covered), (3) costs no material expected value, and (4) does NOT make the payoff worse than holding — worst case,
+    # probability of profit. Such a fix is a PARETO improvement on what you already own (a lower break-even, a better best
+    # case, the same bounded worst case) for free, so it is preferred over Hold/Close whenever the position needs defending
+    # — unless it scores more than INCOME_VIABLE_SLACK points below the top benchmark (i.e. it is genuinely a worse
+    # idea, which is what the composite is for). With no such fix — a naked call whose only options are a debit cap or an
+    # open-tail roll — there is nothing to prefer and the composite decides (Close stands).
+    income_note, income_override = None, None
+    hold_pop = hold_row.get("pop_pct")
+    material = max(100.0, 0.005 * cap_ref)
+
+    def _income_viable(a):
+        if a.get("category") in ("hold", "exit") or a.get("group") == "replace":
+            return False
+        if float(a.get("net_cash") or 0.0) < -1.0:
+            return False
+        if not (a.get("defined_risk") or menu.get("covered")):
+            return False
+        if a.get("d_ev") is not None and float(a["d_ev"]) < -material:
+            return False
+        if a.get("d_pop") is not None and float(a["d_pop"]) < -2:
+            return False
+        if hold_ml is not None and a.get("max_loss") is not None and float(a["max_loss"]) < float(hold_ml) - 0.05 * abs(float(hold_ml)):
+            return False                                                   # a materially WORSE worst case isn't "defending"
+        return True
+
+    def _horizon_days(a):
+        rm = a.get("roll_meta") or {}
+        if rm.get("dte") is not None:
+            return int(rm["dte"])
+        dtes = [int(l["dte_days"]) for l in (a.get("legs") or []) if l.get("dte_days") is not None]
+        return max(dtes) if dtes else 0
+
+    if stressed and winner.get("category") in ("hold", "exit"):
+        pool = [a for a in ranked if _income_viable(a)]
+        # NEAREST SUFFICIENT: among the viable fixes that are about equally good, the one that extends the trade LEAST wins.
+        # Every extra week is more time for the stock to cross the strike and more event exposure, and a far-dated roll
+        # for a sliver of credit isn't income — it is "bank the loss and hide" (a $53 best case over 92 days at risk).
+        viable = None
+        if pool:
+            top = pool[0]["desk_score"]
+            viable = min((a for a in pool if a["desk_score"] >= top - NEAREST_SUFFICIENT), key=lambda a: (_horizon_days(a), -a["desk_score"]))
+        if viable is not None and (winner["desk_score"] - viable["desk_score"]) <= INCOME_VIABLE_SLACK:
+            gap = winner["desk_score"] - viable["desk_score"]
+            was = "closing" if winner.get("category") == "exit" else "doing nothing"
+            fallback = "Close" if winner.get("category") == "exit" else "Hold"
+            income_note = (f"Income policy: {was} scores {winner['desk_score']} ({max(gap, 0)} point{'s' if gap != 1 else ''} ahead of this fix), but that score "
+                           "has no term for the premium you keep collecting. This fix costs no new money, keeps the risk defined and "
+                           f"improves the payoff you already hold — on an income trade that beats {was}. {fallback} stays the fallback.")
+            income_override = {"over": winner.get("name"), "over_score": winner["desk_score"], "gap": max(gap, 0)}
+            winner = viable
+
+    # The mirror image: a fix that is NOT income-viable (it costs new money, or leaves your odds worse than holding) is a
+    # gamble against the cleanest de-risk there is — closing removes the tail outright. It has to beat Close clearly,
+    # not by a coin-flip (a naked call's "roll down + protection" edged Close by 2 points on a worse P(profit)).
+    close_note = None
+    if (close_row is not None and winner is not close_row and not income_override
+            and winner.get("category") not in ("hold", "exit") and not _income_viable(winner)
+            and (winner["desk_score"] - close_row["desk_score"]) < NONVIABLE_MARGIN):
+        close_note = (f"Closing scores {close_row['desk_score']} — within {NONVIABLE_MARGIN} of {winner.get('name')} ({winner['desk_score']}), which "
+                      f"{'costs new money' if float(winner.get('net_cash') or 0.0) < -1.0 else ('lowers your odds of profit (' + format(int(winner['d_pop']), '+d') + 'pt)' if (winner.get('d_pop') or 0) < 0 else 'does not improve the payoff you hold')}; "
+                      "a fix like that has to beat closing clearly, and it didn't.")
+        winner = close_row
+
     # When the pick is a BENCHMARK (hold/close), the useful runner-up is the best way to KEEP the trade alive —
     # the desk's stated focus is fixing the current trade, not just exiting it — so skip past the other benchmark.
     if winner.get("category") in ("hold", "exit"):
@@ -1503,7 +1800,7 @@ def rank_defenses(menu: dict) -> dict:
                   next((a for a in ranked[1:] if a.get("category") not in ("hold", "exit") and a.get("group") != "replace"), None))
         runner_role = "fix"
     else:
-        runner = ranked[1] if len(ranked) > 1 else None
+        runner = next((a for a in ranked if a is not winner), None)      # (the income override can put winner at ranked[k>0])
         runner_role = "next"
     # "Avoid" means a MATERIAL deficit — a re-timed fair-value roll that is $1 worse than holding is noise, not a
     # trap. Flag only an open-tail alternative that costs real E[P&L] (≥ $100 or 0.5% of notional) or gives up
@@ -1534,19 +1831,40 @@ def rank_defenses(menu: dict) -> dict:
                    f"reducing it ({tail})." if fair else
                    f"ΔE[P&L] {d_ev:+,.0f} vs holding ({tail})." if d_ev is not None else f"{tail}."))
 
-    def _earn_line():
-        """Earnings that land AFTER the current expiry are no risk to HOLDING — but they rule out the obvious defense
-        (roll / extend past the print), which is precisely the trap on a threatened short. Say so once, in the pick."""
-        if earn_days is None or posture == "healthy" or (cur_dte is not None and earn_days <= cur_dte):
-            return None
-        return (f"Earnings {earn_when} land AFTER this expiry: holding isn't exposed, but rolling or extending past it would "
-                f"carry a {'naked ' if hold_ml is None else ''}short through a binary gap — every alternative that does is penalized.")
+    def _vs_hold_line(a):
+        """The all-in story against what you hold today, in numbers: worst case, best case, break-even, P(profit)."""
+        bits = []
+        if a.get("max_loss") is not None and hold_ml is not None:
+            bits.append(f"worst case {float(hold_ml):+,.0f} → {float(a['max_loss']):+,.0f}")
+        if a.get("max_gain") is not None and hold_row.get("max_gain") is not None:
+            bits.append(f"best case {float(hold_row['max_gain']):+,.0f} → {float(a['max_gain']):+,.0f}")
+        hb, ab = hold_row.get("breakevens") or [], a.get("breakevens") or []
+        if hb and ab:
+            k = -1 if right == "P" else 0                                     # the break-even on the tested side
+            bits.append(f"break-even ${float(hb[k]):,.2f} → ${float(ab[k]):,.2f}")
+        if a.get("pop_pct") is not None and hold_pop is not None:
+            bits.append(f"P(profit) {hold_pop}% → {a['pop_pct']}%")
+        return ("Versus holding — " + " · ".join(bits)) if bits else None
 
     def _why(a, *, full=False):
         out = []
         cat, rm = a.get("category"), a.get("roll_meta")
         if cat == "hold":
-            out.append("Nothing on the menu beats simply holding — its own recovery odds / E[P&L] are already best-in-class.")
+            if a is not winner:                                  # Hold as the FALLBACK to a fix: say what it keeps and what it forgoes
+                bits = [f"keeps the position exactly as it is (worst case {float(hold_ml):+,.0f})" if hold_ml is not None else
+                        "keeps the position exactly as it is (open tail)"]
+                hb = hold_row.get("breakevens") or []
+                if hb:
+                    bits.append(f"break-even stays ${float(hb[-1 if right == 'P' else 0]):,.2f}")
+                if hold_pop is not None:
+                    bits.append(f"P(profit) stays {hold_pop}%")
+                out.append("Do nothing: " + ", ".join(bits) + " — no trade, no cost, but none of the improvement.")
+            elif stressed:
+                out.append("No fix clears the bar right now — no roll at even cost or better that keeps the risk defined, and closing "
+                           f"({close_row['desk_score'] if close_row is not None else '—'}/100) isn't clearly better — so holding keeps the "
+                           "defined-risk premium working while you watch it.")
+            else:
+                out.append("Nothing on the menu beats simply holding — its own recovery odds / E[P&L] are already best-in-class.")
             if ev_h_note:
                 out.append(f"Note: this expiry itself runs through earnings {earn_when} — holding takes the print.")
         elif cat == "exit":
@@ -1562,38 +1880,167 @@ def rank_defenses(menu: dict) -> dict:
             if p_touch is not None and p_touch >= 40:
                 out.append(f"{p_touch:.0f}% chance the strike is breached before expiry.")
         else:
-            if rm:
+            vh = _vs_hold_line(a) if (full and a is winner) else None
+            if rm and not vh:
                 out.append(f"net credit {rm['credit_total']:+,.0f} (no new money) · new breakeven ${float(rm['new_breakeven']):,.2f}"
                            if rm.get("new_breakeven") is not None else f"net credit {rm['credit_total']:+,.0f} (no new money)")
-                if rm.get("p_otm") is not None:
-                    out.append(f"{float(rm['p_otm']):.0f}% {rm.get('p_otm_source') or ''} P(OTM) over {rm['dte']}d".replace("  ", " "))
+            if rm and rm.get("p_otm") is not None:
+                out.append(f"{float(rm['p_otm']):.0f}% {rm.get('p_otm_source') or ''} P(OTM) over {rm['dte']}d".replace("  ", " "))
             d_ev, d_pop, d_ml = a.get("d_ev"), a.get("d_pop"), a.get("d_max_loss")
-            if d_ev is not None:
-                out.append(f"E[P&L] {d_ev:+,.0f} vs holding")
-            if a.get("defined_risk") and d_ml is not None:
-                out.append(f"max loss {a.get('max_loss'):,.0f} ({d_ml:+,.0f} vs holding)")
-            elif not a.get("defined_risk"):
-                out.append("tail stays open — weighed against the edge above")
-            if d_pop is not None:
-                out.append(f"recovery odds {d_pop:+}pt vs holding")
+            if vh:
+                # the pick's all-in story in ONE line (worst/best case, break-even, P(profit)) — the steps block above already
+                # shows net cash and the legs, so the net credit / break-even / max-loss bullets would only repeat it
+                out.append(vh)
+                if d_ev is not None:
+                    out.append(f"Expected P&L {d_ev:+,.0f} vs holding — a fair-value re-timing; the gain is in the shape of the payoff, not in expected value.")
+                if not a.get("defined_risk"):
+                    out.append("tail stays open — weighed against the edge above")
+            else:
+                if d_ev is not None:
+                    out.append(f"E[P&L] {d_ev:+,.0f} vs holding")
+                if a.get("defined_risk") and d_ml is not None:
+                    out.append(f"max loss {a.get('max_loss'):,.0f} ({d_ml:+,.0f} vs holding)")
+                elif not a.get("defined_risk"):
+                    out.append("tail stays open — weighed against the edge above")
+                if d_pop is not None:
+                    out.append(f"recovery odds {d_pop:+}pt vs holding")
+        if cat in ("hold", "exit") and full and a is winner and close_row is not None and stressed:
+            other = close_row if cat == "hold" else hold_row
+            if abs(float(a["desk_score"]) - float(other["desk_score"])) <= 3:
+                out.append(f"Hold and Close are a coin-flip on the score ({hold_row['desk_score']} vs {close_row['desk_score']}) and have the same expected "
+                           f"P&L ({hold_ev:+,.0f} vs {float(close_row.get('ev') or 0.0):+,.0f}). It comes down to appetite: keep the {hold_pop}% chance of "
+                           "getting back to profit (and carry whatever is ahead), or lock the loss now and take the tail off.")
         out.extend((a.get("_fit_notes") or [])[:2])
         if full and not rm:
             rl = _roll_line()                                   # a non-roll pick must still answer "but the roll search said…"
             if rl:
                 out.append(rl)
-        if full:
-            el = _earn_line()                                   # …and "but there's earnings coming"
-            if el:
-                out.append(el)
+        if full and a is winner and (income_note or close_note):
+            out.insert(0, income_note or close_note)            # why the pick is (or isn't) simply "Close"
         return out
 
     def _avoid_why(a):
         d_ev, d_pop = a.get("d_ev"), a.get("d_pop") or 0
         return f"E[P&L] {d_ev:+,.0f} and recovery odds {d_pop:+}pt vs holding, with the tail still open"
 
+    def _short_exp(iso):
+        try:
+            d = dt.date.fromisoformat(str(iso)[:10])
+            return f"{d.strftime('%b')} {d.day}"
+        except (ValueError, TypeError):
+            return str(iso)
+
+    def _timing():
+        """WHEN to act — the part a roll search can't say. Read off what the market expects: the earnings print (and the
+        move the term structure prices for it), IV vs realized vol, the term structure, and what waiting costs.
+        Deterministic; every sentence cites a number that is on screen."""
+        pts: list[str] = []
+        verdict, title, act_by = "neutral", "No timing edge — act when the trade needs it", None
+        early = bool((assign or {}).get("early_assignment_risk"))
+        urgent = bool(early or acute or (posture == "tested" and cur_dte is not None and cur_dte <= 3))
+        cow = menu.get("cost_of_waiting") or []
+        c5 = next((c for c in cow if c.get("in_trading_days") == 5), None)
+
+        if posture == "healthy" and not stressed:
+            return {"verdict": "hold", "title": "Nothing to time — leave it",
+                    "points": ["The trade is healthy; there is no defense to schedule. Re-check if P(touch), the cushion or an earnings date changes."],
+                    "act_by": None, "vol": None}
+
+        if urgent:
+            verdict, title = "now", "Act now — the clock is the risk"
+            if early:
+                pts.append(f"Early-assignment risk: {(assign or {}).get('early_reason')}.")
+            if acute:
+                pts.append(f"P(touch) {float(p_touch):.0f}% — the strike is very likely to be breached this cycle.")
+            if cur_dte is not None and cur_dte <= 3:
+                pts.append(f"{cur_dte}d left — gamma and pin risk accelerate into expiry; there is no time to be patient.")
+        if c5 and rec.get("recovery_score") is not None and c5.get("recovery_pop") is not None:
+            drop = float(rec["recovery_score"]) - float(c5["recovery_pop"])
+            if drop >= 5:
+                pts.append(f"Waiting 5 trading days cuts recovery odds {rec['recovery_score']}% → {c5['recovery_pop']}%"
+                           + (f" and E[P&L] to {c5['expected_pnl']:+,.0f}" if c5.get("expected_pnl") is not None else "") + " — the odds erode with the clock.")
+
+        move_txt = f" — the term structure prices a ±{float(em):.0f}% move" if em else ""
+        if earn_days is not None and cur_dte is not None:
+            try:
+                act_by = (dt.date.today() + dt.timedelta(days=max(int(earn_days) - 1, 0))).isoformat()
+            except Exception:  # noqa: BLE001
+                act_by = None
+            if earn_days > cur_dte:                                           # the print lands AFTER this expiry
+                if verdict != "now":
+                    verdict, title = "before_print", f"Window: now → {_short_exp(act_by)} — earnings {_short_exp(earn_date)} ({int(earn_days)}d)"
+                pts.append(f"Earnings {earn_when} land AFTER this expiry{move_txt}. Holding isn't exposed — but anything you roll beyond "
+                           "it is a bet on the print, and back-month IV carries the event, which is exactly why an even-cost roll looks so easy.")
+                pre = [a for a in rolls if int((a.get('roll_meta') or {}).get('dte') or 0) < earn_days]
+                post = [a for a in rolls if int((a.get('roll_meta') or {}).get('dte') or 0) >= earn_days]
+                if pre:
+                    b = pre[0]
+                    pts.append(f"Cleanest: {_short_exp(b['roll_meta']['expiry'])} ({b['roll_meta']['dte']}d) — it ends BEFORE the print "
+                               f"(#{ranked.index(b) + 1} of {len(ranked)}, {b['desk_score']}/100).")
+                if post:
+                    b = winner if (winner in post) else post[0]                # the PICK if it is the one that runs through the print
+                    rm_b = b['roll_meta']
+                    k_short = float(rm_b['strike'])
+                    lead = "Through the print" if b is winner else "Best roll through the print"
+                    if spot_px > 0:
+                        dist = abs(spot_px - k_short) / spot_px * 100.0
+                        if em:
+                            p_ev = (1.0 - _norm_cdf(dist / float(em))) * 100.0
+                            inside = dist < float(em)
+                            where = (f"INSIDE the move (≈{p_ev:.0f}% odds the print alone takes it out) — that is the price of the even-cost roll"
+                                     if inside else f"outside the move (≈{p_ev:.0f}% odds the print alone takes it out)")
+                            line = (f"{lead}: {_short_exp(rm_b['expiry'])} ({rm_b['dte']}d{'' if b is winner else ', ' + format(b['desk_score'], 'd') + '/100'}) — its "
+                                    f"${k_short:.0f} short sits {dist:.1f}% from spot vs ±{float(em):.0f}% priced: {where}.")
+                            if inside:
+                                clear = [a for a in post if a is not b and abs(spot_px - float(a['roll_meta']['strike'])) / spot_px * 100.0 >= float(em)]
+                                if clear:
+                                    c = clear[0]
+                                    line += (f" A roll that clears the move exists — {_short_exp(c['roll_meta']['expiry'])} ${float(c['roll_meta']['strike']):.0f} "
+                                             f"({c['roll_meta']['dte']}d) for {float(c['roll_meta']['credit_total']):+,.0f} — but it pays less and ties the position up longer.")
+                                else:
+                                    line += " No roll at even cost or better clears the move."
+                        else:
+                            line = (f"{lead}: {_short_exp(rm_b['expiry'])} ({rm_b['dte']}d) — its ${k_short:.0f} short sits {dist:.1f}% from spot "
+                                    "(the implied earnings move can't be isolated from this chain).")
+                    else:
+                        line = f"{lead}: {_short_exp(rm_b['expiry'])} ({rm_b['dte']}d)."
+                    pts.append(line + (" The risk is defined, so the worst case is capped; size it as a bet on the print."
+                                       if b.get('defined_risk') else ""))
+                if rolls and not pre:
+                    pts.append("No roll that ends before the print clears the bar — so either sell the print from outside its range, or let this "
+                               "expiry run its course and re-establish AFTER the print, when IV has crushed and the gap is already in the price.")
+            elif earn_days <= cur_dte:                                        # the print falls INSIDE this trade's life
+                if verdict != "now":
+                    verdict, title = "before_print", f"Defend before the print — earnings {_short_exp(earn_date)} ({int(earn_days)}d)"
+                pts.append(f"Earnings {earn_when} land INSIDE this trade's life. IV is bid into the print and crushes after it, so a roll or close "
+                           "done BEFORE it gets the inflated premium; holding through it takes the gap on a model that can't price a jump.")
+
+        iv_p, hv_p = rec.get("iv_pct"), rec.get("hv_pct")
+        if iv_p is not None and hv_p is not None and vrp is not None:
+            if vrp >= 10:
+                pts.append(f"Premium is rich vs realized (IV {iv_p}% vs HV {hv_p}%) — selling more time now is well paid.")
+                if verdict == "neutral":
+                    verdict, title = "vol_rich", "Good time to roll — premium is rich"
+            elif vrp <= -10:
+                pts.append(f"Premium is thin vs realized (IV {iv_p}% vs HV {hv_p}%) — re-selling time now is poorly paid; if nothing forces "
+                           "you, a vol bump is the better moment to roll.")
+                if verdict == "neutral":
+                    verdict, title = "vol_cheap", "Poor time to re-sell premium — it's cheap vs realized"
+        tl = ivx.get("term_label")
+        if tl == "front rich (backwardated)" and ivx.get("near_iv_pct") and ivx.get("far_iv_pct"):
+            pts.append(f"Front-month IV {ivx['near_iv_pct']}% is above the back month {ivx['far_iv_pct']}% (backwardation) — rolling OUT sells "
+                       "cheaper vol than the front's premium suggests, so credits are thinner than they look.")
+        if not pts:
+            pts.append("No event, no vol extreme and no clock pressure: nothing argues for acting sooner or later — act when the position needs it.")
+        return {"verdict": verdict, "title": title, "points": pts, "act_by": act_by,
+                "vol": {"iv_pct": iv_p, "hv_pct": hv_p, "vrp_pct": vrp, "implied_move_pct": em,
+                        "earnings_days": (int(earn_days) if earn_days is not None else None)}}
+
+    menu["timing"] = _timing()
     menu["desk_recommendation"] = {
         "name": winner.get("name"), "category": winner.get("category"), "group": winner.get("group"),
         "desk_score": winner.get("desk_score"), "score_breakdown": winner.get("score_breakdown"),
+        "policy": ("income" if income_override else None), "policy_over": income_override,
         "reasons": _why(winner, full=True),
         "runner_up": ({"name": runner.get("name"), "desk_score": runner.get("desk_score"), "reasons": _why(runner)[:2],
                        "role": runner_role} if runner else None),

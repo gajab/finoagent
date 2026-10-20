@@ -1,0 +1,618 @@
+{
+ "ticker": "NVDA",
+ "momentum_setup": {
+  "price": 238.9,
+  "as_of": "2026-10-19 07:59",
+  "atr": 11.79,
+  "adr_pct": 5.9,
+  "qualification": {
+   "is_candidate": true,
+   "grade": "C",
+   "score": 61,
+   "trend_grade": "C",
+   "trend_score": 61,
+   "fragility": {
+    "flags": 4,
+    "max_flags": 4,
+    "level": "extreme",
+    "crash_odds_pct": 24.8,
+    "base_crash_pct": 8.6,
+    "size_cap": 0.3333,
+    "size_cap_label": "\u2153",
+    "components": [
+     {
+      "key": "vol",
+      "label": "Realized volatility (20d, annualized)",
+      "value": 0.7495,
+      "value_fmt": "75%",
+      "cutoff": 0.3917,
+      "cutoff_fmt": "39%",
+      "hit": true,
+      "detail": "Std-dev of the last 20 daily returns \u00d7 \u221a252. The strongest single crash predictor in the test (t=5.4): the most volatile fifth of momentum names crashed 18.7% of the time vs 2.4% for the calmest fifth."
+     },
+     {
+      "key": "above_200",
+      "label": "Distance above the 200-day SMA",
+      "value": 0.4766,
+      "value_fmt": "+47.7%",
+      "cutoff": 0.4045,
+      "cutoff_fmt": "+40.5%",
+      "hit": true,
+      "detail": "How stretched price is above its long-term trend (t=3.5): the most stretched fifth crashed 19.6% of the time vs 4.1% for the least."
+     },
+     {
+      "key": "max_day",
+      "label": "Biggest one-day gain, last 21 sessions",
+      "value": 0.0922,
+      "value_fmt": "+9.2%",
+      "cutoff": 0.0607,
+      "cutoff_fmt": "+6.1%",
+      "hit": true,
+      "detail": "A recent lottery-like jump (t=3.9): names with the biggest recent single-day pops crashed 16.3% of the time vs 3.2%."
+     },
+     {
+      "key": "run_10",
+      "label": "10-day run-up",
+      "value": 0.1242,
+      "value_fmt": "+12.4%",
+      "cutoff": 0.0993,
+      "cutoff_fmt": "+9.9%",
+      "hit": true,
+      "detail": "How hot the last two weeks were (t=3.4): the steepest fifth of recent legs crashed 14.3% of the time vs 5.1%."
+     }
+    ],
+    "calibrated_state": true,
+    "atr14": 11.788,
+    "ema20": 211.34,
+    "exit_policy": {
+     "mode": "fast",
+     "level": 211.34,
+     "rule": "Exit on the first daily CLOSE below the 20-day EMA ($211.34) \u2014 from day 1, in addition to the stop.",
+     "evidence": "On top of a normal stop, this exit cut fragile trades losing >10% from 5.2% to 3.5% and improved the median from \u22124.9% to \u22124.0%, costing ~0.3% of average return per trade (S&P 500, 2019\u20132026)."
+    },
+    "headline": "Fragility 4/4 \u00b7 EXTREME \u2014 24.8% of similar strong-momentum setups fell \u226515% within 20 days (vs 8.6% on average, 2.9\u00d7 the base).",
+    "action": "Size capped at \u2153 and a 20-EMA close-exit from day 1 \u2014 fragility predicts how violent the next month is, not its direction.",
+    "basis": "Point-in-time test on 498 S&P 500 stocks (2019-12 \u2192 2026-09): cutoffs fit on 2019-12 \u2192 2023-05, crash odds measured out of sample on 2023-06 \u2192 2026-09 among strong-momentum setups (price > 50 > 200-SMA rising, \u226410% off the 52w high, 6m \u2265 +25%, RSI \u2265 55). Crash = a \u226515% drawdown within 20 trading days. Current index members (survivorship-biased), no trading costs. Fragility predicts how violent the next month is, not its direction."
+   },
+   "checks": [
+    {
+     "key": "ma_stack",
+     "label": "Stacked rising MAs",
+     "status": "pass",
+     "value": "stacked & rising",
+     "ideal": "price>10>20EMA>50>200SMA, all sloping up",
+     "detail": "10EMA $220.09 \u00b7 20EMA $211.34 \u00b7 50SMA $191.5 \u00b7 200SMA $161.79. Rising test: 50-SMA slope 6.0% (best of ~3-wk/~2-wk, so a V-recovery after a dip still counts) = up; 20-EMA slope 5.9%."
+    },
+    {
+     "key": "golden_cross",
+     "label": "Golden cross (50>200)",
+     "status": "pass",
+     "value": "50>200SMA",
+     "ideal": "50-SMA above 200-SMA",
+     "detail": "Golden cross = primary uptrend; a recent cross is an early momentum turn, a long-standing one confirms the trend."
+    },
+    {
+     "key": "ema_xo",
+     "label": "EMA crossovers",
+     "status": "pass",
+     "value": "10>20EMA (43d)",
+     "ideal": "fast EMAs above slow",
+     "detail": "Hurst 0.549 (persistent/trending)."
+    },
+    {
+     "key": "rel_strength",
+     "label": "Relative strength vs SPY",
+     "status": "pass",
+     "value": "1m 28.4% \u00b7 3m 33.1% \u00b7 RS new high",
+     "ideal": "RS line rising / at new highs",
+     "detail": "Momentum is RELATIVE \u2014 leaders outperform the index; laggards that can't beat SPY are not momentum trades."
+    },
+    {
+     "key": "near_high",
+     "label": "Near 52-week high",
+     "status": "pass",
+     "value": "-1.5%",
+     "ideal": "within 15% of highs",
+     "detail": "52w high $242.51. Leaders make new highs first."
+    },
+    {
+     "key": "prior_move",
+     "label": "Prior momentum move",
+     "status": "pass",
+     "value": "+68%",
+     "ideal": "\u2265 +30% (1\u20136mo)",
+     "detail": "1mo 28.5% \u00b7 3mo 33.5% \u00b7 6mo 67.8%."
+    },
+    {
+     "key": "base",
+     "label": "Base / VCP contraction",
+     "status": "pass",
+     "value": "15.9%/6d",
+     "ideal": "tight, contracting flag",
+     "detail": "Tight base under $242.51 \u2014 the launchpad; a contracting range (VCP) is the highest-quality coil."
+    },
+    {
+     "key": "bb_squeeze",
+     "label": "Bollinger squeeze",
+     "status": "warn",
+     "value": "width 25.22% (pctile 90.0)",
+     "ideal": "band-width in its low 20%",
+     "detail": "A Bollinger squeeze = volatility coiled at a multi-month low; expansion out of it fuels the momentum move."
+    },
+    {
+     "key": "atr_contract",
+     "label": "ATR contraction",
+     "status": "warn",
+     "value": "ATR $11.79 < 1mo $6.2",
+     "ideal": "volatility drying up into the base",
+     "detail": "Falling ATR into a base = energy stored for the breakout; rising ATR = already moving/extended."
+    },
+    {
+     "key": "macd",
+     "label": "MACD",
+     "status": "pass",
+     "value": ">0, >signal, hist \u2191",
+     "ideal": "above zero & signal, histogram rising",
+     "detail": "MACD above zero AND its signal with a rising histogram = momentum accelerating."
+    },
+    {
+     "key": "rsi",
+     "label": "RSI (momentum)",
+     "status": "warn",
+     "value": "68.7",
+     "ideal": "55\u201380 (continuation)",
+     "detail": "RSI bearish divergence \u2014 price made a higher high but RSI didn't. Momentum fading; demand confirmation."
+    },
+    {
+     "key": "roc",
+     "label": "Rate of change",
+     "status": "pass",
+     "value": "20d 22.6% \u00b7 63d 33.5%",
+     "ideal": "positive & accelerating",
+     "detail": "Price rate-of-change confirms the thrust."
+    },
+    {
+     "key": "volume",
+     "label": "Volume (dry-up \u2192 expansion)",
+     "status": "warn",
+     "value": "flat",
+     "ideal": "quiet base, surge on the break",
+     "detail": "Base 0.91\u00d7 the prior run; today 0.78\u00d7 the 20-day avg."
+    },
+    {
+     "key": "obv",
+     "label": "OBV accumulation",
+     "status": "pass",
+     "value": "rising",
+     "ideal": "OBV trending up",
+     "detail": "On-balance volume rising = accumulation under the move."
+    },
+    {
+     "key": "climax",
+     "label": "Distribution check",
+     "status": "pass",
+     "value": "clean",
+     "ideal": "no distribution",
+     "detail": "No high-volume selling climax recently."
+    },
+    {
+     "key": "demand",
+     "label": "Demand below (stop base)",
+     "status": "pass",
+     "value": "0 OB \u00b7 4 FVG",
+     "ideal": "a demand zone to stop under",
+     "detail": "Unmitigated bullish order blocks / fair-value gaps below = where buyers step in; the stop goes under them, not at a round number."
+    },
+    {
+     "key": "room",
+     "label": "Room to supply",
+     "status": "warn",
+     "value": "+1.5% to next",
+     "ideal": "\u22654% clear path to resistance",
+     "detail": "Clear air (LVN vacuum / distance to the next supply) lets a breakout travel before hitting sellers."
+    },
+    {
+     "key": "liquidity",
+     "label": "Structure & liquidity (BSL/SSL)",
+     "status": "fail",
+     "value": "trend down \u00b7 CHoCH",
+     "ideal": "uptrend, BSL above as target",
+     "detail": "Buy-side liquidity $218.87 above (target), sell-side $184.69 below (invalidation). POC $152.15."
+    },
+    {
+     "key": "regime",
+     "label": "Market regime",
+     "status": "warn",
+     "value": "Transitional (ER 0.272)",
+     "ideal": "trending favors momentum",
+     "detail": "No dominant regime \u2014 persistence is near a random walk. Reduce size, wait for the Hurst/ER to resolve, or trade smaller defined-risk structures."
+    },
+    {
+     "key": "regime_edge",
+     "label": "Regime-edge (backtested)",
+     "status": "warn",
+     "value": "n/a",
+     "ideal": "\u2014",
+     "detail": "Regime-edge not evaluated for this name (best-effort) \u2014 see the Regime-edge panel."
+    }
+   ],
+   "summary": "Trend C (61/100) \u00b7 Fragility 4/4 extreme (24.8% crash odds vs 8.6%) \u2192 size \u2153, exit on a close below the 20-EMA. A momentum candidate (grade C, 61/100) with a live pullback entry \u2014 a transitional-regime leader with confluence across trend, volatility, volume & structure.",
+   "passes": 12,
+   "entry_mode": "pullback",
+   "gates": {
+    "uptrend": true,
+    "leadership": true
+   }
+  },
+  "pillars": {
+   "trend_structure": {
+    "points": 18.0,
+    "max": 18.0
+   },
+   "relative_strength": {
+    "points": 14.0,
+    "max": 14.0
+   },
+   "volatility_compression": {
+    "points": 4.0,
+    "max": 16.0
+   },
+   "momentum_oscillators": {
+    "points": 9.0,
+    "max": 12.0
+   },
+   "volume": {
+    "points": 4.0,
+    "max": 10.0
+   },
+   "structure_liquidity": {
+    "points": 2.5,
+    "max": 14.0
+   },
+   "regime": {
+    "points": 2.5,
+    "max": 5.0
+   }
+  },
+  "moving_averages": {
+   "ema10": 220.09,
+   "ema20": 211.34,
+   "ema50": 196.28,
+   "sma50": 191.5,
+   "sma150": 165.81,
+   "sma200": 161.79
+  },
+  "metrics": {
+   "rsi": 68.7,
+   "macd_hist": 2.459,
+   "adr_pct": 5.9,
+   "bb_squeeze": false,
+   "bb_width_pctile": 90.0,
+   "atr_contracting": false,
+   "hurst": 0.549,
+   "efficiency_ratio": 0.272,
+   "golden_cross": {
+    "dir": null,
+    "bars_since": null,
+    "above": true
+   },
+   "rs": {
+    "slope_1m": 28.4,
+    "slope_3m": 33.1,
+    "new_high": true,
+    "available": true
+   },
+   "moves": {
+    "move_1m": 28.5,
+    "move_3m": 33.5,
+    "move_6m": 67.8,
+    "thrust_from_low_pct": 43.8,
+    "best_pct": 67.8
+   },
+   "pct_from_52w_high": -1.5,
+   "high_52w": 242.51,
+   "low_52w": 123.59,
+   "base": {
+    "high": 242.51,
+    "low": 203.89,
+    "days": 6,
+    "depth_pct": 15.9,
+    "tightness": 0.45,
+    "contracting": false
+   },
+   "volume": {
+    "dry_up": false,
+    "expansion": false,
+    "dryup_ratio": 0.91,
+    "today_ratio": 0.78,
+    "obv_rising": true,
+    "distribution_climax": false
+   },
+   "regime": {
+    "regime": "transitional",
+    "label": "Transitional",
+    "playbook": "No dominant regime \u2014 persistence is near a random walk. Reduce size, wait for the Hurst/ER to resolve, or trade smaller defined-risk structures."
+   },
+   "regime_edge": null,
+   "dealer": null
+  },
+  "setups": [
+   {
+    "type": "momentum_pullback",
+    "direction": "long",
+    "regime_fit": "with_regime",
+    "style": "momentum",
+    "confidence": "low",
+    "score": 7.54,
+    "entry": {
+     "low": 239.49,
+     "high": 239.49,
+     "level": 239.49,
+     "label": "momentum pullback"
+    },
+    "stop": {
+     "level": 205.45,
+     "label": "structure stop"
+    },
+    "targets": [
+     {
+      "level": 274.85,
+      "label": "3\u00d7 ATR thrust",
+      "rr": 1.04
+     },
+     {
+      "level": 298.43,
+      "label": "5\u00d7 ATR thrust",
+      "rr": 1.73
+     }
+    ],
+    "risk_reward": 1.04,
+    "sizing": {
+     "risk_per_share": 34.04,
+     "target_move_pct": 15.0,
+     "within_expected_move": false,
+     "note": null
+    },
+    "options": {
+     "structure": "\u2014",
+     "detail": "Momentum swing is a shares trade \u2014 express it with position size on a tight structure stop.",
+     "bias": "long"
+    },
+    "options_plan": {
+     "available": false,
+     "structure": "\u2014",
+     "note": "Shares strategy; leverage comes from size on a tight stop, not options."
+    },
+    "equity_plan": {
+     "side": "Buy (long)",
+     "entry": 239.49,
+     "stop": 205.45,
+     "targets": [
+      {
+       "level": 274.85,
+       "gain_per_share": 35.36
+      },
+      {
+       "level": 298.43,
+       "gain_per_share": 58.94
+      }
+     ],
+     "risk_per_share": 34.04,
+     "reward_per_share_t1": 35.36,
+     "risk_reward": 1.04,
+     "suggested_shares": 2.35,
+     "risk_budget": 250.0,
+     "sizing_basis": "1% risk, gap-adjusted, fragility cap \u2153, fractional shares (whole-share rounding would distort the size at this price)",
+     "dollar_risk": 80.0,
+     "dollar_reward_t1": 83.0,
+     "note": "2.35 shares (1% risk, gap-adjusted, fragility cap \u2153, fractional shares (whole-share rounding would distort the size at this price)). Max loss at the stop \u2248 $80; expected loss if stopped incl. typical gap slippage \u2248 $83; T1 gain \u2248 $83.",
+     "expected_loss_if_stopped": 83.0,
+     "size_adjustment": {
+      "base_shares": 7.34,
+      "stop_atr_multiple": 2.89,
+      "gap_overshoot": 1.039,
+      "gap_adjusted_shares": 7.06,
+      "fragility_cap": 0.3333,
+      "fragility_cap_label": "\u2153",
+      "final_shares": 2.35,
+      "binding": "fragility",
+      "explain": [
+       "Base: $250 risk (1% of a nominal $25k book) \u00f7 $34.04/share to the stop = 7.34 shares.",
+       "Gap-adjusted: the stop is 2.89 ATR from entry; stops that tight historically lost 1.04\u00d7 the planned amount on average when hit (gaps through the stop), so 7.06 shares keeps the expected loss when stopped \u2248 $250.",
+       "Fragility 4/4 cap \u2153: 24.8% of similar setups fell \u226515% within 20 days vs 8.6% on average \u2192 2.35 shares."
+      ]
+     }
+    },
+    "edge": {},
+    "event_risk": null,
+    "entry_style": {
+     "type": "market",
+     "label": "Enter near current price",
+     "note": "Price is already at the entry ($239.49) \u2014 enter around here.",
+     "distance_pct": 0.25
+    },
+    "horizon": {
+     "label": "Momentum pullback",
+     "style": "momentum",
+     "note": "Buy strength on a pullback to a rising MA / demand zone in an uptrend \u2014 lower-risk entry than chasing the breakout."
+    },
+    "from_current": {
+     "to_entry_pct": 0.25,
+     "to_t1_pct": 15.05
+    },
+    "thesis": "Momentum pullback \u2014 an intact uptrend (stacked rising MAs, RS 28.4%) just pulled back to its 20-EMA $211.34 and is turning back up. Buy the reclaim $239.49; stop under 20-EMA $205.45; ride the resumption toward prior highs.",
+    "evidence": [
+     "pullback to 20-EMA",
+     "from 52w high -1.5%",
+     "golden cross",
+     "RSI 68.7",
+     "OBV rising"
+    ],
+    "what_to_watch": [
+     "FRAGILE 4/4 (24.8% crash odds vs 8.6% base): size capped at \u2153; EXIT on the first daily close below the 20-EMA $211.34 \u2014 from day 1, in addition to the stop.",
+     "Entry confirms on a reclaim bar closing back above the 20-EMA $211.34 on improving volume.",
+     "Trail: 10/20-EMA; exit on a daily close below under 20-EMA $205.45.",
+     "Pullback invalidation: a decisive close below the rising MA breaks the uptrend structure \u2014 stand aside."
+    ],
+    "risk_overlay": {
+     "fragility_flags": 4,
+     "fragility_level": "extreme",
+     "crash_odds_pct": 24.8,
+     "base_crash_pct": 8.6,
+     "size_cap": 0.3333,
+     "size_cap_label": "\u2153",
+     "stop_atr_multiple": 2.89,
+     "gap_overshoot": 1.039,
+     "exit_policy": {
+      "mode": "fast",
+      "level": 211.34,
+      "rule": "Exit on the first daily CLOSE below the 20-day EMA ($211.34) \u2014 from day 1, in addition to the stop.",
+      "evidence": "On top of a normal stop, this exit cut fragile trades losing >10% from 5.2% to 3.5% and improved the median from \u22124.9% to \u22124.0%, costing ~0.3% of average return per trade (S&P 500, 2019\u20132026)."
+     },
+     "reduced_fresh_entry": false
+    },
+    "rank": 1
+   },
+   {
+    "type": "momentum_breakout",
+    "direction": "long",
+    "regime_fit": "with_regime",
+    "style": "momentum",
+    "confidence": "low",
+    "score": 5.79,
+    "entry": {
+     "low": 242.86,
+     "high": 242.86,
+     "level": 242.86,
+     "label": "momentum breakout"
+    },
+    "stop": {
+     "level": 223.09,
+     "label": "structure stop"
+    },
+    "targets": [
+     {
+      "level": 278.22,
+      "label": "3\u00d7 ATR thrust",
+      "rr": 1.79
+     },
+     {
+      "level": 301.8,
+      "label": "5\u00d7 ATR thrust",
+      "rr": 2.98
+     }
+    ],
+    "risk_reward": 1.79,
+    "sizing": {
+     "risk_per_share": 19.77,
+     "target_move_pct": 16.5,
+     "within_expected_move": false,
+     "note": null
+    },
+    "options": {
+     "structure": "\u2014",
+     "detail": "Momentum swing is a shares trade \u2014 express it with position size on a tight structure stop.",
+     "bias": "long"
+    },
+    "options_plan": {
+     "available": false,
+     "structure": "\u2014",
+     "note": "Shares strategy; leverage comes from size on a tight stop, not options."
+    },
+    "equity_plan": {
+     "side": "Buy (long)",
+     "entry": 242.86,
+     "stop": 223.09,
+     "targets": [
+      {
+       "level": 278.22,
+       "gain_per_share": 35.36
+      },
+      {
+       "level": 301.8,
+       "gain_per_share": 58.94
+      }
+     ],
+     "risk_per_share": 19.77,
+     "reward_per_share_t1": 35.36,
+     "risk_reward": 1.79,
+     "suggested_shares": 4.01,
+     "risk_budget": 250.0,
+     "sizing_basis": "1% risk, gap-adjusted, fragility cap \u2153, fractional shares (whole-share rounding would distort the size at this price)",
+     "dollar_risk": 79.0,
+     "dollar_reward_t1": 142.0,
+     "note": "4.01 shares (1% risk, gap-adjusted, fragility cap \u2153, fractional shares (whole-share rounding would distort the size at this price)). Max loss at the stop \u2248 $79; expected loss if stopped incl. typical gap slippage \u2248 $83; T1 gain \u2248 $142.",
+     "expected_loss_if_stopped": 83.0,
+     "size_adjustment": {
+      "base_shares": 12.64,
+      "stop_atr_multiple": 1.68,
+      "gap_overshoot": 1.05,
+      "gap_adjusted_shares": 12.03,
+      "fragility_cap": 0.3333,
+      "fragility_cap_label": "\u2153",
+      "final_shares": 4.01,
+      "binding": "fragility",
+      "explain": [
+       "Base: $250 risk (1% of a nominal $25k book) \u00f7 $19.77/share to the stop = 12.64 shares.",
+       "Gap-adjusted: the stop is 1.68 ATR from entry; stops that tight historically lost 1.05\u00d7 the planned amount on average when hit (gaps through the stop), so 12.03 shares keeps the expected loss when stopped \u2248 $250.",
+       "Fragility 4/4 cap \u2153: 24.8% of similar setups fell \u226515% within 20 days vs 8.6% on average \u2192 4.01 shares."
+      ]
+     }
+    },
+    "edge": {},
+    "event_risk": null,
+    "entry_style": {
+     "type": "breakout",
+     "label": "Buy the breakout \u00b7 stop order",
+     "note": "Rests as a STOP buy at $242.86 \u2014 it only fills if price rises ~1.66% and breaks out. You wait for strength, you don't buy here.",
+     "distance_pct": 1.66
+    },
+    "horizon": {
+     "label": "Momentum swing",
+     "style": "momentum",
+     "note": "Breakout of the coil \u2014 hold the thrust, scale into strength, then trail the 10/20-day EMA while the trend holds."
+    },
+    "from_current": {
+     "to_entry_pct": 1.66,
+     "to_t1_pct": 16.46
+    },
+    "thesis": "Momentum breakout \u2014 a leader (RS 28.4% vs SPY, +68% prior move) coiled in a 6-day base (15.9% deep) under $242.51. Buy the break of the $242.51 base pivot (refine with the 5-min opening-range high); stop under bull FVG $223.09; targets at real supply (then trail).",
+    "evidence": [
+     "15.9%/6d base",
+     "from 52w high -1.5%",
+     "golden cross"
+    ],
+    "what_to_watch": [
+     "FRAGILE 4/4 (24.8% crash odds vs 8.6% base): size capped at \u2153; EXIT on the first daily close below the 20-EMA $211.34 \u2014 from day 1, in addition to the stop.",
+     "Fresh breakout into a fragile tape: the better entry is a pullback to the rising 20-EMA or a new base. If you take this one, take it at the reduced size.",
+     "Confirm the break on a volume EXPANSION (base not especially quiet) \u2014 a break on light volume fails more often.",
+     "Trail: 10-EMA $220.09 (aggressive) / 20-EMA $211.34 (looser); exit on a daily close below the trail.",
+     "Invalidation: a close back inside the base (below $bull FVG $223.09) = failed breakout \u2014 take the stop, no averaging down."
+    ],
+    "risk_overlay": {
+     "fragility_flags": 4,
+     "fragility_level": "extreme",
+     "crash_odds_pct": 24.8,
+     "base_crash_pct": 8.6,
+     "size_cap": 0.3333,
+     "size_cap_label": "\u2153",
+     "stop_atr_multiple": 1.68,
+     "gap_overshoot": 1.05,
+     "exit_policy": {
+      "mode": "fast",
+      "level": 211.34,
+      "rule": "Exit on the first daily CLOSE below the 20-day EMA ($211.34) \u2014 from day 1, in addition to the stop.",
+      "evidence": "On top of a normal stop, this exit cut fragile trades losing >10% from 5.2% to 3.5% and improved the median from \u22124.9% to \u22124.0%, costing ~0.3% of average return per trade (S&P 500, 2019\u20132026)."
+     },
+     "reduced_fresh_entry": true
+    },
+    "rank": 2
+   }
+  ],
+  "meta": {
+   "has_intraday": false,
+   "deep": false,
+   "note": "Momentum-swing confluence: 8 weighted pillars behind 2 hard gates (Stage-2 uptrend + leadership), fusing trend/MA structure, relative strength, volatility compression, oscillators, volume, demand-supply & liquidity, regime and dealer positioning. Deterministic; stops/targets snap to real structure."
+  }
+ }
+}

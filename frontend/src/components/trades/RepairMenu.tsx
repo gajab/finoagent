@@ -15,6 +15,7 @@ import { Loader2, AlertTriangle, Wrench, ShieldCheck, Infinity as InfinityIcon, 
 import { useNavigate } from 'react-router-dom';
 import { fetchTradeRepairMenu } from '../../api';
 import type { RepairMenuResult, RepairAlternative } from '../../api';
+import { MoveStepsBlock, stepsLine } from './MoveSteps';
 
 export const money = (v: number | null | undefined) =>
   v == null ? '—' : `${v < 0 ? '−' : '+'}$${Math.abs(v).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
@@ -160,8 +161,8 @@ export function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best
         </span>
       </div>
 
-      {a.legs && a.legs.length > 0 && (
-        <div className="text-[10px] font-mono text-base-content/60 truncate" title={a.mechanics}>{a.legs.map(legStr).join('  ')}</div>
+      {(stepsLine(a) || (a.legs && a.legs.length > 0)) && (
+        <div className="text-[10px] font-mono text-base-content/60 truncate" title={a.mechanics}>{stepsLine(a) || (a.legs || []).map(legStr).join('  ')}</div>
       )}
 
       {/* payoff diagram — P&L (up = profit) vs the underlying price */}
@@ -210,7 +211,8 @@ export function Card({ a, best, spot, onEvaluate }: { a: RepairAlternative; best
         </div>
       </div>
       {open && (
-        <div className="space-y-1 border-t border-white/[0.06] pt-1">
+        <div className="space-y-1.5 border-t border-white/[0.06] pt-1">
+          <MoveStepsBlock a={a} spot={spot} />
           {a.score_breakdown && (
             <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
               <ScoreBar label="edge/$risk" v={a.score_breakdown.edge} />

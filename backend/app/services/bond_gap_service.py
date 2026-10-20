@@ -289,7 +289,7 @@ async def gap_plan(holdings: list[dict], profile: dict, params: dict) -> dict:
     ctx = await ps.load_context(holdings, profile)
     rows_now, _ = ps.analyze_rows(holdings, profile, ctx)
     out = {
-        "as_of": today.isoformat(), "account_type": acct, "min_credit": min_credit, "budget": budget,
+        "as_of": today.isoformat(), "account_type": acct, "min_credit": min_credit, "budget": budget, "after_tax": bool(after_tax),
         **ps.inflation_fields(base_path, infl_src),
         "scenarios": [{k: (round(v * 100, 3) if k in ("short", "long", "rate_shift", "fx_drift") else v) for k, v in s.items()} for s in scs],
         "has_goals": bool((profile or {}).get("goals")), "retired_tax": ps.tax_schedule_fields(sched),
@@ -405,16 +405,17 @@ async def gap_plan(holdings: list[dict], profile: dict, params: dict) -> dict:
             why = ("Keeps this year's spending power whatever inflation does (principal and coupons rise with CPI)"
                    + ("; no TIPS matures that year, so the nearest earlier one is used and the cash waits in T-bills" if f.get("off_year") else "")
                    if c["kind"] == "tips" else
-                   f"Most to spend in {y} after tax in a {'taxable' if acct not in ps.TAX_ADVANTAGED else acct.upper()} account: "
-                   f"{c['after_tax_yield'] * 100:.2f}% a year"
-                   + (" vs " + ", ".join(f"{x['label']} {x['after_tax_yield'] * 100:.2f}%" for x in alt) if alt else ""))
+                   (f"Most to spend in {y} after tax in a {'taxable' if acct not in ps.TAX_ADVANTAGED else acct.upper()} account: "
+                    if after_tax else f"Most to spend in {y} before tax: ")
+                   + f"{_shown_yield(c, after_tax) * 100:.2f}% a year"
+                   + (" vs " + ", ".join(f"{x['label']} {_shown_yield(x, after_tax) * 100:.2f}%" for x in alt) if alt else ""))
             lines.append({
                 "year": y, "leg": leg, "kind": c["kind"], "label": c["label"], "rating": c["rating"],
                 "amount": round(f["cost"], 2), "face": f["face"], "pre_tax_pct": ps._pct(c["pre_tax_yield"]),
                 "real_yield_pct": ps._pct(c["real_yield"]) if c.get("real_yield") is not None else None,
                 "after_tax_pct": ps._pct(c["after_tax_yield"]), "spendable": round(f["cost"] * c["growth"], 2),
                 "security": f["security"], "etf": fam.get(y), "why": why, "basis": c["basis"],
-                "alternatives": [{"label": x["label"], "after_tax_pct": ps._pct(x["after_tax_yield"])} for x in alt],
+                "alternatives": [{"label": x["label"], "after_tax_pct": ps._pct(_shown_yield(x, after_tax))} for x in alt],
             })
         cost = sum(l["amount"] for l in lines)
         worst = max(o["unfunded_today_dollars"] for o in outcomes.values())
@@ -453,12 +454,16 @@ async def gap_plan(holdings: list[dict], profile: dict, params: dict) -> dict:
     be = _breakeven(mi, sum(picks[g["year"]]["T"] for g in gaps) / len(gaps))
     out.update(
         strategies=strategies, recommended=rec["key"], why=why, real_share_pct=round(100 * real_w, 1),
-        breakeven_pct=ps._pct(be), placement=_placement(gaps, picks, profile, sched, mi, base_path, today, min_credit, after_tax),
+        breakeven_pct=ps._pct(be),
+        placement=_placement(gaps, picks, profile, sched, mi, base_path, today, min_credit, after_tax) if after_tax else None,
         notes=[
+            *([] if after_tax else [
+                "Pre-tax view: income tax, tax on fund sales and IRA withdrawal tax are left out — the gaps are smaller and "
+                "taxable bonds look better than they are (tax-exempt munis never win). Switch to After tax for what you'd keep."]),
             f"{real_w * 100:.0f}% of the gap is inflation-adjusted spending. TIPS break even against nominal Treasuries at about "
             f"{be * 100:.2f}% inflation over these maturities" + (f" — you expect {base_path.avg(10) * 100:.2f}%." if be is not None else "."),
             "Sizing is done by the planner itself: purchases are added to your book and scaled until the shortfall years are covered "
-            "after tax, with your fund sales, Social Security and reinvestments re-optimized around them.",
+            f"{'after tax' if after_tax else 'before tax'}, with your fund sales, Social Security and reinvestments re-optimized around them.",
             "Bonds held to maturity pay what they promised in every scenario; cash, future reinvestments and bond funds move with "
             "interest rates (funds: −duration × the rate move today, then they earn the difference); TIPS, Social Security and "
             "inflation-adjusted goals move with CPI.",
@@ -468,6 +473,12 @@ async def gap_plan(holdings: list[dict], profile: dict, params: dict) -> dict:
             "CUSIPs at FedInvest's last close.",
         ])
     return out
+
+
+def _shown_yield(c: dict, after_tax: bool) -> float:
+    """The yield a line quotes: after tax (as compounded over the holding) — or, with taxes left out, the bond's
+    quoted yield, so the text matches the table."""
+    return c["after_tax_yield"] if after_tax else c["pre_tax_yield"]
 
 
 def _money(v: float) -> str:

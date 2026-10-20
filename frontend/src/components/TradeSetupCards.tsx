@@ -3,9 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import {
   Target, Shield, Crosshair, Sparkles, ChevronDown, ChevronUp, Layers3, CalendarClock,
   LineChart, TrendingUp, ShieldCheck, Loader2, Code2, Eye, FlaskConical, Clock, LogIn,
-  CheckCircle2, AlertCircle, XCircle, Award, Rocket, Activity, Timer, History, ChevronsUpDown,
+  CheckCircle2, AlertCircle, XCircle, Award, Rocket, Activity, Timer, History, ChevronsUpDown, ShieldAlert,
 } from 'lucide-react';
-import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg, EquityOdds, QullamaggieData, ConnorsData, ConnorsBacktest, MomentumData } from '../types';
+import type { TradeSetup, TradeSetupsData, SetupVerification, OptionLeg, EquityOdds, QullamaggieData, ConnorsData, ConnorsBacktest, MomentumData, Fragility } from '../types';
 
 // Push an option structure's legs into the Income-Desk → Evaluate tab (sessionStorage handoff).
 function researchInEvaluate(ticker: string, legs: OptionLeg[], expiration: string, navigate: (to: string) => void) {
@@ -34,6 +34,7 @@ export const TYPE_LABEL: Record<string, string> = {
   vwap_pullback_short: 'VWAP Pullback', opening_range_break_long: 'Opening-Range Break',
   opening_range_break_short: 'Opening-Range Break',
   qm_breakout: 'Momentum Breakout', qm_episodic_pivot: 'Episodic Pivot', qm_parabolic_short: 'Parabolic Short',
+  momentum_breakout: 'Momentum Breakout', momentum_pullback: 'Momentum Pullback', momentum_episodic_pivot: 'Episodic Pivot',
 };
 
 // Options structure held to expiry: PoP and the model's own P&L read. Both are MARKET-IMPLIED — the P&L is ~$0 for a
@@ -151,6 +152,14 @@ function EquityView({ setup, spot }: { setup: TradeSetup; spot: number | null })
             <div className="mt-1.5 pt-1.5 border-t border-white/[0.05] text-[11px] text-base-content/70">
               <b>{eq.suggested_shares}</b> shares · risk <b className="text-error">{d0(eq.dollar_risk)}</b> to make <b className="text-success">{d0(eq.dollar_reward_t1)}</b> at T1.
               {eq.sizing_basis && <span className="text-base-content/40"> Sized at {eq.sizing_basis} risk per trade.</span>}
+              {eq.size_adjustment && (
+                <div className="mt-1 space-y-0.5 text-[10px] text-base-content/50 leading-snug">
+                  {eq.size_adjustment.explain.map((x, i) => <div key={i}>• {x}</div>)}
+                  {eq.expected_loss_if_stopped != null && (
+                    <div>Expected loss if stopped, incl. typical gap slippage ≈ <b className="text-error">{d0(eq.expected_loss_if_stopped)}</b>.</div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         ) : (
@@ -327,6 +336,11 @@ export function SetupCard({ setup, ticker, spot, dossier }: { setup: TradeSetup;
             </span>
           )}
           {fitWarn && <span className="badge badge-xs badge-warning gap-1">counter-trend</span>}
+          {setup.risk_overlay && setup.direction === 'long' && setup.risk_overlay.fragility_flags >= 3 && (
+            <span className="badge badge-xs badge-error gap-1" title={`${setup.risk_overlay.exit_policy.rule} ${setup.risk_overlay.exit_policy.evidence}`}>
+              <ShieldAlert className="w-3 h-3" /> Fragile {setup.risk_overlay.fragility_flags}/4 · {setup.risk_overlay.size_cap_label} size · 20-EMA exit
+            </span>
+          )}
         </div>
         <div className="text-right">
           <div className={`text-lg font-bold tabular-nums leading-none ${rrTone}`}>{rr != null ? `${rr}R` : '—'}</div>
@@ -461,6 +475,8 @@ export interface PanelData {
   checks: PanelCheck[];
   execution?: { label: string; text: string }[] | null;
   backtest?: ConnorsBacktest | null;
+  /** second axis (momentum strategies): crash-risk fragility, shown beside the trend grade — never a lone grade */
+  fragility?: Fragility | null;
   footer: string;
 }
 
@@ -506,6 +522,46 @@ function Backtest({ bt }: { bt: ConnorsBacktest }) {
   );
 }
 
+// fragility level → tone (calm good · normal neutral · fragile warn · extreme bad)
+const FRAG_TONE: Record<string, string> = { calm: 'good', normal: 'neutral', fragile: 'warn', extreme: 'bad' };
+
+/** The second axis, sized like the trend-grade box so the two always read together. */
+function FragilityBadge({ f }: { f: Fragility }) {
+  return (
+    <div title={f.headline}
+      className={`flex flex-col items-center justify-center rounded-xl border px-3 py-1.5 min-w-[64px] max-w-[130px] text-center ${TONE_CLASS[FRAG_TONE[f.level]] || TONE_CLASS.neutral}`}>
+      <span className="text-[13px] font-black leading-tight">{f.flags}/{f.max_flags}</span>
+      <span className="text-[9px] uppercase tracking-wide opacity-80">{f.level}</span>
+      <span className="text-[9px] tabular-nums opacity-70">{f.crash_odds_pct}% crash</span>
+    </div>
+  );
+}
+
+/** Every input of the fragility score is spelled out (value vs cutoff + what it measures), then the action and exit. */
+function FragilityBlock({ f }: { f: Fragility }) {
+  const tone = FRAG_TONE[f.level] || 'neutral';
+  const rows: PanelCheck[] = f.components.map(c => ({
+    key: `frag-${c.key}`, label: c.label, status: c.hit ? 'fail' : 'pass', value: c.value_fmt,
+    ideal: `fragile if ≥ ${c.cutoff_fmt}`, detail: c.detail,
+  }));
+  return (
+    <div className={`rounded-lg border px-3 py-2 ${TONE_CLASS[tone]}`}>
+      <div className="text-[10px] uppercase tracking-wider mb-1 flex items-center gap-1">
+        <ShieldAlert className="w-3 h-3" /> Fragility — the second axis (crash risk, not direction)
+      </div>
+      <p className="text-[11.5px] leading-snug text-base-content/80">{f.headline}</p>
+      <div className="rounded-lg border border-white/[0.06] bg-base-200/40 px-3 py-1 mt-1.5">
+        {rows.map(c => <CheckRow key={c.key} c={c} />)}
+      </div>
+      <div className="mt-1.5 space-y-0.5 text-[11px] leading-snug text-base-content/75">
+        <div><b>Action:</b> {f.action}</div>
+        <div><b>Exit:</b> {f.exit_policy.rule} <span className="text-base-content/50">{f.exit_policy.evidence}</span></div>
+      </div>
+      <p className="text-[9.5px] text-base-content/40 leading-snug mt-1">{f.basis}</p>
+    </div>
+  );
+}
+
 export function StrategyPanel({ p }: { p: PanelData }) {
   return (
     <div className="glass-card p-4 space-y-3">
@@ -514,6 +570,7 @@ export function StrategyPanel({ p }: { p: PanelData }) {
           <span className="text-[13px] font-black leading-tight">{p.badge}</span>
           <span className="text-[9px] tabular-nums opacity-70 mt-0.5">{p.score}/100</span>
         </div>
+        {p.fragility && <FragilityBadge f={p.fragility} />}
         <div className="flex-1 min-w-[200px]">
           <div className="flex items-center gap-1.5 text-sm font-bold text-base-content/85">
             <p.Icon className="w-4 h-4 text-primary" /> {p.title}
@@ -528,6 +585,7 @@ export function StrategyPanel({ p }: { p: PanelData }) {
       <div className="rounded-lg border border-white/[0.06] bg-base-200/25 px-3 py-1">
         {p.checks.map(c => <CheckRow key={c.key} c={c} />)}
       </div>
+      {p.fragility && <FragilityBlock f={p.fragility} />}
       {p.backtest !== undefined && p.backtest !== null && <Backtest bt={p.backtest} />}
       {p.execution && p.execution.length > 0 && (
         <div className="rounded-lg border border-primary/20 bg-primary/[0.04] px-3 py-2">
@@ -551,7 +609,7 @@ function qmPanel(d: QullamaggieData): PanelData {
   const q = d.qualification, m = d.metrics, ma = d.moving_averages;
   const tone = q.grade === 'A' ? 'good' : q.grade === 'B' ? 'info' : q.grade === 'C' ? 'warn' : 'neutral';
   return {
-    Icon: Rocket, title: 'Qullamäggie screen', badge: `Grade ${q.grade}`, tone, score: q.score,
+    Icon: Rocket, title: 'Qullamäggie screen', badge: `Trend ${q.grade}`, tone, score: q.score,
     subBadge: q.is_candidate ? 'Candidate' : 'Not a candidate', subBadgeGood: q.is_candidate, summary: q.summary,
     stats: [
       { label: 'ADR', value: `${m.adr_pct ?? '—'}%` },
@@ -559,7 +617,7 @@ function qmPanel(d: QullamaggieData): PanelData {
       { label: 'best move', value: `+${m.moves?.best_pct ?? '—'}%` },
       { label: '10/20/50', value: `${money(ma.ema10)}/${money(ma.ema20)}/${money(ma.sma50)}` },
     ],
-    checks: q.checks, execution: null, backtest: null,
+    checks: q.checks, execution: null, backtest: null, fragility: q.fragility ?? null,
     footer: "Kristjan Kullamägi's method: trade only the strongest leaders — a big prior move, high ADR%, price stacked above rising 10/20-EMA & 50-SMA near new highs — buying the break of a tight base (entry refined by the day's opening-range high), a tight stop, then a 10/20-day MA trail. Setups appear below only when the tape supports them.",
   };
 }
@@ -595,7 +653,7 @@ function momentumPanel(d: MomentumData): PanelData {
   const tone = q.grade === 'A' ? 'good' : q.grade === 'B' ? 'info' : q.grade === 'C' ? 'warn' : 'neutral';
   const gc = m.golden_cross?.above;
   return {
-    Icon: TrendingUp, title: 'Momentum Swing', badge: `Grade ${q.grade}`, tone, score: q.score,
+    Icon: TrendingUp, title: 'Momentum Swing', badge: `Trend ${q.grade}`, tone, score: q.score,
     subBadge: q.is_candidate ? (q.entry_mode ? `${q.entry_mode} ready` : 'Candidate') : (q.gates?.uptrend ? 'No trigger' : 'Not a candidate'),
     subBadgeGood: q.is_candidate, summary: q.summary,
     stats: [
@@ -606,7 +664,7 @@ function momentumPanel(d: MomentumData): PanelData {
       { label: 'golden×', value: gc ? 'yes' : 'no' },
       { label: 'regime', value: m.regime?.label ?? '—' },
     ],
-    checks: q.checks, execution: null, backtest: null,
+    checks: q.checks, execution: null, backtest: null, fragility: q.fragility ?? null,
     footer: "Momentum Swing fuses the whole stack behind two HARD GATES — a Stage-2 uptrend (price>50-SMA>200-SMA, 200 rising) AND leadership (prior move / near 52w-high / outperforming SPY) — then scores 8 weighted pillars: trend & MA structure (golden cross, EMA stacks, Hurst), relative strength, volatility compression (Bollinger squeeze · ATR contraction · VCP base), MACD/RSI/ROC (RSI is continuation-aware), volume dry-up→expansion, demand/supply + POC/LVN + bull/bear FVG + BSL/SSL liquidity, regime (+ backtested regime-edge) and dealer gamma/walls. Entry auto-detects breakout / pullback / episodic pivot; stops & targets snap to real structure. Setups appear below when a trigger is live.",
   };
 }

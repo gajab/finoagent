@@ -131,12 +131,21 @@ def test_no_credit_roll_clears_the_bar_drops_the_stray_rolls_and_says_so(wire):
     assert not any(a["category"] == "roll" for a in out["alternatives"])           # one source of truth: none
 
 
-def test_a_spread_is_left_alone(wire):
+def test_a_strangle_has_no_single_unit_to_roll_and_is_left_alone(wire):
     legs = [{"type": "put", "action": "SELL", "strike": 100, "qty": 1, "expiration": "2026-10-16"},
-            {"type": "put", "action": "BUY", "strike": 95, "qty": 1, "expiration": "2026-10-16"}]
+            {"type": "call", "action": "SELL", "strike": 130, "qty": 1, "expiration": "2026-10-16"}]
     out = _refine(_strategy(legs, [2.0, 0.8]), _phase1())
     assert out["roll_search"] == "skipped" and not any(a.get("roll_meta") for a in out["alternatives"])
     assert "tested_right" not in wire                                              # the optimizer was never called
+
+
+def test_a_vertical_is_searched_as_ONE_package_with_its_wing(wire):
+    legs = [{"type": "put", "action": "SELL", "strike": 100, "qty": 1, "expiration": "2026-10-16"},
+            {"type": "put", "action": "BUY", "strike": 90, "qty": 1, "expiration": "2026-10-16"}]
+    out = _refine(_strategy(legs, [2.0, 0.8]), _phase1())
+    assert out["roll_search"] == "done"
+    assert (wire["tested_right"], wire["tested_strike"], wire["wing_long_strike"]) == ("P", 100.0, 90.0)
+    assert abs(wire["tested_entry"] - 1.2) < 1e-9                                  # the spread's NET credit, not the short leg's
 
 
 def test_missing_payload_and_missing_trade_are_clean_errors(wire):

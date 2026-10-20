@@ -78,8 +78,10 @@ function Overview({ data, grouped, onOpenFixes }: { data: BookTailRiskResult; gr
           {' '}Greeks and tails are good estimates; press Refresh during market hours for live quotes.
         </Callout>
       )}
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
-        <Tile label="Capital" value={money(data.book_capital)} sub="short-strike notional" title={data.capital_basis} />
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+        {data.deployed_reg_t != null && <Tile label="Deployed (Reg-T)" value={money(data.deployed_reg_t)} sub="same basis as My Trades"
+          title="What your broker holds for these Income option trades: the stock held for stock-backed trades, else the Reg-T margin (spreads = width). It is the same per-trade figure My Trades shows in its Deployed column — but only for the Income options trades analysed here, while the My Trades header totals every open position." />}
+        <Tile label="Capital basis" value={money(data.book_capital)} sub="cash-secured · spreads at width" title={data.capital_basis} />
         <Tile label="Carry" value={data.carry_yield_pct != null ? `${data.carry_yield_pct}%/yr` : '—'} sub="θ yield" tone="good" />
         <Tile label="Net θ / day" value={money(data.net_theta)} tone={(data.net_theta ?? 0) >= 0 ? 'good' : 'bad'} sub={data.theta_net_liq_pct != null ? `${data.theta_net_liq_pct}%/day` : undefined} />
         <Tile label="CVaR · 1 month" value={money(data.cvar_95)} tone="warn" sub={data.cvar_capital_pct != null ? `${data.cvar_capital_pct}% of capital` : undefined} />
@@ -87,6 +89,7 @@ function Overview({ data, grouped, onOpenFixes }: { data: BookTailRiskResult; gr
         <Tile label="Net vega" value={money(data.net_vega)} tone={(data.net_vega ?? 0) < 0 ? 'bad' : 'good'} sub="per vol-pt" />
         <Tile label="Net Γ" value={data.net_gamma?.toFixed(2) ?? '—'} tone={(data.net_gamma ?? 0) < 0 ? 'bad' : 'good'} sub={data.short_vol ? 'short vol' : 'long vol'} />
       </div>
+      {data.deployed_reg_t != null && <p className="text-[11px] text-base-content/45 -mt-2 leading-relaxed"><b>Deployed</b> is what your broker holds (Reg-T) for these Income options trades — the My Trades number. <b>Capital basis</b> is the cash-secured notional of naked shorts plus the width of spreads — the denominator the “% of capital” limits are measured against, so it is larger than Deployed.</p>}
       {v && <Callout tone={LEVEL_TONE[v.level] || 'neutral'} icon={<ShieldAlert className="w-4 h-4" />}><b>{v.level}.</b> {v.summary}</Callout>}
 
       {sc && (
@@ -169,6 +172,12 @@ function FixVariantBlock({ tf, v, multi, onManage, toEvaluate }: { tf: TradeFix;
     <div className={multi ? 'rounded-xl border border-white/[0.07] bg-base-100/20 p-3 space-y-2.5' : 'space-y-2.5'}>
       {multi && <div className="flex items-center gap-1.5 flex-wrap text-xs text-base-content/55">This fix addresses {v.checks.map(c => <Chip key={c.key} tone={STATUS_TONE[c.status]}>{c.label}</Chip>)}</div>}
       <div className="text-xs font-mono text-base-content/60 leading-snug">{rec.legs}</div>
+      {v.protected && (
+        <Callout tone="info" icon={<CheckCircle2 className="w-3.5 h-3.5" />}>
+          <b>Already a defined-risk spread</b> — a long option on this side caps the short, so there is no wing to buy. The most it can lose is the {money(v.tailBefore)} shown;
+          closing exits the exposure, leaving it is a choice, not a gap to fix.
+        </Callout>
+      )}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
         <Tile label="Risk now" value={money(v.tailBefore)} tone="bad"
           sub={v.stress ? `at ${sgn(v.stress.name_move_pct, true)}% (${sgn(v.stress.market_move_pct, true)}% mkt × β ${v.stress.beta})` : 'at the stress move'}
@@ -189,10 +198,10 @@ function FixVariantBlock({ tf, v, multi, onManage, toEvaluate }: { tf: TradeFix;
         {tf.short && (
           <button onClick={() => (onManage && tf.tradeId != null ? onManage(tf.tradeId) : undefined)} title={tf.tradeId != null ? 'Jump to this position to close it' : undefined}
             className={`btn btn-sm font-mono normal-case ${!recIsCap ? 'btn-primary' : 'btn-ghost border border-white/10'}`}>
-            Close {tf.short.strike}{tf.short.right}
+            {v.protected ? 'Close the spread' : `Close ${tf.short.strike}${tf.short.right}`}
           </button>
         )}
-        <span className="ml-auto text-[11px] text-base-content/40">recommended: {recIsCap ? 'cap with a long wing' : 'close the short'}</span>
+        <span className="ml-auto text-[11px] text-base-content/40">recommended: {recIsCap ? 'cap with a long wing' : v.protected ? 'close the spread' : 'close the short'}</span>
       </div>
     </div>
   );
@@ -513,7 +522,7 @@ export default function BetaBookRisk({ quoteSource, onManageTrade }: { quoteSour
                 {tab === 'stress' && <Stress data={data} withStock={withStock} />}
                 {tab === 'concentration' && <BetaBookConcentration data={data} />}
                 {tab === 'hedge' && <BetaBookHedge data={data} quoteSource={quoteSource} withStock={withStock && !!raw?.with_stock_downside}
-                  fixes={grouped.trades.length ? { trades: grouped.trades.length, cost: grouped.trades.reduce((s, t) => s + (t.variants[0]?.rec.cost ?? 0), 0) } : null} />}
+                  fixes={(() => { const caps = grouped.trades.filter(t => t.variants[0]?.rec.action === 'cap'); return caps.length ? { trades: caps.length, cost: caps.reduce((s, t) => s + (t.variants[0]?.rec.cost ?? 0), 0) } : null; })()} />}
                 <p className="text-[11px] text-base-content/35 mt-4 leading-relaxed">
                   {data.assumptions?.beta}; {data.assumptions?.tail}; market vol {data.assumptions?.mkt_vol_pct}%; VaR/CVaR over {data.horizon}; crash prob {data.assumptions?.crash_prob_annual_pct}%/yr; hedge rolled {data.assumptions?.hedge_rolls_per_year}×/yr.
                   {' '}θ/Net-Liq &amp; carry use committed capital ({money(data.book_capital)}, Σ cash-secured notional) as the net-liq base, and annualize decay at current pace. Option-layer greeks only. Model estimate — not an order.

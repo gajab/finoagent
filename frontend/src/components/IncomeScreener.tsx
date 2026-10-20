@@ -8,12 +8,15 @@ import { afterFillText, afterFillTitle } from '../lib/fills';
 import LimitOnlyBadge from './LimitOnlyBadge';
 import type {
   IncomeScreenParams, IncomeScreenRow, IncomeVolRow, IncomeEvalParams, IncomeEvalResult, IncomeEvalTrade,
+  IncomeEarningsWindow, EarningsSlot,
 } from '../types';
 
 /** Income Desk → Screener. Three steps, each progressive so a large universe never blocks the UI:
  *  1. screen (one fast server query) → table appears immediately;
  *  2. IV30/HV30 fill in batch-by-batch (vol filters apply as each batch lands);
- *  3. Evaluate runs the desk engine per selected ticker (bounded concurrency) and streams A/B trades in. */
+ *  3. Evaluate runs the desk engine per selected ticker (bounded concurrency) and streams A/B trades in.
+ *  Earnings plays: an "Earnings in" window screens the names REPORTING soon (Yahoo calendar, BMO/AMC slot),
+ *  prices each one's event expiry (ATM IV + implied move) and evaluates with "Sell the print". */
 
 const SECTORS = ['Technology', 'Communication Services', 'Consumer Cyclical', 'Consumer Defensive', 'Financial Services',
   'Healthcare', 'Industrials', 'Energy', 'Basic Materials', 'Real Estate', 'Utilities'];
@@ -23,16 +26,26 @@ const EVAL_CONCURRENCY = 2;       // the server serialises the heavy scan; 2 kee
 const PAGE_SIZE = 25;
 const RESULT_PAGE_SIZE = 8;
 const LS_KEY = 'incomeScreener.v1';
+const EARNINGS_WINDOWS: { v: IncomeEarningsWindow; label: string }[] = [
+  { v: 'today', label: 'Today after the close' },
+  { v: 'tomorrow', label: 'Tomorrow' },
+  { v: 'within_2', label: 'Within 2 trading days' },
+  { v: 'within_3', label: 'Within 3 trading days' },
+  { v: 'within_4', label: 'Within 4 trading days' },
+  { v: 'within_5', label: 'Within 5 trading days' },
+];
+const MOVE_COMFORT = 1.5;   // the desk's earnings-aware line: short strike ≥ 1.5× the isolated implied move
 
 type VolFilters = { ivGtHv: boolean; minRatio: number | null; ivMin: number | null; ivMax: number | null };
 type Row = IncomeScreenRow & { manual?: boolean };
-type SortKey = 'ticker' | 'current_price' | 'today_pct' | 'week52_pos_pct' | 'atm_iv' | 'hv30' | 'iv_hv_ratio' | 'days_to_earnings';
+type SortKey = 'ticker' | 'current_price' | 'today_pct' | 'week52_pos_pct' | 'atm_iv' | 'hv30' | 'iv_hv_ratio' | 'days_to_earnings'
+  | 'event_iv' | 'event_move_pct';
 type EvalState = { status: 'queued' | 'running' | 'done' | 'error'; result?: IncomeEvalResult; error?: string };
 
 const DEFAULT_SCREEN: IncomeScreenParams = {
   price_min: 20, price_max: 500, market_cap_min_b: 2, avg_volume_min: 1_000_000,
   beta_min: null, beta_max: null, change_min: null, change_max: null,
-  week52_pos_min: null, week52_pos_max: null, sectors: [], exclude_earnings_within_days: null, max_results: 100,
+  week52_pos_min: null, week52_pos_max: null, sectors: [], exclude_earnings_within_days: null, earnings_window: null, max_results: 100,
 };
 const DEFAULT_VOL: VolFilters = { ivGtHv: true, minRatio: null, ivMin: null, ivMax: null };
 const DEFAULT_EVAL: IncomeEvalParams = {
@@ -50,6 +63,15 @@ const f2 = (n?: number | null) => (n == null ? '—' : n.toFixed(2));
 const f1pct = (n?: number | null) => (n == null ? '—' : `${n.toFixed(1)}%`);
 const money0 = (n?: number | null) => (n == null ? '—' : `$${Math.round(n).toLocaleString()}`);
 const numOrNull = (v: string): number | null => (v.trim() === '' || isNaN(Number(v)) ? null : Number(v));
+const slotText = (s?: EarningsSlot | null) => (s === 'bmo' ? 'BMO' : s === 'amc' ? 'AMC' : 'time n/a');
+const slotTitle = (s?: EarningsSlot | null) => (s === 'bmo' ? 'Before the open — the crush lands at that day\'s open'
+  : s === 'amc' ? 'After the close — the crush lands at the next session\'s open'
+  : 'Report time not published — treated as after the close (the expiry still spans the print either way)');
+/** "Tue 10-20" from an ISO date, read as a calendar date (no timezone shift). */
+const erDay = (iso: string) => {
+  const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+  return `${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(y, m - 1, d).getDay()]} ${iso.slice(5, 10)}`;
+};
 
 /** Run `worker` over `items` with at most `n` in flight; stops scheduling when `alive()` turns false. */
 async function pool<T>(items: T[], n: number, alive: () => boolean, worker: (t: T) => Promise<void>) {
@@ -60,15 +82,16 @@ async function pool<T>(items: T[], n: number, alive: () => boolean, worker: (t: 
   await Promise.all(Array.from({ length: Math.min(n, items.length) }, next));
 }
 
-function NumField({ label, value, onChange, step = 1, placeholder, suffix }: {
+function NumField({ label, value, onChange, step = 1, placeholder, suffix, disabled, title }: {
   label: string; value: number | null | undefined; onChange: (v: number | null) => void; step?: number; placeholder?: string; suffix?: string;
+  disabled?: boolean; title?: string;
 }) {
   return (
-    <label className="form-control">
+    <label className={`form-control ${disabled ? 'opacity-40' : ''}`} title={title}>
       <span className="label-text text-[11px] text-base-content/60 mb-1">{label}</span>
       <div className="relative">
         <input type="number" step={step} className="input input-bordered input-xs w-full pr-6" placeholder={placeholder ?? 'any'}
-          value={value ?? ''} onChange={e => onChange(numOrNull(e.target.value))} />
+          disabled={disabled} value={value ?? ''} onChange={e => onChange(numOrNull(e.target.value))} />
         {suffix && <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-base-content/40">{suffix}</span>}
       </div>
     </label>
@@ -102,8 +125,10 @@ function Pager({ page, pages, setPage }: { page: number; pages: number; setPage:
 
 // ───────────────────────── Step 3 — results ─────────────────────────
 
-function TradeRow({ t, onOpen }: { t: IncomeEvalTrade; onOpen: () => void }) {
+function TradeRow({ t, onOpen, play }: { t: IncomeEvalTrade; onOpen: () => void; play?: boolean }) {
   const isCall = t.side === 'call';
+  // A days-long earnings hold annualizes (geometrically) into nonsense — show the plain return on BPR instead.
+  const holdReturn = t.premium != null && t.collateral ? (t.premium / t.collateral) * 100 : null;
   return (
     <tr className="hover:bg-base-200/20">
       <td>
@@ -116,6 +141,12 @@ function TradeRow({ t, onOpen }: { t: IncomeEvalTrade; onOpen: () => void }) {
       <td className="font-mono text-xs">
         {t.short_strike}
         {t.short_strike_pct != null && <span className="text-base-content/45"> ({t.short_strike_pct > 0 ? '+' : ''}{t.short_strike_pct.toFixed(1)}%)</span>}
+        {t.move_multiple != null && (
+          <div className={`text-[10px] ${t.move_multiple < MOVE_COMFORT ? 'text-warning' : 'text-base-content/45'}`}
+            title={`Short strike sits ${t.move_multiple.toFixed(2)}× the implied earnings move from spot (±${t.earnings_gap_pct}%). Below ${MOVE_COMFORT}× a normal surprise can reach it.`}>
+            {t.move_multiple.toFixed(1)}× implied move
+          </div>
+        )}
       </td>
       <td className="text-center">
         <GradeBadge g={t.algo_grade} />
@@ -128,7 +159,7 @@ function TradeRow({ t, onOpen }: { t: IncomeEvalTrade; onOpen: () => void }) {
       </td>
       <td className="text-right font-mono text-xs text-success">{f1pct(t.prob_keep_pct)}</td>
       <td className="text-right font-mono text-xs">{f1pct(t.prob_touch_pct)}</td>
-      <td className="text-right font-mono text-xs">{f1pct(t.premium_annualized_pct)}</td>
+      <td className="text-right font-mono text-xs">{play ? f1pct(holdReturn) : f1pct(t.premium_annualized_pct)}</td>
       <td className="text-right font-mono text-xs">{money0(t.collateral)}</td>
       <td className="text-right font-mono text-xs">{f2(t.breakeven)}</td>
       <td className="text-right font-mono text-xs">{t.short_delta != null ? t.short_delta.toFixed(2) : '—'}</td>
@@ -145,6 +176,7 @@ function TickerResultCard({ ticker, st, quote, onOpen }: {
   ticker: string; st: EvalState; quote?: { price: number | null; pct: number | null }; onOpen: (expiry?: string | null) => void;
 }) {
   const r = st.result;
+  const play = r?.earnings_mode === 'play';
   return (
     <div className="rounded-lg border border-white/[0.04] bg-base-200/30">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2 border-b border-white/[0.03]">
@@ -160,7 +192,12 @@ function TickerResultCard({ ticker, st, quote, onOpen }: {
           </span>
         )}
         {r?.expiration && <span className="text-xs text-base-content/60 flex items-center gap-1"><Calendar className="w-3 h-3" />{r.expiration} · {r.dte}d</span>}
-        {r?.next_earnings && <span className="text-xs text-base-content/50">ER {r.next_earnings}</span>}
+        {r?.next_earnings && (
+          <span className={`text-xs ${r.earnings_mode === 'play' ? 'text-warning' : 'text-base-content/50'}`} title={slotTitle(r.earnings_timing)}>
+            ER {erDay(r.next_earnings)} {slotText(r.earnings_timing)}
+          </span>
+        )}
+        {r?.event_move_pct != null && <span className="text-xs text-base-content/60" title="Isolated implied earnings move on this expiry (ATM straddle minus normal diffusion)">implied move ±{r.event_move_pct.toFixed(1)}%</span>}
         {r && r.n_candidates != null && <span className="text-[11px] text-base-content/40">{r.n_qualified ?? 0} qualified of {r.n_candidates} scanned</span>}
         <span className="ml-auto">
           {st.status === 'running' && <span className="text-xs text-base-content/50 flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> evaluating…</span>}
@@ -176,12 +213,15 @@ function TickerResultCard({ ticker, st, quote, onOpen }: {
                 <th>Trade</th><th>Strike</th><th className="text-center">Grade</th><th className="text-right">Score</th>
                 <th className="text-right">Premium</th><th className="text-right" title="Probability the short expires OTM (market-implied)">Win %</th>
                 <th className="text-right" title="Probability the short strike is touched before expiry">P(touch)</th>
-                <th className="text-right">Ann. yield</th><th className="text-right" title="Reg-T margin blocked">BPR</th>
+                {play
+                  ? <th className="text-right" title={`Premium ÷ BPR over the ${r?.dte ?? ''}-day hold (not annualized — compounding a days-long earnings trade isn't meaningful)`}>Return</th>
+                  : <th className="text-right">Ann. yield</th>}
+                <th className="text-right" title="Reg-T margin blocked">BPR</th>
                 <th className="text-right">Breakeven</th><th className="text-right">Δ</th><th />
               </tr>
             </thead>
             <tbody>
-              {r.trades.map(t => <TradeRow key={`${t.side}-${t.short_strike}`} t={t} onOpen={() => onOpen(t.expiration)} />)}
+              {r.trades.map(t => <TradeRow key={`${t.side}-${t.short_strike}`} t={t} play={play} onOpen={() => onOpen(t.expiration)} />)}
             </tbody>
           </table>
         </div>
@@ -234,7 +274,9 @@ function ResultsView({ order, evals, quotes, evalP, running, onStop, onBack, onO
         <button type="button" className="btn btn-xs btn-ghost gap-1" onClick={onBack}><ArrowLeft className="w-3.5 h-3.5" /> Back to screener</button>
         <div className="text-xs text-base-content/60">
           {(evalP.grades ?? ['A', 'B']).join('/')} grade · naked calls &amp; CSPs · ≥{Math.round(evalP.min_prob * 100)}% win · ≥${evalP.min_income} premium ·
-          {' '}{evalP.min_dte}–{evalP.max_dte} DTE · earnings {evalP.earnings === 'exclude' ? 'excluded' : 'allowed'}
+          {' '}{evalP.earnings === 'play'
+            ? <>sell the print · first expiry after the report (≤{evalP.max_dte}d) · gap-aware grading</>
+            : <>{evalP.min_dte}–{evalP.max_dte} DTE · earnings {evalP.earnings === 'exclude' ? 'excluded' : 'allowed'}</>}
         </div>
         <div className="ml-auto flex items-center gap-2">
           {running ? (
@@ -308,7 +350,7 @@ export function IncomeScreener({ onOpenTicker }: {
   const [showFilters, setShowFilters] = useState(true);
 
   const [rows, setRows] = useState<Row[]>([]);
-  const [meta, setMeta] = useState<{ total?: number | null; as_of?: string; note?: string } | null>(null);
+  const [meta, setMeta] = useState<{ total?: number | null; as_of?: string; note?: string; earningsWindow?: IncomeEarningsWindow | null } | null>(null);
   const [screening, setScreening] = useState(false);
   const [screenErr, setScreenErr] = useState<string | null>(null);
   const [vol, setVol] = useState<Record<string, IncomeVolRow | null>>({});   // null = fetched, no data
@@ -333,7 +375,7 @@ export function IncomeScreener({ onOpenTicker }: {
   }, [screenP, volF, evalP]);
   useEffect(() => () => { screenRun.current++; evalRun.current++; }, []);   // cancel in-flight loops on unmount
 
-  const loadVol = async (items: { ticker: string; price?: number | null }[], runId: number) => {
+  const loadVol = async (items: { ticker: string; price?: number | null; next_earnings?: string | null; earnings_timing?: string | null }[], runId: number) => {
     const batches: typeof items[] = [];
     for (let i = 0; i < items.length; i += VOL_BATCH) batches.push(items.slice(i, i + VOL_BATCH));
     await pool(batches, VOL_CONCURRENCY, () => screenRun.current === runId, async (b) => {
@@ -361,13 +403,18 @@ export function IncomeScreener({ onOpenTicker }: {
       const manualSet = new Set(manual.map(m => m.ticker));
       const next: Row[] = [...manual, ...res.rows.filter(r => !manualSet.has(r.ticker))];
       setRows(next);
-      setMeta({ total: res.total_matches, as_of: res.as_of, note: res.universe_note });
+      const earnWin = res.earnings_window?.window ?? null;
+      setMeta({ total: res.total_matches, as_of: res.as_of, note: res.universe_note, earningsWindow: earnWin });
       setSelected(sel => new Set([...sel].filter(t => manualSet.has(t))));
       setVol(v => Object.fromEntries(Object.entries(v).filter(([t]) => manualSet.has(t))));
       setShowFilters(false);
       setScreening(false);
       setVolBusy(true);
-      await loadVol(res.rows.filter(r => !manualSet.has(r.ticker)).map(r => ({ ticker: r.ticker, price: r.current_price })), runId);
+      // An earnings screen also prices each name's EVENT expiry (first expiry after the print).
+      await loadVol(res.rows.filter(r => !manualSet.has(r.ticker)).map(r => ({
+        ticker: r.ticker, price: r.current_price,
+        ...(earnWin ? { next_earnings: r.next_earnings ?? null, earnings_timing: r.earnings_timing ?? null } : {}),
+      })), runId);
     } catch (e: any) {
       if (screenRun.current === runId) setScreenErr(e?.message || 'Screen failed');
     } finally {
@@ -426,6 +473,8 @@ export function IncomeScreener({ onOpenTicker }: {
       if (sortKey === 'atm_iv') return v?.atm_iv ?? null;
       if (sortKey === 'hv30') return v?.hv30 ?? null;
       if (sortKey === 'iv_hv_ratio') return v?.atm_iv != null && v?.hv30 ? v.atm_iv / v.hv30 : null;
+      if (sortKey === 'event_iv') return v?.event_iv ?? null;
+      if (sortKey === 'event_move_pct') return v?.event_move_pct ?? null;
       return (r as any)[sortKey] ?? null;
     };
     return [...vis].sort((a, b) => {
@@ -468,7 +517,7 @@ export function IncomeScreener({ onOpenTicker }: {
     const runId = ++evalRun.current;
     const params = { ...evalP };
     const order = [...selectedList];
-    const earningsHint = Object.fromEntries(rows.map(r => [r.ticker, r.next_earnings ?? null]));
+    const earningsHint = Object.fromEntries(rows.map(r => [r.ticker, { ne: r.next_earnings ?? null, timing: r.earnings_timing ?? null }]));
     setEvalParamsUsed(params);
     setEvalOrder(order);
     setEvals(Object.fromEntries(order.map(t => [t, { status: 'queued' } as EvalState])));
@@ -477,7 +526,7 @@ export function IncomeScreener({ onOpenTicker }: {
     await pool(order, EVAL_CONCURRENCY, () => evalRun.current === runId, async (t) => {
       setEvals(s => ({ ...s, [t]: { status: 'running' } }));
       try {
-        const res = await evaluateIncomeTicker(t, { ...params, next_earnings: earningsHint[t] ?? null });
+        const res = await evaluateIncomeTicker(t, { ...params, next_earnings: earningsHint[t]?.ne ?? null, earnings_timing: earningsHint[t]?.timing ?? null });
         if (evalRun.current === runId) setEvals(s => ({ ...s, [t]: { status: 'done', result: res } }));
       } catch (e: any) {
         if (evalRun.current === runId) setEvals(s => ({ ...s, [t]: { status: 'error', error: e?.message || 'Evaluation failed' } }));
@@ -505,6 +554,13 @@ export function IncomeScreener({ onOpenTicker }: {
   const setS = (k: keyof IncomeScreenParams) => (v: number | null) => setScreenP(p => ({ ...p, [k]: v }));
   const setE = <K extends keyof IncomeEvalParams>(k: K, v: IncomeEvalParams[K]) => setEvalP(p => ({ ...p, [k]: v }));
   const lastEvalDone = evalOrder.length > 0;
+  const play = evalP.earnings === 'play';
+  const eventCols = !!meta?.earningsWindow;
+  // Picking an earnings window means "sell the print": switch the evaluation to the event expiry.
+  const setWindow = (w: IncomeEarningsWindow | null) => {
+    setScreenP(p => ({ ...p, earnings_window: w }));
+    setEvalP(e => ({ ...e, earnings: w ? 'play' : e.earnings === 'play' ? 'exclude' : e.earnings }));
+  };
 
   return (
     <div className="space-y-4">
@@ -529,7 +585,16 @@ export function IncomeScreener({ onOpenTicker }: {
               <NumField label="Today % ≤" value={screenP.change_max} onChange={setS('change_max')} step={0.5} suffix="%" />
               <NumField label="52W position ≥ (0=low)" value={screenP.week52_pos_min} onChange={setS('week52_pos_min')} step={5} suffix="%" />
               <NumField label="52W position ≤ (100=high)" value={screenP.week52_pos_max} onChange={setS('week52_pos_max')} step={5} suffix="%" />
-              <NumField label="No earnings within" value={screenP.exclude_earnings_within_days} onChange={setS('exclude_earnings_within_days')} suffix="d" />
+              <label className="form-control" title="Earnings play: only names reporting in this window (trading sessions), from Yahoo's earnings calendar with the BMO/AMC slot. Only prints with a session left to sell into are kept.">
+                <span className="label-text text-[11px] text-base-content/60 mb-1">Earnings in</span>
+                <select className={`select select-bordered select-xs ${screenP.earnings_window ? 'select-warning' : ''}`} value={screenP.earnings_window ?? ''}
+                  onChange={e => setWindow((e.target.value || null) as IncomeEarningsWindow | null)}>
+                  <option value="">Any time</option>
+                  {EARNINGS_WINDOWS.map(w => <option key={w.v} value={w.v}>{w.label}</option>)}
+                </select>
+              </label>
+              <NumField label="No earnings within" value={screenP.exclude_earnings_within_days} onChange={setS('exclude_earnings_within_days')} suffix="d"
+                disabled={!!screenP.earnings_window} title={screenP.earnings_window ? 'Not used while an earnings window is set' : undefined} />
               <label className="form-control">
                 <span className="label-text text-[11px] text-base-content/60 mb-1">Max names</span>
                 <select className="select select-bordered select-xs" value={screenP.max_results}
@@ -560,7 +625,7 @@ export function IncomeScreener({ onOpenTicker }: {
               <div className="w-24"><NumField label="IV30 ≥" value={volF.ivMin} onChange={x => setVolF(v => ({ ...v, ivMin: x }))} suffix="%" /></div>
               <div className="w-24"><NumField label="IV30 ≤" value={volF.ivMax} onChange={x => setVolF(v => ({ ...v, ivMax: x }))} suffix="%" /></div>
               <div className="ml-auto flex gap-2">
-                <button type="button" className="btn btn-xs btn-ghost" onClick={() => { setScreenP(DEFAULT_SCREEN); setVolF(DEFAULT_VOL); }}>Reset</button>
+                <button type="button" className="btn btn-xs btn-ghost" onClick={() => { setScreenP(DEFAULT_SCREEN); setVolF(DEFAULT_VOL); if (play) setE('earnings', 'exclude'); }}>Reset</button>
                 <button type="submit" className="btn btn-sm btn-primary gap-1.5" disabled={screening}>
                   {screening ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
                   {screening ? 'Screening…' : rows.length ? 'Re-run screen' : 'Run screen'}
@@ -618,6 +683,8 @@ export function IncomeScreener({ onOpenTicker }: {
                 <Th k="atm_iv" title="At-the-money implied vol at a constant 30-day tenor">ATM IV30</Th>
                 <Th k="hv30" title="30-day realized (historical) volatility">HV30</Th>
                 <Th k="iv_hv_ratio" title="IV30 ÷ HV30 — above 1 means options are priced rich">IV/HV</Th>
+                {eventCols && <Th k="event_iv" title="ATM IV on the event expiry — the first listed expiry after the print (where the event vol sits)">Event IV</Th>}
+                {eventCols && <Th k="event_move_pct" title="Isolated implied earnings move on the event expiry: ATM straddle minus normal diffusion — the same number the desk grades strikes against">Impl. move</Th>}
                 <Th k="days_to_earnings">Earnings</Th>
               </tr>
             </thead>
@@ -654,14 +721,34 @@ export function IncomeScreener({ onOpenTicker }: {
                     </td>
                     <td className="text-right font-mono text-xs">{v === undefined ? '' : f1pct(v?.hv30)}</td>
                     <td className={`text-right font-mono text-xs ${ratio == null ? '' : ratio > 1 ? 'text-success' : 'text-base-content/50'}`}>{ratio != null ? ratio.toFixed(2) : ''}</td>
-                    <td className="text-right text-xs">
-                      {r.next_earnings ? <span className={r.days_to_earnings != null && r.days_to_earnings <= evalP.max_dte ? 'text-warning' : 'text-base-content/60'}>{r.next_earnings.slice(5)} <span className="text-base-content/40">({r.days_to_earnings}d)</span></span> : '—'}
+                    {eventCols && (
+                      <td className={`text-right font-mono text-xs ${v?.event_iv != null && v?.atm_iv != null && v.event_iv > v.atm_iv ? 'text-warning' : ''}`}
+                        title={v?.event_expiry ? `${v.event_expiry} (${v.event_dte}d)${v.atm_iv != null && v.event_iv != null ? ` · ${(v.event_iv / v.atm_iv).toFixed(2)}× IV30` : ''}` : undefined}>
+                        {v === undefined ? '' : f1pct(v?.event_iv)}
+                      </td>
+                    )}
+                    {eventCols && (
+                      <td className="text-right font-mono text-xs" title={v?.event_expiry ? `Event expiry ${v.event_expiry} (${v.event_dte}d)` : undefined}>
+                        {v === undefined ? '' : v?.event_move_pct != null ? `±${v.event_move_pct.toFixed(1)}%` : '—'}
+                      </td>
+                    )}
+                    <td className="text-right text-xs whitespace-nowrap">
+                      {r.next_earnings ? (
+                        r.earnings_timing !== undefined && meta?.earningsWindow ? (
+                          <span className="text-warning" title={slotTitle(r.earnings_timing)}>
+                            {erDay(r.next_earnings)} <span className={`badge badge-xs ${r.earnings_timing ? 'badge-warning badge-outline' : 'badge-ghost'}`}>{slotText(r.earnings_timing)}</span>
+                            {r.earnings_estimate && <span className="text-base-content/40" title="Yahoo marks this date as an estimate"> est.</span>}
+                          </span>
+                        ) : (
+                          <span className={r.days_to_earnings != null && r.days_to_earnings <= evalP.max_dte ? 'text-warning' : 'text-base-content/60'}>{r.next_earnings.slice(5)} <span className="text-base-content/40">({r.days_to_earnings}d)</span></span>
+                        )
+                      ) : '—'}
                     </td>
                   </tr>
                 );
               })}
               {pageRows.length === 0 && (
-                <tr><td colSpan={11} className="text-center text-xs text-base-content/50 py-6">
+                <tr><td colSpan={eventCols ? 13 : 11} className="text-center text-xs text-base-content/50 py-6">
                   {pendingCount > 0 ? 'Loading volatility — matches will appear here…' : 'No names pass the volatility filters. Loosen IV/HV or re-screen.'}
                 </td></tr>
               )}
@@ -699,13 +786,16 @@ export function IncomeScreener({ onOpenTicker }: {
                 onChange={e => setE('min_prob', Number(e.target.value) / 100)} />
             </label>
             <NumField label="Min premium ($/contract)" value={evalP.min_income} onChange={v => setE('min_income', v ?? 0)} step={5} />
-            <NumField label="Expiry min (days)" value={evalP.min_dte} onChange={v => setE('min_dte', Math.max(1, v ?? 1))} />
+            <NumField label="Expiry min (days)" value={evalP.min_dte} onChange={v => setE('min_dte', Math.max(1, v ?? 1))}
+              disabled={play} title={play ? 'Sell the print trades the first expiry after the report — no minimum' : undefined} />
             <NumField label="Expiry max (days)" value={evalP.max_dte} onChange={v => setE('max_dte', Math.max(1, v ?? 45))} />
             <label className="form-control">
               <span className="label-text text-[11px] text-base-content/60 mb-1">Earnings before expiry</span>
               <div className="join">
                 <button type="button" className={`btn btn-xs join-item ${evalP.earnings === 'exclude' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setE('earnings', 'exclude')}>Exclude</button>
                 <button type="button" className={`btn btn-xs join-item ${evalP.earnings === 'include' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setE('earnings', 'include')}>Include</button>
+                <button type="button" className={`btn btn-xs join-item ${play ? 'btn-warning' : 'btn-ghost'}`} onClick={() => setE('earnings', 'play')}
+                  title="Sell the elevated event vol: trade the FIRST expiry after the report so the premium spans the print and collects the crush">Sell the print</button>
               </div>
             </label>
           </div>
@@ -718,20 +808,31 @@ export function IncomeScreener({ onOpenTicker }: {
                 {g}
               </label>
             ))}
-            <label className="flex items-center gap-1.5 cursor-pointer" title="Across a print before expiry, discount walls the earnings gap can leap and penalise strikes inside ~1.5× the event move">
-              <input type="checkbox" className="checkbox checkbox-xs checkbox-warning" checked={!!evalP.earnings_aware} onChange={e => setE('earnings_aware', e.target.checked)} />
+            <label className={`flex items-center gap-1.5 ${play ? 'opacity-60' : 'cursor-pointer'}`}
+              title={play ? 'Always on when selling the print — strikes inside ~1.5× the implied move are penalised'
+                : 'Across a print before expiry, discount walls the earnings gap can leap and penalise strikes inside ~1.5× the event move'}>
+              <input type="checkbox" className="checkbox checkbox-xs checkbox-warning" checked={play || !!evalP.earnings_aware} disabled={play}
+                onChange={e => setE('earnings_aware', e.target.checked)} />
               Earnings-aware grading
             </label>
           </div>
+          {play && (
+            <div className="text-[11px] text-base-content/55 flex items-start gap-1.5">
+              <Info className="w-3 h-3 mt-0.5 shrink-0 text-warning" />
+              <span>Sell the print: each name trades its first listed expiry after the report (≤ {evalP.max_dte} days), so the short premium carries the
+                event vol into the crush. Grading is gap-aware; the strike column shows its distance in multiples of the implied move
+                (below {MOVE_COMFORT}× a normal surprise can reach it). Names without an upcoming print are skipped.</span>
+            </div>
+          )}
           <div className="flex flex-wrap items-center justify-end gap-3">
-            {evalP.min_dte > evalP.max_dte && <span className="text-xs text-error mr-auto">Expiry min must be ≤ max.</span>}
+            {!play && evalP.min_dte > evalP.max_dte && <span className="text-xs text-error mr-auto">Expiry min must be ≤ max.</span>}
             {selectedList.length > 20 && (
               <span className="text-[11px] text-base-content/50 mr-auto flex items-center gap-1">
                 <Info className="w-3 h-3" /> ~{Math.ceil(selectedList.length * 10 / 60)} min for {selectedList.length} names — results stream in as each finishes; you can stop any time.
               </span>
             )}
             <button type="button" className="btn btn-sm btn-primary gap-1.5"
-              disabled={!selectedList.length || !(evalP.grades ?? []).length || evalP.min_dte > evalP.max_dte}
+              disabled={!selectedList.length || !(evalP.grades ?? []).length || (!play && evalP.min_dte > evalP.max_dte)}
               onClick={evaluate}>
               <Play className="w-4 h-4" /> Evaluate {selectedList.length || ''} {selectedList.length === 1 ? 'stock' : 'stocks'}
             </button>

@@ -1476,3 +1476,41 @@ def test_rebalance_individual_bonds_get_only_a_share_of_the_change_limit(reb_mar
     assert bond_sold(few) <= 0.25 * 0.25 * few["book_value"] + 1000
     assert all(s["is_fund"] for s in _reb(bond_turnover_pct=0)["sells"])               # funds only
     assert bond_sold(_reb(bond_turnover_pct=100)) > bond_sold(few)
+
+
+def test_gap_plan_pre_tax_view_leaves_taxes_out(fake_market):
+    post, pre = _gap(False), _gap(False, after_tax=False)
+    assert post["after_tax"] is True and pre["after_tax"] is False
+    # before tax every coupon is kept → smaller gaps; account placement only matters when taxes count
+    assert sum(g["shortfall"] for g in pre["gaps"]) < sum(g["shortfall"] for g in post["gaps"])
+    assert post["placement"] and pre["placement"] is None
+    assert pre["notes"][0].startswith("Pre-tax view") and not post["notes"][0].startswith("Pre-tax view")
+    nominal = [l for s in pre["strategies"] for l in s["lines"] if l["leg"] == "nominal"]
+    assert nominal and all("before tax" in l["why"] for l in nominal)
+    for l in nominal:                     # no tax → "after tax" is just the quoted yield (annual vs semi-annual compounding)
+        assert l["after_tax_pct"] == pytest.approx(l["pre_tax_pct"], abs=0.1)
+        assert f"{l['pre_tax_pct']:.2f}% a year" in l["why"]          # the text quotes the same yield as the table
+    # a taxable account: after tax the tax-exempt muni wins the nominal rungs; with taxes left out it never does
+    post_kinds = {l["kind"] for s in post["strategies"] for l in s["lines"] if l["leg"] == "nominal"}
+    assert "muni" in post_kinds and all(l["kind"] != "muni" for l in nominal)
+
+
+def test_rebalance_pre_tax_view_compares_quoted_yields_and_reports_the_tax_it_ignores(reb_market):
+    post, pre = _reb(), _reb(after_tax=False)
+    assert post["after_tax"] is True and pre["after_tax"] is False
+    assert pre["notes"][0].startswith("Pre-tax view")
+    assert pre["totals"]["tax_now"] == 0 and all(s["tax_now"] == 0 for s in pre["sells"])
+    assert post["totals"]["tax_ignored"] == 0 and all(s["tax_ignored"] == 0 for s in post["sells"])
+    for s in pre["sells"]:                         # the tax a real sale would still cost: reported, not counted
+        assert (s["tax_ignored"] != 0) == (s["account_type"] == "taxable" and abs(s["gain"]) >= 1), s
+    # like with like: what's sold at its quoted yield vs what's bought at its quoted yield
+    assert all(s["yield_pct"] == s["total_yield_pct"] for s in pre["sells"])
+    assert all(s["yield_pct"] == s["after_tax_yield_pct"] for s in post["sells"])
+    assert all(l["after_tax_pct"] == l["pre_tax_pct"] for l in pre["buys"] if l["leg"] != "intl")
+    assert all(f["basis"] in ("inside the account", "before tax") for f in pre["fund_alternatives"])
+    assert all(f["basis"] in ("inside the account", "after tax") for f in post["fund_alternatives"])
+    for f in pre["fund_alternatives"]:
+        sell_row = next((s for s in pre["sells"] if s["holding_id"] == f["holding_id"]), None)
+        if sell_row:
+            assert f["yield_pct"] == sell_row["total_yield_pct"]
+

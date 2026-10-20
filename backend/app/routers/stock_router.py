@@ -34,6 +34,7 @@ from ..services.structured_trades_service import run_structured_trade
 from ..services.autocallable_service import run_autocallable
 from ..services.dual_direction_service import run_dual_direction_buffer
 from ..services.concentration_service import run_concentration_management
+from ..services.concentration_ladder_service import run_concentration_ladder, MAX_TICKERS, MAX_LOTS
 from ..services.pmcc_service import run_pmcc_pmcp
 from ..services.zebra_service import run_zebra
 from ..services.derivative_income_service import run_derivative_income, run_portfolio_derivative_income
@@ -228,11 +229,16 @@ class IncomeScreenIn(BaseModel):
     week52_pos_max: float | None = Field(default=None, ge=0, le=100)
     sectors: list[str] = Field(default_factory=list)
     exclude_earnings_within_days: int | None = Field(default=None, ge=0, le=120)
+    earnings_window: str | None = Field(
+        default=None, pattern="^(today|tomorrow|within_[2-5])$",
+        description="Earnings play: only names reporting today after the close, tomorrow, or within 2–5 "
+                    "trading sessions (overrides exclude_earnings_within_days)")
     max_results: int = Field(default=100, ge=10, le=250)
 
 
 class IncomeVolIn(BaseModel):
-    items: list[dict] = Field(default_factory=list, description="[{ticker, price?}] — ≤25 per call")
+    items: list[dict] = Field(default_factory=list,
+                              description="[{ticker, price?, next_earnings?, earnings_timing?}] — ≤25 per call")
 
 
 class IncomeEvalIn(BaseModel):
@@ -240,11 +246,13 @@ class IncomeEvalIn(BaseModel):
     min_income: float = Field(default=20.0, ge=0)
     min_dte: int = Field(default=14, ge=1, le=365)
     max_dte: int = Field(default=45, ge=1, le=365)
-    earnings: str = Field(default="exclude", pattern="^(include|exclude)$")
+    earnings: str = Field(default="exclude", pattern="^(include|exclude|play)$",
+                          description="play = sell the print: first expiry after the report")
     earnings_aware: bool = True
     grades: list[str] = Field(default_factory=lambda: ["A", "B"])
     quote_source: str = "yfinance"
     next_earnings: str | None = Field(default=None, description="Screener hint (YYYY-MM-DD); computed when absent")
+    earnings_timing: str | None = Field(default=None, pattern="^(bmo|amc)$", description="Screener hint: print slot")
 
 
 @router.post("/strategies/income-screener/screen")
@@ -284,7 +292,7 @@ async def income_screener_evaluate(
     from ..services.income_screener_service import evaluate_ticker
     if ticker.startswith("."):
         ticker = "^" + ticker[1:]
-    if body.min_dte > body.max_dte:
+    if body.earnings != "play" and body.min_dte > body.max_dte:    # play ignores the floor (event expiry)
         raise HTTPException(400, "min_dte must be ≤ max_dte")
     try:
         return await evaluate_ticker(ticker, body.model_dump(), user=user, db=db)
@@ -653,7 +661,7 @@ async def get_qullamaggie_setup(
         ticker = "^" + ticker[1:]
     ticker = ticker.upper()
 
-    cache_key = f"qm-setups:{ticker}:v1"
+    cache_key = f"qm-setups:{ticker}:v2"   # v2: fragility axis + gap-adjusted sizing
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return {"ticker": ticker, "qullamaggie_setup": cached, "cached": True}
@@ -726,7 +734,7 @@ async def get_momentum_setup(
         ticker = "^" + ticker[1:]
     ticker = ticker.upper()
 
-    cache_key = f"momentum-setup:{ticker}:v1"
+    cache_key = f"momentum-setup:{ticker}:v2"   # v2: fragility axis + gap-adjusted sizing
     cached = await get_cached(db, cache_key)
     if cached is not None:
         return {"ticker": ticker, "momentum_setup": cached, "cached": True}
@@ -1204,7 +1212,19 @@ above; the real exit is scale-out into strength then TRAIL the 10/20-day EMA (ex
 demand zone in an intact uptrend, or an EPISODIC PIVOT catalyst gap. The single biggest reason to 'pass' is a failed \
 gate, a chop/mean-reverting regime (the regime-edge verdict), heavy overhead supply, or the name already extended."""
 
-_STRATEGY_PRIMERS = {"qullamaggie": _QM_PRIMER, "connors_rsi2": _CONNORS_PRIMER, "momentum": _MOMENTUM_PRIMER}
+# Shared by both momentum strategies: the FRAGILITY axis is evidence-based risk sizing, not a direction call.
+_FRAGILITY_PRIMER = """
+- There are TWO axes. The grade/score is TREND quality. qualification.fragility (0–4 flags: 20d realized vol, distance \
+above the 200-SMA, biggest one-day gain of the last month, 10-day run-up — each in its top 20%) is CRASH RISK, measured out \
+of sample on S&P 500 strong-momentum setups: 0 flags ≈ 6% had a ≥15% drop within 20 days, 3 flags ≈ 20%, 4 flags ≈ 25% \
+(base 8.6%). It predicts how violent the next month is, NOT its direction — a 4/4 name can keep running. Do NOT call a \
+fragile trend 'broken', and do NOT dismiss the odds because the trend grade is high.
+- For fragile LONGS (3–4 flags) the size cap (½ / ⅓), the 20-EMA close-exit from day 1 and the preference for a pullback \
+over a fresh breakout are deliberate, evidence-based rules — do not argue for full size. Every setup is also gap-adjusted: \
+shares are sized so the EXPECTED loss when stopped (typical gap slippage for a stop that tight, measured) equals the budget."""
+
+_STRATEGY_PRIMERS = {"qullamaggie": _QM_PRIMER + _FRAGILITY_PRIMER, "connors_rsi2": _CONNORS_PRIMER,
+                     "momentum": _MOMENTUM_PRIMER + _FRAGILITY_PRIMER}
 
 
 def _strategy_primer(setup: dict, dossier: dict) -> str:
@@ -2629,6 +2649,60 @@ async def compute_concentration(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Concentration Management failed: {exc}")
+
+class LadderLotIn(BaseModel):
+    shares: int = Field(..., gt=0, description="Shares in this lot (all lots are treated as long-term)")
+    cost_basis: float = Field(..., gt=0, description="Cost basis per share")
+
+class LadderPositionIn(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=12)
+    lots: list[LadderLotIn] = Field(..., min_length=1, max_length=MAX_LOTS)
+
+class LadderTaxIn(BaseModel):
+    st_rate_pct: float = Field(40.8, ge=0, le=60, description="All-in short-term / ordinary rate (premium taxed here)")
+    lt_rate_pct: float = Field(23.8, ge=0, le=45, description="All-in long-term rate (fed LTCG + NIIT + state)")
+
+class ConcentrationLadderIn(BaseModel):
+    positions: list[LadderPositionIn] = Field(..., min_length=1, max_length=MAX_TICKERS)
+    tax: LadderTaxIn = LadderTaxIn()
+    mode: str = Field("budget", pattern="^(budget|deferral)$")
+    annual_gain_budget: float | None = Field(None, ge=0, description="Max long-term gain you are willing to realise per tax year (whole book)")
+    horizon_years: int = Field(3, ge=1, le=5)
+    num_rungs: int = Field(4, ge=2, le=6)
+    floor_pct: float = Field(15.0, ge=5, le=35, description="Requested put floor below spot, %")
+    coverage_pct: float = Field(100.0, gt=0, le=100)
+    straddle_defers_put_loss: bool = True
+    execution: str = Field("listed", pattern="^(listed|flex)$", description="listed LEAPS, or FLEX/OTC custom terms (indicative)")
+    flex_spread_vol_pts: float = Field(1.5, ge=0, le=6, description="Assumed dealer markup per leg, vol points")
+    stance: str = Field("balanced", pattern="^(protect|balanced|income)$", description="How the structure menu is scored")
+    max_loss_pct: float = Field(30.0, ge=5, le=60, description="Largest pre-tax loss you accept if the stock falls 40%")
+    call_prob_pct: float = Field(20.0, ge=5, le=45, description="Income structures sell the call at ~this chance of finishing above it")
+
+@router.post("/concentration-ladder")
+async def compute_concentration_ladder(
+    body: ConcentrationLadderIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Tax-aware multi-year collar ladder for concentrated long-term holdings: timing verdict + rungs + by-year tax."""
+    if body.mode == "budget" and not body.annual_gain_budget:
+        raise HTTPException(400, "Budget mode needs an annual gain budget (or switch to max-deferral mode).")
+    try:
+        result = await run_concentration_ladder(
+            positions=[{"ticker": p.ticker, "lots": [{"shares": l.shares, "cost_basis": l.cost_basis} for l in p.lots]}
+                       for p in body.positions],
+            tax=body.tax.model_dump(), mode=body.mode, annual_gain_budget=body.annual_gain_budget,
+            horizon_years=body.horizon_years, num_rungs=body.num_rungs, floor_pct=body.floor_pct,
+            coverage_pct=body.coverage_pct, defer_put_loss=body.straddle_defers_put_loss,
+            execution=body.execution, flex_spread_vol_pts=body.flex_spread_vol_pts, stance=body.stance,
+            max_loss_pct=body.max_loss_pct, call_prob_pct=body.call_prob_pct, user=user, db=db)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Concentration ladder failed: {exc}")
 
 # =========================================================================
 # Strategies — Poor Man's Covered Call / Put

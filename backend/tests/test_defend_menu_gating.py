@@ -101,11 +101,20 @@ def test_healthy_lone_call_skips_the_search_and_drops_the_stray_rolls(monkeypatc
     assert m["desk_recommendation"]["category"] == "hold"
 
 
-def test_a_credit_spread_is_not_a_roll_search_candidate(monkeypatch):
+def test_a_credit_spread_IS_a_roll_search_candidate_as_one_package(monkeypatch):
     legs = [_leg("SELL", "put", 600), _leg("BUY", "put", 580)]
     m = _menu(monkeypatch, legs, [5.0, 2.0], posture="marginal")
-    assert m["roll_search"] == "skipped"                          # rolling one leg would break the structure
-    assert any(a["name"].startswith("Roll the whole structure") for a in m["alternatives"])   # multi-leg rolls untouched
+    assert m["roll_search"] == "pending"                          # priced as one package: close the old spread, open a new one
+    assert m["wing"]["short_strike"] == 600.0 and m["wing"]["long_strike"] == 580.0 and m["wing"]["width"] == 20.0
+    assert abs(m["wing"]["net_entry"] - 3.0) < 1e-9
+    assert m["held"]["collected"] == 300.0                        # what the original spread paid you
+
+
+def test_a_strangle_is_not_a_roll_search_candidate(monkeypatch):
+    legs = [_leg("SELL", "put", 600), _leg("SELL", "call", 700)]
+    m = _menu(monkeypatch, legs, [5.0, 2.0], posture="marginal")
+    assert m["roll_search"] == "skipped" and m["wing"] is None
+    assert any(a["name"].startswith("Roll the whole structure") or a["category"] == "exit" for a in m["alternatives"])
 
 
 def test_tested_csp_is_searched(monkeypatch):

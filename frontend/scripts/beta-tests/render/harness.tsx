@@ -7,6 +7,8 @@ import { MemoryRouter } from 'react-router-dom';
 import assert from 'assert';
 import BetaUnderlyingAnalysis from '../../../src/beta/BetaUnderlyingAnalysis';
 import BetaDefend from '../../../src/beta/BetaDefend';
+import DefendPanel from '../../../src/components/trades/DefendPanel';
+import defendFixture from '../preview/defendFixture.json';
 import BetaTradeInspector from '../../../src/beta/BetaTradeInspector';
 import BetaBookRisk from '../../../src/beta/BetaBookRisk';
 import MyTradesBeta from '../../../src/beta/MyTradesBeta';
@@ -357,6 +359,92 @@ async function main() {
     await m.unmount();
   }
 
+
+  console.log('BetaDefend — defending a credit SPREAD (payloads from the REAL backend engine: preview/defendFixture.json)');
+  {
+    const F: any = defendFixture;
+    const log: string[] = []; let release: any;
+    installFetch([
+      ['/defend/refine', () => new Promise(r => { release = () => r(F.after.final); })],
+      ['/repair-menu', async () => { await new Promise(r => setTimeout(r, 60)); return F.after.phase1; }],
+    ], log);
+    const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
+    await settle(200); let t = m.text();
+    has(t, 'Building the desk recommendation', 'put credit spread', 'Mark if closed', '−$248'); lacks(t, 'What to do', 'When to act', 'Next best moves'); ok('spread: phase 1 paints the header; the recommendation, steps and timing are held back until the roll search lands');
+    assert(log.filter(l => l.includes('/defend/refine')).length === 1, 'the spread triggers the live roll search exactly once'); ok('a credit spread now triggers the live roll search (it used to be skipped)');
+    release(); await settle(200); t = m.text();
+    // the pick: the user's own idea — Nov 20 75/65 at a credit — with the income-policy label, not Hold/Close
+    has(t, 'Desk recommendation', 'Income policy', '→ Roll the $80/70 put spread → $75/65 · Nov 20 (36d) — +$68 credit'); lacks(t, '→ Close the trade', '→ Hold as-is'); ok('the pick is the $80/70 → $75/65 Nov 20 roll at a credit, labelled as the income-policy pick (not Close, not Hold)');
+    // WHAT TO CLOSE and WHAT TO OPEN, with prices and cash, and the net
+    has(t, 'What to do', '1 · Close', 'Buy to close 1× $80 put · Oct 23 @ $3.28', 'Sell to close 1× $70 put · Oct 23 @ $0.46', '2 · Open', 'Sell to open 1× $75 put · Nov 20 @ $6.05', 'Buy to open 1× $65 put · Nov 20 @ $2.55', 'Net cash today', '+$68', 'a credit — no new money');
+    before(t, '1 · Close', '2 · Open'); before(t, '2 · Open', 'Net cash today'); ok('it spells out what to CLOSE (buy back the $80, sell the $70) and what to OPEN ($75/$65 Nov 20), each with price and cash, then the net — no new money');
+    // the ALL-IN picture including the trade you already hold
+    has(t, 'All-in — the trade you hold + this move', 'Collected at open', '+$34', 'Locked in by closing', '−$248', 'Best case', '+$102', 'Worst case', '−$898', 'If the stock is unchanged at expiry', 'Break-even', '$73.98'); ok('all-in: what the old spread collected (+$34), what closing locks in (−$248), and the best/worst case and break-even of old trade + roll together');
+    has(t, 'Versus holding — worst case -966 → -898', 'best case +34 → +102', 'break-even $79.66 → $73.98', 'P(profit) 54% → 58%'); ok('"versus holding" quotes the all-in change in worst case, best case, break-even and P(profit)');
+    // WHEN: the print, the implied move, the window — and it is candid about the pick
+    has(t, 'When to act — Window: now → Nov 11 — earnings Nov 12 (28d)', 'earnings move priced ≈ ±15.7%', 'IV 80% vs HV 85%', 'land AFTER this expiry', 'INSIDE the move', 'price of the even-cost roll', 'A roll that clears the move exists'); lacks(t, 'Only worth it with the short outside'); ok('"when to act": the window ends the day before earnings, the market-implied move is quoted, and the text is candid that the pick sells the print from inside the move');
+    before(t, 'What to do', 'When to act'); before(t, 'Desk recommendation', 'Next best moves'); ok('order is recommendation → what to do → when to act → moves');
+    // the runner-up must not contradict the pick
+    has(t, 'Runner-up:', 'Do nothing: keeps the position exactly as it is'); lacks(t, 'No fix clears the bar'); ok('the Hold runner-up says what it keeps and forgoes — it no longer claims "no fix clears the bar" beside a pick that is a fix');
+    // the ranked rows: pick FIRST (even though Hold scores higher), each with a compact Close → Open line
+    const rows = [...m.container.querySelectorAll('button[aria-expanded]')] as HTMLElement[];
+    assert(/Desk pick/.test(rows[0].textContent || '') && /\$75\/65/.test(rows[0].textContent || ''), `first row should be the desk pick, got: ${rows[0].textContent?.slice(0, 80)}`);
+    ok('the desk pick leads "Next best moves" even though Hold has the higher raw score');
+    const lines = [...m.container.querySelectorAll('[data-testid="move-steps-line"]')].map(e => e.textContent || '');
+    assert(lines.some(l => l === 'Close −1 P$80 +1 P$70 Oct 23  →  Open −1 P$75 +1 P$65 Nov 20'), `compact line missing: ${JSON.stringify(lines.slice(0, 3))}`);
+    assert(lines.includes('No trades — keep every leg') && lines.some(l => l === 'Close −1 P$80 +1 P$70 Oct 23'), 'hold and close have their own lines'); ok('every row reads "Close … → Open …" in one line (Hold: no trades; Close: close both legs)');
+    has(t, 'Worst case (all-in)', 'Best case (all-in)', 'Net cash today'); ok('row stats are labelled all-in (they include the loss already locked into the old spread)');
+    // expanding a row shows the same steps + all-in for THAT option
+    const nSteps = () => m.container.querySelectorAll('[data-testid="move-steps"]').length;
+    const before1 = nSteps(); await click(m.container, /\$65\/55 · Jan 15/); assert(nSteps() === before1 + 1, 'expanding a row adds its steps block'); has(m.text(), 'Sell to open 1× $65 put · Jan 15'); ok('expanding another roll shows ITS close/open steps');
+    await m.unmount();
+  }
+  {
+    const F: any = defendFixture;
+    installFetch([['/repair-menu', () => F.inside.final]], []);
+    const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
+    await settle(200); const t = m.text();
+    has(t, '→ Hold as-is (do nothing)', 'Nothing to trade — you keep', 'Keep short 1× $80 put', 'When to act — Defend before the print — earnings Nov 5 (21d)', 'INSIDE this trade', 'coin-flip', 'appetite');
+    lacks(t, 'Income policy'); ok('print INSIDE the trade and no even-cost roll: Hold (a coin-flip vs Close, said so), "defend before the print", and no income-policy label');
+    has(t, 'Roll search: No roll of this spread at even cost or better'); ok('the search says plainly that no even-cost roll exists');
+    await m.unmount();
+  }
+  {
+    const F: any = defendFixture;
+    installFetch([['/repair-menu', () => F.naked.final]], []);
+    const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AMD" />);
+    await settle(200); const t = m.text();
+    has(t, '→ Cap the tail — buy the $95 call', 'Buy to open 1× $95 call', 'new money', 'Keep short 1× $85 call'); lacks(t, 'Income policy'); ok('a naked call: the pick is a debit wing — shown as NEW money, keeping the short as it is — and the income policy does not apply');
+    await m.unmount();
+  }
+  {
+    const F: any = defendFixture;
+    installFetch([['/repair-menu', () => F.healthy.final]], []);
+    const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
+    await settle(200); const t = m.text();
+    has(t, 'Healthy', '→ Hold as-is (do nothing)', 'Nothing to time — leave it'); lacks(t, 'Income policy', 'Defend before the print', 'coin-flip'); ok('a healthy spread: Hold, nothing to time, no policy label, no print lecture');
+    await m.unmount();
+  }
+  {
+    const F: any = defendFixture;
+    installFetch([['/defend/refine', () => ({ __status: 500, detail: 'chain provider down' })], ['/repair-menu', () => F.after.phase1]], []);
+    const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
+    await settle(300); const t = m.text();
+    has(t, 'Live roll search unavailable', 'chain provider down', 'Retry', 'What to do'); ok('if the live roll search fails the fallback recommendation STILL shows what to close/open (steps come from phase 1)');
+    await m.unmount();
+  }
+
+  console.log('Classic DefendPanel — same steps / timing wording');
+  {
+    const F: any = defendFixture;
+    installFetch([['/defend/refine', () => F.after.final], ['/repair-menu', () => F.after.phase1]], []);
+    const m = await mount(<DefendPanel tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
+    await settle(400); const t = m.text();
+    has(t, 'Roll the $80/70 put spread → $75/65 · Nov 20', 'income policy', 'What to do', 'Buy to close 1× $80 put', 'Net cash today', 'All-in', 'When to act — Window: now → Nov 11');
+    before(t, 'What to do', 'When to act'); ok('the classic panel shows the same what-to-close/open, all-in and when-to-act blocks');
+    await m.unmount();
+  }
+
   console.log('BetaTradeInspector — Manage tab');
   const hold: any = { state: 'hold', headline: 'On plan — nothing to do.', reasons: [], tested: false, breached: false, dte: null, capturedPct: null, quote: { status: 'ok', missing: 0, total: 0 }, classicSignal: null };
   const noop = () => {};
@@ -539,7 +627,7 @@ async function main() {
     await settle(150);
     let t = m.text();
     has(t, 'Income only'); ok('the collapsed bar says the book is Income-only');
-    has(t, 'Book risk', 'At risk', '3 breached · 1 watch · 2 ok', 'CVaR 1-mo', '18.2% of capital', 'updated 3h ago', 'Review 3 fixes', 'Refresh');
+    has(t, 'Book risk', 'At risk', '3 breached · 1 watch · 2 ok', 'CVaR 1-mo', '18.2% of capital', 'updated 3h ago', 'Review 4 fixes', 'Refresh');
     lacks(t, 'Guardrails', 'Stress scenarios'); ok('collapsed bar carries the grade, breach/watch/ok counts, CVaR, θ, freshness and the fix count — and nothing else');
     assert(log.length === 1 && log[0].includes('/book-tail-risk') && log[0].includes('refresh=0'), `expected one stored-snapshot read, got ${JSON.stringify(log)}`); ok('on load it reads the STORED snapshot only (no recompute)');
     assert(!log.some(l => l.includes('/book-hedge-advice')), 'LLM must not run on load'); ok('the LLM hedge plan does not fire on load');
@@ -549,7 +637,7 @@ async function main() {
     ok('opens on Overview: vitals, verdict, flagged guardrails with value vs limit, and the actions');
     has(t, 'Income trades only', '14 trades tagged Income', '12 analysed', 'Left out of the numbers: TOST, EQT', 'no open option legs', 'Not included: 2 Hedge, 2 Untagged, 1 Trade', 'not offsetting', 'Untagged trades are not counted — tag them Income'); ok('Overview states the scope: 14 Income trades, which other folders (2 Hedge, 2 Untagged, 1 Trade) are left out, and how to include untagged ones');
     has(t, 'Indicative prices — the market looks closed.', 'missing or inconsistent for 21 of 22 legs', 're-derived from that leg\'s price', 'press Refresh during market hours'); lacks(t, 'no usable price or IV'); ok('when the chain\'s IV had to be re-derived (market closed) the Overview says so, how many legs, and what to do');
-    has(t, 'short-strike notional'); ok('the Capital tile states its basis (short-strike notional, not margin)');
+    has(t, 'Deployed (Reg-T)', '$41,000', 'same basis as My Trades', 'Capital basis', 'cash-secured · spreads at width', 'the denominator the “% of capital” limits'); ok('the Book shows Deployed (Reg-T, the My Trades figure) next to the Capital basis (cash-secured notional + spread widths) and says how they differ');
     has(t, '2 within limits'); lacks(t, 'Tail loss at −20%'); ok('passing guardrails are folded away behind "N within limits"');
     await click(m.container, /2 within limits/); has(m.text(), 'Tail loss at −20%', '11.5%'); ok('…and open on request');
     await click(m.container, /Up\/down tail symmetry/); t = m.text();
@@ -557,7 +645,7 @@ async function main() {
 
     // ── Fixes: by trade
     await click(m.container, /^Fixes/, '[role="tab"]'); t = m.text();
-    has(t, '3 trades to fix, clearing 4 flagged guardrails', '7', 'each trade appears once'); ok('Fixes summarises: 3 trades clear 4 guardrails (the guardrail-first layout would show 7 cards)');
+    has(t, '4 trades to fix, clearing 4 flagged guardrails', '8', 'each trade appears once'); ok('Fixes summarises: 4 trades clear 4 guardrails (the guardrail-first layout would show 8 cards)');
     const count = (hay: string, needle: string) => hay.split(needle).length - 1;
     assert(count(t, '770C (vs your short 700C)') === 1, `AMD fix should appear once, appeared ${count(t, '770C (vs your short 700C)')}×`); ok('AMD — flagged under three guardrails — appears exactly ONCE');
     has(t, 'Addresses 3 guardrails', 'Up/down tail symmetry', 'Correlated-cluster conc.', 'Sector concentration'); ok('the AMD card lists all three guardrails its fix addresses');
@@ -576,6 +664,10 @@ async function main() {
     has(t, 'at +57% (+30% mkt × β 1.9)', 'live ask $0.11/sh'); ok('"Risk now" states the move behind it (market +30% × β 1.9 = +57%) and the cost states the live ask it was priced at');
     lacks(t, 'model $'); ok('no fix is priced from a model when a live quote existed');
 
+    // a defined-risk spread (the user's real AAOI iron condor) is never told to buy a wing it already holds
+    t = m.text();
+    has(t, 'AAOI', 'Already a defined-risk spread', 'no wing to buy', 'CLOSE the 80/70P put spread', 'Close the spread', 'close the spread');
+    lacks(t, 'BUY 1× 2026-10-30 70P'); ok('a defined-risk spread (an iron condor) is shown as already capped: the fix is "Close the spread", with no "buy the 70P you already hold"');
     // ── Stress
     await click(m.container, /^Stress/, '[role="tab"]'); t = m.text();
     has(t, 'Stress scenarios', '−$9,500', '−$38,000', '−5.2% of capital', 'Where a −20% month hits', 'Vol sensitivity', '+10%', '−$21,000', 'Assignment lab');
