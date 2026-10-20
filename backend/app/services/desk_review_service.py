@@ -292,10 +292,51 @@ def per_side_quant(opp: dict, spot: Optional[float], *, mu: float = 0.0,
     }
 
 
+_TS_SPLIT_MIN_GAP_DAYS = 14     # the two expiries must be ≥ 2 weeks apart, or IV noise swamps the split
+
+
+def _event_split_from_term(ts: Optional[dict], next_earnings: Optional[str], today) -> Optional[dict]:
+    """The MARKET's own split of implied variance into DIFFUSION + EARNINGS EVENT, from two expiries that BOTH
+    contain the print:  IV₁²T₁ = σd²·T₁ + e²,  IV₂²T₂ = σd²·T₂ + e²  ⇒  σd² = (IV₂²T₂ − IV₁²T₁)/(T₂ − T₁),
+    e² = IV₁²T₁ − σd²T₁ (clamped ≥ 0: a front with no event premium). Returns {"event_var", "diffusion_vol"} or
+    None when it can't be split (no back month, expiries too close, print not inside the front, or a curve so
+    inverted no diffusion fits)."""
+    if not ts or not next_earnings:
+        return None
+    f, b = ts.get("front_dte"), ts.get("back_dte")
+    iv1, iv2 = ts.get("front_iv_pct"), ts.get("back_iv_pct")
+    if not (f and b and iv1 and iv2) or int(b) - int(f) < _TS_SPLIT_MIN_GAP_DAYS:
+        return None
+    try:
+        ed = date.fromisoformat(str(next_earnings))
+    except ValueError:
+        return None
+    if not (today <= ed <= today + timedelta(days=int(f))):      # the print must sit inside BOTH expiries
+        return None
+    T1, T2 = int(f) / 365.0, int(b) / 365.0
+    v1, v2 = (iv1 / 100.0) ** 2 * T1, (iv2 / 100.0) ** 2 * T2
+    sd2 = (v2 - v1) / (T2 - T1)
+    if sd2 <= 0:
+        return None
+    return {"event_var": max(v1 - sd2 * T1, 0.0), "diffusion_vol": math.sqrt(sd2)}
+
+
+def _earnings_in_window(opp: dict, next_earnings: Optional[str], today) -> bool:
+    """Is the print inside this trade's window (on or before its NEAREST leg's expiry)?"""
+    exps = [str(l["expiration"]) for l in (opp.get("legs") or []) if l.get("expiration")] \
+        or ([str(opp["expiration"])] if opp.get("expiration") else [])
+    try:
+        return today <= date.fromisoformat(str(next_earnings)) <= date.fromisoformat(min(exps))
+    except (TypeError, ValueError):
+        return False
+
+
 def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[float] = None,
-                      overwrite: bool = False, rnd_grid: Optional[dict] = None) -> dict:
-    # `hv` = the desk's PHYSICAL vol forecast (`_physical_vol_forecast`). An earnings print inside the window adds
-    # its isolated event move as variance — at its implied size, so event premium is never read as edge.
+                      overwrite: bool = False, rnd_grid: Optional[dict] = None,
+                      earnings_in_window: bool = False, event_split: Optional[dict] = None) -> dict:
+    # `hv` = the desk's PHYSICAL vol forecast (`_physical_vol_forecast`). An earnings print inside the window enters
+    # the physical law at the MARKET's implied event size (`event_split`, from the term structure) — so event
+    # premium is never read as edge; when the market's variance can't be split, max(market, diffusion forecast).
     """Full desk read (trader/pm/risk/quant) for one income opportunity. `overwrite`=True means the
     user ALREADY holds the shares (a covered-call OVERWRITE): score the INCREMENTAL short-call overlay
     (stock_shares=0) rather than a fresh buy-write — the stock leg is a sunk position, so the only new
@@ -344,7 +385,8 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
         # then priced at its OWN vol, so multi-leg trades are no longer valued at one averaged IV.
         atm_iv=((opp.get("atm_iv_pct") or 0) / 100.0) or None,
         rnd_grid=rnd_grid,          # the expiry's market-implied law (shared by every trade on the expiry)
-        event_var=((float(opp["earnings_gap_pct"]) / 100.0) ** 2 if opp.get("earnings_gap_pct") else 0.0),
+        event_var=(event_split["event_var"] if (earnings_in_window and event_split) else 0.0),
+        event_fallback=bool(earnings_in_window and not event_split),
     )
 
 
@@ -2888,6 +2930,9 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         if ts:
             vol_stats["term_structure"] = ts
     term_structure = vol_stats.get("term_structure")
+    _today = date.today()
+    _next_earn = (ctx or {}).get("next_earnings")
+    event_split = _event_split_from_term(term_structure, _next_earn, _today)   # market's diffusion + event, or None
 
     rnd_grids = scan.get("_rnd_grids") or {}          # exp → market-implied law (the payoff distribution's prior)
     ranked: list[dict] = []
@@ -2895,9 +2940,11 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         # Overwrite: the user already holds the shares → a covered call is an income overlay, not a
         # fresh buy-write (re-based capital + no beta penalty).
         overwrite = bool(owns_underlying and opp.get("structure") == "covered_call")
+        earn_in = _earnings_in_window(opp, _next_earn, _today)
         try:
             dm = _opp_desk_metrics(opp, spot, sofr_pct, sigma_p, overwrite=overwrite,
-                                   rnd_grid=rnd_grids.get(opp.get("expiration")))
+                                   rnd_grid=rnd_grids.get(opp.get("expiration")),
+                                   earnings_in_window=earn_in, event_split=event_split)
         except Exception as exc:  # noqa: BLE001 — one bad trade must not kill the desk
             logger.debug("desk metrics failed (%s): %s", opp.get("label"), exc)
             dm = {"trader": {}, "pm": {}, "risk": {}, "quant": {"score": None, "verdict": None, "reasons": []}}
@@ -2993,7 +3040,15 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
                               "atr_vol_pct": round(atr_vol * 100, 1) if atr_vol else None, "gap_aware": gap_aware,
                               # the ONE physical forecast behind the payoff law + breach odds (calibrated clustering)
                               "phys_forecast_pct": round(sigma_p * 100, 1) if sigma_p else None,
-                              "vol_k": vol_k, "vol_state": vol_state}})
+                              "vol_k": vol_k, "vol_state": vol_state,
+                              # earnings inside the window: the market's own diffusion vs event split (term structure)
+                              "earnings_in_window": earn_in,
+                              "market_diffusion_iv_pct": (round(event_split["diffusion_vol"] * 100, 1)
+                                                          if (event_split and earn_in) else None),
+                              "market_event_move_pct": (round(math.sqrt(event_split["event_var"]) * 100, 1)
+                                                        if (event_split and earn_in) else None),
+                              "event_split": ("term_structure" if (event_split and earn_in)
+                                              else "fallback_max" if earn_in else None)}})
 
     # BLOCKING trades (structurally broken, etc.) sink to the bottom; then desk score, Sortino, yield —
     # so the top-ranked trade has already cleared every mechanical filter the LLM desk applies.

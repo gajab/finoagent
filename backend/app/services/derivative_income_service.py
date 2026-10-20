@@ -2196,6 +2196,7 @@ def _build_evaluate_opp(legs: list[dict], stock: Optional[dict], chains_by_exp: 
     return _attach_fill_economics(opp)
 
 
+_SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)   # E|Z|: an ATM straddle ≈ √(2/π) × the 1σ move
 _EARN_GAP_MIN_FRAC = 0.4   # a print in the window ALWAYS carries a gap → the isolated event is ≥ 40% of the
                            # straddle move; the decomposition must never collapse it to nothing (a high trailing
                            # HV or a thin decomposition would otherwise zero it out and silently disable the feature)
@@ -2203,10 +2204,10 @@ _EARN_GAP_MIN_FRAC = 0.4   # a print in the window ALWAYS carries a gap → the 
 
 def _earnings_implied_move_pct(calls: dict, puts: dict, spot: float, dte: int,
                                hv: Optional[float]) -> Optional[float]:
-    """The isolated EARNINGS gap as a FRACTION of spot. The ATM straddle prices the market's TOTAL expected
-    move to expiry (event-inflated); the baseline DIFFUSION move is stripped out — variance is additive, so
-    M_event = √(M_total² − M_diffusion²) — leaving the single-day jump the diffusion σ (IV·√T) smears across the
-    horizon. ROBUSTNESS (a print in the window must never silently disable the feature): (a) the ATM straddle is
+    """The isolated EARNINGS gap as a FRACTION of spot, in the trader's "implied move" units (expected ABSOLUTE
+    move). The ATM straddle prices the market's TOTAL expected move to expiry (event-inflated); the baseline
+    DIFFUSION move is stripped out in 1σ units — variance is additive, so σ_event = √(σ_total² − σ_diffusion²) —
+    leaving the single-day jump the diffusion σ (IV·√T) smears across the horizon. ROBUSTNESS (a print in the window must never silently disable the feature): (a) the ATM straddle is
     taken from the nearest strike with BOTH legs priceable (a single dead leg no longer returns None); (b) the
     diffusion vol is CAPPED at the straddle's own implied vol, so a high trailing HV can't drive the event
     negative; (c) the event is FLOORED at _EARN_GAP_MIN_FRAC of the straddle move. Returns None only when NO
@@ -2223,15 +2224,20 @@ def _earnings_implied_move_pct(calls: dict, puts: dict, spot: float, dte: int,
     if not straddle:
         return None
     hz = math.sqrt(max(dte, 1) / 365.0)
-    m_total = straddle / spot                                   # straddle-implied TOTAL move to expiry (fraction)
-    straddle_vol = m_total / hz if hz else None                 # the straddle's own implied annualized vol
+    # UNITS: an ATM straddle prices the expected ABSOLUTE move, E|ΔS| = √(2/π)·σ√T·S ≈ 0.80 × the 1σ move — so it is
+    # converted to 1σ before any variance arithmetic (the old code subtracted a 1σ diffusion from a 0.8σ straddle,
+    # which shrank the event ~2× and usually hit the floor: UAL 2026-10 read 4.6% instead of 7.7%).
+    m_total = straddle / spot                                   # straddle = expected ABSOLUTE total move (fraction)
+    sd_total = m_total / _SQRT_2_OVER_PI                        # … as a 1σ move
+    straddle_vol = sd_total / hz if hz else None                # the straddle's own implied annualized vol (σ)
     # Diffusion baseline CAPPED at the straddle's implied vol — a high trailing HV (a recently-volatile name)
     # must not swamp the total and force the event negative.
     diff_vol = min(hv, straddle_vol) if (hv and straddle_vol) else 0.0
-    m_diff = diff_vol * hz
-    m_event = math.sqrt(max(m_total ** 2 - m_diff ** 2, 0.0))
-    m_event = max(m_event, _EARN_GAP_MIN_FRAC * m_total)        # floor — a print always carries a gap
-    return min(m_event, 0.60)                                   # sanity clamp against a mispriced/illiquid straddle
+    sd_diff = diff_vol * hz
+    sd_event = math.sqrt(max(sd_total ** 2 - sd_diff ** 2, 0.0))    # variance is additive — in σ units
+    sd_event = max(sd_event, _EARN_GAP_MIN_FRAC * sd_total)     # floor — a print always carries a gap
+    # Back to the trader's "implied move" convention (expected absolute move) — what the gap factors size against.
+    return min(sd_event * _SQRT_2_OVER_PI, 0.60)                # sanity clamp against a mispriced/illiquid straddle
 
 
 _RND_GRID_N = 401          # samples in the compact market-implied law handed to the desk (≈8 KB / expiry)
@@ -2676,13 +2682,14 @@ async def run_derivative_income(
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
                  f"{'own' if owns_underlying else 'naked'}:"
-                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v8")   # owns → covered call · else naked-call BPR;
+                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v9")   # owns → covered call · else naked-call BPR;
                  # v4: not-owned short calls now build as structure=naked_call (correct payoff/grade), untradeable-leg
                  #     filter, + context.change_pct/prev_close — all change the cached shape.
                  # v5: opp.earnings_gap_pct (isolated event move) attached when earnings is before expiry.
                  # v6: earnings gap made ROBUST (multi-strike straddle + HV cap + floor) — no longer collapses to None.
                  # v7: legs carry the expected fill (+ commission); opps carry entry_cost / premium_fill.
                  # v8: context.hv21_pct / hv63_pct / index_like (physical-vol forecast + term-structure sign).
+                 # v9: earnings_gap_pct computed in consistent σ units (straddle = √(2/π)·σ).
                  #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:

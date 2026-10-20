@@ -706,7 +706,8 @@ def _narrow(w: np.ndarray, mu: np.ndarray, F: float, var_ratio: float) -> Option
 def _payoff_distribution(life_legs, stock_shares: float, spot: float, dte_days: int, r: float,
                          implied: Optional[float], realized: Optional[float],
                          atm_iv: Optional[float] = None, iv_fallback: float = 0.30,
-                         rnd_grid: Optional[dict] = None, event_var: float = 0.0) -> Optional[dict]:
+                         rnd_grid: Optional[dict] = None, event_var: float = 0.0,
+                         event_fallback: bool = False) -> Optional[dict]:
     """The trade's terminal (or horizon) P&L distribution as exact buckets — see the block comment above.
 
     Prior = the expiry's MARKET-IMPLIED law (`rnd_grid`, the scan's SVI → Breeden-Litzenberger density) when
@@ -714,8 +715,11 @@ def _payoff_distribution(life_legs, stock_shares: float, spot: float, dte_days: 
     minimally tilted to reprice each leg at its mid (and keep the forward) — the Q (market) law.
 
     The P (physical) law re-sizes it to the PHYSICAL variance: ``realized`` (the desk's diffusion vol forecast)
-    over the horizon plus ``event_var`` (an earnings print inside the window, as a variance in log-return units —
-    priced at its implied size, so event premium is never mistaken for edge). Wider than the market → convolve
+    over the horizon plus ``event_var`` — an earnings print inside the window, as the MARKET's implied event
+    variance (log-return σ², split from the term structure), so event premium is never mistaken for edge. When the
+    print is inside but the market's variance can't be split (``event_fallback``), the physical variance is
+    max(market total, diffusion forecast): no edge is claimed on an event we can't separate, but a diffusion
+    forecast that alone exceeds everything the market prices is still a real negative VRP. Wider than the market → convolve
     (`_widen`); narrower (the seller's VRP) → entropy-narrow (`_narrow`). Expectation metrics (PoP / EV / Omega /
     Sortino / Kelly) use P; tail metrics use the WIDER of P and Q — a tail is never thinner than the market prices
     it.
@@ -849,7 +853,8 @@ def _payoff_distribution(life_legs, stock_shares: float, spot: float, dte_days: 
     measure = "market"
     if method != "lognormal_fallback":
         v_q = center * center * T
-        v_p = ((realized * realized * T) if (realized and realized > 0) else v_q) + max(float(event_var or 0.0), 0.0)
+        v_diff = (realized * realized * T) if (realized and realized > 0) else v_q
+        v_p = max(v_q, v_diff) if event_fallback else v_diff + max(float(event_var or 0.0), 0.0)
         if v_p > v_q * (1 + 1e-9):
             w, mu = _widen(w, mu, edges, v_p - v_q)
             measure = "physical_wider"
@@ -1617,7 +1622,7 @@ def management_desk_score(*, keep_drift_pct: Optional[float], keep_standard_pct:
 def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_profit,
                              avg_iv, dte_days, stock_shares=0.0, r=0.05, sofr_pct=5.0,
                              realized_vol=None, strategy_type="", upside_cap_pct=None,
-                             atm_iv=None, rnd_grid=None, event_var=0.0) -> dict:
+                             atm_iv=None, rnd_grid=None, event_var=0.0, event_fallback=False) -> dict:
     """Full desk read for a PROPOSED trade: Trader Greeks + PM ratios + position
     VaR/CVaR + the algorithmic Quant recommendation. `avg_iv` (implied) is decimal (0 = unknown);
     `atm_iv` (decimal, optional) is the expiry's ATM vol (the centre); `rnd_grid` (optional) is the scan's compact
@@ -1647,7 +1652,8 @@ def compute_pretrade_metrics(life_legs, spot, scenarios, capital, max_loss, max_
         iv_fb = realized or 0.30                      # = the desk's horizon-curve iv_fallback (hv or 0.30)
         try:
             dist = _payoff_distribution(life_legs, stock_shares, spot, dte_days, r, implied, realized,
-                                        atm_iv=atm_iv, iv_fallback=iv_fb, rnd_grid=rnd_grid, event_var=event_var)
+                                        atm_iv=atm_iv, iv_fallback=iv_fb, rnd_grid=rnd_grid, event_var=event_var,
+                                        event_fallback=event_fallback)
             if (dist is not None and scenarios and len(scenarios) >= 3 and not _matches_curve(
                     (life_legs, stock_shares, spot, dist["horizon_T"], r, iv_fb, dist["multi_exp"]), scenarios)):
                 dist = None                           # the legs don't reproduce the caller's curve → its grid
