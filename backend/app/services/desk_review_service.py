@@ -32,6 +32,7 @@ from .llm_service import call_llm
 from .derivative_income_service import (
     run_derivative_income, _norm_ticker, _macro_events_in_window, _reports_earnings,
     _wall_buffer, _sigma_frac, _STRONG_WALLS, _BUF_SIGMA_STRONG, _BUF_SIGMA_STD, _prob_touch,
+    _split_chain, _straddle_iv, DEFAULT_RISK_FREE,
 )
 
 if TYPE_CHECKING:
@@ -298,13 +299,14 @@ _TS_SPLIT_MIN_GAP_DAYS = 14     # the two expiries must be ≥ 2 weeks apart, or
 def _event_split_from_term(ts: Optional[dict], next_earnings: Optional[str], today) -> Optional[dict]:
     """The MARKET's own split of implied variance into DIFFUSION + EARNINGS EVENT, from two expiries that BOTH
     contain the print:  IV₁²T₁ = σd²·T₁ + e²,  IV₂²T₂ = σd²·T₂ + e²  ⇒  σd² = (IV₂²T₂ − IV₁²T₁)/(T₂ − T₁),
-    e² = IV₁²T₁ − σd²T₁ (clamped ≥ 0: a front with no event premium). Returns {"event_var", "diffusion_vol"} or
-    None when it can't be split (no back month, expiries too close, print not inside the front, or a curve so
-    inverted no diffusion fits)."""
+    e² = IV₁²T₁ − σd²T₁ (clamped ≥ 0: a front with no event premium). Both IVs are the STRADDLE-implied vols —
+    the same estimator on both expiries (see `_straddle_iv`); the split is never computed from mixed estimators.
+    Returns {"event_var", "diffusion_vol"} or None when it can't be split (no back month, expiries too close, print
+    not inside the front, or a curve so inverted no diffusion fits)."""
     if not ts or not next_earnings:
         return None
     f, b = ts.get("front_dte"), ts.get("back_dte")
-    iv1, iv2 = ts.get("front_iv_pct"), ts.get("back_iv_pct")
+    iv1, iv2 = ts.get("front_straddle_iv_pct"), ts.get("back_straddle_iv_pct")
     if not (f and b and iv1 and iv2) or int(b) - int(f) < _TS_SPLIT_MIN_GAP_DAYS:
         return None
     try:
@@ -333,10 +335,12 @@ def _earnings_in_window(opp: dict, next_earnings: Optional[str], today) -> bool:
 
 def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[float] = None,
                       overwrite: bool = False, rnd_grid: Optional[dict] = None,
-                      earnings_in_window: bool = False, event_split: Optional[dict] = None) -> dict:
+                      earnings_in_window: bool = False, event_split: Optional[dict] = None,
+                      atm_iv: Optional[float] = None) -> dict:
     # `hv` = the desk's PHYSICAL vol forecast (`_physical_vol_forecast`). An earnings print inside the window enters
     # the physical law at the MARKET's implied event size (`event_split`, from the term structure) — so event
     # premium is never read as edge; when the market's variance can't be split, max(market, diffusion forecast).
+    # `atm_iv` = the expiry's STRADDLE-implied vol (the same estimator as the split), else the scan's ATM IV.
     """Full desk read (trader/pm/risk/quant) for one income opportunity. `overwrite`=True means the
     user ALREADY holds the shares (a covered-call OVERWRITE): score the INCREMENTAL short-call overlay
     (stock_shares=0) rather than a fresh buy-write — the stock leg is a sunk position, so the only new
@@ -383,7 +387,7 @@ def _opp_desk_metrics(opp: dict, spot: float, sofr_pct: float, hv: Optional[floa
         realized_vol=hv,            # P-measure — widens the payoff law when realized > implied
         # The expiry's ATM vol centres the distribution (the skew a lone OTM leg can't carry); each leg is
         # then priced at its OWN vol, so multi-leg trades are no longer valued at one averaged IV.
-        atm_iv=((opp.get("atm_iv_pct") or 0) / 100.0) or None,
+        atm_iv=atm_iv or ((opp.get("atm_iv_pct") or 0) / 100.0) or None,
         rnd_grid=rnd_grid,          # the expiry's market-implied law (shared by every trade on the expiry)
         event_var=(event_split["event_var"] if (earnings_in_window and event_split) else 0.0),
         event_fallback=bool(earnings_in_window and not event_split),
@@ -2088,7 +2092,8 @@ def _desk_payload(desk: dict, focus_index: Optional[int] = None) -> dict:
 
 async def _term_structure_probe(ticker: str, spot: float, front_dte: Optional[int],
                                 front_iv_pct: Optional[float], quote_source: str,
-                                user: Optional["User"], db: Optional["AsyncSession"]) -> Optional[dict]:
+                                user: Optional["User"], db: Optional["AsyncSession"],
+                                front_straddle_iv_pct: Optional[float] = None) -> Optional[dict]:
     """Probe ONE back-month expiry's ATM IV so the desk always knows contango vs backwardation
     (front IV richer than back = event/earnings inversion → capture the front, favor shorter DTE).
     On-demand only (desk review), so a second chain fetch is acceptable."""
@@ -2118,8 +2123,13 @@ async def _term_structure_probe(ticker: str, spot: float, front_dte: Optional[in
         back_iv = round(sum(ivs) / len(ivs) * 100, 1)
         diff = round(back_iv - front_iv_pct, 1)        # back minus front
         state = "backwardation" if diff < -0.5 else "contango" if diff > 0.5 else "flat"
+        _bc, _bp = _split_chain(chain)
+        _bsiv = _straddle_iv(_bc, _bp, spot, bdte, DEFAULT_RISK_FREE)
         return {"state": state, "front_dte": front_dte, "front_iv_pct": front_iv_pct,
                 "back_dte": bdte, "back_iv_pct": back_iv, "back_minus_front_pts": diff,
+                # the event split's inputs — the straddle-implied vol on BOTH expiries (one estimator)
+                "front_straddle_iv_pct": front_straddle_iv_pct,
+                "back_straddle_iv_pct": round(_bsiv * 100, 2) if _bsiv else None,
                 "note": "backwardation (front IV > back) = event/earnings panic → favor shorter DTE",
                 "source": "second-expiry probe"}
     except Exception as exc:  # noqa: BLE001
@@ -2926,7 +2936,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
     front = summaries[0] if summaries else {}
     if (vol_stats.get("term_structure") or {}).get("state") is None:
         ts = await _term_structure_probe(ticker, spot, front.get("dte"),
-                                         front.get("atm_iv_pct"), quote_source, user, db)
+                                         front.get("atm_iv_pct"), quote_source, user, db,
+                                         front_straddle_iv_pct=front.get("straddle_iv_pct"))
         if ts:
             vol_stats["term_structure"] = ts
     term_structure = vol_stats.get("term_structure")
@@ -2935,6 +2946,10 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
     event_split = _event_split_from_term(term_structure, _next_earn, _today)   # market's diffusion + event, or None
 
     rnd_grids = scan.get("_rnd_grids") or {}          # exp → market-implied law (the payoff distribution's prior)
+    # exp → the straddle-mid ATM vol: centres the market variance the physical law is compared against, on the
+    # SAME estimator the event split uses (the scan's ATM IV can sit a few vol points off the mids).
+    straddle_iv = {s["expiration"]: s["straddle_iv_pct"] / 100.0 for s in summaries
+                   if s.get("expiration") and s.get("straddle_iv_pct")}
     ranked: list[dict] = []
     for opp in opportunities:
         # Overwrite: the user already holds the shares → a covered call is an income overlay, not a
@@ -2944,7 +2959,8 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         try:
             dm = _opp_desk_metrics(opp, spot, sofr_pct, sigma_p, overwrite=overwrite,
                                    rnd_grid=rnd_grids.get(opp.get("expiration")),
-                                   earnings_in_window=earn_in, event_split=event_split)
+                                   earnings_in_window=earn_in, event_split=event_split,
+                                   atm_iv=straddle_iv.get(opp.get("expiration")))
         except Exception as exc:  # noqa: BLE001 — one bad trade must not kill the desk
             logger.debug("desk metrics failed (%s): %s", opp.get("label"), exc)
             dm = {"trader": {}, "pm": {}, "risk": {}, "quant": {"score": None, "verdict": None, "reasons": []}}

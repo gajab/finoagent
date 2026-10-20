@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 import app.services.lifecycle_service as L
-from app.services.derivative_income_service import _EARN_GAP_MIN_FRAC, _earnings_implied_move_pct
+from app.services.derivative_income_service import _EARN_GAP_MIN_FRAC, _earnings_implied_move_pct, _straddle_iv
 from app.services.desk_review_service import (
     _TS_SPLIT_MIN_GAP_DAYS,
     _earnings_in_window,
@@ -54,7 +54,27 @@ class TestStraddleUnits:
 # ── 1. the market's own diffusion / event split ──────────────────────────────────────────────────────────────
 def _ts(sd, e, f=31, b=59):
     iv = lambda d: math.sqrt(sd ** 2 + e ** 2 / (d / 365.0)) * 100
-    return {"front_dte": f, "back_dte": b, "front_iv_pct": iv(f), "back_iv_pct": iv(b)}
+    return {"front_dte": f, "back_dte": b, "front_straddle_iv_pct": iv(f), "back_straddle_iv_pct": iv(b)}
+
+
+def _chain(sigma, dte, ks=(95.0, 100.0, 105.0), r=0.045, half=0.03):
+    T = dte / 365.0
+    q = lambda px: SimpleNamespace(mid=px, bid=px * (1 - half), ask=px * (1 + half))
+    return ({k: q(bs_price(S, k, T, r, sigma, "call")) for k in ks},
+            {k: q(bs_price(S, k, T, r, sigma, "put")) for k in ks})
+
+
+class TestStraddleIv:
+    @pytest.mark.parametrize("sigma,dte", [(0.30, 31), (0.55, 59), (0.18, 10)])
+    def test_inverts_the_straddle_mid(self, sigma, dte):
+        assert _straddle_iv(*_chain(sigma, dte), S, dte, 0.045) == pytest.approx(sigma, abs=1e-4)
+
+    def test_skips_one_sided_and_garbage_quotes(self):
+        calls, puts = _chain(0.30, 31)
+        puts[100.0].bid = 0.0                                  # nearest strike one-sided → next strikes used
+        assert _straddle_iv(calls, puts, S, 31, 0.045) == pytest.approx(0.30, abs=1e-4)
+        dead = {k: SimpleNamespace(mid=0.001, bid=0.001, ask=0.001) for k in calls}
+        assert _straddle_iv(dead, dead, S, 31, 0.045) is None   # below intrinsic → no vol fits
 
 
 class TestTermStructureSplit:
@@ -65,7 +85,7 @@ class TestTermStructureSplit:
         assert math.sqrt(r["event_var"]) == pytest.approx(e, rel=1e-9)
 
     def test_flat_curve_means_no_event_premium(self):
-        ts = {"front_dte": 31, "back_dte": 59, "front_iv_pct": 40.0, "back_iv_pct": 40.0}
+        ts = {"front_dte": 31, "back_dte": 59, "front_straddle_iv_pct": 40.0, "back_straddle_iv_pct": 40.0}
         r = _event_split_from_term(ts, "2026-10-21", TODAY)
         assert r["event_var"] == 0.0 and r["diffusion_vol"] == pytest.approx(0.40)
 
@@ -76,9 +96,11 @@ class TestTermStructureSplit:
         assert _event_split_from_term(ok, (TODAY + timedelta(days=40)).isoformat(), TODAY) is None   # after front
         close = _ts(0.40, 0.06, f=31, b=31 + _TS_SPLIT_MIN_GAP_DAYS - 1)
         assert _event_split_from_term(close, "2026-10-21", TODAY) is None                   # expiries too close
-        steep = {"front_dte": 31, "back_dte": 59, "front_iv_pct": 80.0, "back_iv_pct": 30.0}
+        steep = {"front_dte": 31, "back_dte": 59, "front_straddle_iv_pct": 80.0, "back_straddle_iv_pct": 30.0}
         assert _event_split_from_term(steep, "2026-10-21", TODAY) is None                   # no diffusion fits
         assert _event_split_from_term({"state": None}, "2026-10-21", TODAY) is None         # one expiry only
+        mixed = {"front_dte": 31, "back_dte": 59, "front_iv_pct": 45.0, "back_iv_pct": 41.0}
+        assert _event_split_from_term(mixed, "2026-10-21", TODAY) is None   # never from mixed ATM-IV estimators
 
     def test_print_in_window(self):
         opp = {"expiration": "2026-11-20", "legs": [{"expiration": "2026-11-20"}]}
@@ -156,3 +178,13 @@ class TestDeskWiring:
         # No print in the window: the desk's 40% diffusion vs the 41%+ market reads as a (diffusion) edge.
         out = self._ev(_opp(self.iv, 9.0), earnings_in_window=False, event_split=self.split)
         assert out > 2.0
+
+    def test_market_variance_is_centred_on_the_straddle_vol(self):
+        # The scan's ATM IV sits 3 vol points under the mids (COF 2026-10: 32.8% vs straddle 35.3%). Centred there,
+        # a fair trade reads as a wider physical law (fake −EV); centred on the straddle vol it is fair again.
+        opp = _opp(0.35, None)
+        opp["atm_iv_pct"] = 32.0
+        off = _opp_desk_metrics(opp, S, 4.3, 0.35)
+        on = _opp_desk_metrics(opp, S, 4.3, 0.35, atm_iv=0.35)
+        assert off["distribution"]["measure"] == "physical_wider" and off["pm"]["expected_value"] < -2.0
+        assert abs(on["pm"]["expected_value"]) < 1.0

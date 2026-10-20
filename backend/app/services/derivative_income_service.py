@@ -924,7 +924,9 @@ def _term_structure(summaries: list[dict]) -> dict:
     (d0, v0), (d1, v1) = pts[0], pts[-1]
     diff = round(v1 - v0, 1)                       # back minus front, vol pts
     state = "backwardation" if diff < -0.5 else "contango" if diff > 0.5 else "flat"
+    siv = {s["dte"]: s.get("straddle_iv_pct") for s in summaries if s.get("dte")}
     return {"state": state, "front_dte": d0, "front_iv_pct": v0, "back_dte": d1, "back_iv_pct": v1,
+            "front_straddle_iv_pct": siv.get(d0), "back_straddle_iv_pct": siv.get(d1),   # the event-split inputs
             "back_minus_front_pts": diff,
             "note": "backwardation (front IV > back) signals event/earnings panic → favor shorter DTE"}
 
@@ -2240,6 +2242,30 @@ def _earnings_implied_move_pct(calls: dict, puts: dict, spot: float, dte: int,
     return min(sd_event * _SQRT_2_OVER_PI, 0.60)                # sanity clamp against a mispriced/illiquid straddle
 
 
+def _straddle_iv(calls: dict, puts: dict, spot: float, dte: int, r: float) -> Optional[float]:
+    """The ATM vol the STRADDLE MID implies (exact Black-Scholes inversion, averaged over the two nearest strikes
+    with both legs two-sided). The term-structure event split needs the SAME estimator on both expiries: the scan's
+    ATM IV and the provider's IV field differ by a few vol points per expiry, and one vol point of mismatch moves
+    the implied event ≈ 3% of spot (COF 2026-10: mixed estimators read a 2.2% event; the straddles say 6.4%)."""
+    if not spot or spot <= 0 or dte < 1:
+        return None
+    T = dte / 365.0
+    ks = sorted((k for k in calls if k in puts and calls[k].bid > 0 and puts[k].bid > 0
+                 and calls[k].ask > 0 and puts[k].ask > 0), key=lambda k: abs(k - spot))[:2]
+    out = []
+    for k in ks:
+        st = calls[k].mid + puts[k].mid
+        f = lambda v: bs_price(spot, k, T, r, v, "call") + bs_price(spot, k, T, r, v, "put") - st
+        lo, hi = 0.01, 4.0
+        if f(lo) > 0 or f(hi) < 0:                   # outside the no-arbitrage band — a stale / garbage quote
+            continue
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (lo, mid) if f(mid) > 0 else (mid, hi)
+        out.append(0.5 * (lo + hi))
+    return sum(out) / len(out) if out else None
+
+
 _RND_GRID_N = 401          # samples in the compact market-implied law handed to the desk (≈8 KB / expiry)
 _RND_GRID_SIGMAS = 6.0     # the grid must reach ±6 total-σ so a high-IV name's tails aren't truncated
 _RND_GRID_MAX_W = 2.5      # … within a sane log-width ceiling
@@ -2521,6 +2547,7 @@ def _scan_expiry(chain: OptionChain, spot: float, dte: int, exp: str, today: dat
     summary = {
         "expiration": exp, "dte": dte, "monthly": _is_monthly_expiry(exp_date),
         "atm_iv_pct": round(atm_iv * 100, 1) if atm_iv else None,
+        "straddle_iv_pct": (round(_siv * 100, 2) if (_siv := _straddle_iv(calls, puts, spot, dte, r)) else None),
         "hv30_pct": round(hv * 100, 1) if hv else None,
         "iv_hv_ratio": iv_hv_ratio, "premium_richness": richness,
         "rnd_available": rnd is not None,
@@ -2682,7 +2709,7 @@ async def run_derivative_income(
     cache_key = (f"derivinc:{ticker}:{exp_key}:"
                  f"{min_prob:.2f}:{int(min_income)}:{','.join(sorted(structures))}:{quote_source}:"
                  f"{'own' if owns_underlying else 'naked'}:"
-                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v9")   # owns → covered call · else naked-call BPR;
+                 f"{'snap' if (ta_levels and ta_levels.get('named')) else 'plain'}:v10")   # owns → covered call · else naked-call BPR;
                  # v4: not-owned short calls now build as structure=naked_call (correct payoff/grade), untradeable-leg
                  #     filter, + context.change_pct/prev_close — all change the cached shape.
                  # v5: opp.earnings_gap_pct (isolated event move) attached when earnings is before expiry.
@@ -2690,6 +2717,7 @@ async def run_derivative_income(
                  # v7: legs carry the expected fill (+ commission); opps carry entry_cost / premium_fill.
                  # v8: context.hv21_pct / hv63_pct / index_like (physical-vol forecast + term-structure sign).
                  # v9: earnings_gap_pct computed in consistent σ units (straddle = √(2/π)·σ).
+                 # v10: summaries carry straddle_iv_pct (the term-structure event split's estimator).
                  #                                             snap = multi-leg strikes biased to TA levels
     # A focus trade forces a fresh build (its exact legs aren't in the cached grid).
     if db is not None and focus is None:
