@@ -20,7 +20,7 @@ before(async () => {
     setup(b) {
       b.onLoad({ filter: /MyTradesV2\.tsx$/ }, (a) => ({
         contents: fs.readFileSync(a.path, 'utf8')
-          + "\nexport { GroupSummary, TradeCard, DeleteConfirm };\n"
+          + "\nexport { GroupSummary, TradeCard, DeleteConfirm };\nexport { default as CampaignTimeline } from './CampaignTimeline';\n"
           + "export { renderToStaticMarkup } from 'react-dom/server';\nexport { createElement } from 'react';\n",
         loader: 'tsx', resolveDir: path.dirname(a.path),
       }));
@@ -56,7 +56,7 @@ const cardProps = (t, pnl) => ({
 });
 const card = (t, pnl) => C.renderToStaticMarkup(C.createElement(C.TradeCard, cardProps(t, pnl)));
 const strip = (trades, pnlMap, extra = {}) => C.renderToStaticMarkup(C.createElement(C.GroupSummary, { trades, pnlMap, ...extra }));
-const text = (html) => html.replace(/<[^>]+>/g, '|').replace(/\|+/g, '|');   // visible text, tag boundaries as |
+const text = (html) => html.replace(/<[^>]+>/g, '|').replace(/\|+/g, '|').replace(/&amp;/g, '&').replace(/&rsquo;/g, '\u2019');   // visible text, tag boundaries as |
 
 // ── (a) negative P&L keeps its minus in the collapsed row ────────────────────────────────────────
 
@@ -177,4 +177,110 @@ test('delete confirm: shows the error from a failed removal and disables the act
   const html = confirm({ keepIncome: true, income: { realized: 20, closedLegs: 1, openLegs: 0, hasIncome: true }, error: 'No option income to keep', deleting: true });
   assert.ok(text(html).includes('No option income to keep'));
   assert.equal((html.match(/disabled=""/g) || []).length, 3);        // Remove stock · Delete everything · Cancel
+});
+
+// ── option journal + campaign card, rendered from the REAL API payload for the AAOI campaign ───────
+
+const AAOI = JSON.parse(fs.readFileSync(path.join(root, 'tests/fixtures/aaoi-campaign.json'), 'utf8'));
+const journal = (props = {}) => C.renderToStaticMarkup(C.createElement(C.CampaignTimeline, { data: AAOI.campaign, ...props }));
+const titles = (html) => [...html.matchAll(/data-testid="event-title">([^<]*)</g)].map(m => m[1].replace(/&amp;/g, '&'));
+
+test('journal: the numbers are the all-in ones — net cash +$413.00, realized −$747.00, BE $70.87, close-out ≤ $4.13 — never "+$2.47 / Closed"', () => {
+  const t = text(journal());
+  assert.ok(t.includes('+$413.00'), t);                       // net cash so far
+  assert.ok(t.includes(`${MINUS}$747.00`), t);                // realized on closed legs
+  assert.ok(t.includes('+$1,160.00'), t);                     // the open P75's credit
+  assert.ok(t.includes('$70.87'), t);                         // break-even at expiry
+  assert.ok(t.includes('≤ $4.13/sh'), t);                     // close-out price
+  assert.ok(!t.includes('$2.47') && !t.includes('Position Closed'), t);
+});
+
+test('journal: the story reads Opened → Closed call spread → Closed put → Rolled, every event named', () => {
+  assert.deepEqual(titles(journal()), [
+    'Opened iron condor — puts $70/$80 · calls $155/$160',
+    'Closed call credit spread $155/$160',
+    'Closed long put $70',
+    'Rolled short put $80 → short put $75',
+  ]);
+});
+
+test('journal: the ORIGINAL opening is there — all four legs, each labelled sold/bought to open with its own cash', () => {
+  const html = journal();
+  const opening = html.split('data-testid="event"')[1];                       // the first event card
+  const labels = [...opening.matchAll(/data-testid="fill-label">([^<]*)</g)].map(m => m[1]);
+  assert.deepEqual(labels, ['Bought to open', 'Sold to open', 'Sold to open', 'Bought to open']);   // P70 · P80 · C155 · C160 — puts then calls, by strike
+  const t = text(opening);
+  for (const piece of ['PUT $70', 'PUT $80', 'CALL $155', 'CALL $160', '@ $0.25', '@ $0.59', '@ $2.34', '@ $1.85', `${MINUS}$25.00`, '+$59.00', '+$234.00', `${MINUS}$185.00`]) {
+    assert.ok(t.includes(piece), `${piece} missing from the opening event: ${t}`);
+  }
+  assert.ok(t.includes('+$83.00'), 'opening net credit +$83.00');
+});
+
+test('journal: event subtitles show expiries as dates, not raw ISO', () => {
+  const t = text(journal());
+  assert.ok(t.includes('exp Oct 30, 2026') && t.includes('Oct 30, 2026 → Nov 20, 2026'), t);
+  assert.ok(!t.includes('exp 2026-10-30') && !t.includes('2026-10-30 → 2026-11-20'), t);
+});
+
+test('journal: every leg says WHAT it was — sold/bought to open/close, opened → closed price, rolled out, open now', () => {
+  const html = journal();
+  const t = text(html);
+  for (const l of ['Sold to open', 'Bought to open', 'Bought to close', 'Sold to close']) assert.ok(t.includes(l), `${l} missing`);
+  assert.ok(t.includes('opened $0.59 → closed $12.10'), t);                 // the rolled-out P80
+  assert.ok(t.includes('opened $1.85 → closed $0.12') && t.includes('opened $2.34 → closed $0.12'), t);
+  assert.equal((html.match(/rolled out/g) || []).length, 1);
+  assert.equal((html.match(/open now/g) || []).length >= 1, true);
+  assert.ok(t.includes('P&L −$1,151.00') && t.includes('P&L +$355.00') && t.includes('P&L +$222.00') && t.includes(`P&L ${MINUS}$173.00`), t);
+});
+
+test('journal: each event ends with its running net cash, and the last one is the all-in +$413.00', () => {
+  const t = text(journal());
+  const running = [...t.matchAll(/Running net cash \|([^|]*)\|/g)].map(m => m[1]);
+  assert.deepEqual(running, ['+$83.00', '+$83.00', '+$463.00', '+$413.00']);
+});
+
+test('journal: "Open now" names what is open; plain-English headline states the position and the close-out', () => {
+  const html = journal();
+  const t = text(html);
+  assert.ok(/Open now\|short PUT \$75/.test(t) || t.includes('short PUT $75'), t);
+  assert.ok(t.includes('Counting all 9 fills, you are net up $413.00 in cash so far.'), t);
+  assert.ok(t.includes('closing everything for ≤ $4.13/share finishes the whole campaign ahead'), t);
+});
+
+test('journal: newest-first reverses the events; the statement view is a one-line-per-fill table', () => {
+  assert.deepEqual(titles(journal({ initialNewestFirst: true })).slice(0, 2), ['Rolled short put $80 → short put $75', 'Closed long put $70']);
+  const st = journal({ initialView: 'statement' });
+  assert.ok(st.includes('data-testid="statement"') && !st.includes('data-testid="timeline"'));
+  assert.equal((st.match(/<tr /g) || []).length, 1 + 9);                    // header + 9 fills
+  assert.ok(text(st).includes('Bought to close') && text(st).includes(`${MINUS}$1,210.00`));
+});
+
+test('journal: compact (classic card) is events only — no tiles, headline or toggles', () => {
+  const html = journal({ compact: true });
+  assert.ok(html.includes('data-testid="timeline"') && !html.includes('data-testid="headline"') && !html.includes('role="tablist"'));
+  assert.equal(titles(html).length, 4);
+});
+
+test('journal: a closed trade shows no break-even / close-out; loading, error and empty states render', () => {
+  const t = text(journal({ data: { ...AAOI.campaign, trade_status: 'closed' } }));
+  assert.ok(!t.includes('Close-out price') && !t.includes('Break-even at expiry') && t.includes('The campaign is closed'), t);
+  assert.ok(text(journal({ data: null, loading: true })).includes('Loading the journal'));
+  assert.ok(text(journal({ data: null, error: 'boom' })).includes('boom'));
+  assert.ok(text(journal({ data: { ...AAOI.campaign, ledger: { rows: [], events: [], net_cash: 0, realized: 0, open_cash: 0 } } })).includes('No option fills'));
+});
+
+test('campaign card: the cost basis, break-even and close-out price count the partial closes; the journal sits inside it', () => {
+  const html = C.renderToStaticMarkup(C.createElement(C.TradeCard, {
+    ...cardProps(AAOI.trade, { unrealized_pnl: 100, pnl_pct: 1, current_value: -1060, entry_cost: 1160, days_held: 21, current_quotes: [], greeks: [], net_greeks: {}, scenarios: [], theta_projection: [], breakevens: [], pricing_complete: true }),
+    isExpanded: true,
+  }));
+  const t = text(html);
+  assert.ok(html.includes('data-testid="effective-net-credit"') && t.includes('+$413.00'), 'all-in basis is +$413 (was +$9)');
+  assert.ok(t.includes('break-even $70.87'), t);
+  assert.ok(!t.includes('$74.91'), 'the old roll-only break-even must be gone');
+  assert.ok(t.includes('rolls') && t.includes(`${MINUS}$1,151.00`) && t.includes('partial closes') && t.includes('+$404.00'), t);
+  assert.ok(html.includes('data-testid="close-out"') && t.includes('≤ $4.13/share'), t);
+  assert.ok(t.includes(`${MINUS}$647.00`), 'campaign P&L = +100 unrealized − 747 banked');
+  assert.ok(t.includes('Journal · everything done on this position') && t.includes('Loading the journal'), 'the card embeds the full journal (fetched lazily)');
+  assert.ok(!t.includes('Transaction ledger'), 'the partial roll-only ledger is gone');
 });

@@ -21,8 +21,11 @@ import {
   Pencil, Trash2, Check, X as XIcon, Save,
 } from 'lucide-react';
 import type { SavedStrategyItem, LivePnlResponse, TradeTransaction } from '../../api';
-import { updateTradeTransaction, deleteTradeTransaction } from '../../api';
+import { updateTradeTransaction, deleteTradeTransaction, fetchCampaignLedger } from '../../api';
+import type { CampaignLedgerResponse } from '../../api';
 import { fmtMoney, fmtQty, fmtDate } from '../../lib/tradeFormat';
+import { walkTransactions, isOptionFill, ledgerMode } from '../../lib/ledger';
+import CampaignTimeline from './CampaignTimeline';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -72,83 +75,6 @@ function SummaryCell({ icon, label, value, subValue, color = '' }: {
       {subValue && <div className="text-[10px] text-base-content/40">{subValue}</div>}
     </div>
   );
-}
-
-// ── Ledger walk ──────────────────────────────────────────────────────────────
-
-interface RowState {
-  txn: TradeTransaction;
-  txnQty: number;
-  txnValue: number;
-  legRealized: number;
-  runningQty: number;
-  runningAvgCost: number;
-  runningCostBasis: number;
-}
-
-function walkTransactions(txns: TradeTransaction[]): {
-  rows: RowState[];
-  totalFees: number;
-  totalRealized: number;
-  finalQty: number;
-  finalAvgCost: number;
-  finalCostBasis: number;
-} {
-  const openLots: { qty: number; price: number }[] = [];
-  let runningQty = 0;
-  let runningCostBasis = 0;
-  let totalFees = 0;
-  let totalRealized = 0;
-
-  const rows: RowState[] = txns.map(t => {
-    const qty = t.quantity;
-    const absQty = Math.abs(qty);
-    totalFees += t.fees || 0;
-    let legRealized = 0;
-
-    if (qty > 0) {
-      openLots.push({ qty: absQty, price: t.price });
-      runningQty += absQty;
-      runningCostBasis += absQty * t.price;
-    } else if (qty < 0) {
-      let toMatch = absQty;
-      let costOfSold = 0;
-      while (toMatch > 1e-9 && openLots.length > 0) {
-        const lot = openLots[0];
-        const matched = Math.min(lot.qty, toMatch);
-        costOfSold += matched * lot.price;
-        legRealized += (t.price - lot.price) * matched;
-        lot.qty -= matched;
-        toMatch -= matched;
-        if (lot.qty < 1e-9) openLots.shift();
-      }
-      totalRealized += legRealized;
-      runningQty -= absQty;
-      runningCostBasis -= costOfSold;
-      if (runningQty < 1e-9) runningCostBasis = 0;
-    }
-
-    const runningAvgCost = runningQty > 1e-9 ? runningCostBasis / runningQty : 0;
-    return {
-      txn: t,
-      txnQty: qty,
-      txnValue: absQty * t.price,
-      legRealized,
-      runningQty: Math.max(0, runningQty),
-      runningAvgCost,
-      runningCostBasis: Math.max(0, runningCostBasis),
-    };
-  });
-
-  const last = rows[rows.length - 1];
-  return {
-    rows,
-    totalFees,
-    totalRealized,
-    finalQty: last?.runningQty ?? 0,
-    finalAvgCost: last?.runningAvgCost ?? 0,
-    finalCostBasis: last?.runningCostBasis ?? 0,
-  };
 }
 
 // ── Inline edit form ─────────────────────────────────────────────────────────
@@ -332,12 +258,27 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
 
   useEffect(() => { loadTxns(); }, [loadTxns]);
 
+  // Option fills have their own cash ledger (server-built); stock fills keep the FIFO lot walk.
+  const mode = ledgerMode(trade);
+  const [campaign, setCampaign] = useState<CampaignLedgerResponse | null>(null);
+  const [campLoading, setCampLoading] = useState(false);
+  const [campErr, setCampErr] = useState<string | null>(null);
+  const loadCampaign = useCallback(async () => {
+    if (mode === 'stock') return;
+    setCampLoading(true); setCampErr(null);
+    try { setCampaign(await fetchCampaignLedger(strategyId)); }
+    catch (e: any) { setCampErr(e?.message || 'Failed to load option journal'); }
+    finally { setCampLoading(false); }
+  }, [strategyId, mode]);
+  useEffect(() => { loadCampaign(); }, [loadCampaign]);
+
   const handleEdit = async (txId: number, data: Parameters<typeof updateTradeTransaction>[2]) => {
     setMutating(true);
     try {
       await updateTradeTransaction(strategyId, txId, data);
       setEditingId(null);
       await loadTxns();
+      await loadCampaign();
       onPositionChanged?.();
     } finally {
       setMutating(false);
@@ -350,6 +291,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
       await deleteTradeTransaction(strategyId, txId);
       setConfirmDeleteId(null);
       await loadTxns();
+      await loadCampaign();
       onPositionChanged?.();
     } finally {
       setMutating(false);
@@ -378,13 +320,19 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
     return <p className="text-xs text-base-content/40 py-2 italic">No transactions recorded yet.</p>;
   }
 
+  // A combo's option fills must not be lot-matched against its shares; an option-only trade has no lots at all
+  // (its raw entries stay editable below, minus the per-share lot columns that mean nothing for options).
+  const optionMode = mode === 'option';
+  const noStockRows = mode === 'combo' && walkTransactions(txns.filter(t => !isOptionFill(t))).rows.length === 0;   // options only so far
   const { rows, totalFees, totalRealized, finalQty, finalAvgCost, finalCostBasis } =
-    walkTransactions(txns);
+    walkTransactions(mode === 'combo' ? txns.filter(t => !isOptionFill(t)) : txns);
 
   const isClosed       = finalQty < 1e-9;
   const unrealizedPnl  = pnl?.unrealized_pnl ?? null;
   const currentPrice   = pnl?.underlying_price ?? null;
-  const totalReturn    = unrealizedPnl != null ? totalRealized + unrealizedPnl : null;
+  // Total return = stock realized + (option realized, when there are options) + live unrealized.
+  const optRealized    = mode === 'combo' ? (campaign?.ledger.realized ?? null) : 0;
+  const totalReturn    = unrealizedPnl != null && optRealized != null ? totalRealized + optRealized + unrealizedPnl : null;
   const buyCount       = txns.filter(t => t.quantity > 0).length;
   const sellCount      = txns.filter(t => t.quantity < 0).length;
 
@@ -407,13 +355,15 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
         </div>
       </div>
 
+      {mode !== 'stock' && <CampaignTimeline data={campaign} loading={campLoading} error={campErr} />}
+
       {/* ── Summary ───────────────────────────────────────────────────────
            When live P&L is available the Position Details panel above already
            shows shares / avg cost / cost basis / unrealized P&L.  Show only
            ledger-history metrics here to avoid duplicating that information.
            When P&L hasn't been fetched yet show the full snapshot as a fallback.
       ─────────────────────────────────────────────────────────────────── */}
-      {pnl ? (
+      {optionMode || noStockRows ? null : pnl ? (
         /* Compact history-only strip */
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs text-base-content/50 px-1">
           {isClosed && (
@@ -486,6 +436,13 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
       )}
 
       {/* ── Transaction table ──────────────────────────────────────────────── */}
+      {!noStockRows && (
+      <details open={!optionMode} className="group">
+      {optionMode && (
+        <summary className="cursor-pointer text-[11px] text-base-content/50 hover:text-base-content/80 select-none py-1">
+          Raw ledger entries — edit / delete individual fills
+        </summary>
+      )}
       <div className="overflow-x-auto -mx-1 rounded-xl border border-white/[0.04]">
         <table className="table table-xs text-xs w-full">
           <thead>
@@ -494,11 +451,13 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
               <th>Action</th>
               <th className="text-right">Qty</th>
               <th className="text-right">Price</th>
-              <th className="text-right">Value</th>
+              {!optionMode && <th className="text-right">Value</th>}
               <th className="text-right hidden sm:table-cell">Fees</th>
-              <th className="text-right border-l border-white/[0.05]">After: Shares</th>
-              <th className="text-right">After: Avg Cost</th>
-              <th className="text-right hidden md:table-cell">Realized P&L</th>
+              {!optionMode && <>
+                <th className="text-right border-l border-white/[0.05]">After: Shares</th>
+                <th className="text-right">After: Avg Cost</th>
+                <th className="text-right hidden md:table-cell">Realized P&L</th>
+              </>}
               <th className="hidden lg:table-cell">Note</th>
               {/* Actions column — always visible */}
               <th className="w-14 text-center">Edit</th>
@@ -541,13 +500,14 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
                     <td className="text-right font-mono">{fmtMoney(txn.price)}</td>
 
                     {/* Value */}
-                    <td className="text-right font-mono text-base-content/60">{fmtMoney(txnValue)}</td>
+                    {!optionMode && <td className="text-right font-mono text-base-content/60">{fmtMoney(txnValue)}</td>}
 
                     {/* Fees */}
                     <td className="text-right font-mono text-base-content/35 hidden sm:table-cell">
                       {txn.fees > 0 ? fmtMoney(txn.fees) : '—'}
                     </td>
 
+                    {!optionMode && (<>
                     {/* After: Shares */}
                     <td className="text-right font-mono font-semibold border-l border-white/[0.04]">
                       {rowClosed
@@ -568,6 +528,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
                     }`}>
                       {legRealized !== 0 ? `${fmtMoney(legRealized, { signed: true })}` : '—'}
                     </td>
+                    </>)}
 
                     {/* Note */}
                     <td className="text-base-content/35 text-[10px] max-w-[100px] truncate hidden lg:table-cell">
@@ -625,7 +586,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
                   {isEditing && (
                     <InlineEditForm
                       txn={txn}
-                      colSpan={TOTAL_COLS}
+                      colSpan={optionMode ? TOTAL_COLS - 4 : TOTAL_COLS}
                       onSave={data => handleEdit(txn.id, data)}
                       onCancel={() => setEditingId(null)}
                     />
@@ -636,7 +597,7 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
           </tbody>
 
           {/* Totals footer */}
-          {rows.length > 1 && (
+          {!optionMode && rows.length > 1 && (
             <tfoot>
               <tr className="border-t border-white/[0.08] bg-base-300/10 text-[10px] text-base-content/40">
                 <td colSpan={5} className="pl-3 py-1.5 font-medium">Totals</td>
@@ -659,6 +620,8 @@ export default function TransactionHistoryPanel({ strategyId, onFetch, trade, pn
           )}
         </table>
       </div>
+      </details>
+      )}
     </div>
   );
 }

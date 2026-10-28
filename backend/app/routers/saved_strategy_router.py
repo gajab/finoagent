@@ -198,10 +198,19 @@ def _roll_summary(s: SavedStrategy) -> Optional[dict]:
         params = json.loads(s.parameters) if s.parameters else {}
     except (ValueError, TypeError):
         return None
-    roll_realized = _roll_realized(params)
+    from ..services.campaign_math import split_option_realized, close_out_breakeven
+    # ALL banked option realized — rolls AND genuine partial closes. The cost basis of what is open now is
+    # reduced by every fill so far, not only the roll-tagged ones (a partial close that banked +$404 must
+    # lower the break-even exactly like a roll does).
+    split = split_option_realized(
+        params.get("closed_legs") or [], roll_scalar=float(params.get("roll_realized_pnl") or 0.0),
+        realized_scalar=params.get("realized_pnl"))
+    roll_realized = split["roll"]
+    partial_realized = split["partial"]
+    campaign_realized = split["total"]
     rolls = params.get("rolls") or []
     count = len(rolls)
-    if count == 0 and abs(roll_realized) < 0.005:
+    if count == 0 and abs(roll_realized) < 0.005 and abs(partial_realized) < 0.005:
         return None
 
     try:
@@ -242,15 +251,20 @@ def _roll_summary(s: SavedStrategy) -> Optional[dict]:
     if raw_net is not None and (payoff_legs or stock):
         from ..services.trade_math import structure_breakevens
         raw_be = structure_breakevens(payoff_legs, raw_net, stock)
-        eff_be = structure_breakevens(payoff_legs, raw_net + roll_realized, stock)
+        eff_be = structure_breakevens(payoff_legs, raw_net + campaign_realized, stock)
 
+    effective_net = round(raw_net + campaign_realized, 2) if raw_net is not None else None
     return {
         "count": count,
+        "has_rolls": count > 0,
         "roll_realized_pnl": round(roll_realized, 2),
-        "raw_net_credit": raw_net,
-        "effective_net_credit": round(raw_net + roll_realized, 2) if raw_net is not None else None,
+        "partial_realized_pnl": round(partial_realized, 2),
+        "campaign_realized_pnl": round(campaign_realized, 2),     # roll + partial = everything banked on options
+        "raw_net_credit": raw_net,                                # credit of the legs open NOW, at their own fills
+        "effective_net_credit": effective_net,                    # …plus everything banked = the all-in cost basis
         "raw_breakevens": raw_be,
         "effective_breakevens": eff_be,
+        "close_even": close_out_breakeven(effective_net, leg_metas and [m["_leg"] for m in leg_metas]),
         "history": rolls,
     }
 
@@ -1682,6 +1696,37 @@ async def roll_position(
     await db.commit()
     await db.refresh(strategy)
     return _to_out(strategy)
+
+
+@router.get("/{strategy_id}/campaign-ledger")
+async def get_campaign_ledger(
+    strategy_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The option journal for ONE trade: every fill (open / close / roll) oldest-first with signed cash
+    (×100) and a running net-cash column, plus the all-in campaign summary (cost basis, break-even and the
+    price to close what is open for an overall profit). Derived from the persisted legs + closed_legs — the
+    same numbers the live P&L reconciles to — NOT from the stock-lot transaction table, whose per-share FIFO
+    math is meaningless for option fills."""
+    from ..services.campaign_math import build_campaign_ledger
+    result = await db.execute(select(SavedStrategy).where(
+        SavedStrategy.id == strategy_id, SavedStrategy.user_id == user.id))
+    strategy = result.scalar_one_or_none()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    legs = json.loads(strategy.legs_data) if strategy.legs_data else []
+    entry_prices = json.loads(strategy.entry_prices) if strategy.entry_prices else []
+    params = json.loads(strategy.parameters) if strategy.parameters else {}
+    open_opts = []
+    for i, l in enumerate(legs):
+        if str(l.get("type", "")).upper() not in ("CALL", "PUT"):
+            continue
+        prem = _leg_entry_premium(l, i, entry_prices)
+        open_opts.append({**l, "premium": prem if prem is not None else 0.0})
+    entry_iso = strategy.entry_date.isoformat() if strategy.entry_date else None
+    ledger = build_campaign_ledger(open_opts, params.get("closed_legs") or [], params.get("rolls") or [], entry_iso)
+    return {"ledger": ledger, "summary": _roll_summary(strategy), "trade_status": strategy.trade_status}
 
 
 @router.post("/{strategy_id}/reopen", response_model=SavedStrategyOut)

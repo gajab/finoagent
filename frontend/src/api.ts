@@ -1406,16 +1406,49 @@ export async function deleteTLHPortfolio(id: number): Promise<void> {
 // treat a rolled position as ONE continuing trade with an adjusted cost basis, rather than a
 // string of disconnected close+open events. All fields are pure (no live quotes).
 export interface RollSummary {
-  count: number;                       // number of rolls so far
-  roll_realized_pnl: number;           // cumulative $ realized on the buy-backs (the cost-basis adjustment)
+  count: number;                       // number of rolls so far (0 for a partial-close-only campaign)
+  has_rolls?: boolean;
+  roll_realized_pnl: number;           // $ realized on roll buy-backs (the cost-basis adjustment on a LIVE campaign)
+  partial_realized_pnl?: number;       // $ realized by genuine partial closes (legs taken off early)
+  campaign_realized_pnl?: number;      // roll + partial = EVERYTHING banked on the options so far
   raw_net_credit: number | null;       // net entry credit of the CURRENT open legs (SELL +, BUY −), ×100
-  effective_net_credit: number | null; // raw_net_credit + roll_realized_pnl — the true premium banked
+  effective_net_credit: number | null; // raw_net_credit + campaign_realized_pnl — the all-in cost basis
   raw_breakevens: number[] | null;     // breakevens of the open legs at their own entry
-  effective_breakevens: number[] | null; // breakevens once roll-realized is folded into the cost basis
+  effective_breakevens: number[] | null; // breakevens once ALL banked option P&L is folded into the cost basis
+  /** Price to close every open leg so the whole campaign ends ≥ $0: net debit you may pay (negative = must
+   *  collect a credit), per share-of-structure when all open legs share a quantity. */
+  close_even?: { debit: number; per_share: number | null; qty: number | null } | null;
   history: {                           // one entry per roll, newest last
     roll_id: string; seq: number; date: string; realized: number;
     buyback_cost?: number; new_credit?: number; from: string[]; to: string[]; note?: string | null;
   }[];
+}
+
+/** One fill in the option journal (open / close / roll), signed cash ×100 (SELL +, BUY −). */
+export interface CampaignLedgerRow {
+  date: string | null; kind: 'open' | 'close'; side: 'buy' | 'sell'; desc: string;
+  type?: string; strike?: number | null; expiration?: string | null; qty: number;
+  price: number;                       // the fill price (per share)
+  entry_price?: number;                // close rows: what the leg was opened at
+  cash: number; realized: number | null;
+  roll: boolean;                       // this leg was ROLLED OUT (its buy-back belongs to a roll)
+  roll_id?: string | null;             // the roll this row belongs to, if any
+  still_open?: boolean;                // a leg that is open right now
+  running_cash: number;
+}
+/** What the trader DID, in one go: opened a structure · took legs off · rolled. */
+export interface CampaignEvent {
+  id: string; kind: 'open' | 'close' | 'roll'; date: string | null;
+  title: string;                       // "Opened iron condor — puts $70/$80 · calls $155/$160" · "Rolled short put $80 → short put $75"
+  subtitle: string;                    // expiries
+  cash: number; realized: number | null; running_cash: number; legs: number;
+  rows: CampaignLedgerRow[];
+}
+export interface CampaignLedger { rows: CampaignLedgerRow[]; events: CampaignEvent[]; net_cash: number; realized: number; open_cash: number }
+export interface CampaignLedgerResponse { ledger: CampaignLedger; summary: RollSummary | null; trade_status: string | null }
+
+export async function fetchCampaignLedger(id: number): Promise<CampaignLedgerResponse> {
+  return apiFetch<CampaignLedgerResponse>(`/api/saved-strategies/${id}/campaign-ledger`);
 }
 
 export interface SavedStrategyItem {

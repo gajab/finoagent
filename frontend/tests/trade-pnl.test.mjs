@@ -5,7 +5,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { fmtMoney, fmtAnnualized, isMeaningfulAnnualized, ANNUALIZED_CLIP_PCT } from '../src/lib/tradeFormat.ts';
-import { pnlTotals, effectivePnl, isUnpriced, hasMark, optionIncome, closedRowDeletion } from '../src/lib/tradePnl.ts';
+import { pnlTotals, effectivePnl, isUnpriced, hasMark, optionIncome, closedRowDeletion, closeOutAdvice, campaignPnl } from '../src/lib/tradePnl.ts';
+import { walkTransactions, isOptionFill, ledgerMode, fillLabel, instrumentLabel, campaignHeadline, EVENT_KIND_LABEL } from '../src/lib/ledger.ts';
 
 const MINUS = '−';
 
@@ -156,4 +157,95 @@ test('closed-journal row delete: a row of a LIVE trade only ever removes its ban
   assert.deepEqual(closedRowDeletion('closed', 'all'), { kind: 'delete_trade', live: false });      // fully closed → drop the journal row
   assert.deepEqual(closedRowDeletion('closed', 'options'), { kind: 'delete_part', live: false });
   assert.deepEqual(closedRowDeletion(null, 'all'), { kind: 'delete_part', live: true });            // unknown status → be safe
+});
+
+// ── journal / campaign math (AAOI, trade 180) ────────────────────────────────────────────────────
+
+// The six REAL ledger rows exactly as the API stores them for the AAOI campaign.
+const AAOI_TXNS = [
+  { id: 337, action: 'open', leg_index: null, quantity: 1, price: 0.83, fees: 0, executed_at: '2026-10-02T20:01:26Z', note: 'Initial position' },
+  { id: 378, action: 'close', leg_index: 2, quantity: -1, price: 0.12, fees: 0, executed_at: '2026-10-15T16:10:38Z', note: 'Close buy call $160 @ $0.12' },
+  { id: 379, action: 'close', leg_index: 3, quantity: 1, price: 0.12, fees: 0, executed_at: '2026-10-15T16:10:38Z', note: 'Close sell call $155 @ $0.12' },
+  { id: 427, action: 'close', leg_index: 1, quantity: -1, price: 3.8, fees: 0, executed_at: '2026-10-23T18:00:00Z', note: 'Close buy put $70 @ $3.8' },
+  { id: 431, action: 'close', leg_index: 0, quantity: 1, price: 12.1, fees: 0, executed_at: '2026-10-23T20:04:41Z', note: 'roll:989bef387503 · out sell put $80 @ $12.1' },
+  { id: 432, action: 'add', leg_index: null, quantity: -1, price: 11.6, fees: 0, executed_at: '2026-10-23T20:04:41Z', note: 'roll:989bef387503 · into sell put $75 exp 2026-11-20' },
+];
+
+test('the stock-lot walk over option fills is exactly the bug: "+$2.47 · Position Closed" for a −$747 open campaign', () => {
+  const w = walkTransactions(AAOI_TXNS);
+  assert.equal(Math.round(w.totalRealized * 100) / 100, 2.47);      // what the journal showed
+  assert.equal(w.finalQty, 0);                                      // …"Position Closed" while a short put is open
+});
+
+test('isOptionFill: option closes + the roll-opened leg are option fills; stock lots are not', () => {
+  assert.deepEqual(AAOI_TXNS.slice(1).map(isOptionFill), [true, true, true, true, true]);
+  assert.equal(isOptionFill({ leg_index: null, note: 'Initial position' }), false);      // a stock/seed row
+  assert.equal(isOptionFill({ leg_index: null, note: null }), false);
+});
+
+test('a covered call\'s stock walk ignores its option fills (they used to be lot-matched against the shares)', () => {
+  const txns = [
+    { id: 1, action: 'open', leg_index: null, quantity: 100, price: 60, fees: 0, executed_at: '2026-08-01T00:00:00Z', note: 'Initial position' },
+    { id: 2, action: 'close', leg_index: 0, quantity: 1, price: 1.82, fees: 0, executed_at: '2026-08-28T00:00:00Z', note: 'Close sell call' },   // short call bought back (+1)
+    { id: 3, action: 'add', leg_index: null, quantity: -1, price: 0.65, fees: 0, executed_at: '2026-09-14T00:00:00Z', note: 'roll:abc · into sell call' },
+  ];
+  const polluted = walkTransactions(txns.slice(0, 2));              // shares + the call buy-back (+1) before the roll-in
+  assert.equal(polluted.finalQty, 101);                             // a phantom 1-share "buy" corrupts the 100-share position…
+  assert.notEqual(polluted.finalAvgCost, 60);                       // …and its average cost
+  const clean = walkTransactions(txns.filter(t => !isOptionFill(t)));
+  assert.equal(clean.finalQty, 100);
+  assert.equal(clean.finalAvgCost, 60);
+  assert.equal(clean.totalRealized, 0);
+});
+
+test('ledgerMode picks the right ledger(s) for the trade', () => {
+  const call = { type: 'call', action: 'sell' };
+  assert.equal(ledgerMode({ legs_data: [{ type: 'put' }], parameters: { realized_pnl: -747, closed_legs: [{ type: 'put', realized: -1151 }] }, strategy_type: 'options_spread' }), 'option');
+  assert.equal(ledgerMode({ legs_data: [call], parameters: { shares: 100 }, strategy_type: 'covered_call' }), 'combo');
+  assert.equal(ledgerMode({ legs_data: [], parameters: { shares: 100, closed_legs: [{ type: 'call', realized: 20 }] }, strategy_type: 'covered_call' }), 'combo');
+  assert.equal(ledgerMode({ legs_data: [], parameters: { shares: 5 }, strategy_type: 'stock_long' }), 'stock');
+  assert.equal(ledgerMode({ legs_data: [call], parameters: {}, strategy_type: 'stock_long' }), 'combo');       // options added to a stock trade
+  assert.equal(ledgerMode(null), 'stock');
+});
+
+test('closeOutAdvice: pay up to / must collect / even', () => {
+  assert.deepEqual(closeOutAdvice({ debit: 413, per_share: 4.13, qty: 1 }), { mode: 'pay', total: 413, perShare: 4.13 });
+  assert.deepEqual(closeOutAdvice({ debit: -250, per_share: -1.25, qty: 2 }), { mode: 'collect', total: 250, perShare: 1.25 });
+  assert.deepEqual(closeOutAdvice({ debit: 0, per_share: 0, qty: 1 }), { mode: 'even', total: 0, perShare: 0 });
+  assert.deepEqual(closeOutAdvice({ debit: 300, per_share: null, qty: null }), { mode: 'pay', total: 300, perShare: null });
+  assert.equal(closeOutAdvice(null), null);
+});
+
+test('campaignPnl = unrealized + EVERYTHING banked (rolls + partials), not roll-only', () => {
+  const roll = { roll_realized_pnl: -1151, campaign_realized_pnl: -747 };
+  assert.equal(campaignPnl(100, roll), -647);
+  assert.equal(campaignPnl(100, { roll_realized_pnl: -1151 }), -1051);      // payload from before partials were counted
+  assert.equal(campaignPnl(null, roll), null);
+  assert.equal(campaignPnl(100, null), null);
+});
+
+test('fillLabel says what a fill IS in the broker\'s words', () => {
+  assert.equal(fillLabel({ kind: 'open', side: 'sell' }), 'Sold to open');
+  assert.equal(fillLabel({ kind: 'open', side: 'buy' }), 'Bought to open');
+  assert.equal(fillLabel({ kind: 'close', side: 'buy' }), 'Bought to close');
+  assert.equal(fillLabel({ kind: 'close', side: 'sell' }), 'Sold to close');
+  assert.deepEqual(EVENT_KIND_LABEL, { open: 'Opened', close: 'Partial close', roll: 'Rolled' });
+});
+
+test('instrumentLabel formats strike without spurious decimals', () => {
+  assert.equal(instrumentLabel({ type: 'put', strike: 80 }), 'PUT $80');
+  assert.equal(instrumentLabel({ type: 'call', strike: 157.5 }), 'CALL $157.50');
+  assert.equal(instrumentLabel({ type: 'put', strike: 75.0 }), 'PUT $75');
+});
+
+test('campaignHeadline: position, banked-vs-open, and the close-out sentence', () => {
+  const ledger = { rows: new Array(9).fill({}), events: [], net_cash: 413, realized: -747, open_cash: 1160 };
+  const live = campaignHeadline(ledger, { effective_breakevens: [70.87], close_even: { debit: 413, per_share: 4.13, qty: 1 } }, true);
+  assert.equal(live[0], 'Counting all 9 fills, you are net up $413.00 in cash so far.');
+  assert.equal(live[1], `${'\u2212'}$747.00 is already banked on closed legs; the legs still open carry a +$1,160.00 credit.`);
+  assert.equal(live[2], 'Break-even at expiry $70.87 — closing everything for ≤ $4.13/share finishes the whole campaign ahead.');
+  const under = campaignHeadline({ ...ledger, net_cash: -250 }, { effective_breakevens: [74], close_even: { debit: -250, per_share: -1.25, qty: 2 } }, true);
+  assert.equal(under[0], 'Counting all 9 fills, you are net down $250.00 in cash so far.');
+  assert.ok(under[2].includes('you must collect ≥ $250.00 closing to get back to even'), under[2]);
+  assert.equal(campaignHeadline(ledger, null, false)[1], `The campaign is closed: ${'\u2212'}$747.00 realized.`);
 });

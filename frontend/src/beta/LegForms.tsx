@@ -86,7 +86,7 @@ export function RollForm({ trade, pnl, idx, onDone, onCancel }: {
   const rp = rollPreview({
     oldIsShort: oldShort, oldQty, oldEntry: legEntryPrice(trade, idx),
     buyback: parseFloat(f.closePrice), newAction: f.newAction, newPremium: parseFloat(f.newPremium), newQty: Number(f.newContracts) || 1,
-    priorRoll: Number(trade.roll?.roll_realized_pnl ?? 0), priorCount: Number(trade.roll?.count ?? 0),
+    priorRoll: Number(trade.roll?.campaign_realized_pnl ?? trade.roll?.roll_realized_pnl ?? 0), priorCount: Number(trade.roll?.count ?? 0),
   });
 
   const submit = async () => {

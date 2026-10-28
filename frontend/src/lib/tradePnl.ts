@@ -75,3 +75,21 @@ export function closedRowDeletion(tradeStatus: string | null | undefined, part: 
   const live = tradeStatus !== 'closed';
   return { kind: part === 'all' && !live ? 'delete_trade' : 'delete_part', live };
 }
+
+/** Plain-English close-out price from the campaign summary's `close_even` — the price at which closing
+ *  everything that is open leaves the WHOLE campaign (every partial close + roll included) at ≥ $0. */
+export function closeOutAdvice(ce: { debit: number; per_share: number | null; qty: number | null } | null | undefined):
+  { mode: 'pay' | 'collect' | 'even'; total: number; perShare: number | null } | null {
+  if (!ce || !Number.isFinite(ce.debit)) return null;
+  const mode = ce.debit > 0.005 ? 'pay' : ce.debit < -0.005 ? 'collect' : 'even';
+  return { mode, total: Math.abs(ce.debit), perShare: ce.per_share == null ? null : Math.abs(ce.per_share) };
+}
+
+/** OVERALL P&L of a live campaign: the open legs' unrealized + EVERYTHING banked on the options so far
+ *  (rolls AND partial closes). Falls back to roll-only for payloads from before partials were counted. */
+export function campaignPnl(unrealized: number | null | undefined,
+  roll: { campaign_realized_pnl?: number; roll_realized_pnl?: number } | null | undefined): number | null {
+  if (unrealized == null || !roll) return null;
+  const banked = roll.campaign_realized_pnl ?? roll.roll_realized_pnl ?? 0;
+  return Math.round((unrealized + banked) * 100) / 100;
+}

@@ -36,10 +36,12 @@ import {
 } from '../../api';
 import type { SavedStrategyItem, LivePnlResponse, TradeTransaction, LegAdvice, LegActionKind, ClosedMonthSummary } from '../../api';
 import { fmtMoney, fmtPct, fmtAnnualized, isMeaningfulAnnualized, fmtDTE, fmtDate, fmtQty, pnlSummary } from '../../lib/tradeFormat';
-import { type PricedPnl, isUnpriced, hasMark, effectivePnl, pnlTotals, optionIncome, closedRowDeletion } from '../../lib/tradePnl';
+import { type PricedPnl, isUnpriced, hasMark, effectivePnl, pnlTotals, optionIncome, closedRowDeletion, closeOutAdvice, campaignPnl as calcCampaignPnl } from '../../lib/tradePnl';
 import { rollPreview } from '../../lib/rollMath';
 import UpdatePositionModal from './UpdatePositionModal';
 import TransactionHistoryPanel from './TransactionHistoryPanel';
+import CampaignTimeline from './CampaignTimeline';
+import { useCampaignLedger } from './useCampaignLedger';
 import CreateAgentFromTradeModal from './CreateAgentFromTradeModal';
 import PayoffChart from './PayoffChart';
 import InstitutionalDesk from './InstitutionalDesk';
@@ -1148,34 +1150,23 @@ function TradeCard({
   // buy-backs is a cost-basis adjustment (roll.roll_realized_pnl), NOT a closed gain — so we
   // separate it from any genuine partial close and headline the campaign P&L (live unrealized +
   // roll realized), which is the only number that says whether the whole trade is ahead.
-  const roll = (trade.roll && (trade.roll.count || 0) > 0) ? trade.roll : null;
+  // The campaign summary exists for a rolled trade AND for one that only had partial closes. The cost basis of
+  // what is open NOW is reduced by EVERYTHING banked on the options — rolls + genuine partial closes — not only
+  // the roll-tagged part (counting only rolls put the AAOI break-even at $74.91 instead of the true $70.87).
+  const campaign = trade.roll ?? null;
+  const roll = (campaign && (campaign.count || 0) > 0) ? campaign : null;
   const rollRealized = roll ? Number(roll.roll_realized_pnl || 0) : 0;
   const isRolled = !!roll;
-  const genuinePartial = !isClosed && realizedPnl != null ? realizedPnl - rollRealized : 0;
-  const hasGenuinePartial = !isClosed && Math.abs(genuinePartial) > 0.005;
-  const campaignPnl = (isRolled && !isClosed && pnl?.unrealized_pnl != null)
-    ? pnl.unrealized_pnl + rollRealized : null;
-  // Only the generic "partial close" banner is superseded by the roll card; genuine partials
-  // (a real take-some-off close) still show through hasGenuinePartial.
-  const showRollCard = isRolled && !isClosed;
+  const partialRealized = campaign ? Number(campaign.partial_realized_pnl ?? 0) : 0;
+  const campaignBanked = campaign ? Number(campaign.campaign_realized_pnl ?? campaign.roll_realized_pnl ?? 0) : 0;
+  const campaignPnl = (campaign && !isClosed) ? calcCampaignPnl(pnl?.unrealized_pnl, campaign) : null;
+  const closeOut = closeOutAdvice(campaign?.close_even);
+  const showRollCard = !!campaign && !isClosed;
+  // The full journal for this position (lazy: only once the card is open); re-fetched when the trade changes.
+  const campaignLedger = useCampaignLedger(trade.id, isExpanded && showRollCard, trade.updated_at);
   // Roll-card equation formatters: a signed $ (credit + / cost −) and a green/red tone.
   const rSgn = (v: number) => `${v < 0 ? '−' : '+'}${fmtMoney(Math.abs(v))}`;
   const rTone = (v: number) => (v >= 0 ? 'text-success' : 'text-error');
-  // The ORIGINAL opening fill — reconstructed from the earliest rolled-out legs, whose stored
-  // entry_price IS the credit first collected (sell → +, buy → −). Lets the ledger start at fill #1.
-  const firstOpen = (() => {
-    const cl: any[] = Array.isArray(trade.parameters?.closed_legs) ? trade.parameters.closed_legs : [];
-    const rolled = cl.filter(l => l?.roll && l.entry_price != null);
-    if (!rolled.length) return null;
-    const minSeq = Math.min(...rolled.map(l => Number(l.roll_seq) || 1));
-    const orig = rolled.filter(l => (Number(l.roll_seq) || 1) === minSeq);
-    if (!orig.length) return null;
-    const cash = orig.reduce((s, l) => s + (/sell|short/i.test(l.action || '') ? 1 : -1) * (Number(l.entry_price) || 0) * 100 * Math.abs(Number(l.qty) || 1), 0);
-    const expOf = (l: any) => { const e = l.leg?.expiration || l.leg?.expiry || l.expiration; return e ? ` exp ${String(e).slice(0, 10)}` : ''; };
-    const descr = orig.map(l => `${l.action} ${l.type} $${l.strike}${expOf(l)}`).join(' · ');
-    return { cash: round2(cash), descr, date: trade.entry_date };
-  })();
-
   // Static class strings so Tailwind's JIT actually generates them (no safelist).
   const TINT_CLASSES: Record<string, string> = {
     success: 'border-l-success/50 bg-success/[0.03] hover:bg-success/[0.06]',
@@ -1293,12 +1284,12 @@ function TradeCard({
 
           {/* Roll campaign — a rolled trade is ONE continuing position; headline the campaign
               P&L and the roll-adjusted cost basis, and keep roll realized distinct from a close. */}
-          {showRollCard && roll && (
+          {showRollCard && campaign && (
             <div className="rounded-xl border border-warning/25 bg-warning/[0.05] px-3 py-2.5 space-y-2">
               <div className="flex items-center gap-2">
                 <RotateCcw className="w-4 h-4 text-warning shrink-0" />
                 <span className="text-[9px] uppercase tracking-wider text-warning/70 font-semibold">
-                  Rolled {roll.count}× · one continuing campaign
+                  {roll ? `Rolled ${roll.count}× · one continuing campaign` : 'Partial closes · adjusted cost basis'}
                 </span>
                 {campaignPnl != null && (
                   <span className="ml-auto text-right leading-tight">
@@ -1316,92 +1307,77 @@ function TradeCard({
                   <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
                     <span className="text-base-content/40 w-[116px] shrink-0 font-sans">Campaign P&amp;L</span>
                     <span className="text-base-content/60">open legs <b className={`tabular-nums ${rTone(pnl.unrealized_pnl)}`}>{rSgn(pnl.unrealized_pnl)}</b></span>
-                    <span className="text-base-content/30">+ roll realized</span>
-                    <b className={`tabular-nums ${rTone(rollRealized)}`}>{rSgn(rollRealized)}</b>
+                    <span className="text-base-content/30">+ banked on options</span>
+                    <b className={`tabular-nums ${rTone(campaignBanked)}`}>{rSgn(campaignBanked)}</b>
                     <span className="text-base-content/30">=</span>
                     <b className={`tabular-nums ${rTone(campaignPnl)}`}>{rSgn(campaignPnl)}</b>
                   </div>
                 )}
-                {roll.raw_net_credit != null && roll.effective_net_credit != null && (
+                {campaign.raw_net_credit != null && campaign.effective_net_credit != null && (
                   <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
-                    <span className="text-base-content/40 w-[116px] shrink-0 font-sans">Net premium banked</span>
-                    <span className="text-base-content/60">entry credit <b className={`tabular-nums ${rTone(roll.raw_net_credit)}`}>{rSgn(roll.raw_net_credit)}</b></span>
-                    <span className="text-base-content/30">+ roll realized</span>
-                    <b className={`tabular-nums ${rTone(rollRealized)}`}>{rSgn(rollRealized)}</b>
+                    <span className="text-base-content/40 w-[116px] shrink-0 font-sans">Cost basis (all-in)</span>
+                    <span className="text-base-content/60">open legs credit <b className={`tabular-nums ${rTone(campaign.raw_net_credit)}`}>{rSgn(campaign.raw_net_credit)}</b></span>
+                    <span className="text-base-content/30">+ banked on options</span>
+                    <b className={`tabular-nums ${rTone(campaignBanked)}`}>{rSgn(campaignBanked)}</b>
                     <span className="text-base-content/30">=</span>
-                    <b className="tabular-nums">{rSgn(roll.effective_net_credit)}</b>
-                    {roll.effective_breakevens && roll.effective_breakevens.length > 0 && (
-                      <span className="text-base-content/40 ml-1 font-sans">→ eff. BE {roll.effective_breakevens.map(b => `$${b.toFixed(2)}`).join(' / ')}
-                        {roll.raw_breakevens && roll.raw_breakevens.length > 0 && (
-                          <span className="text-base-content/30"> (was {roll.raw_breakevens.map(b => `$${b.toFixed(2)}`).join(' / ')})</span>
+                    <b className="tabular-nums" data-testid="effective-net-credit">{rSgn(campaign.effective_net_credit)}</b>
+                    {campaign.effective_breakevens && campaign.effective_breakevens.length > 0 && (
+                      <span className="text-base-content/40 ml-1 font-sans" data-testid="effective-be">→ break-even {campaign.effective_breakevens.map(b => `$${b.toFixed(2)}`).join(' / ')}
+                        {campaign.raw_breakevens && campaign.raw_breakevens.length > 0 && (
+                          <span className="text-base-content/30"> (open legs alone: {campaign.raw_breakevens.map(b => `$${b.toFixed(2)}`).join(' / ')})</span>
                         )}
                       </span>
                     )}
                   </div>
                 )}
+                {/* Where the banked number came from — so it is traceable, never a black box */}
+                {(Math.abs(rollRealized) > 0.005 || Math.abs(partialRealized) > 0.005) && (
+                  <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+                    <span className="text-base-content/40 w-[116px] shrink-0 font-sans">Banked so far</span>
+                    {Math.abs(rollRealized) > 0.005 && <span className="text-base-content/60">rolls <b className={`tabular-nums ${rTone(rollRealized)}`}>{rSgn(rollRealized)}</b></span>}
+                    {Math.abs(rollRealized) > 0.005 && Math.abs(partialRealized) > 0.005 && <span className="text-base-content/30">+</span>}
+                    {Math.abs(partialRealized) > 0.005 && <span className="text-base-content/60">partial closes <b className={`tabular-nums ${rTone(partialRealized)}`}>{rSgn(partialRealized)}</b></span>}
+                    <span className="text-base-content/30">=</span>
+                    <b className={`tabular-nums ${rTone(campaignBanked)}`}>{rSgn(campaignBanked)}</b>
+                  </div>
+                )}
+                {/* The number to act on: what to close the open legs for so the WHOLE campaign ends ahead */}
+                {closeOut && (
+                  <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5" data-testid="close-out">
+                    <span className="text-base-content/40 w-[116px] shrink-0 font-sans">Close-out price</span>
+                    {closeOut.mode === 'pay' && (
+                      <span className="text-base-content/70 font-sans">
+                        Buy back the open legs for{' '}
+                        <b className="text-success tabular-nums">≤ {closeOut.perShare != null ? `${fmtMoney(closeOut.perShare)}/share` : fmtMoney(closeOut.total)}</b>
+                        {closeOut.perShare != null && <span className="text-base-content/40"> ({fmtMoney(closeOut.total)})</span>}
+                        {' '}and the whole campaign finishes ahead.
+                      </span>
+                    )}
+                    {closeOut.mode === 'collect' && (
+                      <span className="text-base-content/70 font-sans">
+                        Under water: you must <b className="text-warning">collect ≥ {fmtMoney(closeOut.total)}</b> closing the open legs to get back to even.
+                      </span>
+                    )}
+                    {closeOut.mode === 'even' && <span className="text-base-content/70 font-sans">Closing at the opening price leaves the campaign at $0.</span>}
+                  </div>
+                )}
               </div>
               <p className="text-[9px] text-base-content/35 leading-snug">
-                A rolled position is ONE campaign. <b>Roll realized</b> is what you banked closing the old legs — it folds into <b>both</b> lines: against the open legs’ live mark it gives your campaign P&amp;L (are you ahead), and against their entry credit it gives the net premium banked (which sets the effective breakeven).
+                A position with partial closes and/or rolls is ONE campaign. <b>Banked</b> is everything realized on the options so far — every roll buy-back and every leg taken off early. It folds into <b>both</b> lines: against the open legs’ live mark it gives your campaign P&amp;L (are you ahead overall), and against their entry credit it gives the all-in cost basis (which sets the break-even and the close-out price).
               </p>
 
-              {/* Transaction ledger — the actual roll fills, so every number above is traceable. */}
-              {roll.history && roll.history.length > 0 && (
-                <div className="rounded-lg border border-white/[0.06] bg-base-100/40 overflow-hidden">
-                  <div className="px-2.5 py-1.5 border-b border-white/[0.06] flex items-center gap-1.5">
-                    <List className="w-3 h-3 text-base-content/40" />
-                    <span className="text-[9px] uppercase tracking-wider text-base-content/45 font-semibold">Transaction ledger</span>
-                    <span className="ml-auto text-[9px] text-base-content/35">{roll.history.length} roll{roll.history.length !== 1 ? 's' : ''}</span>
-                  </div>
-                  <div className="divide-y divide-white/[0.04]">
-                    {firstOpen && (
-                      <div className="px-2.5 py-1.5 text-[10px]">
-                        <div className="flex items-baseline gap-1.5">
-                          <span className="font-semibold text-base-content/75 w-16 shrink-0">Opened</span>
-                          <span className="text-base-content/70 min-w-0" title={firstOpen.descr}>{firstOpen.descr}</span>
-                          <span className="ml-auto font-mono tabular-nums text-success/80 shrink-0">{rSgn(firstOpen.cash)}</span>
-                        </div>
-                        {firstOpen.date && <div className="text-[8px] text-base-content/30 mt-0.5 pl-[68px]">{fmtDate(firstOpen.date)}</div>}
-                      </div>
-                    )}
-                    {roll.history.map((h, i) => (
-                      <div key={h.roll_id || i} className="px-2.5 py-1.5 text-[10px]">
-                        <div className="flex items-baseline gap-1.5 mb-1">
-                          <span className="font-semibold text-base-content/75">Roll {h.seq}</span>
-                          <span className="text-base-content/35">{fmtDate(h.date)}</span>
-                          <span className="ml-auto text-base-content/40">realized</span>
-                          <b className={`font-mono tabular-nums ${rTone(h.realized)}`}>{rSgn(h.realized)}</b>
-                        </div>
-                        {(h.from?.length ?? 0) > 0 && (
-                          <div className="flex items-baseline gap-1.5">
-                            <span className="w-16 shrink-0 text-error/70 uppercase text-[8px] tracking-wider">bought back</span>
-                            <span className="text-base-content/70 min-w-0" title={h.from.join(' · ')}>{h.from.join(' · ')}</span>
-                            {h.buyback_cost != null && <span className="ml-auto font-mono tabular-nums text-error/80 shrink-0">−{fmtMoney(h.buyback_cost)}</span>}
-                          </div>
-                        )}
-                        {(h.to?.length ?? 0) > 0 && (
-                          <div className="flex items-baseline gap-1.5">
-                            <span className="w-16 shrink-0 text-success/70 uppercase text-[8px] tracking-wider">sold new</span>
-                            <span className="text-base-content/70 min-w-0" title={h.to.join(' · ')}>{h.to.join(' · ')}</span>
-                            {h.new_credit != null && <span className="ml-auto font-mono tabular-nums text-success/80 shrink-0">+{fmtMoney(h.new_credit)}</span>}
-                          </div>
-                        )}
-                        {h.note && <div className="text-base-content/35 italic mt-0.5">“{h.note}”</div>}
-                      </div>
-                    ))}
-                  </div>
+              {/* Journal — EVERY fill (the original opening included), grouped into what you did, so every
+                  number above is traceable. Was a partial list that started at the first rolled-out leg. */}
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-1.5">
+                  <List className="w-3 h-3 text-base-content/40" />
+                  <span className="text-[9px] uppercase tracking-wider text-base-content/45 font-semibold">Journal · everything done on this position</span>
                 </div>
-              )}
-              {hasGenuinePartial && (
-                <div className="text-[10px] text-base-content/50">
-                  Plus a genuine partial close:{' '}
-                  <span className={genuinePartial >= 0 ? 'text-success' : 'text-error'}>
-                    {genuinePartial >= 0 ? '+' : '−'}{fmtMoney(Math.abs(genuinePartial))}
-                  </span>{' '}banked.
-                </div>
-              )}
+                <CampaignTimeline compact data={campaignLedger.data} loading={campaignLedger.loading} error={campaignLedger.error} />
+              </div>
               <div className="text-[9px] text-base-content/35">
                 Roll P&amp;L is a cost-basis adjustment — it stays out of the Closed tab until the whole trade
-                is closed (toggle it on there to preview).
+                is closed (toggle it on there to preview). Partial closes already show in the Closed tab.
               </div>
             </div>
           )}
@@ -2267,7 +2243,7 @@ function TradeCard({
                                   {(() => {
                                     // Live decision aids: realized on the buy-back, the roll's net cash, and — the
                                     // number the user asked for — the credit to collect on the new leg to keep the
-                                    // WHOLE campaign (all prior rolls included) at least break-even.
+                                    // WHOLE campaign (every prior roll AND partial close included) at least break-even.
                                     const rl = trade.legs_data?.[rollState.legIdx] || {};
                                     const oldQty = Number(rl.qty ?? rl.contracts ?? 1) || 1;
                                     const isShortOld = /sell|short/i.test(rl.action || '');
@@ -2278,7 +2254,8 @@ function TradeCard({
                                       oldIsShort: isShortOld, oldQty, oldEntry,
                                       buyback: parseFloat(rollState.closePrice), newAction: rollState.newAction,
                                       newPremium: parseFloat(rollState.newPremium), newQty: Number(rollState.newContracts) || 1,
-                                      priorRoll: Number(trade.roll?.roll_realized_pnl ?? 0), priorCount: Number(trade.roll?.count ?? 0),
+                                      // everything already banked on the options — rolls AND partial closes — not just the roll-tagged part
+                                      priorRoll: Number(trade.roll?.campaign_realized_pnl ?? trade.roll?.roll_realized_pnl ?? 0), priorCount: Number(trade.roll?.count ?? 0),
                                     });
                                     if (!rp.hasAny) return null;
                                     const { realizedClose, netRollCash, campaignAfter, newCredit, targetCredit, targetPerShare, meets, priorCount, newQty } = rp;
@@ -2295,7 +2272,7 @@ function TradeCard({
                                               <span className={netRollCash >= 0 ? 'text-success font-semibold' : 'text-error font-semibold'}>{sign(netRollCash)}</span></div>
                                           )}
                                           {campaignAfter != null && (
-                                            <div className="flex justify-between"><span className="text-base-content/40">Campaign realized after{priorCount > 0 ? ` (${priorCount} prior)` : ''}</span>
+                                            <div className="flex justify-between"><span className="text-base-content/40">Campaign realized after{priorCount > 0 ? ` (${priorCount} prior roll${priorCount > 1 ? 's' : ''})` : ''}</span>
                                               <span className={campaignAfter >= 0 ? 'text-success font-semibold' : 'text-error font-semibold'}>{sign(campaignAfter)}</span></div>
                                           )}
                                           {newCredit != null && (
