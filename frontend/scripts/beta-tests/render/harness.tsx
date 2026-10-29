@@ -41,6 +41,7 @@ async function click(container: HTMLElement, re: RegExp, sel = 'button, summary'
   await act(async () => { el!.dispatchEvent(new (g.window as any).MouseEvent('click', { bubbles: true })); });
   await settle(30);
 }
+const openDetails = async (c: HTMLElement) => { await click(c, /^Details/); await settle(30); };
 const has = (t: string, ...xs: string[]) => xs.forEach(x => assert(t.includes(x), `missing "${x}"`));
 const lacks = (t: string, ...xs: string[]) => xs.forEach(x => assert(!t.includes(x), `unexpected "${x}"`));
 const before = (t: string, a: string, b: string) => assert(t.indexOf(a) >= 0 && t.indexOf(b) >= 0 && t.indexOf(a) < t.indexOf(b), `"${a}" should come before "${b}"`);
@@ -372,7 +373,7 @@ async function main() {
     await settle(200); let t = m.text();
     has(t, 'Building the desk recommendation', 'put credit spread', 'Mark if closed', '−$248'); lacks(t, 'What to do', 'When to act', 'Next best moves'); ok('spread: phase 1 paints the header; the recommendation, steps and timing are held back until the roll search lands');
     assert(log.filter(l => l.includes('/defend/refine')).length === 1, 'the spread triggers the live roll search exactly once'); ok('a credit spread now triggers the live roll search (it used to be skipped)');
-    release(); await settle(200); t = m.text();
+    release(); await settle(200); await openDetails(m.container); t = m.text();
     // the pick: the user's own idea — Nov 20 75/65 at a credit — with the income-policy label, not Hold/Close
     has(t, 'Desk recommendation', 'Income policy', '→ Roll the $80/70 put spread → $75/65 · Nov 20 (36d) — +$68 credit'); lacks(t, '→ Close the trade', '→ Hold as-is'); ok('the pick is the $80/70 → $75/65 Nov 20 roll at a credit, labelled as the income-policy pick (not Close, not Hold)');
     // WHAT TO CLOSE and WHAT TO OPEN, with prices and cash, and the net
@@ -387,7 +388,7 @@ async function main() {
     // the runner-up must not contradict the pick
     has(t, 'Runner-up:', 'Do nothing: keeps the position exactly as it is'); lacks(t, 'No fix clears the bar'); ok('the Hold runner-up says what it keeps and forgoes — it no longer claims "no fix clears the bar" beside a pick that is a fix');
     // the ranked rows: pick FIRST (even though Hold scores higher), each with a compact Close → Open line
-    const rows = [...m.container.querySelectorAll('button[aria-expanded]')] as HTMLElement[];
+    const rows = [...m.container.querySelectorAll('button[aria-expanded][title^="Tap for the score"]')] as HTMLElement[];
     assert(/Desk pick/.test(rows[0].textContent || '') && /\$75\/65/.test(rows[0].textContent || ''), `first row should be the desk pick, got: ${rows[0].textContent?.slice(0, 80)}`);
     ok('the desk pick leads "Next best moves" even though Hold has the higher raw score');
     const lines = [...m.container.querySelectorAll('[data-testid="move-steps-line"]')].map(e => e.textContent || '');
@@ -403,7 +404,7 @@ async function main() {
     const F: any = defendFixture;
     installFetch([['/repair-menu', () => F.inside.final]], []);
     const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
-    await settle(200); const t = m.text();
+    await settle(200); await openDetails(m.container); const t = m.text();
     has(t, '→ Hold as-is (do nothing)', 'Nothing to trade — you keep', 'Keep short 1× $80 put', 'When to act — Defend before the print — earnings Nov 5 (21d)', 'INSIDE this trade', 'coin-flip', 'appetite');
     lacks(t, 'Income policy'); ok('print INSIDE the trade and no even-cost roll: Hold (a coin-flip vs Close, said so), "defend before the print", and no income-policy label');
     has(t, 'Roll search: No roll of this spread at even cost or better'); ok('the search says plainly that no even-cost roll exists');
@@ -413,7 +414,7 @@ async function main() {
     const F: any = defendFixture;
     installFetch([['/repair-menu', () => F.naked.final]], []);
     const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AMD" />);
-    await settle(200); const t = m.text();
+    await settle(200); await openDetails(m.container); const t = m.text();
     has(t, '→ Cap the tail — buy the $95 call', 'Buy to open 1× $95 call', 'new money', 'Keep short 1× $85 call'); lacks(t, 'Income policy'); ok('a naked call: the pick is a debit wing — shown as NEW money, keeping the short as it is — and the income policy does not apply');
     await m.unmount();
   }
@@ -421,7 +422,7 @@ async function main() {
     const F: any = defendFixture;
     installFetch([['/repair-menu', () => F.healthy.final]], []);
     const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
-    await settle(200); const t = m.text();
+    await settle(200); await openDetails(m.container); const t = m.text();
     has(t, 'Healthy', '→ Hold as-is (do nothing)', 'Nothing to time — leave it'); lacks(t, 'Income policy', 'Defend before the print', 'coin-flip'); ok('a healthy spread: Hold, nothing to time, no policy label, no print lecture');
     await m.unmount();
   }
@@ -434,6 +435,45 @@ async function main() {
     await m.unmount();
   }
 
+  console.log('BetaDefend — the in-the-money spread trap: what to do · today or wait · details (REAL engine payloads)');
+  {
+    const F: any = defendFixture;
+    let release: any;
+    installFetch([
+      ['/defend/refine', () => new Promise(r => { release = () => r(F.trap.final); })],
+      ['/repair-menu', async () => { await new Promise(r => setTimeout(r, 60)); return F.trap.phase1; }],
+    ], []);
+    const m = await mount(<BetaDefend tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
+    await settle(200); let t = m.text();
+    has(t, 'Building the desk recommendation', 'Details'); lacks(t, 'What to do', 'Today or wait?'); ok('trap: phase 1 holds the plan back (never a provisional pick)');
+    release(); await settle(250); t = m.text();
+    const ap = F.trap.final.action_plan;
+    has(t, 'What to do', ap.verdict, 'Within your rule', 'A little more risk for better odds', 'Or take the loss', 'Your idea'); ok('the plan leads with ONE verdict line, then the moves by tier: within your rule · a little more risk · close');
+    const rowsEl = [...m.container.querySelectorAll('[data-testid="action-row"]')];
+    assert(rowsEl.length === ap.rows.length, `rows ${rowsEl.length} vs ${ap.rows.length}`);
+    const pickEl = rowsEl.find(e => /★ Pick/.test(e.textContent || '')) as HTMLElement;
+    const pickRow = ap.rows.find((r: any) => r.is_pick);
+    assert(pickEl && (pickEl.textContent || '').includes(pickRow.title), 'the pick card is the plan pick'); ok('exactly the plan\'s pick is starred');
+    const idea = ap.rows.find((r: any) => r.tag.startsWith('Your idea'));
+    const ideaEl = rowsEl.find(e => (e.textContent || '').includes(idea.title)) as HTMLElement;
+    for (const o of idea.orders) has(ideaEl.textContent || '', o);
+    has(ideaEl.textContent || '', 'Cash today', 'Worst', 'Best', 'Lose less', 'E[P&L]'); ok('the user\'s own same-strikes roll is priced, with its four orders and the same five numbers as every row');
+    const ex = ap.explorer || [];
+    assert(ex.length >= 8, `explorer families: ${ex.length}`);
+    assert(m.container.querySelectorAll('[data-testid="explorer-row"]').length === ex.length);
+    has(t, 'Every strategy tested', ...ex.map((x: any) => x.family)); ok('every strategy family the search priced is listed with its best version and why (calls, call spreads, jade, butterflies, backspread, calendar, diagonal, rolls…)');
+    const firstEx = m.container.querySelector('[data-testid="explorer-row"]') as HTMLElement;
+    await act(async () => { firstEx.dispatchEvent(new (g.window as any).MouseEvent('click', { bubbles: true })); }); await settle(30);
+    has(m.text(), ex[0].best.orders[0]); ok('tapping a strategy shows its orders');
+    t = m.text();
+    has(t, 'Today or wait?', F.trap.final.timing_read.headline); assert(m.container.querySelectorAll('[data-testid="timing-read"] tbody tr').length === F.trap.final.timing_read.rows.length); ok('today-or-wait: the headline and one row per move (today · last day · bounce · drop · IV −10)');
+    assert(m.container.querySelectorAll('[data-testid="timing-signals"] li').length === F.trap.final.timing_read.signals.length); ok('…and the signals behind it, tagged bounce / drop / volatility / earnings / tape');
+    lacks(t, 'Position anatomy'); await openDetails(m.container); t = m.text();
+    has(t, 'Position anatomy', 'Time now works AGAINST you', 'Desk recommendation', 'Assignment ladder'); ok('the leg-by-leg read, the scored recommendation and the ladder sit in Details');
+    before(t, 'What to do', 'Today or wait?'); before(t, 'Today or wait?', 'Position anatomy'); ok('reading order: what to do → today or wait → details');
+    await m.unmount();
+  }
+
   console.log('Classic DefendPanel — same steps / timing wording');
   {
     const F: any = defendFixture;
@@ -442,6 +482,15 @@ async function main() {
     await settle(400); const t = m.text();
     has(t, 'Roll the $80/70 put spread → $75/65 · Nov 20', 'income policy', 'What to do', 'Buy to close 1× $80 put', 'Net cash today', 'All-in', 'When to act — Window: now → Nov 11');
     before(t, 'What to do', 'When to act'); ok('the classic panel shows the same what-to-close/open, all-in and when-to-act blocks');
+    await m.unmount();
+  }
+  {
+    const F: any = defendFixture;
+    installFetch([['/defend/refine', () => F.trap.final], ['/repair-menu', () => F.trap.phase1]], []);
+    const m = await mount(<DefendPanel tradeId={1} quoteSource="yfinance" ticker="AAOI" />);
+    await settle(400); const t = m.text();
+    has(t, 'What to do', 'Within your rule', 'Today or wait?', 'Position anatomy', 'Time now works AGAINST you', 'Assignment ladder');
+    before(t, 'What to do', 'Position anatomy'); ok('the classic panel leads with the same plan; the anatomy and ladder are in its Details');
     await m.unmount();
   }
 

@@ -74,6 +74,7 @@ class TestDirectionIsInfoOnly:
         for bonus, _note, factors in (up, down):
             trend = next(f for f in factors if f["label"] == "Trend drift")
             assert trend["points"] == 0 and trend["detail"].startswith("info only")
+            assert trend.get("info_only") is True          # tagged → the UI moves it out of the grade
         assert up[0] == down[0]                                                # same score either way
         breach = lambda fs: next(f for f in fs if f["label"] == "Breach risk")
         assert breach(up[2])["points"] == breach(down[2])["points"]
@@ -82,6 +83,7 @@ class TestDirectionIsInfoOnly:
         _, _, fs = _ta_alignment(_csp_opp(), _ta(0.0), None, S, hv=0.30, beta=2.0, mkt_drift=-0.25)
         sysb = next(f for f in fs if f["label"] == "Systemic beta")
         assert sysb["points"] == 0 and "info only" in sysb["detail"]
+        assert sysb.get("info_only") is True
 
     def test_momentum_never_holds_a_trade(self):
         g = _algo_grade(_csp_opp(), {"pm": {}, "risk": {}}, S, 4.3, 30.0, None, None, hv=0.30,

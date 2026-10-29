@@ -175,3 +175,24 @@ def test_scan(monkeypatch, half_spread, expect):
         assert r["n_opportunities"] == 0
         assert r["note"].startswith("No trade cleared 85% keep-probability AND $20 premium")
         assert any("can't be filled" in l and "too wide even for a limit order" in l for l in r["note_reasons"])
+
+
+class TestUntradedWideMarket:
+    """A wide quote nobody traded (open interest only) is a placeholder, not a market a limit order fills in."""
+
+    def test_limit_only_needs_a_trade_in_the_latest_session(self):
+        assert not _limit_only_ok(_q(85, 1.00, 2.90, oi=500, vol=0), 20.0)
+        assert _limit_only_ok(_q(85, 1.00, 2.90, oi=500, vol=0), 20.0, need_volume=False)
+        assert _limit_only_ok(_q(85, 1.00, 2.90, oi=500, vol=1), 20.0)
+
+    def test_untraded_wide_strike_is_dropped_and_explained(self):
+        diag = {}
+        assert _build(_q(85, 1.00, 2.90, oi=500, vol=0), diag=diag) is None
+        assert diag["put"]["untraded"]["n"] == 1
+        lines = _no_trade_reasons(diag, [(EXP, DTE)], [], ["cash_secured_put"], 0.85, 20.0, False, None,
+                                  date.today(), "target", True)
+        assert any("NO contracts traded in the latest session" in l for l in lines)
+
+    def test_traded_wide_strike_is_still_offered(self):
+        o = _build(_q(85, 1.00, 2.90, oi=500, vol=3))
+        assert o is not None and o["limit_only"] is True

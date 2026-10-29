@@ -428,3 +428,32 @@ async def gather_company_filings(db, ticker: str, max_8k: int = 2) -> dict:
         "documents_found": bool(docs),
         "docs": docs,
     }
+
+
+async def earnings_release_times(db, ticker: str, limit: int = 16) -> list[str]:
+    """Exact past EARNINGS-RELEASE timestamps (UTC, ISO) from the SEC: every 8-K carrying Item 2.02 ("Results of Operations"),
+    newest first, with its EDGAR acceptance time — so an after-the-close release (accepted after 4pm ET) can be told from a
+    pre-market one. Reuses the cached submissions block. Best-effort: [] when the company or EDGAR is unavailable."""
+    try:
+        cik = await get_cik(db, ticker)
+        if not cik:
+            return []
+        cik_int = int(cik)
+        cache_key = f"edgar:subs:{cik_int}"
+        subs = await get_cached(db, cache_key) if db is not None else None
+        recent = (subs or {}).get("recent") if subs else None
+        if not recent or "items" not in recent or "acceptanceDateTime" not in recent:
+            raw = await _get(f"https://data.sec.gov/submissions/CIK{cik_int:010d}.json", as_json=True)
+            recent = raw.get("filings", {}).get("recent", {})
+            if db is not None:
+                await set_cached(db, cache_key, {"recent": recent}, ttl_seconds=_TTL_SUBS)
+        out = []
+        for form, items, acc in zip(recent.get("form", []), recent.get("items", []), recent.get("acceptanceDateTime", [])):
+            if form in ("8-K", "6-K") and "2.02" in str(items or "") and acc:
+                out.append(str(acc))
+                if len(out) >= limit:
+                    break
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("earnings_release_times failed for %s: %s", ticker, exc)
+        return []

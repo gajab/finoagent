@@ -366,7 +366,7 @@ class TestSetupsCacheKey:
     change must bump it in exactly one place (the old payload had no `edge.equity.win_pct`)."""
 
     def test_key_is_versioned_past_the_old_shape(self):
-        assert setups_cache_key("NVDA") == "setups:NVDA:v4"      # v3 held edge.equity.{pop_pct, ev_per_share, kelly_pct}
+        assert setups_cache_key("NVDA") == "setups:NVDA:v5"      # v4 had no context.earnings_reaction / flip_levels
 
     def test_no_consumer_hardcodes_the_key(self):
         import pathlib

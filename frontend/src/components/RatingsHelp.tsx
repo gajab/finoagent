@@ -244,12 +244,11 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                   <li><b>Calm tape / clean window</b> — a range-bound / mean-reverting regime (probes of the strike tend to
                     revert rather than persist into assignment), and the σ itself is <b>event-aware</b>, so a window with
                     <b> no earnings/events</b> keeps the breach cone narrow while an upcoming print widens it.</li>
-                  <li><b>Vol-expansion / Defensibility / Systemic beta</b> — path risks: a short-gamma tape can widen the
+                  <li><b>Vol-expansion / Defensibility</b> · <b>Systemic beta</b> — path risks: a short-gamma tape can widen the
                     breach cone; <b>Defensibility</b> rewards a strike you can roll <i>away-and-out for a credit</i> (a put
                     down, a call up — defend for free) and docks near-expiry / debit-to-roll trades; <b>Systemic beta</b>
-                    docks a high-beta short leg when the <b>market moves against it</b> — a short <b>put</b> when the SPX is
-                    trending <b>down</b>, a short <b>call</b> when it's trending <b>up</b> — which the single-name touch
-                    prob can't see.</li>
+                    (context only, not scored) notes a high-beta short leg when the <b>market is trending against it</b> — a
+                    short <b>put</b> into a falling SPX, a short <b>call</b> into a rally.</li>
                 </ul>
                 <p className="text-[12px] text-base-content/55 leading-snug mt-1.5">
                   <b>Win %</b> is still the finish-OTM (keep-at-expiry) probability; <b>Breach risk</b> is the stricter
@@ -283,17 +282,15 @@ export function RatingsHelpButton({ className = '' }: { className?: string }) {
                 </Chip>
 
                 <Chip icon={<Sparkles className="w-4 h-4 text-secondary" />}
-                  title={<>TA factors · DTE-matched (± on base) — e.g. <span className="text-success">Trend drift +6</span>, <span className="text-error">Gamma regime −6</span></>}>
+                  title={<>TA factors · DTE-matched (± on base) — e.g. <span className="text-success">Structure +4</span>, <span className="text-error">Gamma regime −6</span></>}>
                   Each signed bar is one technical factor's points on the base score, computed on the timeframe
-                  <b> matched to your trade's horizon</b> (see <i>Timeframe</i> below). <b>Trend drift</b> — <b>momentum as one signal</b>: the
-                  annualized EMA-slope <i>velocity</i> (a tailwind + or headwind − for the short side) <i>modulated</i> by
-                  MACD <i>acceleration</i> — a tailwind that's decelerating is faded, not paid in full. <b>Structure</b> — is
-                  the strike behind a wall (see the section above). <b>Gamma regime</b> — the dealer-gamma chip above,
-                  applied to every trade. <b>Range fit</b> — a range-bound tape suits neutral premium. <b>LVN slip</b> — a
-                  strike sitting in a thin volume node has no absorption (−). When that momentum accelerates against a strike
-                  that's <b>actually reachable</b> (near-money / non-trivial P(touch)) it becomes a <span className="text-warning"><b>WAIT · timing</b></span>
-                  hold — but on a deep, wall-defended strike it's just the faded drift above, never a veto. (RSI &amp;
-                  Bollinger are shown for context but don't move the deterministic score.)
+                  <b> matched to your trade's horizon</b> (see <i>Timeframe</i> below). <b>Structure</b> — is the strike behind a
+                  wall (see the section above). <b>Gamma regime</b> — the dealer-gamma chip above, applied to every trade.
+                  <b> Range fit</b> — a range-bound tape suits neutral premium. <b>Direction is not scored</b>: trend drift, MACD,
+                  systemic beta, chart patterns and the volume node at your strike appear in <b>Before you trade — technical
+                  context</b> and each trade's <i>Context · not scored</i> notes. Backtests found no edge in them — no directional
+                  edge in trend/momentum states (2016–26), and no higher breach rate for a strike in a low-volume node at the same
+                  σ distance (62 stocks, 5 years) — so they inform, they don't grade.
                 </Chip>
               </div>
 

@@ -458,12 +458,14 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
     _evoid = _clampf(_eg_frac / _EARN_VOID_SCALE, 0.0, 1.0) if (earnings_on and _eg_frac) else 0.0
     _defined_risk = opp.get("max_loss") is not None      # bounded loss (spread/condor/CSP/covered) → gap consequence CAPPED
 
-    def add(label: str, pts: float, note: str, baseline: Optional[float] = None):
+    def add(label: str, pts: float, note: str, baseline: Optional[float] = None, info: bool = False):
         # ``detail`` = the concrete price-point evidence, surfaced per-factor in the UI so the user sees
         # WHY the factor scored (which support/wall/value-area level, GEX value, node volume, etc.).
         # ``baseline_points`` (+ ``earnings_impacted``) = the value WITHOUT the earnings adjustment, for the
         # with/without comparison — set only when it actually differs from the applied points.
         f = {"label": label, "points": pts, "detail": note}
+        if info:                       # context only — never scored; the UI shows it in the pre-trade brief instead
+            f["info_only"] = True
         if baseline is not None and round(baseline, 1) != round(pts, 1):
             f["baseline_points"] = round(baseline, 1)
             f["earnings_impacted"] = True
@@ -509,7 +511,7 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
         _hz = f" ≈ {'+' if mu > 0 else ''}{round(mu * _dte / 365 * 100, 1)}% over {_dte}d" if _dte else ""
         _dir = "tailwind" if pts > 0 else "headwind" if pts < 0 else "neutral"
         add("Trend drift", 0, f"info only (direction isn't scored) — trend velocity {round(mu * 100)}%/yr "
-            f"(annualized EMA slope){_hz}, a {_dir} for this structure{_accel_note}")
+            f"(annualized EMA slope){_hz}, a {_dir} for this structure{_accel_note}", info=True)
     if mode == "range" and s in _NEUTRAL_INCOME:
         _va = f", value area ${round(vp['val'], 1)}–${round(vp['vah'], 1)}" if vp.get("val") and vp.get("vah") else ""
         _poc = f"POC ${round(vp['poc'], 1)}" if vp.get("poc") else "range-bound tape"
@@ -720,12 +722,12 @@ def _ta_alignment(opp: dict, ta: dict, gex: Optional[dict] = None,
             # INFO ONLY — a market-DIRECTION read (SPX trend × beta); direction isn't scored.
             add("Systemic beta", 0, f"info only (direction isn't scored) — beta {round(beta, 2)} into a "
                 f"{'falling' if _legw == 'put' else 'rallying'} market (SPX drift {round(mkt_drift * 100)}%/yr): a broad "
-                f"{_evt} would drag this name toward the short {_legw}")
+                f"{_evt} would drag this name toward the short {_legw}", info=True)
 
     # LVN slip-through — a short strike in a thin volume node has no absorption (Phase-3 friction test).
     lvn = _lvn_check(opp, vp, spot)
     if lvn:
-        add(lvn["label"], lvn["points"], lvn["note"])
+        add(lvn["label"], lvn["points"], lvn["note"], info=True)
     # Dealer gamma regime (GEX proxy) — long gamma suppresses vol (a good backdrop for selling premium);
     # short gamma exacerbates it (dangerous). A STOCK-level positioning read applied to every trade.
     if gex and gex.get("regime") in ("long", "short"):
@@ -814,6 +816,16 @@ def _ta_sync(ticker: str, dte: Optional[int] = None) -> dict:
             ta.update(compute_momentum_indicators(stock))   # MACD / Bollinger / SMA-EMA (daily)
         except Exception:  # noqa: BLE001
             pass
+        try:                                                # recent classical chart patterns (context for the brief)
+            from .chart_pattern_service import compute_chart_patterns
+            cp = compute_chart_patterns(stock, period="6mo" if (dte or 35) <= 25 else "1y") or {}
+            ta["_patterns"] = [{"name": p.get("name"), "direction": p.get("direction"), "status": p.get("status"),
+                                "confidence": p.get("confidence"),
+                                "breakout": (p.get("breakout") or {}).get("level"),
+                                "target": (p.get("target") or {}).get("price")}
+                               for p in (cp.get("patterns") or [])]
+        except Exception:  # noqa: BLE001
+            ta["_patterns"] = []
         try:                                                # EMA-slope drift μ + ATR (gap-aware vol) — swing read
             import pandas as pd, numpy as np                # noqa: F401
             h6 = stock.history(period="6mo", interval="1d").dropna()
@@ -980,6 +992,145 @@ def _ta_summary(ta: dict) -> dict:
         "support": ta.get("supportLevel"), "resistance": ta.get("resistanceLevel"),
         "poc": vp.get("poc"), "value_area": [vp.get("val"), vp.get("vah")] if vp else None,
         "trend": ms.get("trend"), "bos": (ms.get("bos") or {}).get("type") if ms.get("bos") else None,
+    }
+
+
+def _pct_from(x: Optional[float], spot: Optional[float]) -> str:
+    return f"{(x / spot - 1) * 100:+.1f}%" if (x and spot) else ""
+
+
+def _ta_brief(ta: dict, spot: Optional[float], dte: Optional[int]) -> dict:
+    """Pre-trade technical brief — CONTEXT ONLY, never scored. Deterministic sentences from the SAME TA read the
+    desk graded with (structure rung for levels/volume profile, one rung up for the trend), so nothing here can
+    disagree with the grade's levels. Direction is summarised, not scored: the 2016–26 point-in-time backtest found
+    no directional edge in trend/momentum states (see trade_manager_service.BACKTEST)."""
+    ta = ta or {}
+    inst = ta.get("institutional") or {}
+    reg = ta.get("_trend_regime") or inst.get("regime") or {}
+    vp = inst.get("volume_profile") or {}
+    ms = inst.get("market_structure") or {}
+    items: list[dict] = []
+
+    def item(key, topic, tone, text):
+        items.append({"key": key, "topic": topic, "tone": tone, "text": text})
+
+    # Direction — regime, EMA-slope drift, moving averages
+    mu = ta.get("_drift_mu")
+    bias = (reg.get("bias") or "").lower()
+    ma = ta.get("movingAverages") or {}
+    ema = ta.get("emaCrossover") or {}
+    bits = []
+    if reg.get("state"):
+        bits.append(f"{reg['state']} ({bias or 'no bias'})" + (f" on the {ta['_trend_label']} chart" if ta.get("_trend_label") else ""))
+    if mu is not None:
+        hz = f" ≈ {mu * dte / 365 * 100:+.1f}% over {dte}d" if dte else ""
+        bits.append(f"trend velocity {mu * 100:+.0f}%/yr{hz}")
+    if ma.get("sma50") and ma.get("sma200"):
+        bits.append(f"price {ma.get('priceVsSma50', '?')} the 50-day (${ma['sma50']:g}) and {ma.get('priceVsSma200', '?')} "
+                    f"the 200-day (${ma['sma200']:g})" + (f", {ma['goldenDeathCross'].replace('_', ' ')}" if ma.get("goldenDeathCross") else ""))
+    if ema.get("signal"):
+        bits.append(f"EMA 12/26 {ema['signal']}")
+    if bits:
+        tone = "bull" if (bias == "bullish" or (mu or 0) > 0.15) else "bear" if (bias == "bearish" or (mu or 0) < -0.15) else "neutral"
+        item("direction", "Direction", tone, "; ".join(bits) + ".")
+
+    # Momentum — MACD (level, cross, acceleration) + RSI
+    m = ta.get("macd") or {}
+    hv = m.get("histogramValues") or []
+    mbits = []
+    if m.get("histogram") is not None:
+        acc = (float(hv[-1]) - float(hv[-4])) if len(hv) >= 4 else None
+        hist = float(m["histogram"])
+        side = "bullish" if hist > 0 else "bearish"
+        mbits.append(f"MACD {'above' if hist > 0 else 'below'} its signal line (histogram {hist:+.2f}"
+                     + (f"; {side} momentum {'building' if (acc > 0) == (hist > 0) else 'fading'} over the last 3 sessions"
+                        if acc else "") + ")")
+        if m.get("crossover") and m["crossover"] != "none":
+            cx = m["crossover"].replace("_", " ")
+            mbits.append(f"fresh {cx if 'cross' in cx else cx + ' cross'}")
+    if ta.get("currentRSI") is not None:
+        r = float(ta["currentRSI"])
+        zone = "overbought" if r >= 70 else "oversold" if r <= 30 else "neutral"
+        mbits.append(f"RSI {r:.0f} ({zone})")
+    if mbits:
+        h = float(m.get("histogram") or 0)
+        item("momentum", "Momentum", "bull" if h > 0 else "bear" if h < 0 else "neutral", "; ".join(mbits) + ".")
+
+    # Volume profile — where price sits vs value, and the thin zones nearby
+    if vp.get("poc") and spot:
+        val, vah, poc = vp.get("val"), vp.get("vah"), vp.get("poc")
+        where = ("above the value area" if vah and spot > vah else "below the value area" if val and spot < val
+                 else "inside the value area")
+        txt = (f"Price is {where} (VAL ${val:g} {_pct_from(val, spot)} · POC ${poc:g} {_pct_from(poc, spot)} · "
+               f"VAH ${vah:g} {_pct_from(vah, spot)}) on the {ta.get('timeframeLabel') or 'structure'} profile.")
+        bins = vp.get("bins") or []
+        if len(bins) >= 8:
+            import statistics
+            med = statistics.median(b.get("pct", 0) for b in bins) or 0
+            thin_dn = max((b["price"] for b in bins if b["price"] < spot and b.get("pct", med) < 0.5 * med), default=None)
+            thin_up = min((b["price"] for b in bins if b["price"] > spot and b.get("pct", med) < 0.5 * med), default=None)
+            zones = [f"${z:g} ({_pct_from(z, spot)})" for z in (thin_dn, thin_up) if z]
+            if zones:
+                txt += f" Nearest thin (low-volume) zones: {', '.join(zones)} — little traded there, so moves through them tend to be quick."
+        item("volume_profile", "Volume profile", "neutral", txt)
+
+    # Volume behaviour
+    va = ta.get("volumeAnalysis") or {}
+    if va.get("phase"):
+        vt = (f"{va['phase'].replace('_', ' ')}: price {va.get('priceTrend', '?')} {va.get('priceChangePct', 0):+.1f}% on "
+              f"{va.get('volumeTrend', '?')} volume ({va.get('volumeChangePct', 0):+.0f}% vs the prior stretch).")
+        item("volume", "Volume", "neutral", vt + (f" {va['bigMoneyAnalysis']}" if va.get("bigMoneyAnalysis") else ""))
+
+    # Market structure — trend, BOS/CHOCH, swing points, unfilled imbalances
+    if ms:
+        sb = [f"structure {ms.get('trend') or 'unclear'}"]
+        if ms.get("bos"):
+            b = ms["bos"]
+            _lv = (b.get("level") or b.get("price")) if isinstance(b, dict) else None
+            sb.append(f"break of structure {(b.get('type') or '') if isinstance(b, dict) else ''}".rstrip()
+                      + (f" at ${_lv:g}" if _lv else ""))
+        if ms.get("change_of_character"):
+            sb.append("change of character (possible reversal)")
+        if ms.get("recent_swing_high") and ms.get("recent_swing_low"):
+            sb.append(f"swing range ${ms['recent_swing_low']:g} ({_pct_from(ms['recent_swing_low'], spot)}) – "
+                      f"${ms['recent_swing_high']:g} ({_pct_from(ms['recent_swing_high'], spot)})")
+        fv = [g for g in (inst.get("fair_value_gaps") or []) if not g.get("filled") and g.get("mid")]
+        if fv and spot:
+            g = min(fv, key=lambda g: abs(g["mid"] - spot))
+            sb.append(f"nearest unfilled {g.get('type', '')} gap ${g['bottom']:g}–${g['top']:g}")
+        ob = [o for o in (inst.get("order_blocks") or []) if not o.get("mitigated") and o.get("price")]
+        if ob and spot:
+            o = min(ob, key=lambda o: abs(o["price"] - spot))
+            sb.append(f"nearest open {o.get('type', '')} order block ${o['bottom']:g}–${o['top']:g}")
+        tone = "bull" if ms.get("trend") == "up" else "bear" if ms.get("trend") == "down" else "neutral"
+        item("structure", "Market structure", tone, "; ".join(sb) + ".")
+
+    # Recent chart patterns
+    pats = ta.get("_patterns") or []
+    if pats:
+        ps = [f"{p['name']} ({p.get('direction')}, {str(p.get('status') or '').replace('_', ' ')}"
+              + (f", breakout ${p['breakout']:g}" if p.get("breakout") else "")
+              + (f" → target ${p['target']:g} {_pct_from(p['target'], spot)}" if p.get("target") else "") + ")" for p in pats]
+        dirs = {p.get("direction") for p in pats}
+        item("patterns", "Chart patterns", "bull" if dirs == {"bullish"} else "bear" if dirs == {"bearish"} else "neutral",
+             "; ".join(ps) + ".")
+
+    # Tape range — ATR and Bollinger
+    bb = ta.get("bollingerBands") or {}
+    tb = []
+    if ta.get("_atr_pct"):
+        tb.append(f"average daily range {ta['_atr_pct']:.1f}%")
+    if bb.get("percentB") is not None:
+        tb.append(f"Bollinger %B {float(bb['percentB']):.2f} (band width {float(bb.get('bandwidthPct') or 0):.0f}%)")
+    if tb:
+        item("tape", "Tape", "neutral", "; ".join(tb) + ".")
+
+    return {
+        "items": items,
+        "timeframe": ta.get("timeframeLabel"), "trend_timeframe": ta.get("_trend_label"),
+        "note": ("Context only — none of this moves the grade. Direction (trend, MACD, patterns) is summarised, not "
+                 "scored: a 2016–26 backtest found no directional edge in these states. Use it to know the tape you're "
+                 "selling into."),
     }
 
 
@@ -1239,9 +1390,13 @@ def _gap_aware_vol(hv: Optional[float], atr_pct: Optional[float]) -> tuple:
 
 
 def _lvn_check(opp: dict, vp: Optional[dict], spot: Optional[float]) -> Optional[dict]:
-    """Low-Volume-Node 'slip-through' test. A short strike sitting in a THIN volume node has no
-    absorption — price slips through it fast. Returns a demerit {label, points, note} or None. (Sitting
-    BEHIND a High-Volume Node is the opposite — structural friction — already rewarded by Value-area.)"""
+    """Low-Volume-Node context at the short strike — INFO ONLY (0 pts).
+
+    It used to be a −5 "slip-through" demerit. Two problems (2026-10-21): (1) the profile only spans the window's
+    traded range, and a strike OUTSIDE it was matched to the edge bin — the thin tail of the distribution almost by
+    construction — so ~74% of flags were strikes with no volume data at all; (2) a 62-stock, 5-year test of this exact
+    rule (63-day daily profile, 21-session horizon, strikes at 0.75/1/1.5σ) found NO higher touch or finish-ITM rate
+    for LVN strikes at equal σ distance (in-range: −0.4 to −2.9 pts, all inside 2 SE). So it is context, not a grade."""
     bins = (vp or {}).get("bins") or []
     if len(bins) < 8 or not spot:
         return None
@@ -1249,13 +1404,21 @@ def _lvn_check(opp: dict, vp: Optional[dict], spot: Optional[float]) -> Optional
     med = statistics.median([b.get("pct", 0) for b in bins]) or 0.0
     if med <= 0:
         return None
+    lo, hi = bins[0].get("price"), bins[-1].get("price")
+    half = ((bins[1].get("price") or 0) - (lo or 0)) / 2.0
     shorts = [l.get("strike") for l in (opp.get("legs") or [])
               if str(l.get("action", "")).upper().startswith("S") and l.get("strike")]
     for K in shorts:
+        if lo is not None and hi is not None and not (lo - half <= K <= hi + half):
+            return {"label": "LVN slip", "points": 0,
+                    "note": f"info only — short strike ${K:g} is beyond the recent traded range (${lo:g}–${hi:g}): "
+                            "no volume-at-price data there"}
         b = min(bins, key=lambda x: abs(x.get("price", spot) - K))
         if b.get("pct", med) < 0.5 * med:                    # thin node at the short strike
-            return {"label": "LVN slip", "points": -5,
-                    "note": f"short strike in a low-volume node (${b.get('price')}, {b.get('pct')}% vol) — price slips through"}
+            return {"label": "LVN slip", "points": 0,
+                    "note": f"info only — short strike in a low-volume node (${b.get('price')}, {b.get('pct')}% of "
+                            "volume): little traded there, so price tends not to linger — not scored (no measured "
+                            "breach edge)"}
     return None
 
 
@@ -2228,6 +2391,14 @@ async def rank_desk(
     ``focus`` injects the caller's exact placed trade as a candidate so lifecycle
     scoring works even when its strike/expiry is off the scan grid."""
     ticker = _norm_ticker(ticker)
+    if target_expiration:
+        # An exact expiry fixes the horizon: derive the DTE from it SERVER-side so every caller (single-ticker,
+        # the screener, which sent none, and a client clock a day off) reads TA on the same DTE rung and grades
+        # the identical trade identically.
+        try:
+            target_dte = max((date.fromisoformat(str(target_expiration)[:10]) - date.today()).days, 1)
+        except ValueError:
+            pass
     # Fetch the TECHNICAL read FIRST so the scan can bias multi-leg SHORT strikes toward real structural
     # levels (S/R, value area, dealer gamma walls/flip). The SAME ta/gex/portfolio_fit are handed to
     # _finalize_desk so the read happens ONCE — no double fetch, same total latency (already sequential).
@@ -2835,6 +3006,8 @@ def _build_adjustments(g: dict) -> list[dict]:
     for lbl, key in _ADJ_ROWS:
         a = {"label": lbl, "points": round(c.get(key, 0.0), 1), "detail": _adj_detail(lbl, notes),
              "dimension": _factor_dimension(lbl)}
+        if key == "vrp":                       # VRP is priced into the expected value — never its own points
+            a["info_only"] = True
         if key in cb and round(cb[key], 1) != round(c.get(key, 0.0), 1):   # earnings-aware with/without
             a["baseline_points"] = round(cb[key], 1)
             a["earnings_impacted"] = True
@@ -3120,6 +3293,7 @@ async def _finalize_desk(scan: dict, opportunities: list[dict], ticker: str, quo
         "as_of": scan.get("as_of"),
         "ta": ta,
         "ta_summary": _ta_summary(ta),
+        "ta_brief": _ta_brief(ta, spot, max_dte),           # pre-trade technical context (never scored)
         "ta_timeframe": ta.get("timeframeLabel"),   # STRUCTURE rung (DTE-adaptive): levels · VP · POC · breach
         "ta_trend_timeframe": ta.get("_trend_label"),   # TREND/regime rung (one up): Trend drift · Range fit · Calm tape
         "vol_stats": vol_stats,

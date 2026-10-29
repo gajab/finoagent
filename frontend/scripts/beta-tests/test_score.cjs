@@ -32,7 +32,20 @@ ok('dimension nets sum to optNet + taNet', () => {
 });
 ok('dimensions come out in the desk order', () => {
   const s = buildScore(aapl, ORDER);
-  assert.deepEqual(s.dims.map(d => d.dim), ['Loss probability', 'Vol edge', 'Structural defense', 'Regime', 'Directional pressure', 'Event', 'Execution']);
+  // 'Directional pressure' held only a 0-pt Beta row → it's context, not grade, so no chip for it
+  assert.deepEqual(s.dims.map(d => d.dim), ['Loss probability', 'Vol edge', 'Structural defense', 'Regime', 'Event', 'Execution']);
+});
+ok('info-only reads (trend drift, systemic beta, LVN) never form a grade dimension chip', () => {
+  const t = { ...aapl, ta_factors: [...aapl.ta_factors,
+    { label: 'Systemic beta', points: 0, info_only: true, dimension: 'Directional pressure' },
+    { label: 'LVN slip', points: 0, info_only: true, dimension: 'Structural defense' }] };
+  const s = buildScore(t, ORDER);
+  assert.ok(!s.dims.some(d => d.dim === 'Directional pressure'));
+  assert.equal(s.raw, s.base + s.optNet + s.taNet);
+});
+ok('a 0 produced by the earnings-aware adjustment stays in the grade (with/without story)', () => {
+  const t = { ...aapl, ta_factors: [{ label: 'Structure', points: 0, baseline_points: 4, dimension: 'Consequence' }] };
+  assert.ok(buildScore(t, ORDER).dims.some(d => d.dim === 'Consequence'));
 });
 ok('boosts are positive, sorted, max 3; drags negative, worst first', () => {
   const s = buildScore(aapl, ORDER);

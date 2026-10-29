@@ -6,7 +6,7 @@ import logging
 import time
 
 from croniter import croniter
-from sqlalchemy import select, distinct
+from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,7 +50,7 @@ def _normalize_ticker(ticker: str) -> str:
 
 
 async def _distinct_holdings_tickers(db: AsyncSession) -> list[str]:
-    rows = await db.execute(select(distinct(PortfolioHolding.ticker)))
+    rows = await db.execute(select(PortfolioHolding.ticker).distinct())
     tickers = [_normalize_ticker(t) for (t,) in rows.all() if t]
     # Deduplicate after normalization (e.g. BRKB and BRK-B both map to BRK-B)
     seen: set[str] = set()

@@ -16,6 +16,7 @@ import LimitOnlyBadge from './LimitOnlyBadge';
 import NoTradeReasons from './NoTradeReasons';
 import { TraderGrid, PmGrid, RiskGrid } from './trades/DeskMetrics';
 import type { DeskReviewParams, DeskEvaluateParams } from '../api';
+import { TaBriefPanel, TradeContextNotes, isGraded } from './TaBrief';
 import type { DeskReviewResult, DeskRankedTrade, DeskAgentsResult, DeskAgent, RiskTrigger, MonitorPlan, BlindRead, PerSideLeg } from '../types';
 
 const money = (n: number | null | undefined, d = 0) =>
@@ -393,7 +394,7 @@ export function SideQuantPanel({ side, variant = 'entry' }: { side: PerSideLeg; 
               score: side.grade.score, headline: side.grade.algo_grade || undefined,
               headTone: side.grade.algo_grade ? gradeTextTone(side.grade.algo_grade) : '',
               base: side.grade.base_quality, baseLabel: 'base quality',
-              factors: [...(side.grade.grade_adjustments || []), ...(side.grade.ta_factors || [])] as FactorItem[],
+              factors: scored([...(side.grade.grade_adjustments || []), ...(side.grade.ta_factors || [])] as FactorItem[]),
               caption: 'whole-trade base · this leg', foot: 'entering this leg',
             } : null);
         if (!gd) return null;
@@ -421,7 +422,9 @@ export function SideQuantPanel({ side, variant = 'entry' }: { side: PerSideLeg; 
 export const DIM_ORDER = ['Loss probability', 'Vol edge', 'Structural defense', 'Regime',
                    'Directional pressure', 'Consequence', 'Event', 'Execution'];
 
-type FactorItem = { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null };
+type FactorItem = { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null; info_only?: boolean };
+// Info-only factors (direction, systemic beta, LVN at the strike) carry 0 pts — they live in the context notes, not the grade.
+const scored = <T extends { label: string; points: number; info_only?: boolean }>(fs: T[]) => fs.filter(isGraded);
 
 // One DIMENSION group of factors — the bars for that dimension + each bar's inline evidence. Replaces the
 // old option-math / TA split so every contribution to one risk dimension (Loss probability, Vol edge, …)
@@ -592,7 +595,7 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
              dimension on the backend (_FACTOR_TAXONOMY), so all evidence for one dimension (Loss probability,
              Vol edge, Structural defense, …) reads together instead of split across "option math" vs "TA". */}
       {(() => {
-        const all: FactorItem[] = [...adjs, ...tas];
+        const all: FactorItem[] = scored([...adjs, ...tas] as FactorItem[]);
         if (!all.length) return <p className="text-[10px] text-base-content/40 mb-2">Neutral to the current regime — no factor tilts on this structure.</p>;
         const grouped = groupByDimension(all);
         return (
@@ -605,6 +608,7 @@ export function QuantAnalysisSection({ t, q, defaultOpen = false, title = "Quant
           </div>
         );
       })()}
+      <TradeContextNotes factors={[...adjs, ...tas] as FactorItem[]} />
 
       {/* Reconciliation — how the pieces sum to the desk score */}
       <p className="text-[10px] text-base-content/45 pt-1.5 border-t border-white/[0.06]">
@@ -1629,6 +1633,7 @@ export function DeskReview({ ticker, params, renderTrade, renderDebate, data, ev
             {rev.earnings_aware && !rev.earnings_in_window && (
               <div className="text-[10px] text-base-content/45">Earnings-aware ranking on — no print falls in the scanned window, so it had no effect here.</div>
             )}
+            <TaBriefPanel brief={rev.ta_brief} defaultOpen={!!evaluate || rev.ranked.length === 1} />
             {/* No separate 'top pick' card — the #1 row of the ranked table below IS the desk's pick
                 (sorted best→worst). Events already show once at the top of the scan. */}
             {/* Full ranked table */}

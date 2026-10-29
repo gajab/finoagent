@@ -33,7 +33,7 @@ export function LensRail({ lenses, pending, active, onToggle }: {
 }) {
   return (
     <div className="rounded-xl border border-white/[0.08] bg-base-200/25 p-3">
-      <SubHead hint="read on daily data">Six lenses</SubHead>
+      <SubHead hint="read on daily data">{lenses.length === 7 ? 'Seven' : 'Six'} lenses</SubHead>
       <ul className="space-y-0.5">
         {lenses.map(l => {
           const st = STATE[l.state];
@@ -65,7 +65,7 @@ export function LensRail({ lenses, pending, active, onToggle }: {
           );
         })}
       </ul>
-      <p className="mt-2 px-2 text-[11px] text-base-content/40 leading-snug">Trend, momentum and dealer flow are the votes behind the call. Stretch, volume and regime are context.</p>
+      <p className="mt-2 px-2 text-[11px] text-base-content/40 leading-snug">Trend, momentum and dealer flow are the votes behind the call. Stretch, volume{lenses.some(l => l.key === 'earnings') ? ', regime and the last earnings print' : ' and regime'} are context.</p>
     </div>
   );
 }

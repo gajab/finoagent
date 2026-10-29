@@ -86,12 +86,17 @@ def _structure(closes, sh, sl, order: int, keep: int = 6) -> dict:
 
     rsh = highs[-1][1] if highs else None
     rsl = lows[-1][1] if lows else None
+    # The close that would CHOCH this timeframe: the confirmed, still-unbroken swing on the other side.
+    # A V-shaped bounce (e.g. a post-earnings reversal) prints no new confirmed lower high, so this can
+    # sit well above spot — saying where the trend actually turns beats "trend: down" with no level.
+    flip = active_high if trend == "down" else active_low if trend == "up" else None
     return {
         "trend": trend,
         "last_event": events[-1] if events else None,
         "events": events[-keep:],
         "recent_swing_high": round(rsh, 2) if rsh is not None else None,
         "recent_swing_low": round(rsl, 2) if rsl is not None else None,
+        "flip_level": round(flip, 2) if flip is not None else None,
     }
 
 

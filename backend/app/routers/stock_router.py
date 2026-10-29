@@ -35,6 +35,7 @@ from ..services.autocallable_service import run_autocallable
 from ..services.dual_direction_service import run_dual_direction_buffer
 from ..services.concentration_service import run_concentration_management
 from ..services.concentration_ladder_service import run_concentration_ladder, MAX_TICKERS, MAX_LOTS
+from ..services.leap_protection_service import run_leap_protection
 from ..services.pmcc_service import run_pmcc_pmcp
 from ..services.zebra_service import run_zebra
 from ..services.derivative_income_service import run_derivative_income, run_portfolio_derivative_income
@@ -2703,6 +2704,57 @@ async def compute_concentration_ladder(
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Concentration ladder failed: {exc}")
+
+# =========================================================================
+# Strategies — LEAP Protection (protect + diversify a low-basis position without selling)
+# =========================================================================
+
+class LeapProtectionIn(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=12)
+    shares: int = Field(..., gt=0, le=10_000_000)
+    cost_basis: float = Field(..., gt=0, description="Average cost basis per share")
+    index: str = Field("SPY", min_length=1, max_length=12, description="Diversifying index ETF")
+    horizon_years: float = Field(2.0, ge=0.5, le=3.0)
+    expiry: str | None = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="Pin a specific LEAP expiry")
+    tax: LadderTaxIn = LadderTaxIn()
+    tax_lens: str = Field("defer", pattern="^(defer|liquidate)$")
+    erp_pct: float = Field(5.0, ge=0, le=15, description="Equity risk premium of the index over cash, %/yr")
+    alpha_pct: float = Field(0.0, ge=-15, le=15, description="Your view of the stock's return beyond CAPM, %/yr")
+    vol_view: str = Field("implied", pattern="^(implied|realized)$")
+    objective: str = Field("cagr", pattern="^(cagr|ce|mean)$")
+    max_loss_pct: float = Field(25.0, ge=5, le=100, description="Worst-5% average loss you accept over the horizon")
+    max_single_stock_pct: float = Field(50.0, ge=0, le=150, description="Max single-stock delta exposure, % of today's value")
+    borrow_spread_pct: float = Field(1.5, ge=0, le=6)
+    loan_ltv_pct: float = Field(90.0, ge=10, le=100)
+    allow_constructive_sale: bool = False
+    proceeds_to: str = Field("index", pattern="^(index|bond|cash)$", description="Where premium / loan / sale proceeds go")
+    bond_rate_pct: float = Field(4.5, ge=0, le=15, description="Fixed yield of the bond option, %/yr")
+    stock_return_pct: float | None = Field(None, ge=-30, le=50, description="Your expected total return for the stock, %/yr (blank = CAPM)")
+
+@router.post("/leap-protection")
+async def compute_leap_protection(
+    body: LeapProtectionIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Protect + diversify a concentrated, low-basis stock with LEAPS — every structure ranked by after-tax annualised return."""
+    try:
+        result = await run_leap_protection(
+            ticker=body.ticker, shares=body.shares, cost_basis=body.cost_basis, index=body.index,
+            horizon_years=body.horizon_years, expiry=body.expiry, tax=body.tax.model_dump(), tax_lens=body.tax_lens,
+            erp_pct=body.erp_pct, alpha_pct=body.alpha_pct, vol_view=body.vol_view, objective=body.objective,
+            max_loss_pct=body.max_loss_pct, max_single_stock_pct=body.max_single_stock_pct,
+            borrow_spread_pct=body.borrow_spread_pct, loan_ltv_pct=body.loan_ltv_pct,
+            allow_constructive_sale=body.allow_constructive_sale, proceeds_to=body.proceeds_to,
+            bond_rate_pct=body.bond_rate_pct, stock_return_pct=body.stock_return_pct, user=user, db=db)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("leap protection failed")
+        raise HTTPException(status_code=500, detail=f"LEAP protection failed: {exc}")
 
 # =========================================================================
 # Strategies — Poor Man's Covered Call / Put

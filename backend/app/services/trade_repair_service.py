@@ -79,7 +79,16 @@ class _Pricer:
         return float(min(ch.keys(), key=lambda k: abs(k - target))) if ch else float(round(target))
 
     def iv(self, tenor: int, strike: float, right: str) -> float:
-        q = (self._chain(tenor).get(strike) or {}).get(right)
+        """The strike's vol. For an IN-THE-MONEY strike, the OUT-OF-THE-MONEY side's IV at the same strike: an ITM option is
+        mostly intrinsic, so its own quoted IV is noise (AAOI's 80 put at $68 read 61% — a few cents of time value against a
+        dollar-wide market and a lagging spot — beside 103% on the 80 call), and that one number drove the hold row's whole
+        distribution (E[P&L] −$788 against a −$691 mark). By put-call parity both sides carry the same vol."""
+        row = self._chain(tenor).get(strike) or {}
+        if self.spot and self.spot > 0 and ((strike > self.spot) if right == "P" else (strike < self.spot)):
+            alt = (row.get("C" if right == "P" else "P") or {}).get("iv")
+            if alt and alt > 0:
+                return float(alt)
+        q = row.get(right)
         v = q.get("iv") if q else None
         return float(v) if (v and v > 0) else self._tenor_atm_iv(tenor)
 
@@ -205,10 +214,11 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def _dist_metrics(spot, iv, horizon_days, legs, realized, stock, r) -> tuple[Optional[int], Optional[float]]:
+def _dist_metrics(spot, iv, horizon_days, legs, realized, stock, r, collect: Optional[list] = None) -> tuple[Optional[int], Optional[float]]:
     """Lognormal-weighted PoP (%) AND E[P&L] ($) to the horizon — the recovery-odds engine.
     Returns (pop_pct, expected_pnl). The expected P&L is what a 'do-nothing / hold' read needs:
-    not just 'can it come back' but 'what is this worth on average from here'."""
+    not just 'can it come back' but 'what is this worth on average from here'. `collect` (a list) receives every
+    (pnl, weight) sample, so a caller can read other probabilities off the SAME integration (see `set_beat_close`)."""
     if horizon_days <= 0 or iv <= 0:
         return None, None
     T = horizon_days / 365.0
@@ -229,6 +239,8 @@ def _dist_metrics(spot, iv, horizon_days, legs, realized, stock, r) -> tuple[Opt
         P = spot * math.exp(mu + sig * z)
         w = math.exp(-0.5 * z * z)
         pnl = _pnl_at(P, legs, realized, stock, r, horizon_days)
+        if collect is not None:
+            collect.append((pnl, w))
         den += w
         ev += pnl * w
         if pnl >= 0:
@@ -266,7 +278,8 @@ def _build(*, name, category, mechanics, legs, realized, stock, establish_cash, 
     _sh = [lg["iv"] for lg in legs if lg["dte_days"] == horizon and lg["sign"] < 0 and lg.get("iv")]
     _al = [lg["iv"] for lg in legs if lg["dte_days"] == horizon and lg.get("iv")]
     iv_h = (sum(_sh) / len(_sh)) if _sh else ((sum(_al) / len(_al)) if _al else iv_ref)
-    pop, ev = _dist_metrics(spot, iv_h, horizon, legs, realized, stock, r)
+    samples: list = []
+    pop, ev = _dist_metrics(spot, iv_h, horizon, legs, realized, stock, r, collect=samples)
     # E[P&L] is NET of the risk-free return the committed cash would otherwise have earned. The payoff model lets
     # bought stock drift at r but never charged for the cash that buys it, so every stock structure carried a phantom
     # +r·T·outlay (≈ +$83 on a $31k collar over three weeks — enough to flatter it far above simply closing).
@@ -283,6 +296,7 @@ def _build(*, name, category, mechanics, legs, realized, stock, establish_cash, 
         "defined_risk": not upside_undefined,
         "upside_risk_free": bool(_pnl_at(spot * 1.60, legs, realized, stock, r, horizon) >= -1),
         "pop_pct": pop, "ev": ev,
+        "_samples": samples,                     # popped by `set_beat_close` once the benchmark is known — never serialized
         "turns_profitable": bool(max_gain > 0),
         # `price` = the leg's per-share entry price (for a NEW leg: today's chain mid — what you'd actually trade at).
         "legs": [{"action": "SELL" if lg["sign"] < 0 else "BUY", "right": lg["right"],
@@ -292,6 +306,20 @@ def _build(*, name, category, mechanics, legs, realized, stock, establish_cash, 
                      "strike": round(stock["basis"], 2), "qty": abs(int(stock_shares)), "dte_days": None,
                      "price": round(stock["basis"], 2)}] if stock else []),
     }
+
+
+def set_beat_close(alts: list[dict], benchmark: Optional[float]) -> None:
+    """`p_beat_close` on every alternative = the odds its ALL-IN P&L at its own horizon ends BETTER than closing everything
+    today (`benchmark` = the close P&L). On a trapped trade that is the question being asked — "does this leave me better off
+    than taking the loss now?" — and unlike P(profit) it doesn't read 0% for a roll that can only claw back part of the loss.
+    Read off the same lognormal samples `_build` integrated; the private samples are dropped either way."""
+    for a in alts:
+        smp = a.pop("_samples", None)
+        if benchmark is None or not smp or a.get("category") == "exit":
+            continue
+        den = sum(w for _, w in smp)
+        if den > 0:
+            a["p_beat_close"] = round(100.0 * sum(w for p, w in smp if p > float(benchmark) + 0.5) / den)
 
 
 def attach_steps(alt: dict, held: dict, spot: float) -> None:
@@ -550,10 +578,16 @@ def _recoverability(*, spot, K, right, C, iv0, D, r, hold_legs, hold_pop, stock=
     }
 
 
-def _assignment(*, now_val, spot, K, right, C, iv0, D, r, n, ex_div=None, covered=False, stock_basis=None) -> dict:
+def _assignment(*, now_val, spot, K, right, C, iv0, D, r, n, ex_div=None, covered=False, stock_basis=None,
+                wing: Optional[dict] = None) -> dict:
     """Lens 2 — ASSIGNMENT (the real risk on a trapped short). Risk-neutral P(finish ITM), the
     extrinsic value left (→ early-exercise pressure), pin risk into expiry, and the DOLLAR
-    consequence of being assigned (effective basis / capital tied up)."""
+    consequence of being assigned (effective basis / capital tied up).
+
+    `wing` (from `identify_wing`) = the short is half of a vertical: the consequence then depends on WHERE it finishes —
+    past the long both legs exercise and cancel (no shares, the full width), between the strikes the short is assigned
+    and the long expires (unhedged shares). The effective basis uses the spread's NET credit, not the short leg's own
+    premium (an 80/70 opened for $0.34 read "effective $77.40 after the $2.60 credit")."""
     T = max(D, 1) / 365.0
     s = max(iv0, 0.02)
     sig = s * math.sqrt(T)
@@ -577,7 +611,21 @@ def _assignment(*, now_val, spot, K, right, C, iv0, D, r, n, ex_div=None, covere
     pin = round(abs(spot - K) / em, 2) if em > 0 else None
     basis = round(K - C, 2)
     cap = round(100.0 * K * n, 0)
-    if right == "P":
+    if wing and wing.get("long_strike") is not None:
+        Kl = float(wing["long_strike"])
+        net = float(wing.get("net_entry") or 0.0)
+        basis = round(K - net, 2) if right == "P" else round(K + net, 2)
+        width_loss = (abs(K - Kl) - net) * _MULT * n
+        if right == "P":
+            consequence = (f"Below ${Kl:.0f} at expiry both legs exercise and cancel — no shares, the full ${width_loss:,.0f} loss. "
+                           f"Between ${Kl:.0f} and ${K:.0f} the ${K:.0f} put is assigned and the ${Kl:.0f} expires: you BUY {int(100 * n)} sh "
+                           f"at ${K:.0f} (effective ${basis:.2f} after the ${net:.2f} net credit) with no protection left — ${cap:,.0f} "
+                           "of cash or margin. Above it, nothing happens.")
+        else:
+            consequence = (f"Above ${Kl:.0f} at expiry both legs exercise and cancel — no shares, the full ${width_loss:,.0f} loss. "
+                           f"Between ${K:.0f} and ${Kl:.0f} the ${K:.0f} call is assigned and the ${Kl:.0f} expires: you are SHORT "
+                           f"{int(100 * n)} sh from ${K:.0f} (effective ${basis:.2f}) with nothing capping the upside. Below it, nothing happens.")
+    elif right == "P":
         consequence = (f"Assignment ⇒ you BUY {int(100 * n)} sh at ${K:.0f} (effective ${basis:.2f} after the "
                        f"${C:.2f} credit) — ${cap:,.0f} of cash committed.")
     elif covered:
@@ -1245,6 +1293,7 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
             "collected": round(sum(-lg["sign"] * lg["qty"] * _MULT * lg["entry"] for lg in hold), 0)}
     for a in alts:
         attach_steps(a, held, spot)
+    set_beat_close(alts, (None if stock else unreal))
 
     _covered = bool(stock and (stock.get("shares") or 0) >= 100 * n and right == "C")
     return {
@@ -1257,7 +1306,8 @@ def repair_alternatives(*, legs: list[dict], spot: float, dte_days: int, r: floa
         "recoverability": _recoverability(spot=spot, K=K, right=right, C=C, iv0=iv0, D=D, r=r,
                                           hold_legs=hold, hold_pop=hold_pop, stock=stock),
         "assignment": _assignment(now_val=now_val, spot=spot, K=K, right=right, C=C, iv0=iv0, D=D, r=r,
-                                  n=n, ex_div=ex_div, covered=_covered, stock_basis=(stock or {}).get("basis")),
+                                  n=n, ex_div=ex_div, covered=_covered, stock_basis=(stock or {}).get("basis"),
+                                  wing=(wing_info if (wing_info and not wing_info["kept"]) else None)),
         "cost_of_waiting": _cost_of_waiting(spot=spot, iv0=iv0, D=D, r=r, hold_legs=hold),
         "hold": {"pop_pct": hold_pop, "expected_pnl": hold_ev, "max_loss": hold_ml,
                  "greeks": hold_row.get("greeks"), "breakevens": hold_row.get("breakevens")},
@@ -1418,7 +1468,8 @@ def level_note(px: float, sup: float, res: float) -> str:
 
 def build_roll_alternatives(*, candidates: list[dict], tested: dict, tested_mark: float, hold: Optional[dict],
                             spot: float, r: float, stock: Optional[dict], iv_default: float,
-                            held: Optional[dict] = None, kept: Optional[list] = None) -> list[dict]:
+                            held: Optional[dict] = None, kept: Optional[list] = None,
+                            benchmark: Optional[float] = None) -> list[dict]:
     """Turn the roll optimizer's CREDIT-ONLY candidates into FULL alternatives — payoff, greeks, PoP,
     E[P&L], max loss, Δ-vs-hold — built by the SAME `_build` engine as every other repair, so a roll is
     scored on exactly the same footing as a cap, a collar or a close. This is what makes the desk's
@@ -1498,7 +1549,184 @@ def build_roll_alternatives(*, candidates: list[dict], tested: dict, tested_mark
         if held:
             attach_steps(row, held, spot)
         out.append(row)
+    set_beat_close(out, benchmark)
     return out
+
+
+def build_ladder_alternatives(*, ladder: dict, right: str, short_strike: float, long_strike: Optional[float], qty: int,
+                              credit_ps: float, unwind_ps: float, hold: Optional[dict], spot: float, r: float,
+                              held: Optional[dict] = None, horizon_cap: int = 180, wait_ctx: Optional[dict] = None,
+                              benchmark: Optional[float] = None, same_max_debit_frac: float = 0.15) -> list[dict]:
+    """Turn the ASSIGNMENT LADDER (defend_playbook_service.assignment_ladder) into full alternatives — payoff, PoP,
+    E[P&L], all-in steps — built by the same `_build` as every repair, so the moves a spread's own roll search can never
+    find (it insists on the same width, which is a DEBIT once the spread is in the money) are ranked on the same footing:
+
+      · CASH-SECURED — close what you hold and sell ONE put (call) further away, the premium paying for the close. Two
+        rungs: the nearest one that puts the assignment price at or below today's stock price, and the lowest assignment
+        price on the whole ladder. Its tail is the stock's (`defined_risk` False), so the income policy never picks it
+        on its own — it is the answer for the "lowest cost if assigned" goal.
+      · WIDER DEFINED RISK — the spread with the short furthest away that still pays for the close: the nearest rung,
+        and the rung with the best P(profit) within `horizon_cap` days.
+      · SAME STRIKES, MORE TIME — the spread rolled as-is to the first MONTHLY on the ladder, allowed a small debit (≤
+        `same_max_debit_frac` of the width): the trade a premium seller reaches for first ("assume assignment at $80, sell the
+        Nov 20 $80 call, roll the $70 put" — stock + short call + long put pays exactly like the short put spread). It costs a
+        little, buys time and the print, and its best case stays near break-even — the row says all three. For a put spread it
+        carries `alt_route`: the same payoff placed as a collar after assignment.
+
+    Each row carries `roll_meta` (with `route`, `basis`, …) so the timing read, the goals and the cards treat it as a roll.
+    `wait_ctx` = {held_legs, dte_now, event_var, earn_days, near_vol} → each row also gets `wait`: the same roll done on
+    the last day before the current expiry at the same price (`defend_playbook_service.wait_cost`)."""
+    rungs = (ladder or {}).get("rungs") or []
+    put = right == "P"
+    n = int(qty or 1)
+    word = "put" if put else "call"
+    realized = n * _MULT * (float(credit_ps) - float(unwind_ps))          # closing what you hold, vs what it collected
+    picks: list[tuple[str, dict]] = []
+    csp = [rg for rg in rungs if rg.get("csp")]
+    near_ok = next((rg for rg in csp if (rg["csp"]["basis"] <= spot if put else rg["csp"]["basis"] >= spot)), None)
+    if near_ok:
+        picks.append(("csp", near_ok))
+    if csp:
+        lowest = min(csp, key=lambda rg: rg["csp"]["basis"] if put else -rg["csp"]["basis"])
+        if lowest is not near_ok:
+            picks.append(("csp", lowest))
+    if long_strike is not None:
+        sp = [rg for rg in rungs if rg.get("spread")]
+        if sp:
+            picks.append(("spread", sp[0]))
+            within = [rg for rg in sp if rg["dte"] <= horizon_cap]
+            if within:
+                best = max(within, key=lambda rg: (rg["spread"]["p_profit_pct"], -rg["dte"]))
+                if best is not sp[0]:
+                    picks.append(("spread", best))
+
+    if long_strike is not None:
+        same = [rg for rg in rungs if rg.get("same_width")]
+        width0 = abs(short_strike - long_strike)
+        from .defend_playbook_service import _monthly_like
+        first = next((rg for rg in same if _monthly_like(rg["expiry"])), same[0] if same else None)
+        if first and first["same_width"]["net_cash"] >= -same_max_debit_frac * width0 * _MULT * n:
+            picks.append(("same", first))
+
+    out: list[dict] = []
+    for route, rg in picks:
+        exp, dte = rg["expiry"], int(rg["dte"])
+        try:
+            d = dt.date.fromisoformat(str(exp)[:10])
+            exp_lbl = f"{d.strftime('%b')} {d.day}" + (f" '{d.strftime('%y')}" if d.year != dt.date.today().year else "")
+        except (ValueError, TypeError):
+            exp_lbl = str(exp)
+        old_txt = (f"${short_strike:.0f}/{long_strike:.0f} {word} spread" if long_strike is not None else f"${short_strike:.0f} {word}")
+        if route == "csp":
+            c = rg["csp"]
+            K = float(c["strike"])
+            legs = [{"strike": K, "right": right, "sign": -1, "qty": n, "dte_days": dte, "iv": float(c["iv"]), "entry": float(c["premium"])}]
+            net = float(c["net_cash"])
+            credit_lbl = "even cost" if abs(net) < 0.5 else f"{'+' if net >= 0 else '−'}${abs(net):,.0f}"
+            name = (f"Convert to a cash-secured ${K:.0f} {word} · {exp_lbl} ({dte}d) — {credit_lbl} · "
+                    f"{'assigned' if put else 'called'} at ${c['basis']:.2f}")
+            mech = (f"Close the {old_txt} (~${unwind_ps:.2f} debit) and sell the ${K:.0f} {word} expiring {exp} (~${c['premium']:.2f}) — "
+                    f"{'EVEN cost' if abs(net) < 0.5 else 'a NET CREDIT of $' + format(net, ',.0f')}, no new money. "
+                    + (f"Cash-secured: if assigned you buy {100 * n} sh at ${K:.0f}, effective ${c['basis']:.2f} after every credit — "
+                       f"{c['basis_vs_spot_pct']:+.1f}% vs today, ${c['capital']:,.0f} of cash." if put else
+                       f"If assigned you are short {100 * n} sh from ${K:.0f}, effective ${c['basis']:.2f}."))
+            rat = (f"Uses time{' and the earnings premium' if rg.get('spans_earnings') else ''} to move the assignment price from "
+                   f"${short_strike:.0f} to an effective ${c['basis']:.2f} for no new money — the move for a stock you are willing to own. "
+                   "The long protection goes: below the strike the loss is the stock's, not capped.")
+            rm_extra = {"route": "csp", "basis": c["basis"], "basis_vs_spot_pct": c["basis_vs_spot_pct"],
+                        "p_assigned_pct": c["p_assigned_pct"], "capital": c["capital"], "net_cash_natural": c.get("net_cash_natural")}
+            p_otm, new_be, cap = 100 - c["p_assigned_pct"], c["basis"], c["capital"]
+        elif route == "same":
+            sw = rg["same_width"]
+            Ks, Kl = float(sw["short"]), float(sw["long"])
+            legs = [{"strike": Ks, "right": right, "sign": -1, "qty": n, "dte_days": dte, "iv": float(sw["short_iv"]), "entry": float(sw["short_mid"])},
+                    {"strike": Kl, "right": right, "sign": 1, "qty": n, "dte_days": dte, "iv": float(sw["long_iv"]), "entry": float(sw["long_mid"])}]
+            net = float(sw["net_cash"])
+            credit_lbl = "even cost" if abs(net) < 0.5 else f"{'+' if net >= 0 else '−'}${abs(net):,.0f}"
+            name = f"Roll the ${Ks:.0f}/{Kl:.0f} {word} spread to {exp_lbl} ({dte}d) — same strikes, {credit_lbl}"
+            mech = (f"Close the {old_txt} (~${unwind_ps:.2f}) and sell the same ${Ks:.0f}/{Kl:.0f} {word} spread expiring {exp} "
+                    f"(~${sw['short_mid'] - sw['long_mid']:.2f}) — {'a debit of $' + format(-net, ',.0f') if net < -0.5 else 'about even'}. "
+                    "Same strikes, same width: more time and the earnings print to recover; the worst case moves by the debit.")
+            rat = ("Keeps the trade exactly as it is, just later: time for the stock to recover. It cannot add profit — the best case is "
+                   "the old credit minus what the roll costs.")
+            rm_extra = {"route": "same", "wing": {"short": Ks, "long": Kl, "width": width0, "old_short": short_strike, "old_long": long_strike},
+                        "net_cash_natural": sw.get("net_cash_natural")}
+            p_otm, new_be, cap = None, None, round(width0 * _MULT * n)
+        else:
+            spd = rg["spread"]
+            Ks, Kl = float(spd["short"]), float(spd["long"])
+            legs = [{"strike": Ks, "right": right, "sign": -1, "qty": n, "dte_days": dte, "iv": float(spd["short_iv"]), "entry": float(spd["short_mid"])},
+                    {"strike": Kl, "right": right, "sign": 1, "qty": n, "dte_days": dte, "iv": float(spd["long_iv"]), "entry": float(spd["long_mid"])}]
+            net = float(spd["net_cash"])
+            credit_lbl = "even cost" if abs(net) < 0.5 else f"{'+' if net >= 0 else '−'}${abs(net):,.0f} credit"
+            name = (f"Roll to a {'wider ' if spd.get('wider') else ''}${Ks:.0f}/{Kl:.0f} {word} spread · {exp_lbl} ({dte}d) — {credit_lbl}")
+            mech = (f"Close the {old_txt} (~${unwind_ps:.2f} debit) and open the ${Ks:.0f}/{Kl:.0f} {word} spread expiring {exp} "
+                    f"(~${spd['credit']:.2f} credit) — {'EVEN cost' if abs(net) < 0.5 else 'a NET CREDIT of $' + format(net, ',.0f')}, defined risk"
+                    + (f"; the wing is ${spd['width']:.0f} wide (was ${abs(short_strike - long_strike):.0f}) — that extra width is what pays for "
+                       "the better strike, and it raises the worst case." if spd.get("wider") else "."))
+            rat = (f"Keeps the risk DEFINED while moving the short from ${short_strike:.0f} to ${Ks:.0f} and adding {dte} days"
+                   + (" across earnings" if rg.get("spans_earnings") else "")
+                   + f": break-even ${spd['breakeven']:.2f}, ≈{spd['p_profit_pct']}% odds of finishing in profit, worst case "
+                   f"${abs(spd['max_loss']):,.0f}.")
+            rm_extra = {"route": "spread", "wing": {"short": Ks, "long": Kl, "width": spd["width"], "old_short": short_strike, "old_long": long_strike},
+                        "net_cash_natural": spd.get("net_cash_natural")}
+            p_otm, new_be, cap = None, spd["breakeven"], round(spd["width"] * _MULT * n)
+        row = _build(name=name, category="roll", group="adjust", mechanics=mech, legs=legs, realized=realized, stock=None,
+                     establish_cash=net, spot=spot, r=r, iv_ref=legs[0]["iv"], rationale=rat)
+        for lg in row["legs"]:
+            if lg.get("right") in ("P", "C"):
+                lg["expiry"] = exp
+        row["roll_meta"] = {"expiry": exp, "dte": dte, "strike": legs[0]["strike"], "credit_total": net, "p_otm": p_otm,
+                            "p_otm_source": ("BS" if p_otm is not None else None), "spans_earnings": bool(rg.get("spans_earnings")),
+                            "structure": {}, "scores": {}, "new_breakeven": new_be, "new_capital": cap, **rm_extra}
+        if hold:
+            _vs_hold(row, hold.get("pop_pct"), hold.get("expected_pnl"), hold.get("max_loss"))
+        if held:
+            attach_steps(row, held, spot)
+        if route == "same" and put:
+            # the user's framing of the very same trade: take the shares at the short strike, sell a call there, keep a put below
+            sw = rg["same_width"]
+            old_long = next((l for l in (held or {}).get("legs") or [] if l.get("sign", 0) > 0 and l.get("right") == right), None)
+            put_roll = (float(sw["long_mid"]) - float(old_long["mark"])) * _MULT * n if old_long else None
+            call_px = sw.get("other_mid")
+            row["alt_route"] = {
+                "title": "Same payoff as a collar: take the shares, sell a covered call",
+                "steps": [s_ for s_ in [
+                    (f"Now: sell the {_short_lbl(held)} ${long_strike:.0f} put and buy the {exp_lbl} ${long_strike:.0f} put"
+                     + (f" — about {'−' if put_roll > 0 else '+'}${abs(put_roll):,.0f}" if put_roll is not None else "")),
+                    f"At expiry: let the ${short_strike:.0f} put be assigned — you buy {100 * n} shares at ${short_strike:.0f} (${short_strike * _MULT * n:,.0f})",
+                    (f"Then sell the {exp_lbl} ${short_strike:.0f} call" + (f" — about +${float(call_px) * _MULT * n:,.0f} at today's price" if call_px else "")),
+                ] if s_],
+                "capital": round(short_strike * _MULT * n),
+                "note": ("Shares + short $%.0f call + long $%.0f put pay exactly like the $%.0f/%.0f put spread. The spread roll needs no cash "
+                         "for shares and is one order; the collar ties up $%s and the call is priced only when you sell it. Never sell the "
+                         "call before the shares arrive — until then it is naked.") % (short_strike, long_strike, short_strike, long_strike,
+                                                                                      format(short_strike * _MULT * n, ",.0f")),
+            }
+        if wait_ctx:
+            try:
+                from .defend_playbook_service import wait_cost
+                row["wait"] = wait_cost(
+                    held_legs=wait_ctx["held_legs"], spot=spot, r=r, dte_now=wait_ctx.get("dte_now"),
+                    new_legs=[{"right": lg["right"], "strike": lg["strike"], "sign": lg["sign"], "qty": lg["qty"], "dte": dte,
+                               "iv": lg["iv"], "mid": lg["entry"]} for lg in legs],
+                    event_var=wait_ctx.get("event_var"), earn_days=wait_ctx.get("earn_days"), near_vol=wait_ctx.get("near_vol"))
+            except Exception:  # noqa: BLE001
+                row["wait"] = None
+        out.append(row)
+    set_beat_close(out, benchmark)
+    return out
+
+
+def _short_lbl(held: Optional[dict]) -> str:
+    """'Oct 30' — the expiry of the position you hold, for the plain-English steps."""
+    exp = next((l.get("expiry") for l in (held or {}).get("legs") or [] if l.get("expiry")), None)
+    try:
+        d = dt.date.fromisoformat(str(exp)[:10])
+        return f"{d.strftime('%b')} {d.day}"
+    except (ValueError, TypeError):
+        return "current"
+
 
 
 def drop_plain_rolls(menu: dict) -> dict:
@@ -1817,10 +2045,18 @@ def rank_defenses(menu: dict) -> dict:
     if (close_row is not None and winner is not close_row and not income_override
             and winner.get("category") not in ("hold", "exit") and not _income_viable(winner)
             and (winner["desk_score"] - close_row["desk_score"]) < NONVIABLE_MARGIN):
-        close_note = (f"Closing scores {close_row['desk_score']} — within {NONVIABLE_MARGIN} of {winner.get('name')} ({winner['desk_score']}), which "
-                      f"{'costs new money' if float(winner.get('net_cash') or 0.0) < -1.0 else ('lowers your odds of profit (' + format(int(winner['d_pop']), '+d') + 'pt)' if (winner.get('d_pop') or 0) < 0 else 'does not improve the payoff you hold')}; "
-                      "a fix like that has to beat closing clearly, and it didn't.")
-        winner = close_row
+        # …and the fallback is the BETTER of the two benchmarks: when holding outscores closing, rejecting the fix must not
+        # hand the pick to Close (AAOI: a wider roll 62, Hold 60, Close 57 → "Close" — on an income desk, backwards).
+        bench = hold_row if (hold_row.get("desk_score") or 0) > (close_row.get("desk_score") or 0) else close_row
+        why_not = ('costs new money' if float(winner.get('net_cash') or 0.0) < -1.0 else
+                   ('lowers your odds of profit (' + format(int(winner['d_pop']), '+d') + 'pt)' if (winner.get('d_pop') or 0) < 0 else
+                    ('raises the worst case ' + format(float(hold_ml), '+,.0f') + ' → ' + format(float(winner['max_loss']), '+,.0f')
+                     if (hold_ml is not None and winner.get('max_loss') is not None and float(winner['max_loss']) < float(hold_ml) - 0.05 * abs(float(hold_ml)))
+                     else 'does not improve the payoff you hold')))
+        close_note = (f"{'Holding' if bench is hold_row else 'Closing'} scores {bench['desk_score']} — within {NONVIABLE_MARGIN} of "
+                      f"{winner.get('name')} ({winner['desk_score']}), which {why_not}; a fix like that has to beat "
+                      f"{'holding' if bench is hold_row else 'closing'} clearly, and it didn't.")
+        winner = bench
 
     # When the pick is a BENCHMARK (hold/close), the useful runner-up is the best way to KEEP the trade alive —
     # the desk's stated focus is fixing the current trade, not just exiting it — so skip past the other benchmark.
@@ -1891,9 +2127,25 @@ def rank_defenses(menu: dict) -> dict:
                     bits.append(f"P(profit) stays {hold_pop}%")
                 out.append("Do nothing: " + ", ".join(bits) + " — no trade, no cost, but none of the improvement.")
             elif stressed:
-                out.append("No fix clears the bar right now — no roll at even cost or better that keeps the risk defined, and closing "
-                           f"({close_row['desk_score'] if close_row is not None else '—'}/100) isn't clearly better — so holding keeps the "
-                           "defined-risk premium working while you watch it.")
+                free = [x for x in rolls if float(x.get("net_cash") or 0.0) >= -1.0]
+                if free:
+                    out.append("No fix clears the bar right now — the rolls that cost no new money all raise the worst case (a wider "
+                               "wing) or hand the tail to the stock (a cash-secured put), and closing "
+                               f"({close_row['desk_score'] if close_row is not None else '—'}/100) isn't clearly better — so holding keeps "
+                               "the defined-risk position in place while you watch it. The goals below show what each path costs.")
+                else:
+                    out.append("No fix clears the bar right now — no roll at even cost or better that keeps the risk defined, and closing "
+                               f"({close_row['desk_score'] if close_row is not None else '—'}/100) isn't clearly better — so holding keeps the "
+                               "defined-risk position in place while you watch it.")
+                an = menu.get("anatomy") or {}
+                th = (an.get("net") or {}).get("theta_day")
+                if th is not None and th < -0.5:
+                    out.append(f"But this is a hold for a BOUNCE, not for decay: time costs ≈${abs(th):,.0f}/day at a flat price "
+                               "(the long leg's time value is bleeding faster than the short's).")
+                pin = an.get("pin") or {}
+                if (pin.get("p_pct") or 0) >= 10:
+                    out.append(f"Expiry plan: if it is between ${pin['low']:,.0f} and ${pin['high']:,.0f} into the final close "
+                               f"(≈{pin['p_pct']}% odds), close or roll it — don't carry assigned shares with no protection.")
             else:
                 out.append("Nothing on the menu beats simply holding — its own recovery odds / E[P&L] are already best-in-class.")
             if ev_h_note:
@@ -1913,7 +2165,11 @@ def rank_defenses(menu: dict) -> dict:
             if vrp is not None and vrp <= -10:
                 out.append(f"Premium is {abs(vrp):.0f}% under-priced (IV {iv_pct}% vs HV {hv_pct}%) — you aren't paid to carry it, "
                            "and any roll re-sells more time at that same sub-realized vol.")
-            if p_touch is not None and p_touch >= 40:
+            K_c = float(menu.get("short_strike") or 0.0)
+            if K_c and spot_px and ((spot_px < K_c) if right == "P" else (spot_px > K_c)):
+                out.append(f"The ${K_c:.0f} short is already ${abs(spot_px - K_c):.2f} in the money "
+                           f"({(assign or {}).get('p_itm')}% odds it finishes there).")
+            elif p_touch is not None and p_touch >= 40:
                 out.append(f"{p_touch:.0f}% chance the strike is breached before expiry.")
         else:
             vh = _vs_hold_line(a) if (full and a is winner) else None
@@ -1943,9 +2199,13 @@ def rank_defenses(menu: dict) -> dict:
         if cat in ("hold", "exit") and full and a is winner and close_row is not None and stressed:
             other = close_row if cat == "hold" else hold_row
             if abs(float(a["desk_score"]) - float(other["desk_score"])) <= 3:
-                out.append(f"Hold and Close are a coin-flip on the score ({hold_row['desk_score']} vs {close_row['desk_score']}) and have the same expected "
-                           f"P&L ({hold_ev:+,.0f} vs {float(close_row.get('ev') or 0.0):+,.0f}). It comes down to appetite: keep the {hold_pop}% chance of "
-                           "getting back to profit (and carry whatever is ahead), or lock the loss now and take the tail off.")
+                c_ev = float(close_row.get("ev") or 0.0)
+                same = abs(hold_ev - c_ev) <= max(25.0, 0.03 * abs(c_ev))
+                out.append(f"Hold and Close are a coin-flip on the score ({hold_row['desk_score']} vs {close_row['desk_score']})"
+                           + (f" and have about the same expected P&L ({hold_ev:+,.0f} vs {c_ev:+,.0f})" if same else
+                              f"; expected P&L {hold_ev:+,.0f} holding vs {c_ev:+,.0f} closing")
+                           + f". It comes down to appetite: keep the {hold_pop}% chance of getting back to profit (and carry whatever is "
+                           "ahead), or lock the loss now and take the tail off.")
         out.extend((a.get("_fit_notes") or [])[:2])
         if full and not rm:
             rl = _roll_line()                                   # a non-roll pick must still answer "but the roll search said…"
@@ -1982,12 +2242,23 @@ def rank_defenses(menu: dict) -> dict:
                     "points": ["The trade is healthy; there is no defense to schedule. Re-check if P(touch), the cushion or an earnings date changes."],
                     "act_by": None, "vol": None}
 
+        an = menu.get("anatomy") or {}
+        th_day = (an.get("net") or {}).get("theta_day")
+        K_t = float(menu.get("short_strike") or 0.0)
+        itm = bool(K_t and spot_px and ((spot_px < K_t) if right == "P" else (spot_px > K_t)))
         if urgent:
             verdict, title = "now", "Act now — the clock is the risk"
+            if itm and th_day is not None and th_day < -0.5:
+                title = f"Decide now — every day costs ≈${abs(th_day):,.0f} at a flat price"
             if early:
                 pts.append(f"Early-assignment risk: {(assign or {}).get('early_reason')}.")
-            if acute:
+            if acute and itm:
+                pts.append(f"The ${K_t:.0f} short is already ${abs(spot_px - K_t):.2f} in the money (P(finish ITM) "
+                           f"{(assign or {}).get('p_itm')}%) — this is no longer about whether it gets tested, but what to do with it.")
+            elif acute:
                 pts.append(f"P(touch) {float(p_touch):.0f}% — the strike is very likely to be breached this cycle.")
+            if itm and th_day is not None and th_day < -0.5:
+                pts.append(f"Time is against this position (≈${abs(th_day):,.0f}/day at a flat price): waiting only pays if the stock moves your way.")
             if cur_dte is not None and cur_dte <= 3:
                 pts.append(f"{cur_dte}d left — gamma and pin risk accelerate into expiry; there is no time to be patient.")
         if c5 and rec.get("recovery_score") is not None and c5.get("recovery_pop") is not None:
@@ -2007,6 +2278,27 @@ def rank_defenses(menu: dict) -> dict:
                     verdict, title = "before_print", f"Window: now → {_short_exp(act_by)} — earnings {_short_exp(earn_date)} ({int(earn_days)}d)"
                 pts.append(f"Earnings {earn_when} land AFTER this expiry{move_txt}. Holding isn't exposed — but anything you roll beyond "
                            "it is a bet on the print, and back-month IV carries the event, which is exactly why an even-cost roll looks so easy.")
+                # the nearest roll through the print shows it best: the event is the biggest share of its premium
+                waits = sorted((a for a in rolls if a.get("wait") and (a.get("roll_meta") or {}).get("spans_earnings")),
+                               key=lambda a: int(a["roll_meta"].get("dte") or 0))
+                if waits:
+                    wa = waits[0]["wait"]
+                    ns = wa.get("new_short") or {}
+                    if ns and wa.get("cost_flat") is not None:
+                        leg = f"${float(ns['strike']):.0f} {'put' if right == 'P' else 'call'} in {_short_exp(waits[0]['roll_meta']['expiry'])}"
+                        rises = float(ns["iv_later_pct"]) - float(ns["iv_now_pct"]) >= 1.0
+                        tail = (f"Rolling then instead of now: {wa['cost_flat']:+,.0f} if the stock goes nowhere"
+                                + (" — buying back what you hold costs more by then, too." if wa["cost_flat"] < 0 else "."))
+                        if wa["cost_flat"] < 0 and rises:
+                            pts.append(f"Waiting for IV to 'rise into earnings' doesn't pay: on the last day before expiry the {leg} would quote "
+                                       f"{ns['iv_later_pct']:.0f}% IV ({ns['iv_now_pct']:.0f}% today) yet pay ${ns['premium_later']:.2f} instead of "
+                                       f"${ns['premium_now']:.2f} — the event premium stays, the ordinary time value decays. {tail}")
+                        elif wa["cost_flat"] < 0:
+                            pts.append(f"Waiting doesn't pay: on the last day before expiry the {leg} would pay ${ns['premium_later']:.2f} instead of "
+                                       f"${ns['premium_now']:.2f}. {tail}")
+                        else:
+                            pts.append(f"Waiting pays here: the position you hold is still decaying in your favour, so the same roll on the last "
+                                       f"day before expiry nets more ({tail[0].lower() + tail[1:]}) — roll late, before the closing bell.")
                 pre = [a for a in rolls if int((a.get('roll_meta') or {}).get('dte') or 0) < earn_days]
                 post = [a for a in rolls if int((a.get('roll_meta') or {}).get('dte') or 0) >= earn_days]
                 if pre:
@@ -2018,7 +2310,13 @@ def rank_defenses(menu: dict) -> dict:
                     rm_b = b['roll_meta']
                     k_short = float(rm_b['strike'])
                     lead = "Through the print" if b is winner else "Best roll through the print"
-                    if spot_px > 0:
+                    b_itm = (k_short > spot_px) if right == "P" else (k_short < spot_px)
+                    if spot_px > 0 and b_itm:
+                        need = abs(k_short - spot_px) / spot_px * 100.0
+                        line = (f"{lead}: {_short_exp(rm_b['expiry'])} ({rm_b['dte']}d) — its ${k_short:.0f} short is still {need:.1f}% IN the money: "
+                                f"it needs a {'rally' if right == 'P' else 'drop'} of that size by then to finish clear"
+                                + (f" (the print alone is priced at ±{float(em):.0f}%)" if em else "") + ".")
+                    elif spot_px > 0:
                         dist = abs(spot_px - k_short) / spot_px * 100.0
                         if em:
                             p_ev = (1.0 - _norm_cdf(dist / float(em))) * 100.0
@@ -2028,7 +2326,10 @@ def rank_defenses(menu: dict) -> dict:
                             line = (f"{lead}: {_short_exp(rm_b['expiry'])} ({rm_b['dte']}d{'' if b is winner else ', ' + format(b['desk_score'], 'd') + '/100'}) — its "
                                     f"${k_short:.0f} short sits {dist:.1f}% from spot vs ±{float(em):.0f}% priced: {where}.")
                             if inside:
-                                clear = [a for a in post if a is not b and abs(spot_px - float(a['roll_meta']['strike'])) / spot_px * 100.0 >= float(em)]
+                                clear = [a for a in post if a is not b and bool(a.get('defined_risk')) == bool(b.get('defined_risk'))
+                                         and (a.get('roll_meta') or {}).get('route') == rm_b.get('route')
+                                         and abs(spot_px - float(a['roll_meta']['strike'])) / spot_px * 100.0 >= float(em)
+                                         and ((float(a['roll_meta']['strike']) < spot_px) if right == 'P' else (float(a['roll_meta']['strike']) > spot_px))]
                                 if clear:
                                     c = clear[0]
                                     line += (f" A roll that clears the move exists — {_short_exp(c['roll_meta']['expiry'])} ${float(c['roll_meta']['strike']):.0f} "
@@ -2085,4 +2386,11 @@ def rank_defenses(menu: dict) -> dict:
     for a in alts:
         a.pop("_fit_notes", None)
         a["is_desk_pick"] = (a is winner)
+    try:
+        from .defend_playbook_service import action_plan, objectives, timing_read
+        menu["playbook"] = {"objectives": objectives(menu)}
+        menu["action_plan"] = action_plan(menu)
+        menu["timing_read"] = timing_read(menu)
+    except Exception:  # noqa: BLE001 — the goals are a re-reading of the ranked menu; never cost the menu itself
+        menu["playbook"] = menu.get("playbook") or None
     return menu

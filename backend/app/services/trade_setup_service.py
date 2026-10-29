@@ -30,6 +30,7 @@ from .market_structure_service import compute_market_structure
 from .regime_service import compute_regime
 from .dealer_positioning_service import compute_dealer_positioning
 from .chart_pattern_service import compute_chart_patterns
+from .earnings_reaction_service import earnings_reaction
 from .stock_service import safe_float
 from .zebra_service import _bs_price, _norm_cdf, DEFAULT_RISK_FREE
 from .first_passage import trade_odds
@@ -173,9 +174,10 @@ def _edge(setup, spot, atm_iv, dte) -> dict:
 def setups_cache_key(ticker: str) -> str:
     """Cache key of the ``/trade-setups`` payload. The router AND the trade manager read/write the SAME entry,
     so both go through this one function. Bump the version whenever the payload SHAPE changes.
+    v5: ``context.earnings_reaction`` + ``context.flip_levels``; spent chart patterns no longer vote;
     v4: ``edge.equity`` = first-passage odds (no EV/Kelly), flat 1% sizing, exact options PoP / model P&L;
     v3: VP levels now Daily·4H·1H (was macro/swing/micro); v2: multi-style + meaningful targets."""
-    return f"setups:{ticker}:v4"
+    return f"setups:{ticker}:v5"
 
 
 _RISK_BUDGET = 250.0        # $ risked per trade = 1% of a nominal $25k book (share-sizing basis)
@@ -837,7 +839,21 @@ def _atr_from_structure(structure) -> float:
     return 0.0
 
 
-def _context(bias, structure, regime, dealer) -> dict:
+def _earnings_reaction(indicators, micro) -> dict | None:
+    """Post-print read on the SAME daily series the indicators use and the SAME reaction-session
+    anchor as the "Last Earnings" AVWAP, so the two never disagree about which print it was."""
+    ind = indicators or {}
+    if ind.get("interval") != "1d":
+        return None
+    e = ((micro or {}).get("avwap") or {}).get("earnings") or {}
+    try:
+        return earnings_reaction(ind.get("timestamps") or [], ind.get("prices") or [], ind.get("highs") or [],
+                                 ind.get("lows") or [], ind.get("volumes") or [], e.get("anchor_date"), e.get("value"))
+    except Exception:  # noqa: BLE001 — context only; never break the setups payload
+        return None
+
+
+def _context(bias, structure, regime, dealer, earnings=None) -> dict:
     reg = (regime or {}).get("regime") or {}
     em = ((dealer or {}).get("expected_move") or {}).get("em_30d") or {}
     gf = (dealer or {}).get("gamma_flip") or {}
@@ -851,6 +867,10 @@ def _context(bias, structure, regime, dealer) -> dict:
                           "lower": em.get("lower"), "iv": em.get("iv_atm_pct")} if em else None,
         "dealer": {"gamma": ng.get("sign"), "flip": gf.get("level"), "note": ng.get("label")} if dealer else None,
         "trend_alignment": {k: (tf.get(k) or {}).get("trend") for k in ("daily", "h4", "h1")} if structure else None,
+        # the close that would turn each timeframe (a CHOCH) — see market_structure_service._structure
+        "flip_levels": {k: (((tf.get(k) or {}).get("structure") or {}).get("flip_level")) for k in ("daily", "h4", "h1")}
+                       if structure else None,
+        "earnings_reaction": earnings,
     }
 
 
@@ -1357,7 +1377,7 @@ def compute_trade_setups(stock) -> dict | None:
         return {
             "price": _r(spot),
             "as_of": _now_str(),
-            "context": _context(bias, structure, regime, dealer),
+            "context": _context(bias, structure, regime, dealer, _earnings_reaction(indicators, micro)),
             "confluence_zones": zones[:8],
             "setups": setups,
             "chart_patterns": patterns,

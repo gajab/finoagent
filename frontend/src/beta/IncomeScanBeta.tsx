@@ -16,6 +16,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Loader2, Search, SlidersHorizontal, Check, ChevronDown, AlertTriangle, Briefcase, X, Zap } from 'lucide-react';
 import { runDeskReview, fetchOptionExpirations, createPaperTrade } from '../api';
 import type { DeskReviewParams } from '../api';
+import { TaBriefPanel, TradeContextNotes } from '../components/TaBrief';
 import type { DeskReviewResult, DeskRankedTrade } from '../types';
 import { TradeExplorer } from '../components/DeskReview';
 import { TickerChrome } from '../components/DerivativeIncome';
@@ -342,6 +343,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
             {showCtx && ctx && <div className="mt-3"><TickerChrome ticker={rev.ticker} context={ctx} events={rev.flag_events} expirySummaries={rev.expiry_summaries} /></div>}
           </div>
           {rev.data_source_note && <div className="rounded-lg border border-warning/30 bg-warning/[0.07] px-3 py-2 text-xs text-warning flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5 shrink-0" /> {rev.data_source_note}</div>}
+          <TaBriefPanel brief={rev.ta_brief} defaultOpen={false} />
 
           {ranked.length === 0 ? (
             <NoTradeReasons note={rev.note} reasons={rev.note_reasons}
@@ -495,6 +497,7 @@ export default function IncomeScanBeta({ seed = null, onSeedConsumed }: { seed?:
                       </div>
                     </div>
                     <ScoreCard t={selected} />
+                    <TradeContextNotes factors={[...(selected.grade_adjustments || []), ...(selected.ta_factors || [])] as any} />
                     {audit && scanned && (
                       <div className="rounded-xl border border-white/[0.08] bg-base-200/20">
                         <TradeExplorer t={selected} ticker={rev.ticker} params={scanned} spot={rev.spot} nextEarnings={nextEarnings} />

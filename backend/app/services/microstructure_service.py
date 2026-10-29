@@ -206,22 +206,41 @@ def _date_str(x) -> str:
 
 
 def _last_earnings_date(stock) -> _dt.date | None:
-    """Most recent PAST earnings report date, from earnings_dates / earnings_history."""
-    cands: list[_dt.date] = []
-    for attr in ("earnings_dates", "earnings_history"):
+    """First trading day that REACTED to the most recent past earnings report (the AVWAP anchor).
+
+    Report timestamps come from ``earnings_dates`` (needs lxml) or, failing that, ``.info``'s
+    earnings timestamps. ``earnings_history`` is NOT used: its index is the fiscal QUARTER END
+    (TTMI: 2026-09-30 for the 2026-10-22 print), which anchored the AVWAP three weeks early.
+    An after-close report reacts the next session, so it anchors on the following day."""
+    from .derivative_income_service import _amc_bmo, _info_earnings_ts
+
+    stamps: list = []
+    try:
+        df = stock.earnings_dates
+        if df is not None and not df.empty:
+            stamps = list(df.index)
+    except Exception:  # noqa: BLE001 — lxml missing / Yahoo throttled
+        stamps = []
+    if not stamps:
         try:
-            df = getattr(stock, attr)
-            if df is not None and not df.empty:
-                for d in df.index:
-                    try:
-                        cands.append(_to_date(d))
-                    except Exception:
-                        continue
-        except Exception:
+            stamps = _info_earnings_ts(stock.info or {})
+        except Exception:  # noqa: BLE001
+            stamps = []
+    now = pd.Timestamp.now(tz="America/New_York")
+    past = []
+    for t in stamps:
+        try:
+            ts = pd.Timestamp(t)
+            ts = ts.tz_convert("America/New_York") if ts.tzinfo else ts.tz_localize("America/New_York")
+        except Exception:  # noqa: BLE001
             continue
-    today = _dt.date.today()
-    past = [d for d in cands if d <= today]
-    return max(past) if past else None
+        if ts <= now:
+            past.append(ts)
+    if not past:
+        return None
+    last = max(past)
+    react = last.date() + _dt.timedelta(days=1) if _amc_bmo(last) == "amc" else last.date()
+    return react if react <= now.date() else None
 
 
 # ---------------------------------------------------------------------------

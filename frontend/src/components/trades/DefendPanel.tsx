@@ -18,6 +18,8 @@
  *   5  Action menu     — priced repairs (roll / spread / strangle / hedge / wheel) + Hold + Close, Δ-vs-hold
  *   6  Context         — what broke: recoverable time value · vol state · structure · sector · earnings
  *   7  War room (lazy) — a Quant→Risk→PM defense cascade fed ONLY the numbers above
+ *   ACTION PLAN first (one card: facts + up to five actions with cash / worst / best / beats-closing + orders); the
+ *   recommendation's reasoning, the leg-by-leg anatomy, every lens and the assignment ladder sit in one folded Details block
  *
  * Everything but the LLM war-room comes off ONE core fetch and renders immediately (no inner button).
  */
@@ -31,6 +33,7 @@ import { fetchDefendMenu, fetchDefendCommittee, fetchDefendRefine } from '../../
 import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor } from '../../api';
 import { Card, money, rank, ScoreBar } from './RepairMenu';
 import { MoveStepsBlock, TimingBlock } from './MoveSteps';
+import { ActionPlan, AssignmentLadder, PositionAnatomy } from './DefendPlaybook';
 
 const num = (v: number | null | undefined, d = 0) =>
   v == null || !isFinite(v) ? '—' : v.toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -593,16 +596,24 @@ export default function DefendPanel({ tradeId, quoteSource, ticker }: { tradeId:
               <button className="btn btn-ghost btn-xs h-auto min-h-0 py-0.5" onClick={() => void refine(data)}>Retry</button>
             </div>
           )}
-          <DeskRecommendation d={data} onEvaluate={toEvaluate} />
+          {data.action_plan?.rows?.length ? <ActionPlan d={data} /> : <DeskRecommendation d={data} onEvaluate={toEvaluate} />}
         </>
       )}
-      <Recoverability d={data} />
-      <Assignment d={data} />
-      <Synthetic d={data} />
-      <CostOfWaiting d={data} />
-      {!holdBack && <ActionMenu d={data} onEvaluate={toEvaluate} />}
-      <ContextLens d={data} />
-      {!holdBack && <CommitteeLens tradeId={tradeId} quoteSource={quoteSource} defend={data} />}
+      <details className="rounded-lg border border-white/[0.08] px-2.5 py-2" data-testid="defend-details">
+        <summary className="cursor-pointer select-none text-xs font-semibold text-base-content/70">Details — why the pick · leg-by-leg read · every move · assignment ladder · lenses</summary>
+        <div className="space-y-2.5 mt-2.5">
+          {!holdBack && data.action_plan?.rows?.length ? <DeskRecommendation d={data} onEvaluate={toEvaluate} /> : null}
+          <PositionAnatomy d={data} />
+          <Recoverability d={data} />
+          <Assignment d={data} />
+          <Synthetic d={data} />
+          <CostOfWaiting d={data} />
+          {!holdBack && <ActionMenu d={data} onEvaluate={toEvaluate} />}
+          {!holdBack && <AssignmentLadder d={data} />}
+          <ContextLens d={data} />
+          {!holdBack && <CommitteeLens tradeId={tradeId} quoteSource={quoteSource} defend={data} />}
+        </div>
+      </details>
     </div>
   );
 }

@@ -8,8 +8,9 @@
  *
  *   header        → where the trade stands: posture, spot, cushion, days left, P(finish ITM), mark if closed
  *                   (plus a warning when early assignment is likely)
- *   recommendation→ the ONE desk pick: score ring, why, runner-up, what to avoid
- *   next best moves → every priced option as a ranked row WITH its payoff curve (tap for breakdown and rationale)
+ *   what to do    → ONE card: a few facts + at most five actions (desk pick · same strikes later · close · more room ·
+ *                   own the shares cheaper), each with cash today / worst / best / beats-closing, one line, when, and orders on a tap
+ *   details (folded) → the full recommendation, the leg-by-leg anatomy, every priced move, the assignment ladder, the risk read
  *   risk read     → recoverability as tiles + the drivers that build it
  *   folded        → cost of waiting · what broke · synthetic reframe · war room
  */
@@ -23,6 +24,7 @@ import { fetchDefendMenu, fetchDefendCommittee, fetchDefendRefine } from '../api
 import type { RepairMenuResult, RepairAlternative, DefendCommittee, DefendFactor } from '../api';
 import { money, rank, CAT, PayoffCurve, legStr } from '../components/trades/RepairMenu';
 import { MoveStepsBlock, TimingBlock, stepsLine } from '../components/trades/MoveSteps';
+import { ActionPlan, AssignmentLadder, PositionAnatomy } from '../components/trades/DefendPlaybook';
 import { Accordion, Callout, Chip, Meter, ScoreRing, SubHead, Tile, TONE, type Tone } from './BetaKit';
 
 const num = (v: number | null | undefined, d = 0) => (v == null || !isFinite(v) ? '—' : v.toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d }));
@@ -525,6 +527,7 @@ export default function BetaDefend({ tradeId, quoteSource, ticker }: { tradeId: 
   if (!data) return null;
 
   const holdBack = data.roll_search === 'pending' && !refineErr;
+  const planned = !!data.action_plan?.rows?.length;        // the one-card action plan; without it, the full recommendation leads
   const cw = data.cost_of_waiting || [];
   const ctx = data.context;
   return (
@@ -536,9 +539,17 @@ export default function BetaDefend({ tradeId, quoteSource, ticker }: { tradeId: 
           <button className="underline" onClick={() => void refine(data)}>Retry</button>
         </Callout>
       )}
-      {holdBack ? <Refining /> : <Recommendation d={data} onEvaluate={toEvaluate} />}
-      {!holdBack && (data.alternatives || []).length > 0 && <Moves d={data} onEvaluate={toEvaluate} />}
-      <RiskRead d={data} />
+      {holdBack ? <Refining /> : planned ? <ActionPlan d={data} /> : <Recommendation d={data} onEvaluate={toEvaluate} />}
+
+      <Accordion title="Details" icon={<Layers className="w-4 h-4" />} defaultOpen={!planned} summary="why the pick · leg-by-leg read · timing · every move · assignment ladder · risk read">
+        <div className="space-y-3">
+          <PositionAnatomy d={data} />
+          {!holdBack && planned && <Recommendation d={data} onEvaluate={toEvaluate} />}
+          {!holdBack && (data.alternatives || []).length > 0 && <Moves d={data} onEvaluate={toEvaluate} />}
+          {!holdBack && <AssignmentLadder d={data} />}
+          <RiskRead d={data} />
+        </div>
+      </Accordion>
 
       {cw.length > 0 && (
         <Accordion title="Cost of waiting" icon={<Clock className="w-4 h-4" />}

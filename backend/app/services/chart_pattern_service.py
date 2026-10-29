@@ -814,7 +814,13 @@ def compute_chart_patterns(stock, period: str = "1y", interval: str = "1d") -> d
             if abs(tgt - close) / close > 0.5:                      # >50% away on a 1y daily chart = noise
                 continue
             if p["status"] == "broken_out":                          # already played out → no edge left
-                if (side == "down" and close <= tgt) or (side == "up" and close >= tgt):
+                # Reached at ANY point since the pattern completed, not just "close is beyond it now": a
+                # measured move that was hit and then bounced back (TTMI: double-top target $82 hit by the
+                # earnings flush to $71.71, then +20% back to $88) is spent, not a live bearish signal.
+                after = df.iloc[p["as_of_idx"] + 1:]
+                hit_dn = side == "down" and (close <= tgt or (not after.empty and float(after["Low"].min()) <= tgt))
+                hit_up = side == "up" and (close >= tgt or (not after.empty and float(after["High"].max()) >= tgt))
+                if hit_dn or hit_up:
                     continue
             # a still-FORMING pattern must be compact (target within 25%) — no 40%+ year-spanning
             # "measured moves" that price is nowhere near yet.

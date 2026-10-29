@@ -52,16 +52,22 @@ class _Res:
 
 
 def install(monkeypatch, *, earn_days=28, cur_dte=8, entry=(2.60, 2.26), spot=SPOT, posture="marginal", p_touch=62.0,
-            vrp=-6.0, earnings=True, legs=None, sym="AAOI", ivs=None, trend=-35.0):
-    """Wire the world; returns (db, strategy). `legs` overrides the default 80/70 put spread (list of (type, action, strike))."""
+            vrp=-6.0, earnings=True, legs=None, sym="AAOI", ivs=None, trend=-35.0, bid_ask=False):
+    """Wire the world; returns (db, strategy). `legs` overrides the default 80/70 put spread (list of (type, action, strike)).
+    `bid_ask` = quote a two-sided market around every mid (±max(2.5¢, 3%)) — what the straddle vols, the anatomy and the
+    assignment ladder need; off by default so the older tests keep their exact (mid-only) world."""
     ivs = ivs or term_ivs(earn_days)
 
     def chain(n):
         qs = []
         for k in range(40, 125, 5):
             for right, kind in (("C", "call"), ("P", "put")):
-                qs.append(SimpleNamespace(right=right, strike=float(k), oi=500, volume=50, iv=ivs[n],
-                                          mid=round(max(bs_price(spot, float(k), n / 365, 0.045, ivs[n], kind), 0.05), 2)))
+                mid = round(max(bs_price(spot, float(k), n / 365, 0.045, ivs[n], kind), 0.05), 2)
+                q = SimpleNamespace(right=right, strike=float(k), oi=500, volume=50, iv=ivs[n], mid=mid)
+                if bid_ask:
+                    half = max(0.025, 0.03 * mid)
+                    q.bid, q.ask = round(max(0.01, mid - half), 2), round(mid + half, 2)
+                qs.append(q)
         return SimpleNamespace(quotes=qs)
 
     class Prov:
@@ -108,6 +114,11 @@ def install(monkeypatch, *, earn_days=28, cur_dte=8, entry=(2.60, 2.26), spot=SP
     monkeypatch.setattr(dps, "compute_dealer_positioning", lambda tk: None)
     monkeypatch.setattr(cas, "_next_earnings_sync", lambda t: (iso(earn_days) if earnings else None))
     monkeypatch.setattr(ros, "dt", _DtShim)
+    from app.services import edgar_service
+
+    async def _no_edgar(*_a, **_k):                 # the earnings-history read never leaves the box in tests
+        return []
+    monkeypatch.setattr(edgar_service, "earnings_release_times", _no_edgar)
     return DB(), strategy
 
 

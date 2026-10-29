@@ -3,7 +3,9 @@ spread-roll search) run against a synthetic Black-Scholes AAOI-style option chai
 a put credit spread 80/70, spot $81, clock pinned to 2026-10-15). Synthetic data only; run from the repo root:
     backend/venv/bin/python frontend/scripts/beta-tests/preview/gen_defend_fixture.py
 Cases: after = print AFTER this expiry (Nov 20 75/65 even-cost roll exists) · inside = print INSIDE the trade (no even-cost roll) ·
-       healthy = nothing to defend · naked = a naked short call (no income-viable fix)."""
+       healthy = nothing to defend · naked = a naked short call (no income-viable fix) ·
+       trap = the in-the-money spread (spot $68.50, 8d, print the week after expiry, two-sided market) — anatomy, three goals,
+       assignment ladder."""
 import json
 import os
 import sys
@@ -19,6 +21,7 @@ CASES = {
     "inside": dict(earn_days=21, cur_dte=22),
     "healthy": dict(earn_days=28, cur_dte=8, posture="healthy", p_touch=8.0, vrp=5.0, trend=3.0),
     "naked": dict(earn_days=28, cur_dte=8, legs=[("call", "SELL", 85)], entry=(1.8,), p_touch=55.0, vrp=-19.4, trend=60.0),
+    "trap": dict(spot=68.5, cur_dte=8, earn_days=14, posture="tested", p_touch=99.0, bid_ask=True),
 }
 out = {}
 for name, kw in CASES.items():
@@ -29,7 +32,7 @@ for name, kw in CASES.items():
         mp.undo()
     # phase 1 is only kept where the preview shows the "building the recommendation" state; elsewhere it IS the final payload
     out[name] = {"final": json.loads(json.dumps(final))}
-    if name == "after":
+    if name in ("after", "trap"):
         out[name]["phase1"] = p1
     d = final["desk_recommendation"]
     print(f"{name:8} pick = {d['name']}  [{d['desk_score']}]  policy={d.get('policy')}  timing={final['timing']['verdict']}")

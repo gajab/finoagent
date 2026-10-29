@@ -119,7 +119,7 @@ def _no_trade_reasons(diag: dict, scanned: list[tuple[str, int]], failed: list[s
             out.append(f"{name}: no out-of-the-money strikes are quoted for this expiry.")
             continue
         parts = []
-        liq = {c: d[c] for c in ("wide", "no_market", "thin") if c in d}
+        liq = {c: d[c] for c in ("wide", "untraded", "no_market", "thin") if c in d}
         n_liq = sum(v["n"] for v in liq.values())
         if n_liq:
             blocked["liquidity"] = True
@@ -127,13 +127,17 @@ def _no_trade_reasons(diag: dict, scanned: list[tuple[str, int]], failed: list[s
             if "wide" in liq:
                 bits.append(f"{liq['wide']['n']} too wide even for a limit order (spread > "
                             f"{LIMIT_ONLY_MAX_SPREAD * 100:.0f}% of mid, or the bid alone pays < {m})")
+            if "untraded" in liq:
+                bits.append(f"{liq['untraded']['n']} wide with NO contracts traded in the latest session (open "
+                            "interest only — a placeholder quote, not a market a limit order would fill in)")
             if "no_market" in liq:
                 bits.append(f"{liq['no_market']['n']} with no bid")
             if "thin" in liq:
                 bits.append(f"{liq['thin']['n']} with a dead book (OI + volume < {MIN_LIQUIDITY})")
             # the example: the nearest-to-tradable failure (a real but too-wide market before a dead or one-sided book)
-            code = next(c for c in ("wide", "thin", "no_market") if c in liq)
-            why = {"wide": "too wide", "thin": "dead book", "no_market": "no bid"}[code]
+            code = next(c for c in ("wide", "untraded", "thin", "no_market") if c in liq)
+            why = {"wide": "too wide", "untraded": "no trades in the latest session", "thin": "dead book",
+                   "no_market": "no bid"}[code]
             best = liq[code]["ex"]
             parts.append(f"{n_liq} clear {p}% keep and {m} but can't be filled — {'; '.join(bits)}"
                          + (f" (closest: {quote(best, rt)} — {why})" if best else ""))
@@ -840,11 +844,14 @@ def _executable(q: OptionQuote) -> tuple[bool, str]:
     return code == "ok", why
 
 
-def _limit_only_ok(q: OptionQuote, min_income: float) -> bool:
+def _limit_only_ok(q: OptionQuote, min_income: float, need_volume: bool = True) -> bool:
     """A WIDE but real market worth a limit order: two-sided, a live book, spread ≤ LIMIT_ONLY_MAX_SPREAD × mid,
-    and even the bid alone clears the premium floor (so the trade still qualifies if it only fills at the bid)."""
+    and even the bid alone clears the premium floor (so the trade still qualifies if it only fills at the bid).
+    It must also have TRADED in the latest session (volume > 0): a wide quote that nobody has hit — open interest
+    only — is a market maker's placeholder, not evidence a limit order would ever fill there."""
     return (q.bid > 0 and q.ask > 0 and q.mid > 0 and (q.oi + q.volume) >= MIN_LIQUIDITY
-            and (q.ask - q.bid) / q.mid <= LIMIT_ONLY_MAX_SPREAD and q.bid * CONTRACT_MULTIPLIER >= min_income)
+            and (q.ask - q.bid) / q.mid <= LIMIT_ONLY_MAX_SPREAD and q.bid * CONTRACT_MULTIPLIER >= min_income
+            and (q.volume > 0 or not need_volume))
 
 
 def _diag_add(diag: Optional[dict], reason: str, q: OptionQuote, p_keep: Optional[float], premium: float,
@@ -1118,8 +1125,10 @@ def _single_leg_income(structure: str, label: str, q: OptionQuote, spot: float,
         if code == "wide" and prob_ok and prem_ok and _limit_only_ok(q, min_income):
             limit_only = True                             # a real market, just wide → offer it as a limit order
         elif code != "ok":
-            _diag_add(diag, code if (prob_ok and prem_ok) else ("prob" if not prob_ok else "premium"),
-                      q, p_keep, premium, liquid=(code == "wide" and _limit_only_ok(q, 0.0)))
+            reason = code if (prob_ok and prem_ok) else ("prob" if not prob_ok else "premium")
+            if reason == "wide" and q.volume <= 0 and _limit_only_ok(q, min_income, need_volume=False):
+                reason = "untraded"                       # limit-only on every count except it never traded
+            _diag_add(diag, reason, q, p_keep, premium, liquid=(code == "wide" and _limit_only_ok(q, 0.0)))
             return None
     if not prob_ok:
         _diag_add(diag, "prob", q, p_keep, premium)

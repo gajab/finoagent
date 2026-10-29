@@ -231,6 +231,8 @@ export interface TFStructure {
   events: StructureEvent[];
   recent_swing_high: number | null;
   recent_swing_low: number | null;
+  /** close that would CHOCH this timeframe (the unbroken swing on the other side of the trend) */
+  flip_level?: number | null;
 }
 export interface LiquidityPool {
   type: 'BSL' | 'SSL';
@@ -324,6 +326,21 @@ export interface SetupContext {
   expected_move: { pct_30d: number | null; upper: number | null; lower: number | null; iv: number | null } | null;
   dealer: { gamma: string | null; flip: number | null; note: string | null } | null;
   trend_alignment: { daily: string | null; h4: string | null; h1: string | null } | null;
+  /** the close that would turn each timeframe's trend (CHOCH level) */
+  flip_levels?: { daily: number | null; h4: number | null; h1: number | null } | null;
+  /** the most recent material earnings print and where price sits against it — context, never a vote */
+  earnings_reaction?: EarningsReaction | null;
+}
+export interface EarningsReaction {
+  date: string; sessions_since: number; direction: 'up' | 'down';
+  move_pct: number; sigma_multiple: number | null; rvol: number | null;
+  print_high: number; print_low: number; prior_close: number;
+  since_pct: number; retraced_pct: number | null;
+  /** reclaimed = back through the print-day extreme AGAINST the print; extended = beyond it WITH the print */
+  state: 'reclaimed' | 'inside' | 'extended';
+  avwap: number | null; avwap_side: 'above' | 'below' | null;
+  read: string;
+  evidence: string | null;
 }
 export interface ConfluenceZone {
   center: number; low: number; high: number; kind: string; score: number;
@@ -4249,7 +4266,7 @@ export interface PerSideLeg {
 }
 export interface FactorRow {
   label: string; points: number; detail?: string; baseline_points?: number;
-  earnings_impacted?: boolean; dimension?: string | null;
+  earnings_impacted?: boolean; dimension?: string | null; info_only?: boolean;
 }
 export interface PerSideQuant {
   sides: PerSideLeg[];
@@ -4271,7 +4288,7 @@ export interface DeskRankedTrade extends DerivativeIncomeOpportunity {
   grade_timing_hold?: string[]; // TIMING holds (momentum against a REACHABLE strike) → WAIT, keeps its quality letter
   base_quality?: number;        // the algorithmic_quant base score BEFORE regime/factor adjustments
   grade_adjustments?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null }[];  // signed option-math contributions → desk_score (dimension = risk dimension for UI grouping; baseline_points = value WITHOUT the earnings-aware adjustment)
-  ta_factors?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null }[]; // signed technical/regime contributions → desk_score (dimension = risk dimension for UI grouping; baseline_points = the value WITHOUT the earnings-aware adjustment)
+  ta_factors?: { label: string; points: number; detail?: string; baseline_points?: number; earnings_impacted?: boolean; dimension?: string | null; info_only?: boolean }[]; // signed technical/regime contributions → desk_score (dimension = risk dimension for UI grouping; baseline_points = the value WITHOUT the earnings-aware adjustment)
   qp?: {                        // Q-vs-P: implied (risk-neutral) vs physical (realized) read
     implied_vol_pct?: number | null; realized_vol_pct?: number | null; weight_vol_pct?: number | null;
     iv_hv_ratio?: number | null;                     // < 1 = negative VRP (implied under-prices risk)
@@ -4342,8 +4359,17 @@ export interface MonitorPlan {
   error?: string;
 }
 
+/** Pre-trade technical context on a desk payload — deterministic, never scored. */
+export interface TaBrief {
+  items: { key: string; topic: string; tone: 'bull' | 'bear' | 'neutral' | 'warn'; text: string }[];
+  timeframe?: string | null;
+  trend_timeframe?: string | null;
+  note?: string;
+}
+
 export interface DeskReviewResult {
   ticker: string;
+  ta_brief?: TaBrief;
   spot: number;
   sofr_pct: number;
   as_of?: string;
@@ -5708,4 +5734,174 @@ export interface SelloffBookData {
     vega_per_pt: number; capital: number; short_legs: number };
   has_covered_stock?: boolean; assumptions?: string[]; read?: string[];
   coverage?: { requested: number; analysed: number; skipped: { trade_id: number | null; ticker: string | null; reason: string }[] };
+}
+
+// ---------------------------------------------------------------------------
+// LEAP Protection — protect + diversify a low-basis position without selling
+// ---------------------------------------------------------------------------
+export interface LeapProtectionRequest {
+  ticker: string;
+  shares: number;
+  cost_basis: number;
+  index: string;
+  horizon_years: number;
+  expiry?: string | null;
+  tax: { st_rate_pct: number; lt_rate_pct: number };
+  tax_lens: 'defer' | 'liquidate';
+  erp_pct: number;
+  alpha_pct: number;
+  vol_view: 'implied' | 'realized';
+  objective: 'cagr' | 'ce' | 'mean';
+  max_loss_pct: number;
+  max_single_stock_pct: number;
+  borrow_spread_pct: number;
+  loan_ltv_pct: number;
+  allow_constructive_sale: boolean;
+  proceeds_to: 'index' | 'bond' | 'cash';
+  bond_rate_pct: number;
+  stock_return_pct?: number | null;
+}
+
+export interface LeapLeg {
+  und: string;
+  action: 'BUY' | 'SELL';
+  type: 'call' | 'put' | 'futures';
+  strike: number;
+  pct_of_spot?: number;
+  expiry: string;
+  qty_per_share: number;
+  contracts?: number;
+  bid?: number;
+  ask?: number;
+  mid?: number;
+  px?: number;
+  iv_pct?: number;
+  delta?: number;
+  oi?: number;
+  volume?: number;
+  spread_pct?: number | null;
+  notional?: number;
+  contracts_note?: string | null;
+  twin?: string | null;        // index leg priced/settled as its European cash-settled twin (SPX / XSP …)
+}
+
+/** A written option's early-assignment read: chance (simulated) the holder exercises before expiry, and what to do. */
+export interface LeapAssignment {
+  leg: string;
+  contracts: number;
+  american: boolean;
+  p_pct: number;
+  level: 'none' | 'low' | 'medium' | 'high';
+  when: string | null;
+  twin: string | null;
+  trigger?: string;
+  if_assigned: string | null;
+  action: string;
+  note?: string;
+}
+
+export interface LeapDividends {
+  payments: number;
+  per_payment: number | null;
+  gross_total: number;
+  after_tax_total: number;
+  rate_pct: number;
+  qualified: boolean;
+  why: string | null;
+  where: string;
+  at_expiry_total: number;
+  expected: boolean;
+}
+
+export type LeapLedgerLine =
+  | { kind: 'shares' | 'rolls' | 'cash' | 'loan' | 'tax' | 'liq_tax'; label: string }
+  | { kind: 'sleeve'; dest: 'index' | 'bond'; label: string }
+  | { kind: 'divs'; dest: 'index' | 'bond' | 'cash'; count: number; rate_pct: number; label: string }
+  | { kind: 'leg'; und: string; type: 'call' | 'put' | 'futures'; action: 'BUY' | 'SELL'; strike: number; units: number; contracts: number; early?: number[] };
+
+export interface LeapLedger { lines: LeapLedgerLine[]; values: number[][] }
+
+export interface LeapStrategyRow {
+  id: string;
+  family: string;
+  family_label: string;
+  name: string;
+  blurb: string;
+  how: string[];
+  legs: LeapLeg[];
+  rolls: { action: string; type: string; rule: string; cycle_days: number; first_strike: number; first_expiry: string; first_bid: number; contracts: number; first_yield_pct: number }[];
+  net_cash_total: number;
+  to_dest_total: number;
+  loan_total: number;
+  cagr_pct: number;
+  mean_ann_pct: number;
+  ce_ann_pct: number;
+  cvar5_pct: number;
+  p_loss_pct: number;
+  vol_ann_pct: number;
+  pctiles_pct: number[];
+  single_stock_pct: number;
+  index_pct: number;
+  expected_tax_total: number;
+  vs_hold_cagr_pts: number;
+  constructive_sale: { risk: 'low' | 'elevated' | 'high' | 'n/a'; note: string };
+  eligible: boolean;
+  reasons: string[];
+  reason_tags: string[];
+  warnings: string[];
+  tax_note: string;
+  money: null | { source: string; today_total: number; where: string; at_expiry_total: number; expected: boolean; kept_as_collateral: boolean };
+  dividends: LeapDividends | null;
+  assignment: LeapAssignment[];
+  shape: {
+    floored: boolean; floor_value: number | null; worst_value: number; worst_pct: number; best_value: number; best_pct: number;
+    pretax_floored: boolean; pretax_floor_pct: number | null; capped: boolean; cap_value: number | null;
+    protect_below: number | null; cap_above: number | null; floor_ann_pct: number | null; cap_ann_pct: number | null;
+    worst_ann_pct: number; best_ann_pct: number; p_cap_pct: number | null; p_floor_pct: number | null;
+  };
+  payout: { market: LeapLedger; stock_only: LeapLedger };
+  rank: number;
+  recommended: boolean;
+}
+
+export interface LeapProtectionResponse {
+  success: boolean;
+  as_of: string;
+  ticker: string;
+  index: string;
+  spot: number;
+  index_spot: number;
+  shares: number;
+  cost_basis: number;
+  position_value: number;
+  starting_wealth: number;
+  embedded_gain: number;
+  embedded_tax: number;
+  horizon_label: string;
+  horizon: {
+    expiry: string; dte: number; years: number; index_expiry: string | null; roll_expiry: string | null;
+    roll_days: number | null; available: { expiry: string; dte: number }[];
+  };
+  market: {
+    atm_iv_pct: number; index_atm_iv_pct: number; hv_pct: number | null; index_hv_pct: number | null; rho: number;
+    beta: number; sigma_used_pct: number; index_sigma_used_pct: number; carry_pct: number;
+    short_atm_iv_pct: number | null; forward_vol_pct: number | null;
+    jumps: null | {
+      stock_diffusion_pct: number; stock_idio_jumps_per_yr: number; stock_idio_jump_mean_pct: number; stock_fit_vol_pts: number;
+      index_diffusion_pct?: number; market_jumps_per_yr?: number; market_jump_mean_pct?: number; index_fit_vol_pts?: number;
+    };
+    div_yield_pct: number; index_div_yield_pct: number; risk_free_pct: number; risk_free_source: string;
+    stock_drift_pct: number; index_drift_pct: number; capm_stock_pct: number; corr_obs: number | null;
+  };
+  best_id: string;
+  best_note: string | null;
+  strategies: LeapStrategyRow[];
+  families: { id: string; label: string; best_id: string | null }[];
+  destination: { kind: 'index' | 'bond' | 'cash'; label: string; rate_pct: number | null };
+  grid: { moves: number[]; prices: number[]; index_moves_market: number[] };
+  scenarios: { id: string; label: string; mode: 'market' | 'stock_only'; move: number }[];
+  assumptions: Record<string, number | string | boolean | null>;
+  notes: string[];
+  alternatives: { name: string; note: string }[];
+  disclaimer: string;
 }

@@ -2913,6 +2913,55 @@ def _parse_defend_position(strategy) -> tuple:
     return legs, near_exp, max(0.0, pos["shares"]), pos["basis"]
 
 
+async def _fetch_book(provider, ticker: str, exp) -> dict:
+    """One expiry's chain as the Defend desk's book: {strike: {'P'|'C': {mid, iv, bid, ask}}} (the liquid quote per strike)."""
+    from ..services.hedging_service import _split_chain
+    calls, puts = _split_chain(await provider.get_option_chain(ticker, exp))
+    book: dict = {}
+    for side, rt in ((puts, "P"), (calls, "C")):
+        for k, q in (side or {}).items():
+            mid, iv = getattr(q, "mid", None), getattr(q, "iv", None)
+            bid, ask = getattr(q, "bid", None), getattr(q, "ask", None)
+            book.setdefault(float(k), {})[rt] = {"mid": float(mid) if mid else None, "iv": float(iv) if iv else None,
+                                                 "bid": float(bid) if bid is not None else None,
+                                                 "ask": float(ask) if ask is not None else None,
+                                                 "oi": int(getattr(q, "oi", 0) or 0)}
+    return book
+
+
+def _daily_hv(ticker: str) -> Optional[dict]:
+    """The DAILY tape for the timing read: close-to-close realized vol (HV20 / HV60, % — the yardstick an option's IV is
+    priced against), the stock's 5- and 20-day return, daily RSI(14), and the market around it (SPY / QQQ 5-day return,
+    VIX level and its 5-day change). One best-effort download; any piece may be None."""
+    try:
+        import numpy as np
+        import yfinance as yf
+        h = yf.Ticker(ticker).history(period="6mo", interval="1d")
+        c = np.asarray(h["Close"].tolist(), dtype=float) if h is not None and not h.empty else np.array([])
+        if len(c) < 25:
+            return None
+        r = np.diff(np.log(c))
+        d = np.diff(c[-15:])
+        up, dn = float(np.clip(d, 0, None).mean()), float(-np.clip(d, None, 0).mean())
+        out = {"hv20": round(float(np.std(r[-20:], ddof=1) * np.sqrt(252) * 100), 1),
+               "hv60": (round(float(np.std(r[-60:], ddof=1) * np.sqrt(252) * 100), 1) if len(r) >= 60 else None),
+               "ret5": round(float(c[-1] / c[-6] - 1.0) * 100, 1), "ret20": round(float(c[-1] / c[-21] - 1.0) * 100, 1),
+               "rsi14": (round(100.0 - 100.0 / (1.0 + up / dn), 0) if dn > 0 else 100.0)}
+        try:
+            mk = yf.download(["SPY", "QQQ", "^VIX"], period="1mo", interval="1d", progress=False, auto_adjust=True)["Close"]
+            for col, key in (("SPY", "spy5"), ("QQQ", "qqq5")):
+                s_ = mk[col].dropna()
+                out[key] = round(float(s_.iloc[-1] / s_.iloc[-6] - 1.0) * 100, 1) if len(s_) >= 6 else None
+            v = mk["^VIX"].dropna()
+            out["vix"] = round(float(v.iloc[-1]), 1) if len(v) else None
+            out["vix5"] = round(float(v.iloc[-1] - v.iloc[-6]), 1) if len(v) >= 6 else None
+        except Exception:  # noqa: BLE001 — the market strip is optional
+            pass
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @router.get("/{strategy_id}/repair-menu")
 async def get_repair_menu(
     strategy_id: int,
@@ -2957,21 +3006,13 @@ async def get_repair_menu(
     except (ValueError, TypeError):
         dte_days = 30
 
-    # LIVE chains for the near (trade) expiry AND the far (+roll_days) expiry → {tenor: {strike:{P/C:{mid,iv}}}}.
+    # LIVE chains for the near (trade) expiry AND the far (+roll_days) expiry → {tenor: {strike:{P/C:{mid,iv,bid,ask}}}}.
     async def _chain_for(target_dte: int) -> tuple:
         try:
             exps = await provider.get_option_expirations(strategy.ticker)
             exp = min(exps, key=lambda e: abs((dt.date.fromisoformat(str(e)[:10]) - dt.date.today()).days - target_dte))
             adte = max(1, (dt.date.fromisoformat(str(exp)[:10]) - dt.date.today()).days)
-            calls, puts = _split_chain(await provider.get_option_chain(strategy.ticker, exp))
-            book: dict = {}
-            for side, rt in ((puts, "P"), (calls, "C")):
-                for k, q in (side or {}).items():
-                    mid = getattr(q, "mid", None)
-                    iv = getattr(q, "iv", None)
-                    book.setdefault(float(k), {})[rt] = {"mid": float(mid) if mid else None,
-                                                         "iv": float(iv) if iv else None}
-            return adte, book, str(exp)[:10]
+            return adte, await _fetch_book(provider, strategy.ticker, exp), str(exp)[:10]
         except Exception:  # noqa: BLE001 — no chain → pure BS fallback in the engine
             return target_dte, {}, None
 
@@ -3109,10 +3150,12 @@ async def get_repair_menu(
     except Exception:  # noqa: BLE001
         pass
 
-    # ── THE PRINT, AS THE MARKET PRICES IT — the earnings date plus the move the term structure implies for it
-    #    (back-month vs front-month IV when the print sits between the two expiries). The ranking scales its earnings
-    #    deduction by how exposed each short strike is to that move, and the timing read quotes it. ──
+    # ── THE PRINT, AS THE MARKET PRICES IT — the earnings date plus the move the term structure implies for it. Read
+    #    off the STRADDLE vols of the last expiry before the print and the first one after it (the tightest pair; the
+    #    provider IV field and a far month gave AAOI ±3% where the Oct 30 → Nov 6 straddles price ±15%). The ranking scales
+    #    its earnings deduction by how exposed each short strike is to that move, and the timing read quotes it. ──
     try:
+        from ..services.defend_playbook_service import term_structure
         _earn = (menu.get("context") or {}).get("earnings") or {}
         _ed, _days = str(_earn.get("date") or "")[:10], _earn.get("days")
         if _ed and isinstance(_days, (int, float)) and _days >= 0:
@@ -3121,8 +3164,75 @@ async def get_repair_menu(
             _far_iv = (float(_iv["far_iv_pct"]) / 100.0) if _iv.get("far_iv_pct") else None
             menu["event"] = {"date": _ed, "days": int(_days), "position": ("inside" if _days <= n_dte else "after"),
                              "implied_move_pct": implied_event_move(_near_iv, _far_iv, n_dte, (f_dte if far_book else None), _days),
-                             "far_expiry": (f_exp if far_book else None)}
+                             "far_expiry": (f_exp if far_book else None), "source": "provider IV"}
+            try:
+                _exps = [(str(e)[:10], (dt.date.fromisoformat(str(e)[:10]) - dt.date.today()).days)
+                         for e in await provider.get_option_expirations(strategy.ticker)]
+                _pre = [x for x in _exps if 0 < x[1] < _days][-1:]
+                _post = [x for x in _exps if x[1] >= _days][:1]
+                _have = {n_exp: near_book, f_exp: far_book}
+                _books = []
+                for _e, _d in _pre + _post:
+                    _b = _have.get(_e) or await _fetch_book(provider, strategy.ticker, _e)
+                    if _b:
+                        _books.append((_e, _d, _b))
+                _ts = term_structure(_books, spot, 0.045, _days)
+                if _ts.get("event_move_pct"):
+                    menu["event"].update({"implied_move_pct": _ts["event_move_pct"], "event_var": _ts["event_var"],
+                                          "source": f"straddles {_ts['pre']} → {_ts['post']}",
+                                          "term": _ts["expiries"]})
+            except Exception:  # noqa: BLE001 — keep the provider-IV estimate
+                pass
     except Exception:  # noqa: BLE001 — the print is context; the menu stands without it
+        pass
+
+    # ── THE VOL READ — what options cost vs what the stock is actually doing: the near expiry's STRADDLE vol against DAILY
+    #    close-to-close realized vol (the TA read's HV comes off intraday bars on a short-dated trade, which misses the very
+    #    overnight gaps a stressed name prints). It replaces the IV/HV/VRP the ranking and timing quote, so one vol read
+    #    speaks on the screen. Skipped when the near expiry itself spans the print (its IV then carries the event). ──
+    try:
+        from ..services.defend_playbook_service import straddle_vol, implied_spot
+        import asyncio as _aio_v
+        _hv = await _aio_v.to_thread(_daily_hv, strategy.ticker)
+        _S_opt = implied_spot(near_book, spot, n_dte, 0.045) or spot
+        _sv = straddle_vol(near_book, _S_opt, n_dte, 0.045)
+        _ev = menu.get("event") or {}
+        _near_spans = bool(_ev and _ev.get("position") == "inside")
+        if _hv:
+            menu["tape"] = _hv
+        if _sv:
+            vr = {"atm_iv_pct": round(_sv * 100, 1), "expiry": n_exp, "spans_earnings": _near_spans,
+                  "hv20_pct": (_hv or {}).get("hv20"), "hv60_pct": (_hv or {}).get("hv60"), "vrp_pct": None}
+            if vr["hv20_pct"]:
+                vr["vrp_pct"] = round((vr["atm_iv_pct"] / vr["hv20_pct"] - 1.0) * 100, 1)
+            menu["vol_read"] = vr
+            _rec = menu.get("recoverability") or {}
+            if vr["vrp_pct"] is not None and not _near_spans and _rec:
+                _rec.update({"iv_pct": vr["atm_iv_pct"], "hv_pct": vr["hv20_pct"], "vrp_pct": vr["vrp_pct"]})
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── ANATOMY — what each leg is doing for you now (time value, theta, vega, odds), the expiry zones, pin + early
+    #    assignment, and what each leg can be done with on its own. The assignment lens adopts its early-exercise read
+    #    (computed against the option-implied price, not a lagging last trade) so one read speaks. ──
+    try:
+        from ..services.defend_playbook_service import position_anatomy
+        an = position_anatomy(held=menu.get("held") or {}, spot=spot, dte=n_dte, r=0.045, book=near_book,
+                              ticker=strategy.ticker, event=menu.get("event"), ex_div=ex_div)
+        if an:
+            menu["anatomy"] = an
+            from ..services.defend_playbook_service import pin_read
+            _pz = an.get("pin") or {}
+            _sm = (float(an["atm_iv_pct"]) / 100.0 * (n_dte / 365.0) ** 0.5) if an.get("atm_iv_pct") else None
+            menu["pin_read"] = pin_read(near_book, spot, _pz.get("low"), _pz.get("high"), sigma_move=_sm)
+            _K = menu.get("short_strike")
+            _lbl = next((l["label"] for l in an["legs"] if l["sign"] < 0 and _K is not None and abs(l["strike"] - float(_K)) < 1e-6), None)
+            _ea = next((e for e in an.get("early_assignment") or [] if e["leg"] == _lbl), None)
+            if _ea and menu.get("assignment"):
+                menu["assignment"].update({"extrinsic": _ea["extrinsic"], "early_level": _ea["level"],
+                                           "early_assignment_risk": _ea["level"] == "high",
+                                           "early_reason": (_ea["why"] if _ea["level"] != "low" else None)})
+    except Exception:  # noqa: BLE001 — the anatomy is a read; the menu stands without it
         pass
 
     # ── LIVE ROLL SEARCH — phase 2 of ONE recommendation (see /defend/refine). Applies to a LONE short
@@ -3701,17 +3811,171 @@ async def refine_defend_with_rolls(
     kept = [{**k, "dte_days": current_dte, "iv": iv_default} for k in (wing["kept"] if wing else [])]   # the untouched side of a condor
     built = build_roll_alternatives(
         candidates=cands, tested=tested, tested_mark=float((out.get("tested") or {}).get("mark") or 0.0),
-        hold=d.get("hold"), spot=spot, r=0.045, stock=stock, iv_default=iv_default, held=d.get("held"), kept=kept)
+        hold=d.get("hold"), spot=spot, r=0.045, stock=stock, iv_default=iv_default, held=d.get("held"), kept=kept,
+        benchmark=(None if stock else d.get("unrealized_pnl")))
+
+    # ── THE ASSIGNMENT LADDER — the moves a same-width search can never find once the spread is in the money (rolling it
+    #    as-is is then a DEBIT): a cash-secured put further away, or a wider defined-risk spread, each paid for by time and
+    #    the event premium. Lone puts and clean verticals (no condor side, no shares); a naked call never converts to a
+    #    bigger naked call, so calls only get the spread route. ──
+    ladder_alts: list = []
+    books: list = []
+    try:
+        if not stock and (lone or (wing and not wing["kept"])):
+            ladder, ladder_alts, books = await _assignment_ladder_for(provider, strategy.ticker, d, spot, current_dte, wing, tested)
+            if ladder:
+                d["ladder"] = ladder
+    except Exception:  # noqa: BLE001 — the ladder is additive; the roll search still stands
+        ladder_alts = []
+    # ── THE RISK-BUDGET SEARCH — the user's rule for a defense: never add to the worst case, raise the odds of losing less
+    #    (money / capital may be added; legs may sit in different expiries). Valued on the market's own law, at real fills. ──
+    try:
+        if not stock and (lone or (wing and not wing["kept"])):
+            rb = await _risk_budget_for(provider, strategy.ticker, d, spot, current_dte, books)
+            if rb:
+                d["risk_budget"] = rb
+    except Exception:  # noqa: BLE001
+        logger.debug("risk budget search failed", exc_info=True)
+    # ── HOW THIS STOCK REALLY MOVES ON EARNINGS — exact release times from the SEC vs the move priced now ──
+    try:
+        eh = await _earnings_history_for(db, strategy.ticker, (d.get("event") or {}).get("implied_move_pct"))
+        if eh:
+            d["earnings_history"] = eh
+    except Exception:  # noqa: BLE001
+        pass
     drop_plain_rolls(d)                                                      # the search is now the ONLY source of rolls
-    d["alternatives"] = [a for a in d["alternatives"] if not a.get("roll_meta")] + built   # idempotent on a re-run
+    d["alternatives"] = [a for a in d["alternatives"] if not a.get("roll_meta")] + built + ladder_alts   # idempotent on a re-run
     d["roll_structure"] = out.get("structure")
     d["roll_note"] = (out.get("note") if cands else
                       ("No roll of this spread at even cost or better clears the quality bar right now — closing the old spread and "
-                       "reopening further out would cost money, or leave a coin-flip short strike." if wing else
+                       "reopening further out would cost money, or leave a coin-flip short strike."
+                       + (" A wider spread or a cash-secured put CAN be done for no new money — see the assignment ladder." if ladder_alts else "")
+                       if wing else
                        "No net-credit roll clears the quality bar right now — rolling would cost money or leave a coin-flip strike."))
     d["roll_search"] = "done"
     rank_defenses(d)
     return _to_native(d)
+
+
+async def _assignment_ladder_for(provider, ticker: str, d: dict, spot: float, current_dte: int, wing: Optional[dict],
+                                 tested: dict) -> tuple:
+    """Price the assignment ladder for the defended position and turn its best rungs into ranked alternatives.
+    Returns (ladder, alternatives). Chains for the rung expiries are fetched concurrently."""
+    import asyncio
+    import datetime as dt
+    from ..services.defend_playbook_service import assignment_ladder, ladder_expiries
+    from ..services.trade_repair_service import build_ladder_alternatives
+
+    held = d.get("held") or {}
+    hlegs = [l for l in held.get("legs") or [] if l.get("right") in ("P", "C")]
+    if not hlegs:
+        return None, [], []
+    right = tested["right"]
+    n = int(tested.get("qty") or 1)
+    unwind_ps = sum(-int(l["sign"]) * int(l["qty"]) * float(l.get("mark") or 0.0) for l in hlegs) / n
+    an = d.get("anatomy") or {}
+    q = {(l["right"], float(l["strike"]), int(l["sign"])): l for l in an.get("legs") or []}
+    nat = 0.0
+    for l in hlegs:
+        a = q.get((l["right"], float(l["strike"]), int(l["sign"])))
+        px = (a or {}).get("ask") if int(l["sign"]) < 0 else (a or {}).get("bid")
+        if px is None:
+            nat = None
+            break
+        nat += -int(l["sign"]) * int(l["qty"]) * float(px)
+    unwind_nat = (nat / n) if nat is not None else None
+    credit_ps = float(held.get("collected") or 0.0) / (100.0 * n)
+    ev = d.get("event") or {}
+    earn_days = ev.get("days") if isinstance(ev.get("days"), (int, float)) and ev.get("days") >= 0 else None
+
+    today = dt.date.today()
+    exps = []
+    for e in await provider.get_option_expirations(ticker):
+        try:
+            exps.append((str(e)[:10], (dt.date.fromisoformat(str(e)[:10]) - today).days))
+        except (ValueError, TypeError):
+            continue
+    picks = ladder_expiries(exps, cur_dte=current_dte, earn_days=earn_days)
+    if not picks:
+        return None, [], []
+    got = await asyncio.gather(*[_fetch_book(provider, ticker, e) for e, _ in picks], return_exceptions=True)
+    books = [(e, dte, b) for (e, dte), b in zip(picks, got) if isinstance(b, dict) and b]
+    long_k = float(wing["long_strike"]) if wing else None
+    ladder = assignment_ladder(right=right, short_strike=float(tested["strike"]), long_strike=long_k, qty=n, credit_ps=credit_ps,
+                               unwind_ps=unwind_ps, unwind_nat_ps=unwind_nat, books=books, spot=spot, r=0.045,
+                               earn_days=earn_days, cash_secured=(right == "P"))
+    ladder.update({"right": right, "short_strike": float(tested["strike"]), "long_strike": long_k})
+    ivs = {(l["right"], float(l["strike"])): float(l.get("iv_pct") or 0.0) / 100.0 for l in an.get("legs") or []}
+    near_vol = (float(an["atm_iv_pct"]) / 100.0) if an.get("atm_iv_pct") else None
+    held_for_wait = [{"right": l["right"], "strike": float(l["strike"]), "sign": int(l["sign"]), "qty": int(l["qty"]),
+                      "iv": ivs.get((l["right"], float(l["strike"]))) or near_vol or 0.5, "mark": float(l.get("mark") or 0.0)}
+                     for l in hlegs]
+    alts = build_ladder_alternatives(
+        ladder=ladder, right=right, short_strike=float(tested["strike"]), long_strike=long_k, qty=n, credit_ps=credit_ps,
+        unwind_ps=unwind_ps, hold=d.get("hold"), spot=spot, r=0.045, held=held,
+        wait_ctx={"held_legs": held_for_wait, "dte_now": current_dte, "event_var": ev.get("event_var"),
+                  "earn_days": earn_days, "near_vol": near_vol}, benchmark=d.get("unrealized_pnl"))
+    # …and CLOSING gets the same today-vs-last-day read (buying back what you hold, nothing opened)
+    from ..services.defend_playbook_service import wait_cost
+    close_row = next((a for a in d.get("alternatives") or [] if a.get("category") == "exit"), None)
+    if close_row is not None:
+        close_row["wait"] = wait_cost(held_legs=held_for_wait, new_legs=[], spot=spot, r=0.045, dte_now=current_dte,
+                                      near_vol=near_vol)
+    return ladder, alts, books
+
+
+async def _risk_budget_for(provider, ticker: str, d: dict, spot: float, current_dte: int, books: list) -> Optional[dict]:
+    """Run `risk_budget_search` for the defended position: the trade's own expiry chain + up to three later expiries from
+    the ladder's books (≤ ~100 days), vols off each expiry's straddle, and the today-vs-last-day read on every result."""
+    from ..services.defend_playbook_service import (risk_budget_search, straddle_vol, implied_spot, vol_curve, wait_cost)
+    held = d.get("held") or {}
+    near_exp = next((l.get("expiry") for l in held.get("legs") or [] if l.get("expiry")), None)
+    if not near_exp:
+        return None
+    near_book = await _fetch_book(provider, ticker, near_exp)
+    later = [(e, dte, b) for e, dte, b in sorted(books, key=lambda x: x[1]) if dte <= 100][:3]
+    an = d.get("anatomy") or {}
+    vols = {}
+    v0 = (float(an["atm_iv_pct"]) / 100.0) if an.get("atm_iv_pct") else straddle_vol(near_book, implied_spot(near_book, spot, current_dte, 0.045) or spot, current_dte, 0.045)
+    if v0:
+        vols[int(current_dte)] = v0
+    for e, dte, b in later:
+        v = straddle_vol(b, implied_spot(b, spot, dte, 0.045) or spot, dte, 0.045)
+        if v:
+            vols[int(dte)] = v
+    ev = d.get("event") or {}
+    earn_days = ev.get("days") if isinstance(ev.get("days"), (int, float)) and ev.get("days") >= 0 else None
+    rb = risk_budget_search(held=held, anatomy=an, near_book=near_book, near_exp=near_exp, near_dte=int(current_dte), later=later,
+                            spot=spot, r=0.045, vol_of=vol_curve(vols), earn_days=earn_days, ticker=ticker)
+    if not rb:
+        return None
+    for c in rb["best"] + rb["more_time"] + ([rb["same_strikes"]] if rb.get("same_strikes") else []):
+        c["wait"] = wait_cost(held_legs=c.get("_closes") or [], new_legs=c.get("_opens") or [], spot=spot, r=0.045,
+                              dte_now=current_dte, event_var=ev.get("event_var"), earn_days=earn_days, near_vol=vols.get(int(current_dte)))
+    for c in rb["best"] + rb["more_time"] + ([rb["same_strikes"]] if rb.get("same_strikes") else []):
+        c.pop("_closes", None)
+        c.pop("_opens", None)
+    return rb
+
+
+async def _earnings_history_for(db, ticker: str, implied_1sd_pct) -> Optional[dict]:
+    """The last ~12 earnings reactions (exact SEC release times, daily closes) vs the move priced for the next print."""
+    import asyncio
+    from ..services import edgar_service
+    from ..services.defend_playbook_service import earnings_history
+    rel = await edgar_service.earnings_release_times(db, ticker, limit=12)
+    if len(rel) < 4:
+        return None
+
+    def _bars():
+        import yfinance as yf
+        h = yf.Ticker(ticker).history(period="5y", interval="1d")
+        if h is None or h.empty:
+            return []
+        return [(ix.date().isoformat(), float(o), float(c)) for ix, o, c in zip(h.index, h["Open"], h["Close"])]
+
+    bars = await asyncio.to_thread(_bars)
+    return earnings_history(rel, bars, implied_1sd_pct)
 
 
 @router.get("/{strategy_id}/live-pnl")

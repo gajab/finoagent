@@ -28,7 +28,12 @@ export default function MarketContextHero({ context, spot, ticker }: { context: 
   const em = context?.expected_move;
   const dealer = context?.dealer;
   const ta = context?.trend_alignment;
+  const flips = context?.flip_levels;
+  const er = context?.earnings_reaction;
   const long = dealer?.gamma === 'long';
+  // a print the market has since reversed (gap-down reclaimed against a bearish read, or the mirror) argues with the bias
+  const erAgainst = !!er && er.state === 'reclaimed' &&
+    ((er.direction === 'down' && bias.direction === 'bearish') || (er.direction === 'up' && bias.direction === 'bullish'));
 
   // expected-move meter geometry (lower — spot — upper)
   let spotPct = 50;
@@ -55,6 +60,15 @@ export default function MarketContextHero({ context, spot, ticker }: { context: 
       </div>
 
       <p className="text-sm text-base-content/70 leading-snug mt-3">{readout(bias.direction, regime.label, ticker)}</p>
+      {er && (
+        <div className={`mt-2 text-xs leading-snug rounded-lg border px-3 py-2 text-base-content/75 ${erAgainst ? 'border-warning/40 bg-warning/5' : 'border-base-content/10 bg-base-content/[0.03]'}`}>
+          <span className={`font-semibold ${erAgainst ? 'text-warning' : 'text-base-content/80'}`}>
+            {erAgainst ? 'Post-earnings · against this read: ' : 'Post-earnings: '}
+          </span>
+          {er.read}
+          {er.evidence && <span className="block text-[10px] text-base-content/45 mt-1">{er.evidence}</span>}
+        </div>
+      )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mt-3">
         <StatTile
@@ -82,15 +96,23 @@ export default function MarketContextHero({ context, spot, ticker }: { context: 
           sub={dealer?.flip != null ? `flip $${dealer.flip}` : undefined}
         />
         <StatTile
-          label="Timeframes" tip="Trend direction on the Daily, 4-hour and 1-hour charts. When all three agree, the move is higher-conviction."
+          label="Timeframes" tip="Trend direction on the Daily, 4-hour and 1-hour charts, and the close that would flip each one (a change of character: above the last unbroken swing high in a downtrend, below the last swing low in an uptrend). When all three agree, the move is higher-conviction."
           value={ta ? (
-            <span className="flex items-center gap-2">
-              {(['daily', 'h4', 'h1'] as const).map(k => (
-                <span key={k} className="flex flex-col items-center leading-none">
-                  <span className={`text-base ${trendTone(ta[k])}`}>{trendIco(ta[k])}</span>
-                  <span className="text-[9px] text-base-content/40 mt-0.5">{k === 'daily' ? 'D' : k === 'h4' ? '4H' : '1H'}</span>
-                </span>
-              ))}
+            <span className="flex items-center gap-2.5">
+              {(['daily', 'h4', 'h1'] as const).map(k => {
+                const f = flips?.[k];
+                return (
+                  <span key={k} className="flex flex-col items-center leading-none">
+                    <span className={`text-base ${trendTone(ta[k])}`}>{trendIco(ta[k])}</span>
+                    <span className="text-[9px] text-base-content/40 mt-0.5">{k === 'daily' ? 'D' : k === 'h4' ? '4H' : '1H'}</span>
+                    {f != null && (ta[k] === 'up' || ta[k] === 'down') && (
+                      <span className="text-[9px] text-base-content/50 mt-0.5 tabular-nums" title={`A close ${ta[k] === 'down' ? 'above' : 'below'} $${f} flips this timeframe`}>
+                        {ta[k] === 'down' ? '>' : '<'}${f}
+                      </span>
+                    )}
+                  </span>
+                );
+              })}
             </span>
           ) : '—'}
         />

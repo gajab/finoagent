@@ -188,4 +188,27 @@ ok('with no engine read (still loading, or it failed) the counted lenses are "no
   assert.equal(L.trend.state, 'not_scored'); assert.equal(L.momentum.state, 'not_scored'); assert.equal(L.dealer.state, 'not_scored'); assert.equal(L.regime.state, 'not_scored');
   assert.equal(L.trend.detail, 'Needs the market read');
 });
+ok('earnings lens: only after a recent print, context-only, and a reversed gap-down argues with a short call', () => {
+  // TTMI 2026-10-26: −27.7% print, back above the print-day high two sessions later, verdict still bearish
+  const er = { date: '2026-10-22', sessions_since: 2, direction: 'down', move_pct: -27.66, sigma_multiple: 6.1, rvol: 4.3,
+    print_high: 84.09, print_low: 71.71, prior_close: 102.15, since_pct: 19.62, retraced_pct: 51.3, state: 'reclaimed',
+    avwap: 78.44, avwap_side: 'above', read: 'x', evidence: null };
+  const short = ctx('bearish', 'strong', [conf('market_structure', 'bearish', 'market structure is bearish')], { earnings_reaction: er });
+  const lenses = M.deriveLenses(short, tech(), 88.39);
+  const L = byKey(lenses);
+  assert.equal(lenses.length, 7);
+  assert.equal(L.earnings.counted, false); assert.equal(L.earnings.lean, 'bullish'); assert.equal(L.earnings.state, 'caution');
+  assert.match(L.earnings.detail, /−?-27\.7% on 4\.3× volume/); assert.match(L.earnings.detail, /back above the print-day high \$84\.09/);
+  assert.match(L.earnings.detail, /above earnings AVWAP \$78\.44/);
+  assert.ok(M.disagreements(lenses, M.deriveVerdict(short), null, null).some(d => d.who === 'Earnings'));
+  // the same print still below the print-day low SUPPORTS a short; a long call is cautioned
+  const ext = { ...er, state: 'extended', since_pct: -3 };
+  assert.equal(byKey(M.deriveLenses(ctx('bearish', 'strong', [], { earnings_reaction: ext }), tech(), 70)).earnings.state, 'supports');
+  assert.equal(byKey(M.deriveLenses(ctx('bullish', 'moderate', [], { earnings_reaction: ext }), tech(), 70)).earnings.state, 'caution');
+  // inside the print-day range has no lean; a gap-up that lost its print-day low leans bearish
+  assert.equal(byKey(M.deriveLenses(ctx('bearish', 'strong', [], { earnings_reaction: { ...er, state: 'inside' } }), tech(), 80)).earnings.lean, null);
+  assert.equal(byKey(M.deriveLenses(ctx('bullish', 'strong', [], { earnings_reaction: { ...er, direction: 'up', state: 'reclaimed' } }), tech(), 80)).earnings.state, 'caution');
+  // no print → no lens (six, as before)
+  assert.equal(M.deriveLenses(ctx('bearish', 'strong', []), tech(), 88).length, 6);
+});
 console.log(`\n${n} passed`);

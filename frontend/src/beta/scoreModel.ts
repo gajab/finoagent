@@ -7,6 +7,7 @@
  *     base + Σ option-math factors + Σ technical factors = raw        (raw may exceed 0..100)
  *     desk_score = raw clamped to [0, 100]                            (the cap is stated, never hidden)
  */
+import { isGraded } from '../lib/factors';
 import type { DeskRankedTrade } from '../types';
 
 export interface ScoreFactor { label: string; points: number; detail?: string; dimension?: string | null }
@@ -49,6 +50,7 @@ export function buildScore(t: DeskRankedTrade, dimOrder: string[]): ScoreModel {
 
   const byDim = new Map<string, number>();
   for (const f of [...adjs, ...tas]) {
+    if (!isGraded(f as any)) continue;   // info-only / 0-pt reads are context, not part of the grade
     const d = f.dimension || 'Other';
     byDim.set(d, r1((byDim.get(d) ?? 0) + f.points));
   }

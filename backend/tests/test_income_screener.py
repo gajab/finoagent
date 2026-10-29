@@ -219,3 +219,28 @@ def test_evaluate_play_mode_trades_the_event_expiry(monkeypatch):
     monkeypatch.setattr(isc, "_now_et", lambda: _et(MON, 16, 30))
     late = asyncio.run(isc.evaluate_ticker("XYZ", p))
     assert late["trades"] == [] and "already out" in late["skipped"]
+
+
+def test_rank_desk_derives_dte_from_the_expiry_for_every_caller(monkeypatch):
+    """The screener used to send no target_dte (→ the 35-day TA rung) while single-ticker sent the expiry's DTE, so
+    the SAME 2-day trade was graded on different TA levels (VLO 407.5P scored 55 vs 52). rank_desk now derives it."""
+    import app.services.desk_review_service as drs
+
+    seen = []
+
+    async def fake_ctx(ticker, dte=None):
+        seen.append(("ctx", dte))
+        return {}, {}, {}
+
+    async def fake_scan(ticker, **kw):
+        seen.append(("scan", kw.get("target_dte")))
+        return {"error": "stop"}
+
+    monkeypatch.setattr(drs, "_desk_context", fake_ctx)
+    monkeypatch.setattr(drs, "run_derivative_income", fake_scan)
+    monkeypatch.setattr(drs, "_structural_levels", lambda ta, gex: None)
+    exp = (date.today() + timedelta(days=2)).isoformat()
+    for client_dte in (None, 3, 40):                        # screener (none), a client clock a day off, a wrong hint
+        seen.clear()
+        asyncio.run(drs.rank_desk("XYZ", target_dte=client_dte, target_expiration=exp))
+        assert seen == [("ctx", 2), ("scan", 2)]

@@ -1,4 +1,4 @@
-import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, DeskReviewResult, DeskAgentsResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight, LadderRequest, LadderResponse } from './types';
+import type { User, ApiKeyInfo, AllowedUser, StockData, LLMMessage, LLMResponse, SearchResponse, PortfolioSummary, PortfolioHolding, HoldingInput, EnhancedPortfolioSummary, PortfolioTransaction, TransactionInput, DividendData, FundamentalData, PortfolioTechnicalData, Agent, AgentRun, AgentCreateInput, AgentUpdateInput, AgentStatus, PricePredictionData, StockNote, AskResponse, BulkParseResponse, BulkTransactionParseResponse, ParsedTransaction, DCFAnalysisData, DCFValuation, GuruAnalysisResponse, GuruAnalysisEntry, FinancialHealthData, LLMAnalysisResponse, BoxSpreadResponse, BoxScanResponse, DerivativeIncomeResult, DerivativeIncomePortfolioResult, DeskReviewResult, DeskAgentsResult, SingleStockLongShortResponse, PairTradeResponse, PairSuggestionsResponse, Portfolio130_30Response, ExitAnalysisData, AIImpactData, AIFortressData, AIStressTestData, RupeeData, EarningsInsight, LadderRequest, LadderResponse, LeapProtectionRequest, LeapProtectionResponse } from './types';
 import type { BondMarket, BondCatalogue, BondLookup, BondProfile, BondHoldingInput, BondPortfolio, BondCashFlow, BondLadderParams, BondLadderResult, TipsLadderResult, BondSimulation, BondLadderSaved, BondPlan, BondCalcResult, BondYieldMenu, BondStatus, BondPreview, BondFilters, BondWithdrawalMode, BondBuyParams, BondBuyPlan, BondGapParams, BondGapPlan, BondRebalanceParams, BondRebalance } from './types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
@@ -1241,6 +1241,13 @@ export async function computeConcentration(params: {
   });
 }
 
+export async function computeLeapProtection(req: LeapProtectionRequest): Promise<LeapProtectionResponse> {
+  return apiFetch<LeapProtectionResponse>('/api/stock/leap-protection', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+}
+
 export async function computeConcentrationLadder(req: LadderRequest): Promise<LadderResponse> {
   return apiFetch<LadderResponse>('/api/stock/concentration-ladder', {
     method: 'POST',
@@ -2046,6 +2053,11 @@ export interface RepairAlternative {
   // Present only on candidates from the live credit-only roll search (merged into this same ranked menu):
   // the search's own read — RND probability, which structural levels the new strike clears, earnings.
   roll_meta?: RollMeta | null;
+  wait?: MoveWait | null;
+  // Odds the ALL-IN P&L at this move's horizon ends better than closing everything today (absent on Close itself).
+  p_beat_close?: number | null;
+  // The same payoff placed another way (a same-strikes put-spread roll = shares at the short strike + a covered call + the long put).
+  alt_route?: { title: string; steps: string[]; capital: number; note: string } | null;
 }
 export interface MoveStep { action: 'BUY' | 'SELL' | string; right: 'P' | 'C' | 'STK' | string; strike: number | null; qty: number; expiry?: string | null; price: number; cash?: number | null }
 export interface MoveSteps {
@@ -2065,6 +2077,84 @@ export interface RollMeta {
   structure: Record<string, boolean | number>;      // per-level 'clears …' flags + cleared_count + levels_available
   scores: { composite?: number; probability?: number; structure?: number; credit?: number; cushion?: number; cushion_sigma?: number; time_factor?: number };
   new_breakeven: number | null; new_capital: number | null;
+  // Assignment-ladder rows: 'csp' = close what you hold, sell ONE put further away (cash-secured; `basis` = the effective
+  // price you'd buy the shares at after every credit); 'spread' = a wider defined-risk spread that pays for the close.
+  route?: 'csp' | 'spread';
+  basis?: number; basis_vs_spot_pct?: number; p_assigned_pct?: number; capital?: number; net_cash_natural?: number | null;
+}
+// The same roll done on the last day before the current expiry at the same stock price (and at ±1σ) vs doing it now.
+// `new_short`: the quoted IV of the new short then vs now (it rises into a print) and its premium then vs now (it does not).
+export interface MoveWait {
+  wait_days: number; net_now: number; net_later_flat: number; cost_flat: number;
+  new_short?: { strike: number; iv_now_pct: number; iv_later_pct: number; premium_now: number; premium_later: number };
+  up?: { spot: number; net_later: number }; down?: { spot: number; net_later: number };
+}
+// ANATOMY — what each held leg is doing for you now. Greeks are from YOUR side, in dollars: theta $/day (+ = time pays you),
+// vega $ per vol point (+ = rising IV helps), delta in share-equivalents.
+export interface AnatomyLeg {
+  label: string; right: 'P' | 'C'; strike: number; sign: number; qty: number; expiry?: string | null;
+  bid: number | null; ask: number | null; mid: number; entry: number; intrinsic: number; extrinsic: number; iv_pct: number;
+  delta: number; delta_sh: number; theta_day: number; vega: number; gamma: number; p_itm_pct: number; moneyness: string;
+}
+export interface DefendAnatomy {
+  underlying: { spot: number; implied: number | null; stale_quotes: boolean };
+  dte: number; atm_iv_pct: number | null;
+  legs: AnatomyLeg[];
+  net: { delta_sh: number; theta_day: number; vega: number; gamma: number };
+  spread: { width: number; mark: number; close_natural: number; credit: number; loss_now: number; max_loss: number; max_gain: number;
+            more_to_lose: number; more_to_gain: number; slippage: number; pct_of_max_loss: number | null } | null;
+  zones: { key: 'max_loss' | 'pin' | 'max_gain'; label: string; p_pct: number; pnl: number | null; pnl_range?: [number, number]; what: string }[];
+  early_assignment: { leg: string; level: 'high' | 'possible' | 'low'; extrinsic: number; carry: number; why: string }[];
+  pin: { p_pct: number; low: number; high: number; text: string } | null;
+  leg_moves: { leg: string; move: string; cash: number; new_max_loss: number | null; assignment_basis: number | null; verdict: 'avoid' | 'directional' | string; text: string }[];
+  insights: { kind: string; tone: 'good' | 'bad' | 'warn' | 'info'; text: string }[];
+}
+// THE ASSIGNMENT LADDER — per later expiry, the furthest strike a no-new-money roll can reach.
+export interface LadderRung {
+  expiry: string; dte: number; spans_earnings: boolean; atm_iv_pct: number | null;
+  csp: { strike: number; premium: number; bid: number; ask: number; iv: number; net_cash: number; net_cash_natural: number | null;
+         basis: number; basis_vs_spot_pct: number; p_assigned_pct: number; capital: number } | null;
+  spread: { short: number; long: number; width: number; credit: number; net_cash: number; net_cash_natural: number | null;
+            max_loss: number; breakeven: number; p_profit_pct: number; p_max_loss_pct: number; wider: boolean } | null;
+  same_width: { short: number; long: number; net_cash: number } | null;
+}
+export interface DefendLadder {
+  rungs: LadderRung[]; unwind: { mid: number; natural: number | null }; credit_collected: number;
+  right: 'P' | 'C'; short_strike: number; long_strike: number | null;
+}
+// The ranked menu re-read by GOAL (lowest risk · recover with defined risk · lowest cost if assigned). `alt` = the
+// alternative's name on the menu (same numbers as its card).
+export interface DefendGoal {
+  key: 'min_risk' | 'recover' | 'assign'; title: string; alt: string; is_pick: boolean; headline: string; points: string[];
+  net_cash: number | null; worst: number | null; best: number | null; pop_pct: number | null; basis?: number;
+}
+// One action on the plan. Numbers are ALL-IN (the trade you hold included) at a realistic fill (halfway mid → natural), on the
+// market's own distribution. tier: 'rule' = keeps the worst case at or below today's · 'more' = adds `added_risk` for more time ·
+// 'close' = close now. beat_close_pct = odds it ends meaningfully better than closing now.
+export interface DefendActionRow {
+  alt: string | null; tag: string; tier?: 'rule' | 'more' | 'close'; title: string; is_pick: boolean;
+  cash: number | null; cash_mid?: number | null; worst: number | null; best: number | null; beat_close_pct: number | null;
+  ev?: number | null; days: number | null; orders?: string[]; added_risk?: number; capital?: number | null;
+  why: string; when: string | null; wait?: MoveWait | null; alt_route: RepairAlternative['alt_route'];
+}
+// Every strategy family the search priced: its best version, and in one line why it is or isn't the answer.
+export interface DefendExplorerRow {
+  family: string; kind: string; tested: number; status: 'rule' | 'more' | 'unlimited'; why: string;
+  best: { title: string; orders: string[]; cash: number; cash_fill: number; worst: number | null; best: number | null;
+          ev: number | null; p_beat: number | null; days: number; added_risk: number | null };
+}
+export interface DefendActionPlan {
+  facts: string[]; rows: DefendActionRow[]; benchmark: number | null; verdict?: string | null;
+  rule_worst?: number | null; need?: number | null; searched?: number | null; allowance?: number | null;
+  explorer?: DefendExplorerRow[];
+}
+// TODAY OR WAIT — each action's cash today vs the same action on the last day before expiry (flat / ±1σ) and today if IV
+// drops 10 points; plus the signals that say which world is likelier.
+export interface DefendTimingRead {
+  verdict: 'today' | 'last_day' | 'either' | null; headline: string | null; wait_days?: number;
+  up_spot?: number | null; down_spot?: number | null;
+  rows: { alt: string | null; title: string; now: number; flat: number; up: number | null; down: number | null; iv_down: number | null; verdict: string }[];
+  signals: { side: 'bounce' | 'drop' | 'vol' | 'event' | 'market'; text: string }[];
 }
 // One factor in the recoverability build-up — a probability driver (kind 'prob') or a technical
 // read (kind 'ta'). favorable: true = helps a recovery, false = works against it, null = neutral/2-sided.
@@ -2088,6 +2178,7 @@ export interface DefendAssignment {
   p_itm: number | null; extrinsic: number; intrinsic: number;
   early_assignment_risk: boolean; early_reason: string | null;
   pin_ratio: number | null; effective_basis: number; assignment_capital: number; consequence: string;
+  early_level?: 'high' | 'possible' | 'low';
 }
 export interface DefendCostOfWaiting { in_trading_days: number; dte_left: number; recovery_pop: number | null; expected_pnl: number | null; }
 // Lens 5 — CONTEXT, computed in the SAME core fetch (folded in, no second click): recoverable time
@@ -2120,7 +2211,16 @@ export interface RepairMenuResult {
   // structure and what waiting costs. `act_by` = the last sensible day before the print.
   timing?: MoveTiming | null;
   // The print as the market prices it: where it falls relative to this expiry, and the implied ±1σ move (null when it can't be isolated).
-  event?: { date: string; days: number; position: 'inside' | 'after'; implied_move_pct: number | null; far_expiry: string | null } | null;
+  event?: { date: string; days: number; position: 'inside' | 'after'; implied_move_pct: number | null; far_expiry: string | null;
+             source?: string; term?: { expiry: string; dte: number; atm_iv_pct: number | null; spans_earnings: boolean }[] } | null;
+  // What options cost vs what the stock does: the near expiry's straddle vol vs DAILY realized vol (HV20/HV60).
+  vol_read?: { atm_iv_pct: number; expiry: string | null; spans_earnings: boolean; hv20_pct: number | null; hv60_pct: number | null; vrp_pct: number | null } | null;
+  anatomy?: DefendAnatomy | null;
+  ladder?: DefendLadder | null;
+  playbook?: { objectives: DefendGoal[] } | null;
+  // The whole desk on one card: short facts + at most five actions, each with the same four numbers.
+  action_plan?: DefendActionPlan | null;
+  timing_read?: DefendTimingRead | null;
   // The tested WING when the position is a clean vertical (a credit spread, or one side of an iron condor) — rolled as ONE package.
   wing?: { right: 'P' | 'C'; qty: number; short_strike: number; long_strike: number; width: number; short_entry: number; long_entry: number; net_entry: number; kept_legs: number } | null;
   // The position as it stands today (every alternative's steps are diffed against it).
@@ -2222,7 +2322,7 @@ export async function runLifecycleAgent(
   });
 }
 
-export interface DeskFactor { label: string; points: number; }
+export interface DeskFactor { label: string; points: number; detail?: string; info_only?: boolean; }
 export interface DeskScoreResult {
   matched: boolean;
   error?: string;

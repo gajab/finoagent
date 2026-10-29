@@ -52,6 +52,7 @@ class TestStructure:
         st = _structure(closes, sh, sl, order=1)
         assert st["last_event"]["type"] == "CHOCH" and st["last_event"]["direction"] == "bearish"
         assert any(e["direction"] == "bullish" for e in st["events"])   # the earlier upside break
+        assert st["flip_level"] == 124.0          # down now; only a close back above the unbroken 124 high turns it
 
     def test_bos_marks_continuation(self):
         # trend already up, then a close breaks a HIGHER high → BOS bullish
@@ -60,6 +61,7 @@ class TestStructure:
         st = _structure(closes, sh, sl, order=1)
         assert st["trend"] == "up"
         assert any(e["type"] == "BOS" and e["direction"] == "bullish" for e in st["events"])
+        assert st["flip_level"] == 116.0          # up; a close below the confirmed 116 swing low is the CHOCH
 
 
 class TestLiquidityPools:

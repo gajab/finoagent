@@ -22,9 +22,10 @@ const ZebraStrategy = lazy(() => import('../components/ZebraStrategy').then(m =>
 const TaxLossHarvesting = lazy(() => import('../components/TaxLossHarvesting').then(m => ({ default: m.TaxLossHarvesting })));
 const CppiStrategy = lazy(() => import('../components/CppiStrategy').then(m => ({ default: m.CppiStrategy })));
 const HedgingStrategy = lazy(() => import('../components/HedgingStrategy').then(m => ({ default: m.HedgingStrategy })));
+const LeapProtection = lazy(() => import('../components/LeapProtection').then(m => ({ default: m.LeapProtection })));
 const DerivativeIncome = lazy(() => import('../components/DerivativeIncome').then(m => ({ default: m.DerivativeIncome })));
 
-type Strategy = 'box' | 'longshort' | 'structured' | 'dual_direction' | 'concentration' | 'poormans' | 'zebra' | 'tax_loss_harvesting' | 'cppi' | 'hedging' | 'derivative_income';
+type Strategy = 'box' | 'longshort' | 'structured' | 'dual_direction' | 'concentration' | 'leap_protection' | 'poormans' | 'zebra' | 'tax_loss_harvesting' | 'cppi' | 'hedging' | 'derivative_income';
 
 const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; description: string }[] = [
 
@@ -75,6 +76,12 @@ const STRATEGIES: { id: Strategy; label: string; icon: React.ReactNode; descript
     label: 'Concentration Management',
     icon: <Target className="w-5 h-5" />,
     description: 'Tax-efficiently diversify large, concentrated stock positions.',
+  },
+  {
+    id: 'leap_protection',
+    label: 'LEAP Protection',
+    icon: <ShieldCheck className="w-5 h-5" />,
+    description: 'Protect & diversify a low-basis holding without selling — every LEAP structure ranked by after-tax annualised return.',
   },
   {
     id: 'poormans',
@@ -204,6 +211,7 @@ export default function StrategiesPage() {
                 {activeStrategy === 'structured' && <StructuredTrades />}
                 {activeStrategy === 'dual_direction' && <DualDirectionBuffer />}
                 {activeStrategy === 'concentration' && <ConcentrationManager />}
+                {activeStrategy === 'leap_protection' && <LeapProtection />}
                 {activeStrategy === 'poormans' && <PoorMansCovered />}
                 {activeStrategy === 'zebra' && <ZebraStrategy />}
                 {activeStrategy === 'cppi' && <CppiStrategy />}

@@ -17,10 +17,11 @@ const ZebraStrategy = lazy(() => import('../components/ZebraStrategy').then(m =>
 const TaxLossHarvesting = lazy(() => import('../components/TaxLossHarvesting').then(m => ({ default: m.TaxLossHarvesting })));
 const CppiStrategy = lazy(() => import('../components/CppiStrategy').then(m => ({ default: m.CppiStrategy })));
 const HedgingStrategy = lazy(() => import('../components/HedgingStrategy').then(m => ({ default: m.HedgingStrategy })));
+const LeapProtection = lazy(() => import('../components/LeapProtection').then(m => ({ default: m.LeapProtection })));
 const IncomeDeskBeta = lazy(() => import('./IncomeDeskBeta'));
 
 export type StrategyId = 'derivative_income' | 'poormans' | 'zebra' | 'box' | 'hedging' | 'cppi' | 'dual_direction' | 'structured'
-  | 'tax_loss_harvesting' | 'concentration' | 'longshort';
+  | 'tax_loss_harvesting' | 'concentration' | 'leap_protection' | 'longshort';
 
 const STRATEGY: Record<StrategyId, { label: string; hint: string }> = {
   derivative_income: { label: 'Income Desk', hint: 'Grades every option-selling trade, then the Quant · Risk · PM desk debates the best.' },
@@ -33,13 +34,14 @@ const STRATEGY: Record<StrategyId, { label: string; hint: string }> = {
   structured: { label: 'Structured trades', hint: 'Principal-protected notes using zero-coupon bonds + options.' },
   tax_loss_harvesting: { label: 'Tax-loss harvesting', hint: 'Optimize losses with correlated proxies and synthetic long options.' },
   concentration: { label: 'Concentration', hint: 'Tax-efficiently diversify large, concentrated stock positions.' },
+  leap_protection: { label: 'LEAP protection', hint: 'Protect & diversify a low-basis holding without selling — every LEAP structure ranked by after-tax return.' },
   longshort: { label: 'Long/short equity', hint: 'Hedge market risk by pairing long positions with ETF shorts.' },
 };
 
 const FAMILIES: { id: string; label: string; items: StrategyId[] }[] = [
   { id: 'income', label: 'Income', items: ['derivative_income', 'poormans', 'zebra', 'box'] },
   { id: 'protect', label: 'Protect', items: ['hedging', 'cppi', 'dual_direction', 'structured'] },
-  { id: 'tax', label: 'Tax & concentration', items: ['tax_loss_harvesting', 'concentration'] },
+  { id: 'tax', label: 'Tax & concentration', items: ['tax_loss_harvesting', 'concentration', 'leap_protection'] },
   { id: 'equity', label: 'Equity', items: ['longshort'] },
 ];
 
@@ -88,6 +90,7 @@ export default function StrategiesBeta() {
             {active === 'structured' && <StructuredTrades />}
             {active === 'tax_loss_harvesting' && <TaxLossHarvesting />}
             {active === 'concentration' && <ConcentrationManager />}
+            {active === 'leap_protection' && <LeapProtection />}
             {active === 'longshort' && <LongShortStrategy />}
           </Suspense>
         </div>

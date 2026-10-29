@@ -11,7 +11,7 @@ import type { SetupContext, TradeSetup, TradeSetupsData, ConfluenceZone, Technic
 import { tradeOdds, type OddsResult } from './firstPassage';
 
 export type Dir = 'long' | 'short' | 'neutral';
-export type LensKey = 'trend' | 'momentum' | 'dealer' | 'stretch' | 'volume' | 'regime';
+export type LensKey = 'trend' | 'momentum' | 'dealer' | 'stretch' | 'volume' | 'regime' | 'earnings';
 export type LensState = 'supports' | 'caution' | 'against' | 'neutral' | 'not_scored';
 export type LayerKey = 'plan' | 'levels' | 'structure' | 'blocks' | 'liquidity' | 'dealer' | 'value' | 'strategy';
 export type Style = 'day' | 'swing' | 'position';
@@ -178,6 +178,24 @@ export function deriveLenses(ctx: SetupContext | null | undefined, tech: Technic
     out.push({ key: 'regime', label: 'Regime', counted: false, lean: null, state: lbl ? state : 'not_scored',
       detail: nm ? [nm, num(r?.hurst) ? `Hurst ${r!.hurst}` : null, r?.confidence ? `${r.confidence} confidence` : null,
         lbl === 'mean_reverting' && dir !== 'neutral' ? 'fade extremes — breakouts tend to fail' : null].filter(Boolean).join(' · ') : 'No regime read' });
+  }
+  // Earnings — context, and only after a recent material print (every other lens reads pre-print structure)
+  {
+    const er = ctx?.earnings_reaction;
+    if (er) {
+      const down = er.direction === 'down';
+      // a print reversed against itself leans the other way; one extended with itself leans its way
+      const lean: Lens['lean'] = er.state === 'inside' ? null : (down === (er.state === 'reclaimed') ? 'bullish' : 'bearish');
+      const want = WANT[dir];
+      const state: LensState = !want || !lean ? 'neutral' : lean === want ? 'supports' : 'caution';
+      const where = er.state === 'inside' ? `inside the print-day range ${money(er.print_low)}–${money(er.print_high)}`
+        : down === (er.state === 'reclaimed') ? `back above the print-day high ${money(er.print_high)}` : `below the print-day low ${money(er.print_low)}`;
+      const sign = (n: number) => `${n >= 0 ? '+' : ''}${fx(n, 1)}%`;
+      out.push({ key: 'earnings', label: 'Earnings', counted: false, lean, state,
+        detail: [`${er.date}: ${sign(er.move_pct)}${num(er.rvol) ? ` on ${fx(er.rvol, 1)}× volume` : ''}`,
+          er.sessions_since ? `${sign(er.since_pct)} since` : null, where,
+          er.avwap_side && num(er.avwap) ? `${er.avwap_side} earnings AVWAP ${money(er.avwap)}` : null].filter(Boolean).join(' · ') });
+    }
   }
   return out;
 }

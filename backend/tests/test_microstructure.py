@@ -162,3 +162,42 @@ class TestComputeMicrostructure:
 
     def test_no_data_returns_none(self):
         assert compute_microstructure(_EmptyStock()) is None
+
+
+class _InfoOnlyStock:
+    """earnings_dates unavailable (no lxml / throttled); .info carries the report timestamp;
+    earnings_history is indexed by the fiscal QUARTER END, which must never be used as the anchor."""
+    def __init__(self, report_ts):
+        self._ts = report_ts
+
+    @property
+    def earnings_dates(self):
+        raise ImportError("`Import lxml` failed.")
+
+    @property
+    def earnings_history(self):
+        return pd.DataFrame({"epsActual": [1.46]}, index=[pd.Timestamp("2026-09-30")])
+
+    @property
+    def info(self):
+        return {"earningsTimestamp": int(self._ts.timestamp())} if self._ts is not None else {}
+
+
+class TestLastEarningsDate:
+    def _ago(self, days, hh, mm):
+        d = (pd.Timestamp.now(tz="America/New_York") - pd.Timedelta(days=days)).normalize()
+        return d + pd.Timedelta(hours=hh, minutes=mm)
+
+    def test_bmo_report_anchors_on_report_day(self):
+        from app.services.microstructure_service import _last_earnings_date
+        ts = self._ago(4, 8, 30)                       # before the open → reacts the same session
+        assert _last_earnings_date(_InfoOnlyStock(ts)) == ts.date()
+
+    def test_amc_report_anchors_on_next_session(self):
+        from app.services.microstructure_service import _last_earnings_date
+        ts = self._ago(4, 16, 5)                       # after the close → the gap is the NEXT day
+        assert _last_earnings_date(_InfoOnlyStock(ts)) == (ts + pd.Timedelta(days=1)).date()
+
+    def test_quarter_end_is_never_the_anchor(self):
+        from app.services.microstructure_service import _last_earnings_date
+        assert _last_earnings_date(_InfoOnlyStock(None)) is None

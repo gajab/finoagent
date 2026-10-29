@@ -171,5 +171,13 @@ class TestComputeInvariants:
                 else:
                     assert tgt > bk                            # bullish target above trigger
 
+    def test_target_hit_then_bounced_is_spent(self):
+        # TTMI 2026-10: double-top target hit by an earnings flush, then price bounced back above it.
+        # The measured move has played out — it must not keep surfacing (and voting) as a live short.
+        live = compute_chart_patterns(_FakeStock(_df(_path([90, 100, 120, 108, 120, 104, 98, 103]))))
+        spent = compute_chart_patterns(_FakeStock(_df(_path([90, 100, 120, 108, 120, 104, 93, 103]))))
+        assert [p["type"] for p in live["patterns"]] == ["double_top"]   # dip stayed above the target
+        assert spent["patterns"] == []                                     # dip went through it
+
     def test_short_history_returns_none(self):
         assert compute_chart_patterns(_FakeStock(_df([100, 101, 102]))) is None

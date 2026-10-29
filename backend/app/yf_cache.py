@@ -33,8 +33,23 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import warnings
 
 logger = logging.getLogger(__name__)
+
+
+def _quiet_yfinance_pandas_deprecations() -> None:
+    """Silence pandas deprecation warnings raised *inside* yfinance's own code.
+
+    yfinance 1.7.0 (latest) calls ``DataFrame.sort_index(inplace=True)``, which pandas 3.1
+    deprecates (PDEP-8) — one Pandas4Warning per process, nothing we can change. The filter is
+    scoped to the ``yfinance.*`` modules, so the same deprecation in OUR code still surfaces.
+    """
+    try:
+        from pandas.errors import Pandas4Warning as category
+    except ImportError:  # pandas < 3.1 has no Pandas4Warning; nothing to silence
+        return
+    warnings.filterwarnings("ignore", category=category, module=r"yfinance(\.|$)")
 
 
 def _cache_dir() -> str:
@@ -71,4 +86,5 @@ def configure() -> None:
         logger.warning("Could not configure yfinance cache: %s", exc)
 
 
+_quiet_yfinance_pandas_deprecations()
 configure()
